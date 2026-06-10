@@ -25,6 +25,10 @@
         };
       });
 
+      checks.x86_64-linux.nixos-test = nixpkgs.legacyPackages.x86_64-linux.testers.runNixOSTest (
+        import ./nix/test.nix { tribuchet = self.packages.x86_64-linux.default; }
+      );
+
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           packages = with pkgs; [

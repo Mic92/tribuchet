@@ -79,8 +79,12 @@ pub fn spawn(spec: &SandboxSpec) -> Result<Child> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    cmd.spawn()
-        .with_context(|| format!("spawning builder {}", spec.builder))
+    cmd.spawn().with_context(|| {
+        let detail = platform::spawn_error_detail(spec)
+            .map(|d| format!(" ({d})"))
+            .unwrap_or_default();
+        format!("spawning builder {}{detail}", spec.builder)
+    })
 }
 
 pub fn cleanup(a: &BuildAssignment, dir: &Path) {
@@ -164,8 +168,16 @@ mod platform {
         let uid = getuid().as_raw();
         let gid = getgid().as_raw();
 
+        let err_file = setup_error_file(&spec.root);
         unsafe {
-            cmd.pre_exec(move || setup(&root, &build_dir, &binds, &cwd, network, uid, gid));
+            cmd.pre_exec(move || {
+                setup(&root, &build_dir, &binds, &cwd, network, uid, gid).inspect_err(|e| {
+                    // std forwards only the errno from pre_exec to the
+                    // parent, dropping our message; leave the failing
+                    // step in a file the parent reads on spawn failure.
+                    let _ = std::fs::write(&err_file, e.to_string());
+                })
+            });
         }
         Ok(cmd)
     }
@@ -271,6 +283,14 @@ mod platform {
         Ok(())
     }
 
+    pub fn setup_error_file(root: &Path) -> PathBuf {
+        root.with_file_name("setup-error")
+    }
+
+    pub fn spawn_error_detail(spec: &SandboxSpec) -> Option<String> {
+        std::fs::read_to_string(setup_error_file(&spec.root)).ok()
+    }
+
     pub fn cleanup(_a: &BuildAssignment, _dir: &Path) {
         // Mounts lived in the child's namespace and died with it; the
         // build dir itself is removed by the caller.
@@ -344,6 +364,10 @@ mod platform {
             .args(&spec.args);
         cmd.current_dir(&spec.cwd);
         Ok(cmd)
+    }
+
+    pub fn spawn_error_detail(_spec: &SandboxSpec) -> Option<String> {
+        None
     }
 
     pub fn cleanup(a: &BuildAssignment, _dir: &Path) {
