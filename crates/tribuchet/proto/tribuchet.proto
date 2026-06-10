@@ -1,0 +1,116 @@
+syntax = "proto3";
+
+package tribuchet.v1;
+
+// Worker-facing service. Workers dial the hub and keep a long-lived
+// bidirectional stream open (NAT-friendly; the hub never dials workers).
+service WorkerHub {
+  // Single bidi stream multiplexing registration, heartbeats, build
+  // assignment, path negotiation, NAR transfer, logs and results.
+  rpc Session(stream WorkerMessage) returns (stream HubMessage);
+}
+
+message WorkerMessage {
+  oneof msg {
+    Register register = 1;
+    Heartbeat heartbeat = 2;
+    // Subset of the offered input paths the worker does not have cached.
+    MissingPaths missing_paths = 3;
+    LogChunk log = 4;
+    BuildResult result = 5;
+    // Output NARs streamed back after BuildResult announces them.
+    NarTransfer nar = 6;
+  }
+}
+
+message HubMessage {
+  oneof msg {
+    BuildAssignment assignment = 1;
+    // Input closure of an assigned build; worker answers MissingPaths.
+    PathOffer path_offer = 2;
+    NarTransfer nar = 3;
+    // topTmpDir contents (structured attrs, passAsFile files).
+    TmpDirArchive tmp_dir = 4;
+    CancelBuild cancel = 5;
+  }
+}
+
+message Register {
+  string worker_name = 1;
+  repeated string systems = 2; // e.g. "x86_64-linux"
+  repeated string features = 3; // e.g. "kvm", "big-parallel"
+  uint32 max_jobs = 4;
+  // ed25519 public key used to sign output NARs.
+  bytes signing_public_key = 5;
+}
+
+message Heartbeat {
+  uint32 running_jobs = 1;
+  double load1 = 2;
+}
+
+message BuildAssignment {
+  string build_id = 1;
+  string system = 2;
+  string builder = 3;
+  repeated string args = 4;
+  map<string, string> env = 5;
+  // Scratch output paths, identical on client and worker.
+  map<string, string> outputs = 6;
+  string tmp_dir_in_sandbox = 7; // "/build"
+  string store_dir = 8; // "/nix/store"
+  bool fixed_output = 9; // grants network inside the sandbox
+}
+
+message PathOffer {
+  string build_id = 1;
+  repeated string store_paths = 2;
+}
+
+message MissingPaths {
+  string build_id = 1;
+  repeated string store_paths = 2;
+}
+
+// One store path or output, streamed as a zstd-compressed NAR.
+// `payload` is a oneof so a chunked CAS encoding can be added later
+// without breaking the protocol.
+message NarTransfer {
+  string build_id = 1;
+  string store_path = 2;
+  oneof payload {
+    bytes zstd_nar_chunk = 3;
+  }
+  bool eof = 4;
+}
+
+message TmpDirArchive {
+  string build_id = 1;
+  bytes zstd_tar_chunk = 2;
+  bool eof = 3;
+}
+
+message LogChunk {
+  string build_id = 1;
+  bytes data = 2;
+}
+
+message CancelBuild {
+  string build_id = 1;
+}
+
+message BuildResult {
+  string build_id = 1;
+  int32 exit_code = 2;
+  // For each output: NAR sha256 and ed25519 signature over
+  // "<store_path>:<nar_sha256>". NAR data follows as NarTransfer
+  // messages on the worker stream.
+  repeated OutputSignature outputs = 3;
+  string error = 4;
+}
+
+message OutputSignature {
+  string store_path = 1;
+  bytes nar_sha256 = 2;
+  bytes signature = 3;
+}
