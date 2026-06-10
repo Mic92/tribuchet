@@ -1,7 +1,9 @@
 mod attach;
 mod build_json;
 mod ca;
+mod chunkio;
 mod hub;
+mod nar;
 mod proto;
 mod worker;
 
@@ -45,6 +47,15 @@ enum Command {
         hub: String,
         #[arg(long, default_value = "/var/lib/tribuchet")]
         state_dir: PathBuf,
+        /// Systems this worker builds for (default: host system).
+        #[arg(long = "system")]
+        systems: Vec<String>,
+        #[arg(long, default_value = "/var/lib/tribuchet/tls/ca.crt")]
+        ca_cert: PathBuf,
+        #[arg(long, default_value = "/var/lib/tribuchet/tls/worker.crt")]
+        cert: PathBuf,
+        #[arg(long, default_value = "/var/lib/tribuchet/tls/worker.key")]
+        key: PathBuf,
     },
     /// Certificate authority management (init CA, issue worker certs).
     Ca {
@@ -56,8 +67,7 @@ enum Command {
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -69,7 +79,26 @@ fn main() -> anyhow::Result<()> {
             listen,
             config_dir,
         } => hub::run(&socket, &listen, &config_dir),
-        Command::Worker { hub, state_dir } => worker::run(&hub, &state_dir),
+        Command::Worker {
+            hub,
+            state_dir,
+            mut systems,
+            ca_cert,
+            cert,
+            key,
+        } => {
+            if systems.is_empty() {
+                systems.push(worker::host_system());
+            }
+            worker::run(worker::WorkerOpts {
+                hub,
+                state_dir,
+                systems,
+                ca_cert,
+                cert,
+                key,
+            })
+        }
         Command::Ca { action } => ca::run(action),
     }
 }

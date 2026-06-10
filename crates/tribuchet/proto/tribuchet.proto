@@ -114,3 +114,39 @@ message OutputSignature {
   bytes nar_sha256 = 2;
   bytes signature = 3;
 }
+
+// Local service between `tribuchet attach` and the hub, served on a unix
+// socket. The hub is colocated with nix-daemon, so it reads input store
+// paths and topTmpDir directly from disk; attach only sends metadata.
+service AttachHub {
+  rpc Build(BuildRequest) returns (stream AttachEvent);
+}
+
+message BuildRequest {
+  string system = 1;
+  string builder = 2;
+  repeated string args = 3;
+  map<string, string> env = 4;
+  // Output name -> scratch store path.
+  map<string, string> outputs = 5;
+  repeated string input_paths = 6;
+  string top_tmp_dir = 7;
+  string tmp_dir_in_sandbox = 8;
+  string store_dir = 9;
+  bool fixed_output = 10;
+}
+
+message AttachEvent {
+  oneof event {
+    bytes log = 1;
+    OutputNar output = 2;
+    int32 exit_code = 3;
+    string error = 4;
+  }
+}
+
+message OutputNar {
+  string store_path = 1;
+  bytes zstd_nar_chunk = 2;
+  bool eof = 3;
+}

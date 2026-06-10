@@ -16,10 +16,8 @@ pub struct BuildJson {
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub top_tmp_dir: PathBuf,
-    pub tmp_dir: PathBuf,
     pub tmp_dir_in_sandbox: PathBuf,
     pub store_dir: String,
-    pub real_store_dir: String,
     pub system: String,
     pub input_paths: Vec<String>,
     /// Output name -> scratch store path. The same scratch paths must be
@@ -29,8 +27,8 @@ pub struct BuildJson {
 
 impl BuildJson {
     pub fn load(path: &Path) -> Result<Self> {
-        let data = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let data =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let parsed: Self = serde_json::from_str(&data).context("parsing build.json")?;
         if parsed.version != 1 {
             bail!("unsupported build.json version {}", parsed.version);
