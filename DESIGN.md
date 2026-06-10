@@ -102,6 +102,20 @@ sqlite for worker identities and stats. The transfer protocol keeps a
 `oneof` payload so a chunked CAS (FastCDC + blake3) can replace whole-NAR
 streaming later without a protocol break.
 
+## Known limitations (MVP)
+
+* Dedupe is keyed on the scratch output set, which Nix randomizes per
+  build attempt: it only catches concurrent duplicate submissions of the
+  same goal, not the same derivation submitted twice. Proper dedupe
+  needs a derivation identity in build.json (upstream patch).
+* A worker dying mid-build fails the build instead of requeueing it.
+* The replay buffer for deduped subscribers holds compressed output
+  chunks in memory.
+* When a worker reconnects, the previous session's scheduler loop may
+  still grab one job and fail it before noticing the closed channel.
+* No build cancellation: Nix killing the attach process does not yet
+  stop the remote build.
+
 ## Deployment
 
 * NixOS modules for hub and worker.

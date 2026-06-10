@@ -25,12 +25,10 @@ tower.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 zstd.workspace = true
+nix.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-
-[target.'cfg(target_os = "linux")'.dependencies]
-nix.workspace = true
 
 [build-dependencies]
 tonic-build.workspace = true

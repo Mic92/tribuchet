@@ -101,6 +101,44 @@ impl HubState {
     }
 }
 
+/// A store path directly under the store dir: absolute, exactly one
+/// component, no tricks. The hub runs as root and reads these from disk,
+/// so anything else would be an arbitrary-file-read primitive.
+fn valid_store_path(store_dir: &str, path: &str) -> bool {
+    path.strip_prefix(store_dir)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .is_some_and(|base| !base.is_empty() && base != "." && base != ".." && !base.contains('/'))
+}
+
+#[allow(clippy::result_large_err)] // tonic::Status is what the caller needs
+fn validate_request(req: &BuildRequest) -> Result<(), Status> {
+    let bad = |what: &str, p: &str| {
+        Status::invalid_argument(format!("{what} is not a valid store path: {p}"))
+    };
+    if !req.store_dir.starts_with('/') || req.store_dir.contains("..") {
+        return Err(Status::invalid_argument("invalid store dir"));
+    }
+    for p in &req.input_paths {
+        if !valid_store_path(&req.store_dir, p) {
+            return Err(bad("input path", p));
+        }
+    }
+    for p in req.outputs.values() {
+        if !valid_store_path(&req.store_dir, p) {
+            return Err(bad("output path", p));
+        }
+    }
+    let tmp = Path::new(&req.top_tmp_dir);
+    if !tmp.is_absolute()
+        || tmp
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(Status::invalid_argument("invalid topTmpDir"));
+    }
+    Ok(())
+}
+
 fn dedupe_key(req: &BuildRequest) -> String {
     let mut outs: Vec<&str> = req.outputs.values().map(|s| s.as_str()).collect();
     outs.sort_unstable();
@@ -129,6 +167,7 @@ impl attach_hub_server::AttachHub for AttachSvc {
         if req.outputs.is_empty() {
             return Err(Status::invalid_argument("build request without outputs"));
         }
+        validate_request(&req)?;
         let key = dedupe_key(&req);
 
         let mut inflight = self.state.inflight.lock().await;
@@ -549,10 +588,20 @@ async fn run_async(socket: &Path, listen: &str, config_dir: &Path) -> Result<()>
     }
     let _ = std::fs::remove_file(socket);
     let uds = tokio::net::UnixListener::bind(socket)?;
-    // attach runs as the nix build user; let it reach the socket.
+    // attach runs as a nix build user: restrict the socket to that group
+    // (anyone who can reach it can have store paths packed and shipped).
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o666))?;
+        match nix::unistd::Group::from_name("nixbld") {
+            Ok(Some(group)) => {
+                std::os::unix::fs::chown(socket, None, Some(group.gid.as_raw()))?;
+                std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o660))?;
+            }
+            _ => {
+                tracing::warn!("group nixbld not found; hub socket is world-writable");
+                std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o666))?;
+            }
+        }
     }
     let attach_server = Server::builder()
         .add_service(attach_hub_server::AttachHubServer::new(AttachSvc { state }))
@@ -564,4 +613,21 @@ async fn run_async(socket: &Path, listen: &str, config_dir: &Path) -> Result<()>
         async { attach_server.await.context("attach gRPC server") },
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn store_path_validation() {
+        let ok = |p| valid_store_path("/nix/store", p);
+        assert!(ok("/nix/store/abc-foo"));
+        assert!(!ok("/nix/store/"));
+        assert!(!ok("/nix/store/.."));
+        assert!(!ok("/nix/store/abc/../../etc"));
+        assert!(!ok("/nix/store/abc/bin/sh"));
+        assert!(!ok("/etc/shadow"));
+        assert!(!ok("/nix/storeX/abc"));
+    }
 }

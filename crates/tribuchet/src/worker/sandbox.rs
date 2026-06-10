@@ -74,6 +74,9 @@ pub fn prepare(
 
 pub fn spawn(spec: &SandboxSpec) -> Result<Child> {
     let mut cmd = platform::command(spec)?;
+    // Own process group, so orphaned builder children can be killed
+    // after the builder exits (there is no PID namespace to do it).
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     cmd.env_clear()
         .envs(&spec.env)
         .stdin(Stdio::null())

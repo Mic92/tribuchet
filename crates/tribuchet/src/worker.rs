@@ -356,6 +356,13 @@ impl ActiveBuild {
             }));
         }
         let status = child.wait()?;
+        // Builder children that daemonized would keep the log pipes open
+        // forever (no PID namespace); kill the whole process group so the
+        // log threads see EOF.
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(child.id() as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
         for t in log_threads {
             let _ = t.join();
         }

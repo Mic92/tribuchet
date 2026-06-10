@@ -14,7 +14,7 @@ clap = { version = "4", features = ["derive"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 hex = "0.4"
 hyper-util = "0.1"
-nix = { version = "0.29", features = ["mount", "sched", "user", "fs", "hostname"] }
+nix = { version = "0.29", features = ["mount", "sched", "user", "fs", "hostname", "signal"] }
 prost = "0.13"
 rand = "0.8"
 rcgen = { version = "0.13", features = ["x509-parser"] }
