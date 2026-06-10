@@ -21,6 +21,9 @@ use crate::nar;
 use crate::proto::{attach_event, attach_hub_client::AttachHubClient, BuildRequest};
 
 pub fn run(build_json: &Path, socket: &Path) -> Result<()> {
+    // Tell Nix the build environment is ready (everything before this
+    // byte is treated as sandbox setup chatter, not build log).
+    std::io::stderr().write_all(b"\x02\n")?;
     let build = BuildJson::load(build_json)?;
     let rt = tokio::runtime::Runtime::new()?;
     let code = rt.block_on(run_async(build, socket.to_owned()))?;
