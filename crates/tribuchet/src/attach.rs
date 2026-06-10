@@ -59,6 +59,7 @@ async fn run_async(build: BuildJson, socket: PathBuf) -> Result<i32> {
         fixed_output,
     };
 
+    let expected_outputs: Vec<String> = req.outputs.values().cloned().collect();
     let mut stream = client.build(req).await?.into_inner();
 
     // store path -> (chunk sender, unpack task)
@@ -71,6 +72,9 @@ async fn run_async(build: BuildJson, socket: PathBuf) -> Result<i32> {
                 std::io::stderr().write_all(&data)?;
             }
             Some(attach_event::Event::Output(out)) => {
+                if !expected_outputs.contains(&out.store_path) {
+                    bail!("hub sent unexpected output {}", out.store_path);
+                }
                 let (tx, _) = unpackers.entry(out.store_path.clone()).or_insert_with(|| {
                     let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
                     let dest = PathBuf::from(&out.store_path);

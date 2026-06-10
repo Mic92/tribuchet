@@ -334,9 +334,23 @@ async fn run_job(
 
     let missing = loop {
         match recv(in_rx).await? {
-            worker_message::Msg::MissingPaths(m) if m.build_id == job.id => break m.store_paths,
+            worker_message::Msg::MissingPaths(m) if m.build_id == job.id => {
+                // Only ever pack paths we offered: anything else would let
+                // a compromised worker read arbitrary host files.
+                let offered: std::collections::HashSet<&String> = req.input_paths.iter().collect();
+                if let Some(p) = m.store_paths.iter().find(|p| !offered.contains(p)) {
+                    bail!("worker requested unoffered path {p}");
+                }
+                break m.store_paths;
+            }
             worker_message::Msg::Heartbeat(_) => {}
-            other => bail!("unexpected worker message while negotiating paths: {other:?}"),
+            other => {
+                if is_stale(&other, &job.id) {
+                    tracing::warn!(id = job.id, "dropping stale worker message");
+                    continue;
+                }
+                bail!("unexpected worker message while negotiating paths: {other:?}");
+            }
         }
     };
     tracing::info!(
@@ -352,6 +366,19 @@ async fn run_job(
     stream_tmp_dir(&job.id, Path::new(&req.top_tmp_dir), out_tx).await?;
 
     relay_build(job, vkey, out_tx, in_rx).await
+}
+
+/// Messages that belong to a different (earlier, abandoned) build must
+/// not abort the current one.
+fn is_stale(msg: &worker_message::Msg, build_id: &str) -> bool {
+    let id = match msg {
+        worker_message::Msg::Log(l) => &l.build_id,
+        worker_message::Msg::Result(r) => &r.build_id,
+        worker_message::Msg::Nar(n) => &n.build_id,
+        worker_message::Msg::MissingPaths(m) => &m.build_id,
+        _ => return false,
+    };
+    id != build_id
 }
 
 async fn recv(in_rx: &mut mpsc::Receiver<WorkerMessage>) -> Result<worker_message::Msg> {
@@ -511,6 +538,15 @@ async fn relay_build(
                         bail!("worker result is missing output {scratch}");
                     }
                 }
+                // ... and nothing besides the requested outputs, or the
+                // worker could plant arbitrary store paths on the client.
+                if pending.len() != job.req.outputs.len() {
+                    let extra: Vec<&String> = pending
+                        .keys()
+                        .filter(|p| !job.req.outputs.values().any(|o| o == *p))
+                        .collect();
+                    bail!("worker result contains unrequested outputs: {extra:?}");
+                }
                 awaiting_outputs = true;
                 if pending.is_empty() {
                     job.replay.publish(attach_event::Event::ExitCode(0)).await;
@@ -553,7 +589,13 @@ async fn relay_build(
                     }
                 }
             }
-            other => bail!("unexpected worker message: {other:?}"),
+            other => {
+                if is_stale(&other, &job.id) {
+                    tracing::warn!(id = job.id, "dropping stale worker message");
+                    continue;
+                }
+                bail!("unexpected worker message: {other:?}");
+            }
         }
     }
 }
