@@ -182,6 +182,26 @@ mod platform {
         Ok(cmd)
     }
 
+    fn existing_mount_flags(target: &Path) -> io::Result<MsFlags> {
+        use nix::sys::statvfs::{statvfs, FsFlags};
+        let st = statvfs(target).map_err(ioerr("statvfs"))?;
+        let f = st.flags();
+        let mut flags = MsFlags::empty();
+        for (fs, ms) in [
+            (FsFlags::ST_NOSUID, MsFlags::MS_NOSUID),
+            (FsFlags::ST_NODEV, MsFlags::MS_NODEV),
+            (FsFlags::ST_NOEXEC, MsFlags::MS_NOEXEC),
+            (FsFlags::ST_NOATIME, MsFlags::MS_NOATIME),
+            (FsFlags::ST_NODIRATIME, MsFlags::MS_NODIRATIME),
+            (FsFlags::ST_RELATIME, MsFlags::MS_RELATIME),
+        ] {
+            if f.contains(fs) {
+                flags |= ms;
+            }
+        }
+        Ok(flags)
+    }
+
     fn ioerr(step: &str) -> impl Fn(nix::errno::Errno) -> io::Error + '_ {
         move |e| io::Error::other(format!("{step}: {e}"))
     }
@@ -238,11 +258,15 @@ mod platform {
             )
             .map_err(|e| io::Error::other(format!("binding {}: {e}", src.display())))?;
             if ro {
+                // In a user namespace, a bind mount keeps its source's
+                // locked flags (nosuid, nodev, ...); a remount that drops
+                // any of them fails with EPERM, so carry them over.
+                let locked = existing_mount_flags(&target)?;
                 mount(
                     none,
                     &target,
                     none,
-                    MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY,
+                    MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY | locked,
                     none,
                 )
                 .map_err(|e| io::Error::other(format!("remounting {} ro: {e}", src.display())))?;
