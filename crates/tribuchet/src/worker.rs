@@ -35,6 +35,9 @@ pub struct WorkerOpts {
     pub ca_cert: PathBuf,
     pub cert: PathBuf,
     pub key: PathBuf,
+    /// Hard limit per build; a hung builder would otherwise occupy the
+    /// worker forever.
+    pub build_timeout: std::time::Duration,
 }
 
 pub fn host_system() -> String {
@@ -158,8 +161,9 @@ async fn run_async(opts: WorkerOpts) -> Result<()> {
                         let build = active.take().unwrap();
                         let out_tx = out_tx.clone();
                         let signing_key = signing_key.clone();
+                        let timeout = opts.build_timeout;
                         tokio::task::spawn_blocking(move || {
-                            if let Err(e) = build.execute(&out_tx, &signing_key) {
+                            if let Err(e) = build.execute(&out_tx, &signing_key, timeout) {
                                 tracing::error!("build execution failed: {e:#}");
                                 let _ = out_tx.blocking_send(msg(worker_message::Msg::Result(
                                     BuildResult {
@@ -313,6 +317,7 @@ impl ActiveBuild {
         &self,
         out_tx: &mpsc::Sender<WorkerMessage>,
         signing_key: &SigningKey,
+        timeout: std::time::Duration,
     ) -> Result<()> {
         let a = &self.assignment;
         let spec = sandbox::prepare(a, &self.dir, &self.sources)?;
@@ -355,16 +360,29 @@ impl ActiveBuild {
                 }
             }));
         }
-        let status = child.wait()?;
+        let pgrp = nix::unistd::Pid::from_raw(child.id() as i32);
+        let deadline = std::time::Instant::now() + timeout;
+        let mut timed_out = false;
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                timed_out = true;
+                let _ = nix::sys::signal::killpg(pgrp, nix::sys::signal::Signal::SIGKILL);
+                break child.wait()?;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        };
         // Builder children that daemonized would keep the log pipes open
         // forever (no PID namespace); kill the whole process group so the
         // log threads see EOF.
-        let _ = nix::sys::signal::killpg(
-            nix::unistd::Pid::from_raw(child.id() as i32),
-            nix::sys::signal::Signal::SIGKILL,
-        );
+        let _ = nix::sys::signal::killpg(pgrp, nix::sys::signal::Signal::SIGKILL);
         for t in log_threads {
             let _ = t.join();
+        }
+        if timed_out {
+            bail!("build timed out after {}s", timeout.as_secs());
         }
         let exit_code = status.code().unwrap_or(128);
         tracing::info!(id = a.build_id, exit_code, "builder finished");

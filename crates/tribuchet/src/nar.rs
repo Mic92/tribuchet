@@ -153,6 +153,12 @@ fn unpack_node(r: &mut impl Read, dest: &Path) -> Result<()> {
         }
         "directory" => {
             fs::create_dir(dest)?;
+            // Strictly increasing names (as the NAR spec requires) rule
+            // out duplicate entries; a duplicate name could otherwise
+            // first create a symlink and then write through it, escaping
+            // the unpack root.
+            let mut last_name = String::new();
+            let mut seen_folded = std::collections::HashSet::new();
             loop {
                 match read_str(r)?.as_str() {
                     ")" => break,
@@ -162,6 +168,16 @@ fn unpack_node(r: &mut impl Read, dest: &Path) -> Result<()> {
                         let name = read_str(r)?;
                         if name.is_empty() || name == "." || name == ".." || name.contains('/') {
                             bail!("invalid NAR entry name {name:?}");
+                        }
+                        if name <= last_name {
+                            bail!("NAR entry {name:?} not in strictly increasing order");
+                        }
+                        last_name = name.clone();
+                        // On the case-insensitive default filesystem a
+                        // case-colliding entry would overwrite its sibling
+                        // (Nix uses a case hack here; we reject).
+                        if cfg!(target_os = "macos") && !seen_folded.insert(name.to_lowercase()) {
+                            bail!("case-colliding NAR entry {name:?}");
                         }
                         expect(r, "node")?;
                         unpack_node(r, &dest.join(name))?;
@@ -212,5 +228,40 @@ mod tests {
         pack(&out, &mut nar2)?;
         assert_eq!(nar, nar2);
         Ok(())
+    }
+
+    fn tok(buf: &mut Vec<u8>, s: &[u8]) {
+        write_str(buf, s).unwrap();
+    }
+
+    /// A NAR with a duplicate entry name (symlink, then regular file)
+    /// would write through the symlink and escape the unpack root.
+    #[test]
+    fn rejects_duplicate_entries() {
+        let escape = tempfile::tempdir().unwrap();
+        let mut nar = Vec::new();
+        tok(&mut nar, b"nix-archive-1");
+        tok(&mut nar, b"(");
+        tok(&mut nar, b"type");
+        tok(&mut nar, b"directory");
+        for _ in 0..2 {
+            tok(&mut nar, b"entry");
+            tok(&mut nar, b"(");
+            tok(&mut nar, b"name");
+            tok(&mut nar, b"x");
+            tok(&mut nar, b"node");
+            tok(&mut nar, b"(");
+            tok(&mut nar, b"type");
+            tok(&mut nar, b"symlink");
+            tok(&mut nar, b"target");
+            tok(&mut nar, escape.path().as_os_str().as_encoded_bytes());
+            tok(&mut nar, b")");
+            tok(&mut nar, b")");
+        }
+        tok(&mut nar, b")");
+
+        let dst = tempfile::tempdir().unwrap();
+        let err = unpack(&mut nar.as_slice(), &dst.path().join("out")).unwrap_err();
+        assert!(err.to_string().contains("strictly increasing"), "{err}");
     }
 }

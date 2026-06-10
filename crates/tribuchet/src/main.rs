@@ -56,6 +56,9 @@ enum Command {
         cert: PathBuf,
         #[arg(long, default_value = "/var/lib/tribuchet/tls/worker.key")]
         key: PathBuf,
+        /// Kill builds running longer than this many seconds.
+        #[arg(long, default_value_t = 24 * 3600)]
+        build_timeout_secs: u64,
     },
     /// Certificate authority management (init CA, issue worker certs).
     Ca {
@@ -86,6 +89,7 @@ fn main() -> anyhow::Result<()> {
             ca_cert,
             cert,
             key,
+            build_timeout_secs,
         } => {
             if systems.is_empty() {
                 systems.push(worker::host_system());
@@ -97,6 +101,7 @@ fn main() -> anyhow::Result<()> {
                 ca_cert,
                 cert,
                 key,
+                build_timeout: std::time::Duration::from_secs(build_timeout_secs),
             })
         }
         Command::Ca { action } => ca::run(action),
