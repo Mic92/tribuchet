@@ -9,25 +9,6 @@ let
     exec ${tribuchet}/bin/tribuchet attach "$1" --socket /run/tribuchet/hub.sock
   '';
 
-  # Only present in the hub's store: forces a NAR transfer to the worker,
-  # whose store image does not contain it.
-  uniqueInput = pkgs.writeText "tribuchet-test-input" "tribuchet-payload";
-
-  testExpr = pkgs.writeText "tt-test.nix" ''
-    let
-      bash = builtins.storePath ${builtins.toJSON "${pkgs.bash}"};
-      unique = builtins.storePath ${builtins.toJSON "${uniqueInput}"};
-    in
-    derivation {
-      name = "tt-remote-build";
-      system = "x86_64-linux";
-      builder = "''${bash}/bin/bash";
-      args = [
-        "-c"
-        "read line < ''${unique}; echo \"$line built-remotely\" > $out"
-      ];
-    }
-  '';
 in
 {
   name = "tribuchet";
@@ -39,11 +20,7 @@ in
         environment.systemPackages = [ tribuchet ];
         networking.firewall.allowedTCPPorts = [ 7437 ];
         virtualisation.writableStore = true;
-        virtualisation.additionalPaths = [
-          pkgs.bash
-          uniqueInput
-          testExpr
-        ];
+        virtualisation.additionalPaths = [ pkgs.bash ];
 
         nix.package = pkgs.nixVersions.latest;
         nix.settings = {
@@ -114,14 +91,30 @@ in
         )
 
     with subtest("nix-daemon builds remotely via external-builders"):
-        out = hub.succeed("nix-build ${testExpr} --no-out-link").strip()
+        # The input is added at runtime, so it cannot be in the worker's
+        # store image: it must travel over the wire.
+        hub.succeed("echo tribuchet-payload > /root/payload")
+        unique = hub.succeed("nix-store --add /root/payload").strip()
+        hub.succeed(
+            "cat > /root/test.nix << 'NIXEOF'\n"
+            "let\n"
+            "  bash = builtins.storePath \"${pkgs.bash}\";\n"
+            f"  unique = builtins.storePath \"{unique}\";\n"
+            "in derivation {\n"
+            "  name = \"tt-remote-build\";\n"
+            "  system = \"x86_64-linux\";\n"
+            "  builder = bash + \"/bin/bash\";\n"
+            "  args = [ \"-c\" (\"read line < \" + unique + \"; echo \\\"$line built-remotely\\\" > $out\") ];\n"
+            "}\n"
+            "NIXEOF"
+        )
+        out = hub.succeed("nix-build /root/test.nix --no-out-link").strip()
         hub.succeed(f"grep -q 'tribuchet-payload built-remotely' {out}")
 
     with subtest("build really ran on the worker"):
         worker.succeed("journalctl -u tribuchet-worker | grep -q 'builder finished'")
         hub.succeed("journalctl -u tribuchet-hub | grep -q 'dispatching build'")
-        # the unique input was not in the worker store image: it must
-        # have been transferred
-        worker.succeed("test -e /var/lib/tribuchet/store/$(basename ${uniqueInput})")
+        import os
+        worker.succeed(f"test -e /var/lib/tribuchet/store/{os.path.basename(unique)}")
   '';
 }
