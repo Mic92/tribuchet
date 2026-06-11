@@ -32,6 +32,10 @@ pub struct SandboxSpec {
     pub build_dir: PathBuf,
     /// (host source, absolute path inside sandbox), mounted read-only.
     pub binds_ro: Vec<(PathBuf, PathBuf)>,
+    /// Device nodes the sandbox itself provides; the only binds that
+    /// stay writable. Never derived from request-supplied paths.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub binds_dev: Vec<(PathBuf, PathBuf)>,
     /// Scratch output store paths (used by the macOS profile).
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub outputs: Vec<String>,
@@ -65,6 +69,7 @@ pub fn prepare(
             .iter()
             .map(|(store_path, src)| (src.clone(), PathBuf::from(store_path)))
             .collect(),
+        binds_dev: Vec::new(),
         outputs: a.outputs.values().cloned().collect(),
     };
     spec.binds_ro.sort(); // deterministic mount order
@@ -126,7 +131,7 @@ mod platform {
         for dev in ["null", "zero", "random", "urandom", "tty"] {
             let host = PathBuf::from("/dev").join(dev);
             std::fs::File::create(root.join("dev").join(dev))?;
-            spec.binds_ro.push((host.clone(), host)); // dev nodes: bind, rw via node perms
+            spec.binds_dev.push((host.clone(), host)); // dev nodes: bind, rw via node perms
         }
         for (link, target) in [
             ("dev/fd", "/proc/self/fd"),
@@ -144,8 +149,17 @@ mod platform {
     }
 
     pub fn command(spec: &SandboxSpec) -> Result<Command> {
+        // The shipped tmp dir is mounted at the request's sandbox build
+        // dir; pre-create the mount point inside the private root.
+        std::fs::create_dir_all(
+            spec.root.join(
+                Path::new(&spec.cwd)
+                    .strip_prefix("/")
+                    .unwrap_or(Path::new(&spec.cwd)),
+            ),
+        )?;
         // Pre-create bind targets matching the source type.
-        for (src, dst) in &spec.binds_ro {
+        for (src, dst) in spec.binds_ro.iter().chain(&spec.binds_dev) {
             let target = spec.root.join(dst.strip_prefix("/").unwrap_or(dst));
             if target.exists() || target.symlink_metadata().is_ok() {
                 continue;
@@ -166,6 +180,7 @@ mod platform {
         let root = spec.root.clone();
         let build_dir = spec.build_dir.clone();
         let binds: Vec<(PathBuf, PathBuf)> = spec.binds_ro.clone();
+        let binds_dev: Vec<(PathBuf, PathBuf)> = spec.binds_dev.clone();
         let cwd = spec.cwd.clone();
         let network = spec.network;
         let uid = getuid().as_raw();
@@ -174,7 +189,10 @@ mod platform {
         let err_file = setup_error_file(&spec.root);
         unsafe {
             cmd.pre_exec(move || {
-                setup(&root, &build_dir, &binds, &cwd, network, uid, gid).inspect_err(|e| {
+                setup(
+                    &root, &build_dir, &binds, &binds_dev, &cwd, network, uid, gid,
+                )
+                .inspect_err(|e| {
                     // std forwards only the errno from pre_exec to the
                     // parent, dropping our message; leave the failing
                     // step in a file the parent reads on spawn failure.
@@ -214,12 +232,12 @@ mod platform {
         root: &Path,
         build_dir: &Path,
         binds: &[(PathBuf, PathBuf)],
+        binds_dev: &[(PathBuf, PathBuf)],
         cwd: &str,
         network: bool,
         uid: u32,
         gid: u32,
     ) -> io::Result<()> {
-        let _ = nix::unistd::setsid();
         let mut flags = CloneFlags::CLONE_NEWUSER
             | CloneFlags::CLONE_NEWNS
             | CloneFlags::CLONE_NEWIPC
@@ -276,12 +294,17 @@ mod platform {
             }
             Ok(())
         };
+        // Request-derived binds are always read-only; only the sandbox's
+        // own device nodes stay writable. Keying writability on a path
+        // prefix of a client-influenced destination would let a request
+        // bind host devices read-write.
         for (src, dst) in binds {
-            // /dev nodes need to stay writable.
-            let ro = !dst.starts_with("/dev");
-            bind_one(src, dst, ro)?;
+            bind_one(src, dst, true)?;
         }
-        bind_one(build_dir, Path::new("/build"), false)?;
+        for (src, dst) in binds_dev {
+            bind_one(src, dst, false)?;
+        }
+        bind_one(build_dir, Path::new(cwd), false)?;
 
         // A fresh proc mount needs an unmasked host /proc (denied in many
         // containers); fall back to bind-mounting the host's /proc.
@@ -305,6 +328,9 @@ mod platform {
         }
 
         chroot(root).map_err(ioerr("chroot"))?;
+        // chroot(2) does not move the cwd; enter the new root first so
+        // no path resolution can start outside it.
+        std::env::set_current_dir("/").map_err(|e| io::Error::other(format!("chdir /: {e}")))?;
         std::env::set_current_dir(cwd)
             .map_err(|e| io::Error::other(format!("chdir {cwd}: {e}")))?;
         Ok(())
@@ -356,6 +382,16 @@ mod platform {
         Ok(())
     }
 
+    /// SBPL string literal escaping: a quote or backslash in an
+    /// interpolated path must not terminate the literal and inject
+    /// profile directives.
+    fn sb_escape(s: &str) -> Result<String> {
+        if s.bytes().any(|b| b.is_ascii_control()) {
+            anyhow::bail!("control character in sandbox profile path {s:?}");
+        }
+        Ok(s.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+
     pub fn command(spec: &SandboxSpec) -> Result<Command> {
         let mut profile = String::from(
             "(version 1)\n\
@@ -374,10 +410,10 @@ mod platform {
             "/private/tmp",
             "/dev",
         ] {
-            profile.push_str(&format!("  (subpath \"{path}\")\n"));
+            profile.push_str(&format!("  (subpath \"{}\")\n", sb_escape(path)?));
         }
         for out in &spec.outputs {
-            profile.push_str(&format!("  (subpath \"{out}\")\n"));
+            profile.push_str(&format!("  (subpath \"{}\")\n", sb_escape(out)?));
         }
         profile.push_str(")\n");
         if spec.network {

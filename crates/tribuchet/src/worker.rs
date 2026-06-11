@@ -49,8 +49,26 @@ pub fn host_system() -> String {
     format!("{arch}-{os}")
 }
 
+/// Write a secret file atomically with mode 0600: created via a temp
+/// file so it is never world-readable (fs::write + chmod would race)
+/// and a torn write cannot leave a short key behind.
+pub(crate) fn write_secret(path: &Path, data: &[u8]) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = path.with_extension("tmp");
+    let _ = std::fs::remove_file(&tmp);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .with_context(|| format!("creating {}", tmp.display()))?;
+    f.write_all(data)?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 fn load_signing_key(state_dir: &Path) -> Result<SigningKey> {
-    use std::os::unix::fs::PermissionsExt;
     let path = state_dir.join("signing.key");
     if path.exists() {
         let bytes: [u8; 32] = std::fs::read(&path)?
@@ -59,9 +77,40 @@ fn load_signing_key(state_dir: &Path) -> Result<SigningKey> {
         Ok(SigningKey::from_bytes(&bytes))
     } else {
         let key = SigningKey::generate(&mut rand::rngs::OsRng);
-        std::fs::write(&path, key.to_bytes())?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        write_secret(&path, &key.to_bytes())?;
         Ok(key)
+    }
+}
+
+/// Remove leftovers from interrupted runs: abandoned build dirs and
+/// stale staging entries in the input cache.
+fn sweep_state_dir(state_dir: &Path) {
+    if let Ok(entries) = std::fs::read_dir(state_dir.join("builds")) {
+        for entry in entries.flatten() {
+            tracing::info!("removing stale build dir {}", entry.path().display());
+            remove_path_all(&entry.path());
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(state_dir.join("store")) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(".tmp-") {
+                tracing::info!("removing stale partial transfer {}", entry.path().display());
+                remove_path_all(&entry.path());
+            }
+        }
+    }
+}
+
+/// Remove whatever is at `path` without following a symlink at `path`.
+fn remove_path_all(path: &Path) {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => {
+            let _ = std::fs::remove_dir_all(path);
+        }
+        Ok(_) => {
+            let _ = std::fs::remove_file(path);
+        }
+        Err(_) => {}
     }
 }
 
@@ -75,8 +124,14 @@ pub fn run(opts: WorkerOpts) -> Result<()> {
 }
 
 async fn run_async(opts: WorkerOpts) -> Result<()> {
-    std::fs::create_dir_all(opts.state_dir.join("store"))?;
-    std::fs::create_dir_all(opts.state_dir.join("builds"))?;
+    use std::os::unix::fs::PermissionsExt;
+    for sub in ["store", "builds"] {
+        let dir = opts.state_dir.join(sub);
+        std::fs::create_dir_all(&dir)?;
+        // Shipped tmp dirs and staged NARs are not for other local users.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    sweep_state_dir(&opts.state_dir);
     let signing_key = load_signing_key(&opts.state_dir)?;
 
     let tls = ClientTlsConfig::new()
@@ -92,12 +147,17 @@ async fn run_async(opts: WorkerOpts) -> Result<()> {
         .connect()
         .await
         .context("connecting to hub")?;
-    let mut client = WorkerHubClient::new(channel);
+    let mut client = WorkerHubClient::new(channel)
+        .max_decoding_message_size(crate::hub::MAX_MSG_SIZE)
+        .max_encoding_message_size(crate::hub::MAX_MSG_SIZE);
 
     let (out_tx, out_rx) = mpsc::channel::<WorkerMessage>(64);
     out_tx
         .send(msg(worker_message::Msg::Register(Register {
-            worker_name: std::env::var("HOSTNAME").unwrap_or_else(|_| "worker".into()),
+            worker_name: nix::unistd::gethostname()
+                .ok()
+                .and_then(|h| h.into_string().ok())
+                .unwrap_or_else(|| "worker".into()),
             systems: opts.systems.clone(),
             features: vec![],
             max_jobs: 1,
@@ -135,47 +195,80 @@ async fn run_async(opts: WorkerOpts) -> Result<()> {
         match m {
             hub_message::Msg::Assignment(a) => {
                 tracing::info!(id = a.build_id, "build assigned");
-                active = Some(ActiveBuild::new(a, &opts.state_dir)?);
+                // The hub never re-dispatches an abandoned build; tear
+                // down anything still staged for the previous one.
+                if let Some(old) = active.take() {
+                    tracing::warn!(id = old.assignment.build_id, "discarding abandoned build");
+                    old.abort().await;
+                }
+                let build_id = a.build_id.clone();
+                match validate_assignment(&a).and_then(|()| ActiveBuild::new(a, &opts.state_dir)) {
+                    Ok(b) => active = Some(b),
+                    Err(e) => fail_build(&out_tx, &build_id, &e).await?,
+                }
             }
             hub_message::Msg::PathOffer(offer) => {
                 let Some(build) = active.as_mut() else {
                     continue;
                 };
-                let missing = build.negotiate(&offer.store_paths, &opts.state_dir);
-                out_tx
-                    .send(msg(worker_message::Msg::MissingPaths(MissingPaths {
-                        build_id: offer.build_id,
-                        store_paths: missing,
-                    })))
-                    .await?;
+                match build.negotiate(&offer.store_paths, &opts.state_dir) {
+                    Ok(missing) => {
+                        out_tx
+                            .send(msg(worker_message::Msg::MissingPaths(MissingPaths {
+                                build_id: offer.build_id,
+                                store_paths: missing,
+                            })))
+                            .await?;
+                    }
+                    Err(e) => {
+                        let build = active.take().unwrap();
+                        let id = build.assignment.build_id.clone();
+                        build.abort().await;
+                        fail_build(&out_tx, &id, &e).await?;
+                    }
+                }
             }
             hub_message::Msg::Nar(n) => {
                 if let Some(build) = active.as_mut() {
-                    build.feed_nar(n, &opts.state_dir).await?;
+                    // A bad transfer fails this build, not the session.
+                    if let Err(e) = build.feed_nar(n, &opts.state_dir).await {
+                        let build = active.take().unwrap();
+                        let id = build.assignment.build_id.clone();
+                        build.abort().await;
+                        fail_build(&out_tx, &id, &e).await?;
+                    }
                 }
             }
             hub_message::Msg::TmpDir(t) => {
                 if let Some(build) = active.as_mut() {
-                    if build.feed_tmp_dir(t).await? {
-                        // All inputs and the tmp dir are in place: build.
-                        let build = active.take().unwrap();
-                        let out_tx = out_tx.clone();
-                        let signing_key = signing_key.clone();
-                        let timeout = opts.build_timeout;
-                        tokio::task::spawn_blocking(move || {
-                            if let Err(e) = build.execute(&out_tx, &signing_key, timeout) {
-                                tracing::error!("build execution failed: {e:#}");
-                                let _ = out_tx.blocking_send(msg(worker_message::Msg::Result(
-                                    BuildResult {
-                                        build_id: build.assignment.build_id.clone(),
-                                        exit_code: 1,
-                                        outputs: vec![],
-                                        error: format!("{e:#}"),
-                                    },
-                                )));
-                            }
-                            build.cleanup();
-                        });
+                    match build.feed_tmp_dir(t).await {
+                        Err(e) => {
+                            let build = active.take().unwrap();
+                            let id = build.assignment.build_id.clone();
+                            build.abort().await;
+                            fail_build(&out_tx, &id, &e).await?;
+                        }
+                        Ok(false) => {}
+                        Ok(true) => {
+                            let build = active.take().unwrap();
+                            let out_tx = out_tx.clone();
+                            let signing_key = signing_key.clone();
+                            let timeout = opts.build_timeout;
+                            tokio::task::spawn_blocking(move || {
+                                if let Err(e) = build.execute(&out_tx, &signing_key, timeout) {
+                                    tracing::error!("build execution failed: {e:#}");
+                                    let _ = out_tx.blocking_send(msg(worker_message::Msg::Result(
+                                        BuildResult {
+                                            build_id: build.assignment.build_id.clone(),
+                                            exit_code: 1,
+                                            outputs: vec![],
+                                            error: format!("{e:#}"),
+                                        },
+                                    )));
+                                }
+                                build.cleanup();
+                            });
+                        }
                     }
                 }
             }
@@ -185,6 +278,53 @@ async fn run_async(opts: WorkerOpts) -> Result<()> {
         }
     }
     bail!("hub closed the session");
+}
+
+/// Report a per-build failure to the hub without tearing the session down.
+async fn fail_build(
+    out_tx: &mpsc::Sender<WorkerMessage>,
+    build_id: &str,
+    err: &anyhow::Error,
+) -> Result<()> {
+    tracing::error!(id = build_id, "build setup failed: {err:#}");
+    out_tx
+        .send(msg(worker_message::Msg::Result(BuildResult {
+            build_id: build_id.into(),
+            exit_code: 1,
+            outputs: vec![],
+            error: format!("{err:#}"),
+        })))
+        .await
+        .map_err(|_| anyhow::anyhow!("hub connection lost"))
+}
+
+/// The worker must not trust the hub for filesystem-relevant strings:
+/// build ids become path components, output paths are packed (and on
+/// macOS deleted) on the host.
+fn validate_assignment(a: &BuildAssignment) -> Result<()> {
+    if a.build_id.len() != 32 || !a.build_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("invalid build id {:?}", a.build_id);
+    }
+    if !a.builder.starts_with('/') {
+        bail!("builder must be an absolute path");
+    }
+    let tmp = Path::new(&a.tmp_dir_in_sandbox);
+    if !tmp.is_absolute()
+        || tmp.components().any(|c| {
+            !matches!(
+                c,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        })
+    {
+        bail!("invalid tmpDirInSandbox {:?}", a.tmp_dir_in_sandbox);
+    }
+    for p in a.outputs.values() {
+        if !crate::hub::valid_store_path(crate::hub::STORE_DIR, p) {
+            bail!("invalid output path {p:?}");
+        }
+    }
+    Ok(())
 }
 
 type Unpacker = (mpsc::Sender<Vec<u8>>, tokio::task::JoinHandle<Result<()>>);
@@ -220,21 +360,29 @@ impl ActiveBuild {
         })
     }
 
-    fn negotiate(&mut self, offered: &[String], state_dir: &Path) -> Vec<String> {
+    fn negotiate(&mut self, offered: &[String], state_dir: &Path) -> Result<Vec<String>> {
         let mut missing = Vec::new();
         for p in offered {
+            // Only real store paths may become bind-mount sources; a
+            // compromised hub must not get the worker's own files
+            // (signing key, TLS key) mounted into a sandbox.
+            if !crate::hub::valid_store_path(crate::hub::STORE_DIR, p) {
+                bail!("offered path {p:?} is not a store path");
+            }
             let host = PathBuf::from(p);
             let cached = state_dir.join("store").join(store_base(p));
-            if host.exists() {
+            // symlink_metadata: store paths that are dangling symlinks
+            // are legitimate and must count as present.
+            if host.symlink_metadata().is_ok() {
                 self.sources.insert(p.clone(), host);
-            } else if cached.exists() {
+            } else if cached.symlink_metadata().is_ok() {
                 self.sources.insert(p.clone(), cached);
             } else {
                 self.pending.insert(p.clone());
                 missing.push(p.clone());
             }
         }
-        missing
+        Ok(missing)
     }
 
     async fn feed_nar(&mut self, n: NarTransfer, state_dir: &Path) -> Result<()> {
@@ -242,9 +390,11 @@ impl ActiveBuild {
         {
             bail!("hub sent NAR for unrequested path {}", n.store_path);
         }
+        // Staging name starts with ".": disjoint from finished cache
+        // entries, because valid store names never start with a dot.
         let partial = state_dir
             .join("store")
-            .join(format!("{}.partial", store_base(&n.store_path)));
+            .join(format!(".tmp-{}", store_base(&n.store_path)));
         let (tx, _) = self
             .nar_unpackers
             .entry(n.store_path.clone())
@@ -252,11 +402,9 @@ impl ActiveBuild {
                 let dest = partial.clone();
                 let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
                 let task = tokio::task::spawn_blocking(move || -> Result<()> {
-                    if dest.exists() {
-                        // stale leftover from a crashed transfer
-                        let _ = std::fs::remove_dir_all(&dest);
-                        let _ = std::fs::remove_file(&dest);
-                    }
+                    // stale leftover from a crashed transfer; lstat so a
+                    // dangling symlink is removed rather than skipped
+                    remove_path_all(&dest);
                     let mut dec = zstd::stream::read::Decoder::new(ChannelReader::new(rx))?;
                     nar::unpack(&mut dec, &dest)
                         .with_context(|| format!("unpacking {}", dest.display()))
@@ -273,6 +421,7 @@ impl ActiveBuild {
             drop(tx);
             task.await??;
             let cached = state_dir.join("store").join(store_base(&n.store_path));
+            remove_path_all(&cached); // stale/truncated leftover
             std::fs::rename(&partial, &cached)?;
             self.pending.remove(&n.store_path);
             self.sources.insert(n.store_path, cached);
@@ -288,9 +437,7 @@ impl ActiveBuild {
             let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
             let task = tokio::task::spawn_blocking(move || -> Result<()> {
                 let dec = zstd::stream::read::Decoder::new(ChannelReader::new(rx))?;
-                let mut tar = tar::Archive::new(dec);
-                tar.set_preserve_permissions(true);
-                tar.unpack(&dest).context("unpacking tmp dir archive")
+                unpack_tmp_dir_archive(dec, &dest).context("unpacking tmp dir archive")
             });
             (tx, task)
         });
@@ -384,7 +531,12 @@ impl ActiveBuild {
         if timed_out {
             bail!("build timed out after {}s", timeout.as_secs());
         }
-        let exit_code = status.code().unwrap_or(128);
+        // Signal deaths become 128 + signo (matching shell conventions),
+        // so an OOM SIGKILL (137) is distinguishable from a SIGSEGV (139).
+        let exit_code = status.code().unwrap_or_else(|| {
+            use std::os::unix::process::ExitStatusExt;
+            128 + status.signal().unwrap_or(0)
+        });
         tracing::info!(id = a.build_id, exit_code, "builder finished");
 
         if exit_code != 0 {
@@ -402,7 +554,9 @@ impl ActiveBuild {
         let mut packed = Vec::new();
         for scratch in a.outputs.values() {
             let host_path = sandbox::output_host_path(&spec, scratch);
-            if !host_path.exists() {
+            // lstat: a symlink output whose target only resolves inside
+            // the sandbox is still a valid output.
+            if host_path.symlink_metadata().is_err() {
                 bail!("builder did not produce output {scratch}");
             }
             let nar_file = self.dir.join(format!("{}.nar.zst", store_base(scratch)));
@@ -469,6 +623,51 @@ impl ActiveBuild {
             tracing::warn!("cleaning up {}: {e}", self.dir.display());
         }
     }
+
+    /// Tear down a build abandoned before execution: stop the unpacker
+    /// tasks (so none keeps writing into shared staging paths) and
+    /// remove everything staged on disk.
+    async fn abort(mut self) {
+        for (_, (tx, task)) in self.nar_unpackers.drain() {
+            drop(tx);
+            task.abort();
+            let _ = task.await;
+        }
+        if let Some((tx, task)) = self.tmp_unpacker.take() {
+            drop(tx);
+            task.abort();
+            let _ = task.await;
+        }
+        if let Err(e) = std::fs::remove_dir_all(&self.dir) {
+            tracing::warn!("cleaning up {}: {e}", self.dir.display());
+        }
+    }
+}
+
+/// Unpack the client-supplied tmp-dir tar, refusing anything but plain
+/// files, directories, and symlinks, and applying only the 0777 mode
+/// bits: a root worker must not materialize client-chosen setuid bits.
+fn unpack_tmp_dir_archive(reader: impl Read, dest: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut tar = tar::Archive::new(reader);
+    for entry in tar.entries()? {
+        let mut entry = entry?;
+        let path = dest.join(entry.path()?);
+        let kind = entry.header().entry_type();
+        match kind {
+            tar::EntryType::Regular | tar::EntryType::Directory | tar::EntryType::Symlink => {}
+            other => bail!("unsupported tar entry type {other:?} in tmp dir archive"),
+        }
+        let mode = entry.header().mode()? & 0o777;
+        entry.set_preserve_permissions(false);
+        if !entry.unpack_in(dest)? {
+            bail!("tar entry escapes the tmp dir");
+        }
+        if kind != tar::EntryType::Symlink {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))?;
+        }
+    }
+    Ok(())
 }
 
 struct TeeWriter<'a, A: Write, B: Write>(&'a mut A, &'a mut B);
@@ -481,5 +680,84 @@ impl<A: Write, B: Write> Write for TeeWriter<'_, A, B> {
     }
     fn flush(&mut self) -> std::io::Result<()> {
         self.0.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_assignment() -> BuildAssignment {
+        BuildAssignment {
+            build_id: "0123456789abcdef0123456789abcdef".into(),
+            system: "x86_64-linux".into(),
+            builder: "/nix/store/abc-bash/bin/bash".into(),
+            args: vec![],
+            env: Default::default(),
+            outputs: [("out".to_string(), "/nix/store/abc-out".to_string())].into(),
+            tmp_dir_in_sandbox: "/build".into(),
+            store_dir: "/nix/store".into(),
+            fixed_output: false,
+        }
+    }
+
+    #[test]
+    fn assignment_validation() {
+        assert!(validate_assignment(&base_assignment()).is_ok());
+
+        // build_id becomes a path component under state_dir/builds
+        for id in ["../../../../etc", "/etc", "0123", ""] {
+            let mut a = base_assignment();
+            a.build_id = id.into();
+            assert!(validate_assignment(&a).is_err(), "{id:?}");
+        }
+
+        let mut a = base_assignment();
+        a.tmp_dir_in_sandbox = "../escape".into();
+        assert!(validate_assignment(&a).is_err());
+
+        // output paths are packed (and on macOS deleted) on the host
+        let mut a = base_assignment();
+        a.outputs.insert("doc".into(), "/etc/shadow".into());
+        assert!(validate_assignment(&a).is_err());
+
+        let mut a = base_assignment();
+        a.builder = "-p".into();
+        assert!(validate_assignment(&a).is_err());
+    }
+
+    #[test]
+    fn tmp_dir_archive_strips_setuid_and_rejects_hardlinks() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        // setuid bit in the archive must not materialize on disk
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_path("evil")?;
+        header.set_size(2);
+        header.set_mode(0o4755);
+        header.set_cksum();
+        builder.append(&header, &b"hi"[..])?;
+        let data = builder.into_inner()?;
+        let dest = tempfile::tempdir()?;
+        unpack_tmp_dir_archive(data.as_slice(), dest.path())?;
+        let mode = std::fs::metadata(dest.path().join("evil"))?
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o7777, 0o755, "mode {mode:o}");
+
+        // hard links could alias files outside the build dir
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_path("link")?;
+        header.set_entry_type(tar::EntryType::Link);
+        header.set_link_name("/etc/passwd")?;
+        header.set_size(0);
+        header.set_cksum();
+        builder.append(&header, &b""[..])?;
+        let data = builder.into_inner()?;
+        let dest = tempfile::tempdir()?;
+        assert!(unpack_tmp_dir_archive(data.as_slice(), dest.path()).is_err());
+        Ok(())
     }
 }
