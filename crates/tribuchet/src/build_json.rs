@@ -36,9 +36,50 @@ impl BuildJson {
         Ok(parsed)
     }
 
-    /// Fixed-output derivations always carry `outputHash` in their
-    /// environment; they are granted network access in the sandbox.
+    /// Fixed-output derivations carry `outputHash` in their environment
+    /// (under structured attrs: inside the `__json` blob, the env's only
+    /// key). They are granted network access in the sandbox.
     pub fn is_fixed_output(&self) -> bool {
-        self.env.contains_key("outputHash")
+        if self.env.contains_key("outputHash") {
+            return true;
+        }
+        if let Some(json) = self.env.get("__json") {
+            if let Ok(attrs) = serde_json::from_str::<serde_json::Value>(json) {
+                return attrs.get("outputHash").is_some_and(|h| !h.is_null());
+            }
+        }
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn doc(env: serde_json::Value) -> BuildJson {
+        serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "builder": "/bin/sh",
+            "args": [],
+            "env": env,
+            "topTmpDir": "/tmp/x",
+            "tmpDirInSandbox": "/build",
+            "storeDir": "/nix/store",
+            "system": "x86_64-linux",
+            "inputPaths": [],
+            "outputs": {},
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn fixed_output_detection() {
+        assert!(!doc(serde_json::json!({})).is_fixed_output());
+        assert!(doc(serde_json::json!({"outputHash": "sha256-..."})).is_fixed_output());
+        // structured attrs: outputHash lives in the __json blob
+        let env = serde_json::json!({"__json": "{\"outputHash\":\"sha256-...\"}"});
+        assert!(doc(env).is_fixed_output());
+        let env = serde_json::json!({"__json": "{\"name\":\"x\"}"});
+        assert!(!doc(env).is_fixed_output());
     }
 }
