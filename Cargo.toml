@@ -9,7 +9,6 @@ license = "MIT"
 
 [workspace.dependencies]
 anyhow = "1"
-async-stream = "0.3"
 clap = { version = "4", features = ["derive"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 hex = "0.4"
@@ -30,4 +29,5 @@ tonic-build = "0.12"
 tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+time = "0.3"
 zstd = "0.13"

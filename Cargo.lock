@@ -1838,7 +1838,6 @@ name = "tribuchet"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-stream",
  "clap",
  "ed25519-dalek",
  "hex",
@@ -1852,6 +1851,7 @@ dependencies = [
  "sha2",
  "tar",
  "tempfile",
+ "time",
  "tokio",
  "tokio-stream",
  "tonic",
