@@ -9,6 +9,10 @@ let
     exec ${tribuchet}/bin/tribuchet attach "$1" --socket /run/tribuchet/hub.sock
   '';
 
+  # evaluated here so the container closure can be pre-seeded into both
+  # VM stores; the hub re-evaluates the same expression at test time
+  nspawn = import ./nspawn-container.nix { nixpkgs = pkgs.path; };
+
 in
 {
   name = "tribuchet";
@@ -20,7 +24,14 @@ in
         environment.systemPackages = [ tribuchet ];
         networking.firewall.allowedTCPPorts = [ 7437 ];
         virtualisation.writableStore = true;
-        virtualisation.additionalPaths = [ pkgs.bash ];
+        # container eval and closure streaming need room
+        virtualisation.memorySize = 4096;
+        virtualisation.diskSize = 4096;
+        virtualisation.additionalPaths = [
+          pkgs.bash
+          pkgs.stdenvNoCC
+          nspawn.toplevel
+        ];
 
         # patched so uid-range derivations reach the external builder
         # (upstream rejects them before invoking it)
@@ -57,6 +68,9 @@ in
             };
           in [ (mk "a") (mk "b") ]
         '';
+        environment.etc."tt/nspawn.nix".text = ''
+          import ${./nspawn-container.nix} { nixpkgs = ${pkgs.path}; }
+        '';
         environment.etc."tt/uidrange.nix".text = ''
           let
             bash = builtins.storePath "${pkgs.bash}";
@@ -88,6 +102,13 @@ in
         # paths the worker lacks really travel over the wire.
         virtualisation.useNixStoreImage = true;
         virtualisation.writableStore = true;
+        # booting a NixOS container inside the sandbox needs room
+        virtualisation.memorySize = 4096;
+        virtualisation.diskSize = 4096;
+        virtualisation.additionalPaths = [
+          pkgs.stdenvNoCC
+          nspawn.toplevel
+        ];
 
         systemd.services.tribuchet-worker = {
           # started by the test script once certificates exist
@@ -159,6 +180,10 @@ in
     with subtest("uid-range build runs as sandbox root with a cgroup"):
         out = hub.succeed("nix-build /etc/tt/uidrange.nix --no-out-link").strip()
         hub.succeed(f"grep -q uid-range-ok {out}")
+
+    with subtest("systemd-nspawn boots a NixOS container in a remote build"):
+        out = hub.succeed("nix-build /etc/tt/nspawn.nix --no-out-link", timeout=1800).strip()
+        hub.succeed(f"[[ $(cat {out}/msg) = 'Hello World' ]]")
 
     with subtest("build really ran on the worker"):
         worker.succeed("journalctl -u tribuchet-worker | grep -q 'builder finished'")

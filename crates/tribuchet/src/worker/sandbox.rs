@@ -188,7 +188,9 @@ mod platform {
         if let Some(base) = spec.uid_range {
             // The builder is root inside the namespace but uid `base`
             // on the host; writable trees must be owned by the range
-            // (Nix's chownToBuilder).
+            // (Nix's chownToBuilder). The sandbox root itself too:
+            // container payloads mkdir top-level dirs like /run.
+            std::os::unix::fs::lchown(root, Some(base), Some(base))?;
             for dir in [
                 root.join("nix/store"),
                 root.join("etc"),
@@ -593,6 +595,20 @@ mod platform {
             none,
         )
         .map_err(ioerr("mounting /proc"))?;
+
+        // Like Nix: uid-range builds get a real sysfs (the userns owns
+        // its netns, so the kernel allows it); container managers fail
+        // without one ("VFS: Mount too revealing").
+        if uid_count > 1 {
+            mount(
+                Some("sysfs"),
+                &root.join("sys"),
+                Some("sysfs"),
+                MsFlags::empty(),
+                none,
+            )
+            .map_err(ioerr("mounting /sys"))?;
+        }
 
         if has_cgroup {
             // the cgroup namespace makes the build's own cgroup the root
