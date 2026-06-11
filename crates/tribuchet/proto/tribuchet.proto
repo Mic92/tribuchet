@@ -35,10 +35,17 @@ message HubMessage {
   }
 }
 
+// Features are per system: an emulated system must not inherit e.g.
+// "kvm" from the host.
+message SystemCaps {
+  string system = 1;            // e.g. "x86_64-linux"
+  repeated string features = 2; // e.g. "kvm", "big-parallel"
+}
+
 message Register {
+  reserved 2, 3; // formerly flat systems + features lists
   string worker_name = 1;
-  repeated string systems = 2; // e.g. "x86_64-linux"
-  repeated string features = 3; // e.g. "kvm", "big-parallel"
+  repeated SystemCaps caps = 6;
   uint32 max_jobs = 4;
   // ed25519 public key used to sign output NARs.
   bytes signing_public_key = 5;

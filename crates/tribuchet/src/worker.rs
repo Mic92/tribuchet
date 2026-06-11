@@ -210,23 +210,88 @@ fn requires_uid_range(env: &HashMap<String, String>) -> bool {
 }
 
 /// System features this worker can honor, advertised to the hub for
-/// scheduling. Mirrors Nix's defaults; `kvm` needs the device node and
-/// `uid-range` needs root for the 65536-uid mapping.
-fn local_features() -> Vec<String> {
+/// scheduling. Mirrors Nix's defaults. Emulated systems get only the
+/// baseline: kvm is an x86 device to an emulated guest, and uid-range
+/// under emulation is untested.
+fn local_features(native: bool, uid_base: u32) -> Vec<String> {
     let mut features = vec![
         "nixos-test".to_owned(),
         "benchmark".to_owned(),
         "big-parallel".to_owned(),
     ];
-    if cfg!(target_os = "linux") {
+    if cfg!(target_os = "linux") && native {
         if std::path::Path::new("/dev/kvm").exists() {
             features.push("kvm".to_owned());
         }
-        if nix::unistd::geteuid().is_root() {
+        if can_map_uid_range(uid_base) {
             features.push("uid-range".to_owned());
         }
     }
     features
+}
+
+/// Per-system capability list for Register; native systems get the
+/// probed feature set, emulated ones only the baseline.
+fn system_caps(opts: &WorkerOpts, ctx: &WorkerCtx) -> Vec<crate::proto::SystemCaps> {
+    let native = local_features(true, opts.auto_allocate_uids_base);
+    let emulated = local_features(false, opts.auto_allocate_uids_base);
+    opts.systems
+        .iter()
+        .map(|s| crate::proto::SystemCaps {
+            system: s.clone(),
+            features: if ctx.emulators.contains_key(s) {
+                emulated.clone()
+            } else {
+                native.clone()
+            },
+        })
+        .collect()
+}
+
+/// Probe whether a 65536-uid mapping actually works (root alone is not
+/// enough: user namespaces may be disabled). The child unshares and the
+/// parent writes the map: after CLONE_NEWUSER the child has no caps in
+/// the parent namespace, so it could not map a range itself. Forks
+/// because unshare(CLONE_NEWUSER) fails with EINVAL in a multithreaded
+/// process; the child runs only async-signal-safe syscalls.
+#[cfg(target_os = "linux")]
+fn can_map_uid_range(base: u32) -> bool {
+    use nix::unistd::ForkResult;
+    let Ok((sync_r, sync_w)) = nix::unistd::pipe() else {
+        return false;
+    };
+    let Ok((hold_r, hold_w)) = nix::unistd::pipe() else {
+        return false;
+    };
+    match unsafe { nix::unistd::fork() } {
+        Ok(ForkResult::Child) => {
+            if nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWUSER).is_err() {
+                unsafe { libc::_exit(1) }
+            }
+            let _ = nix::unistd::write(&sync_w, b"u");
+            drop(sync_w);
+            // block until the parent has tried the map write
+            drop(hold_w);
+            let _ = nix::unistd::read(&hold_r, &mut [0u8; 1]);
+            unsafe { libc::_exit(0) }
+        }
+        Ok(ForkResult::Parent { child }) => {
+            drop(sync_w);
+            let unshared = nix::unistd::read(&sync_r, &mut [0u8; 1]) == Ok(1);
+            let mapped = unshared
+                && std::fs::write(format!("/proc/{child}/uid_map"), format!("0 {base} 65536"))
+                    .is_ok();
+            drop(hold_w);
+            let _ = nix::sys::wait::waitpid(child, None);
+            mapped
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn can_map_uid_range(_base: u32) -> bool {
+    false
 }
 
 /// Cap on a single NAR transfer in either direction; a `truncate -s 1P
@@ -549,8 +614,7 @@ async fn session(
                 .ok()
                 .and_then(|h| h.into_string().ok())
                 .unwrap_or_else(|| "worker".into()),
-            systems: opts.systems.clone(),
-            features: local_features(),
+            caps: system_caps(opts, ctx),
             max_jobs: opts.max_jobs.max(1),
             signing_public_key: signing_key.verifying_key().to_bytes().to_vec(),
         })))

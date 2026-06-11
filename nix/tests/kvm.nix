@@ -1,8 +1,11 @@
 # Requires the kvm system feature and expects the device in the sandbox.
-{ bash }:
+{
+  bash,
+  system ? "x86_64-linux",
+}:
 derivation {
   name = "tt-kvm";
-  system = "x86_64-linux";
+  inherit system;
   requiredSystemFeatures = [ "kvm" ];
   builder = builtins.storePath bash + "/bin/bash";
   args = [

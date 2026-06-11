@@ -77,6 +77,12 @@ in
         environment.etc."tt/kvm.nix".text = ''
           import ${./tests/kvm.nix} { bash = "${pkgs.bash}"; }
         '';
+        environment.etc."tt/kvm-emulated.nix".text = ''
+          import ${./tests/kvm.nix} {
+            bash = "${pkgs.bash}";
+            system = "aarch64-linux";
+          }
+        '';
         environment.etc."tt/uidrange.nix".text = ''
           import ${./tests/uidrange.nix} { bash = "${pkgs.bash}"; }
         '';
@@ -203,6 +209,10 @@ in
         else:
             err = hub.fail("nix-build /etc/tt/kvm.nix --no-out-link 2>&1")
             assert "no connected worker" in err, err
+
+    with subtest("emulated system does not inherit the host's kvm feature"):
+        err = hub.fail("nix-build /etc/tt/kvm-emulated.nix --no-out-link 2>&1")
+        assert "no connected worker" in err, err
 
     with subtest("runaway build log is killed at max-log-size"):
         err = hub.fail("nix-build /etc/tt/logbomb.nix --no-out-link 2>&1")

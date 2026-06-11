@@ -152,14 +152,15 @@ struct HubState {
 
 #[derive(Clone)]
 struct WorkerCaps {
-    systems: Vec<String>,
-    features: std::collections::HashSet<String>,
+    /// system -> features the worker honors for it
+    systems: HashMap<String, std::collections::HashSet<String>>,
 }
 
 impl WorkerCaps {
     fn serves(&self, system: &str, features: &[String]) -> bool {
-        self.systems.iter().any(|s| s == system)
-            && features.iter().all(|f| self.features.contains(f))
+        self.systems
+            .get(system)
+            .is_some_and(|have| features.iter().all(|f| have.contains(f)))
     }
 }
 
@@ -600,7 +601,7 @@ impl crate::proto::worker_hub_server::WorkerHub for WorkerSvc {
         }
         tracing::info!(
             worker = register.worker_name,
-            systems = ?register.systems,
+            caps = ?register.caps,
             "worker registered"
         );
 
@@ -633,8 +634,11 @@ async fn worker_loop(
 ) {
     let max_jobs = register.max_jobs.clamp(1, MAX_WORKER_JOBS) as usize;
     let caps = WorkerCaps {
-        systems: register.systems.clone(),
-        features: register.features.iter().cloned().collect(),
+        systems: register
+            .caps
+            .iter()
+            .map(|c| (c.system.clone(), c.features.iter().cloned().collect()))
+            .collect(),
     };
     let caps_guard = CapsGuard::new(state.clone(), caps.clone());
     let router = Router::default();
@@ -1172,13 +1176,19 @@ mod tests {
     #[test]
     fn worker_caps_feature_matching() {
         let caps = WorkerCaps {
-            systems: vec!["x86_64-linux".into()],
-            features: ["kvm".to_owned()].into(),
+            systems: [
+                ("x86_64-linux".to_owned(), ["kvm".to_owned()].into()),
+                ("aarch64-linux".to_owned(), [].into()),
+            ]
+            .into(),
         };
         assert!(caps.serves("x86_64-linux", &[]));
         assert!(caps.serves("x86_64-linux", &["kvm".into()]));
         assert!(!caps.serves("x86_64-linux", &["kvm".into(), "uid-range".into()]));
-        assert!(!caps.serves("aarch64-linux", &[]));
+        assert!(caps.serves("aarch64-linux", &[]));
+        // emulated system must not inherit the host's kvm
+        assert!(!caps.serves("aarch64-linux", &["kvm".into()]));
+        assert!(!caps.serves("i686-linux", &[]));
     }
 
     #[test]
