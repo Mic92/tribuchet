@@ -12,6 +12,10 @@ use anyhow::{bail, Context, Result};
 
 const MAGIC: &str = "nix-archive-1";
 
+/// Maximum directory nesting; deeper trees would risk overflowing the
+/// (2 MiB) blocking-thread stack via per-level recursion.
+const MAX_DEPTH: u32 = 256;
+
 fn write_str(w: &mut impl Write, s: &[u8]) -> io::Result<()> {
     w.write_all(&(s.len() as u64).to_le_bytes())?;
     w.write_all(s)?;
@@ -37,8 +41,9 @@ fn read_len(r: &mut impl Read) -> Result<u64> {
     Ok(u64::from_le_bytes(buf))
 }
 
-/// Read a length-prefixed token (not file contents; bounded).
-fn read_str(r: &mut impl Read) -> Result<String> {
+/// Read a length-prefixed byte token (not file contents; bounded).
+/// Entry names and symlink targets are byte strings, like in Nix.
+fn read_bytes(r: &mut impl Read) -> Result<Vec<u8>> {
     let len = read_len(r)?;
     if len > 4096 {
         bail!("NAR token too long: {len}");
@@ -46,7 +51,12 @@ fn read_str(r: &mut impl Read) -> Result<String> {
     let mut buf = vec![0u8; len as usize];
     r.read_exact(&mut buf)?;
     read_padding(r, len)?;
-    String::from_utf8(buf).context("NAR token not UTF-8")
+    Ok(buf)
+}
+
+/// Read a length-prefixed token that must be a UTF-8 keyword.
+fn read_str(r: &mut impl Read) -> Result<String> {
+    String::from_utf8(read_bytes(r)?).context("NAR token not UTF-8")
 }
 
 fn expect(r: &mut impl Read, tok: &str) -> Result<()> {
@@ -60,10 +70,13 @@ fn expect(r: &mut impl Read, tok: &str) -> Result<()> {
 /// Serialize the filesystem object at `path` as a NAR into `w`.
 pub fn pack(path: &Path, w: &mut impl Write) -> Result<()> {
     write_str(w, MAGIC.as_bytes())?;
-    pack_node(path, w)
+    pack_node(path, w, 0)
 }
 
-fn pack_node(path: &Path, w: &mut impl Write) -> Result<()> {
+fn pack_node(path: &Path, w: &mut impl Write, depth: u32) -> Result<()> {
+    if depth > MAX_DEPTH {
+        bail!("NAR nesting deeper than {MAX_DEPTH} levels");
+    }
     use std::os::unix::fs::PermissionsExt;
     let meta = fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
     write_str(w, b"(")?;
@@ -82,7 +95,9 @@ fn pack_node(path: &Path, w: &mut impl Write) -> Result<()> {
         write_str(w, b"contents")?;
         w.write_all(&meta.len().to_le_bytes())?;
         let mut f = fs::File::open(path)?;
-        let copied = io::copy(&mut f, w)?;
+        // Bound the copy: a file growing mid-pack must not push extra
+        // bytes into the stream (framing corruption on the wire).
+        let copied = io::copy(&mut (&mut f).take(meta.len()), w)?;
         if copied != meta.len() {
             bail!("file {} changed size during pack", path.display());
         }
@@ -98,7 +113,7 @@ fn pack_node(path: &Path, w: &mut impl Write) -> Result<()> {
             write_str(w, b"name")?;
             write_str(w, entry.file_name().as_encoded_bytes())?;
             write_str(w, b"node")?;
-            pack_node(&entry.path(), w)?;
+            pack_node(&entry.path(), w, depth + 1)?;
             write_str(w, b")")?;
         }
     } else {
@@ -112,11 +127,21 @@ fn pack_node(path: &Path, w: &mut impl Write) -> Result<()> {
 /// `dest` must not exist yet.
 pub fn unpack(r: &mut impl Read, dest: &Path) -> Result<()> {
     expect(r, MAGIC)?;
-    unpack_node(r, dest)
+    unpack_node(r, dest, 0)?;
+    // The verified hash covers the whole stream; refuse trailing bytes
+    // it would otherwise silently attest to.
+    let mut buf = [0u8; 1];
+    if r.read(&mut buf)? != 0 {
+        bail!("trailing data after NAR");
+    }
+    Ok(())
 }
 
-fn unpack_node(r: &mut impl Read, dest: &Path) -> Result<()> {
+fn unpack_node(r: &mut impl Read, dest: &Path, depth: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
+    if depth > MAX_DEPTH {
+        bail!("NAR nesting deeper than {MAX_DEPTH} levels");
+    }
     expect(r, "(")?;
     expect(r, "type")?;
     match read_str(r)?.as_str() {
@@ -132,7 +157,12 @@ fn unpack_node(r: &mut impl Read, dest: &Path) -> Result<()> {
                 bail!("expected NAR token \"contents\", got {tok:?}");
             }
             let len = read_len(r)?;
-            let mut f = fs::File::create(dest)?;
+            // create_new: never truncate an existing file or follow a
+            // pre-planted symlink at dest.
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(dest)?;
             let copied = io::copy(&mut r.take(len), &mut f)?;
             if copied != len {
                 bail!("truncated NAR file contents");
@@ -147,8 +177,9 @@ fn unpack_node(r: &mut impl Read, dest: &Path) -> Result<()> {
         }
         "symlink" => {
             expect(r, "target")?;
-            let target = read_str(r)?;
-            std::os::unix::fs::symlink(target, dest)?;
+            let target = read_bytes(r)?;
+            let target = std::os::unix::ffi::OsStrExt::from_bytes(target.as_slice());
+            std::os::unix::fs::symlink::<&std::ffi::OsStr, _>(target, dest)?;
             expect(r, ")")?;
         }
         "directory" => {
@@ -157,7 +188,7 @@ fn unpack_node(r: &mut impl Read, dest: &Path) -> Result<()> {
             // out duplicate entries; a duplicate name could otherwise
             // first create a symlink and then write through it, escaping
             // the unpack root.
-            let mut last_name = String::new();
+            let mut last_name: Vec<u8> = Vec::new();
             let mut seen_folded = std::collections::HashSet::new();
             loop {
                 match read_str(r)?.as_str() {
@@ -165,8 +196,13 @@ fn unpack_node(r: &mut impl Read, dest: &Path) -> Result<()> {
                     "entry" => {
                         expect(r, "(")?;
                         expect(r, "name")?;
-                        let name = read_str(r)?;
-                        if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+                        let name = read_bytes(r)?;
+                        if name.is_empty()
+                            || name == b"."
+                            || name == b".."
+                            || name.contains(&b'/')
+                            || name.contains(&0)
+                        {
                             bail!("invalid NAR entry name {name:?}");
                         }
                         if name <= last_name {
@@ -176,11 +212,15 @@ fn unpack_node(r: &mut impl Read, dest: &Path) -> Result<()> {
                         // On the case-insensitive default filesystem a
                         // case-colliding entry would overwrite its sibling
                         // (Nix uses a case hack here; we reject).
-                        if cfg!(target_os = "macos") && !seen_folded.insert(name.to_lowercase()) {
+                        if cfg!(target_os = "macos")
+                            && !seen_folded.insert(String::from_utf8_lossy(&name).to_lowercase())
+                        {
                             bail!("case-colliding NAR entry {name:?}");
                         }
                         expect(r, "node")?;
-                        unpack_node(r, &dest.join(name))?;
+                        let name: &std::ffi::OsStr =
+                            std::os::unix::ffi::OsStrExt::from_bytes(name.as_slice());
+                        unpack_node(r, &dest.join(name), depth + 1)?;
                         expect(r, ")")?;
                     }
                     other => bail!("unexpected NAR token {other:?} in directory"),
@@ -228,6 +268,60 @@ mod tests {
         pack(&out, &mut nar2)?;
         assert_eq!(nar, nar2);
         Ok(())
+    }
+
+    /// Names and symlink targets are byte strings on Unix; the decoder
+    /// must accept what the encoder produces.
+    #[test]
+    fn roundtrip_non_utf8_names() -> Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        let src = tempfile::tempdir()?;
+        let name = std::ffi::OsStr::from_bytes(b"f\xff\xfe");
+        fs::write(src.path().join(name), b"x")?;
+        std::os::unix::fs::symlink(
+            std::ffi::OsStr::from_bytes(b"t\xffarget"),
+            src.path().join("link"),
+        )?;
+
+        let mut nar = Vec::new();
+        pack(src.path(), &mut nar)?;
+        let dst = tempfile::tempdir()?;
+        let out = dst.path().join("out");
+        unpack(&mut nar.as_slice(), &out)?;
+        assert_eq!(fs::read(out.join(name))?, b"x");
+        assert_eq!(
+            fs::read_link(out.join("link"))?.as_os_str().as_bytes(),
+            b"t\xffarget"
+        );
+        Ok(())
+    }
+
+    /// The verified stream hash must cover exactly what is materialized.
+    #[test]
+    fn rejects_trailing_data() {
+        let src = tempfile::tempdir().unwrap();
+        fs::write(src.path().join("f"), b"x").unwrap();
+        let mut nar = Vec::new();
+        pack(src.path(), &mut nar).unwrap();
+        nar.extend_from_slice(b"garbage");
+        let dst = tempfile::tempdir().unwrap();
+        let err = unpack(&mut nar.as_slice(), &dst.path().join("out")).unwrap_err();
+        assert!(err.to_string().contains("trailing data"), "{err}");
+    }
+
+    /// A pre-existing file (or pre-planted symlink) at dest must not be
+    /// truncated or written through.
+    #[test]
+    fn refuses_existing_dest() {
+        let src = tempfile::tempdir().unwrap();
+        fs::write(src.path().join("f"), b"x").unwrap();
+        let mut nar = Vec::new();
+        pack(&src.path().join("f"), &mut nar).unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let out = dst.path().join("out");
+        fs::write(&out, b"old").unwrap();
+        assert!(unpack(&mut nar.as_slice(), &out).is_err());
+        assert_eq!(fs::read(&out).unwrap(), b"old");
     }
 
     fn tok(buf: &mut Vec<u8>, s: &[u8]) {
