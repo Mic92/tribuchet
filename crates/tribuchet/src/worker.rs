@@ -7,6 +7,7 @@
 //!
 //! Runs up to `--max-jobs` builds concurrently over one hub session.
 
+pub mod binfmt;
 mod cgroup;
 pub mod sandbox;
 
@@ -54,6 +55,10 @@ pub struct WorkerOpts {
     /// First uid of the per-slot 65536-uid ranges for uid-range builds
     /// (Nix's auto-allocate-uids scheme; needs a root worker).
     pub auto_allocate_uids_base: u32,
+    /// "system=/path/to/static-emulator" pairs; each system is
+    /// advertised to the hub and its builds run under a per-sandbox
+    /// binfmt_misc registration (Linux, kernel 6.7+).
+    pub emulate: Vec<String>,
 }
 
 /// Per-process context threaded through builds.
@@ -74,6 +79,8 @@ struct WorkerCtx {
     pinned: std::sync::Mutex<HashMap<String, u32>>,
     /// Builds currently executing, reported in heartbeats.
     running: std::sync::atomic::AtomicU32,
+    /// system -> static emulator binary, from --emulate.
+    emulators: HashMap<String, PathBuf>,
     /// Slot i maps the uid block [uid_base + i*65536, 65536); disjoint
     /// blocks keep concurrent uid-range builds apart.
     uid_base: u32,
@@ -368,6 +375,28 @@ async fn run_async(opts: WorkerOpts) -> Result<()> {
     }
     sweep_state_dir(&opts.state_dir);
     let signing_key = load_signing_key(&opts.state_dir)?;
+    let mut opts = opts;
+    let mut emulators = HashMap::new();
+    for pair in &opts.emulate {
+        if !cfg!(target_os = "linux") {
+            anyhow::bail!("--emulate requires Linux (binfmt_misc)");
+        }
+        let (system, path) = pair
+            .split_once('=')
+            .with_context(|| format!("--emulate {pair}: expected system=/path"))?;
+        if binfmt::register_line(system).is_none() {
+            anyhow::bail!("--emulate {system}: no binfmt magic known");
+        }
+        let path = PathBuf::from(path);
+        if !path.is_file() {
+            anyhow::bail!("--emulate {system}: {} not found", path.display());
+        }
+        if !opts.systems.contains(&system.to_string()) {
+            opts.systems.push(system.to_string());
+        }
+        emulators.insert(system.to_string(), path);
+    }
+    let opts = opts;
     let ctx = std::sync::Arc::new(WorkerCtx {
         state_dir: opts.state_dir.clone(),
         sandbox_bin_sh: opts.sandbox_bin_sh.clone(),
@@ -382,6 +411,7 @@ async fn run_async(opts: WorkerOpts) -> Result<()> {
         cache_lock: std::sync::Mutex::new(()),
         pinned: std::sync::Mutex::new(HashMap::new()),
         running: std::sync::atomic::AtomicU32::new(0),
+        emulators,
         uid_base: opts.auto_allocate_uids_base,
         uid_slots: std::sync::Mutex::new(vec![false; opts.max_jobs.max(1) as usize]),
         shared_link_lock: std::sync::Mutex::new(()),
@@ -867,6 +897,7 @@ impl ActiveBuild {
             self.ctx.sandbox_bin_sh.as_deref(),
             &self.ctx.secret_paths,
             uid_slot.as_ref().map(|s| s.base),
+            self.ctx.emulators.get(&a.system).map(PathBuf::as_path),
         )?;
         spec.cgroup = self
             .ctx

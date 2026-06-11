@@ -20,6 +20,7 @@ use std::process::{Child, Command, Stdio};
 use anyhow::{Context, Result};
 
 use crate::proto::BuildAssignment;
+use crate::worker::binfmt;
 
 pub struct SandboxSpec {
     pub builder: String,
@@ -52,6 +53,11 @@ pub struct SandboxSpec {
     /// uid mapped to 1000, like Nix without auto-allocate-uids.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub uid_range: Option<u32>,
+    /// Static emulator binary for foreign-system builds, bound at
+    /// binfmt::INTERP_PATH and registered in a per-userns binfmt_misc
+    /// instance (Linux only).
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub emulator: Option<PathBuf>,
     /// Secret files the build must never read (worker signing/TLS
     /// keys). macOS: Seatbelt deny rules; Linux: defense in depth, the
     /// mount namespace already hides them.
@@ -75,6 +81,7 @@ pub fn prepare(
     bin_sh: Option<&Path>,
     secrets: &[PathBuf],
     uid_range: Option<u32>,
+    emulator: Option<&Path>,
 ) -> Result<SandboxSpec> {
     let build_dir = dir.join("top").join("build");
     std::fs::create_dir_all(&build_dir)?;
@@ -95,9 +102,14 @@ pub fn prepare(
         outputs: a.outputs.values().cloned().collect(),
         cgroup: None,
         uid_range,
+        emulator: emulator.map(Path::to_path_buf),
         deny_read: secrets.to_vec(),
     };
     if cfg!(target_os = "linux") {
+        if let Some(em) = emulator {
+            spec.binds_ro
+                .push((em.to_owned(), PathBuf::from(binfmt::INTERP_PATH)));
+        }
         if let Some(sh) = bin_sh {
             // Like Nix's busybox sandbox path: shebangs and system(3)
             // need a shell at /bin/sh.
@@ -274,14 +286,23 @@ mod platform {
         let cwd = spec.cwd.clone();
         let network = spec.network;
         let system = spec.system.clone();
+        let binfmt_line = match &spec.emulator {
+            Some(_) => Some(binfmt::register_line(&spec.system).ok_or_else(|| {
+                anyhow::anyhow!("no binfmt magic known for system {}", spec.system)
+            })?),
+            None => None,
+        };
         // Single uid 1000 (Nix default) or, for uid-range builds,
-        // in-namespace root over a 65536-uid block.
+        // in-namespace root over a 65536-uid block. Emulated builds map
+        // uid 0 for the binfmt registration, dropped to 1000 in setup().
         let (sandbox_uid, host_uid, uid_count) = match spec.uid_range {
             Some(base) => (0, base, 65536u32),
+            None if binfmt_line.is_some() => (0, getuid().as_raw(), 1),
             None => (1000, getuid().as_raw(), 1),
         };
         let (sandbox_gid, host_gid) = match spec.uid_range {
             Some(base) => (0, base),
+            None if binfmt_line.is_some() => (0, getgid().as_raw()),
             None => (100, getgid().as_raw()),
         };
 
@@ -299,6 +320,7 @@ mod platform {
                 setup(&SetupParams {
                     root: &root,
                     system: &system,
+                    binfmt_line: binfmt_line.as_deref(),
                     build_dir: &build_dir,
                     binds: &binds,
                     binds_dev: &binds_dev,
@@ -456,6 +478,7 @@ mod platform {
     struct SetupParams<'a> {
         root: &'a Path,
         system: &'a str,
+        binfmt_line: Option<&'a str>,
         build_dir: &'a Path,
         binds: &'a [(PathBuf, PathBuf)],
         binds_dev: &'a [(PathBuf, PathBuf)],
@@ -473,6 +496,7 @@ mod platform {
         let SetupParams {
             root,
             system,
+            binfmt_line,
             build_dir,
             binds,
             binds_dev,
@@ -654,6 +678,22 @@ mod platform {
         std::env::set_current_dir(cwd)
             .map_err(|e| io::Error::other(format!("chdir {cwd}: {e}")))?;
 
+        if let Some(line) = binfmt_line {
+            // Fresh per-userns binfmt_misc instance (kernel 6.7+).
+            mount(
+                Some("binfmt_misc"),
+                "/proc/sys/fs/binfmt_misc",
+                Some("binfmt_misc"),
+                MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+                none,
+            )
+            .map_err(ioerr(
+                "mounting binfmt_misc (emulated builds need kernel 6.7+)",
+            ))?;
+            std::fs::write("/proc/sys/fs/binfmt_misc/register", line)
+                .map_err(|e| io::Error::other(format!("registering binfmt entry: {e}")))?;
+        }
+
         // Last-resort fork-bomb brake; the PID namespace makes the bomb
         // killable, the rlimit caps how big it can get. Clamp to the
         // inherited hard limit: raising it needs init-ns CAP_SYS_RESOURCE,
@@ -698,6 +738,14 @@ mod platform {
                 .map_err(ioerr("setgid"))?;
             nix::unistd::setuid(nix::unistd::Uid::from_raw(sandbox_uid))
                 .map_err(ioerr("setuid"))?;
+        } else if binfmt_line.is_some() {
+            // binfmt registration needed in-namespace root; remap to
+            // Nix's uid 1000 via a nested userns. Exec lookup falls back
+            // to the ancestor namespace's binfmt instance.
+            unshare(CloneFlags::CLONE_NEWUSER).map_err(ioerr("nested unshare"))?;
+            std::fs::write("/proc/self/setgroups", "deny").map_err(werr("nested setgroups"))?;
+            std::fs::write("/proc/self/uid_map", "1000 0 1").map_err(werr("nested uid_map"))?;
+            std::fs::write("/proc/self/gid_map", "100 0 1").map_err(werr("nested gid_map"))?;
         }
         Ok(())
     }
@@ -891,6 +939,7 @@ mod tests {
             outputs: vec![],
             cgroup: None,
             uid_range: None,
+            emulator: None,
             deny_read: vec![],
         };
         std::fs::create_dir_all(&spec.build_dir)?;

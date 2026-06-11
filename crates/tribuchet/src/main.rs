@@ -79,6 +79,10 @@ enum Command {
         /// start-id; needs a root worker).
         #[arg(long, default_value_t = 872415232)]
         auto_allocate_uids_base: u32,
+        /// Emulated system as "system=/path/to/static-emulator"
+        /// (repeatable; Linux, kernel 6.7+).
+        #[arg(long)]
+        emulate: Vec<String>,
     },
     /// Certificate authority management (init CA, issue worker certs).
     Ca {
@@ -115,6 +119,7 @@ fn main() -> anyhow::Result<()> {
             build_memory_max_bytes,
             max_jobs,
             auto_allocate_uids_base,
+            emulate,
         } => {
             if systems.is_empty() {
                 systems.push(worker::host_system());
@@ -132,6 +137,7 @@ fn main() -> anyhow::Result<()> {
                 build_memory_max: build_memory_max_bytes,
                 max_jobs,
                 auto_allocate_uids_base,
+                emulate,
             })
         }
         Command::Ca { action } => ca::run(action),

@@ -104,7 +104,11 @@ Reference implementations: `nix/src/libstore/unix/build/` and
   `uid-range` system feature get a disjoint 65536-uid block (Nix's
   auto-allocate-uids scheme, root worker required), run as in-namespace
   root, and see their own delegated cgroup subtree at `/sys/fs/cgroup`
-  — enough for systemd-nspawn inside the sandbox.
+  — enough for systemd-nspawn inside the sandbox. `--emulate
+  system=/path/to/static-qemu` advertises foreign systems; such builds
+  get the emulator bound into the sandbox and registered in a per-userns
+  binfmt_misc instance (kernel 6.7+); a nested user namespace drops the
+  registration-time root back to uid 1000 for the build.
 * macOS: no mount namespace, so inputs are materialized in the host
   /nix/store, `/build` is a symlink to the build dir, and the builder
   runs under `/usr/bin/sandbox-exec` with a deny-default write profile

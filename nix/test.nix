@@ -45,7 +45,10 @@ in
           system-features = [ "uid-range" ];
           external-builders = builtins.toJSON [
             {
-              systems = [ "x86_64-linux" ];
+              systems = [
+                "x86_64-linux"
+                "aarch64-linux"
+              ];
               program = "${attachWrapper}";
               args = [ ];
             }
@@ -83,6 +86,22 @@ in
           }
         '';
 
+        environment.etc."tt/cross.nix".text = ''
+          let
+            busybox = builtins.storePath "${pkgs.pkgsCross.aarch64-multiplatform.pkgsStatic.busybox}";
+          in
+          derivation {
+            name = "tt-cross";
+            system = "aarch64-linux";
+            builder = busybox + "/bin/busybox";
+            args = [
+              "sh"
+              "-c"
+              "\"$builder\" uname -m > $out; \"$builder\" id -u >> $out"
+            ];
+          }
+        '';
+
         systemd.services.tribuchet-hub = {
           # started by the test script once certificates exist
           wantedBy = lib.mkForce [ ];
@@ -114,7 +133,7 @@ in
           # started by the test script once certificates exist
           wantedBy = lib.mkForce [ ];
           serviceConfig = {
-            ExecStart = "${tribuchet}/bin/tribuchet worker --hub https://hub:7437 --state-dir /var/lib/tribuchet --max-jobs 2";
+            ExecStart = "${tribuchet}/bin/tribuchet worker --hub https://hub:7437 --state-dir /var/lib/tribuchet --max-jobs 2 --emulate aarch64-linux=${pkgs.pkgsStatic.qemu-user}/bin/qemu-aarch64";
             StateDirectory = "tribuchet";
             Environment = "RUST_LOG=info";
             # delegate the cgroup subtree so the worker can apply
@@ -180,6 +199,11 @@ in
     with subtest("uid-range build runs as sandbox root with a cgroup"):
         out = hub.succeed("nix-build /etc/tt/uidrange.nix --no-out-link").strip()
         hub.succeed(f"grep -q uid-range-ok {out}")
+
+    with subtest("aarch64 build runs under per-sandbox binfmt emulation"):
+        out = hub.succeed("nix-build /etc/tt/cross.nix --no-out-link").strip()
+        hub.succeed(f"grep -q aarch64 {out}")
+        hub.succeed(f"grep -qx 1000 {out}")
 
     with subtest("systemd-nspawn boots a NixOS container in a remote build"):
         out = hub.succeed("nix-build /etc/tt/nspawn.nix --no-out-link", timeout=1800).strip()
