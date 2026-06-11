@@ -143,6 +143,56 @@ impl Drop for UidSlot {
     }
 }
 
+/// Host credentials backing one build's sandbox.
+///
+/// Root workers lease a uid slot for two cases: uid-range builds (the
+/// builder is namespace root over a 65536-uid block) and pasta FOD
+/// builds (pasta is rootless-only, so the build drops to a single
+/// unprivileged uid). A leased uid runs the whole sandbox setup itself
+/// after the drop, which is why sandbox::prepare hands it the per-build
+/// tree (chown + 0700) and the worker state dirs are traverse-only
+/// (0711). Everything else runs as the worker's own uid.
+enum BuildOwner {
+    Worker,
+    UidRange(UidSlot),
+    Fod(UidSlot),
+}
+
+impl BuildOwner {
+    fn for_build(ctx: &std::sync::Arc<WorkerCtx>, a: &BuildAssignment) -> Result<Self> {
+        let is_root = nix::unistd::geteuid().is_root();
+        if requires_uid_range(&a.env) {
+            if !is_root {
+                bail!("build requires the uid-range feature, but the worker does not run as root");
+            }
+            if !cfg!(target_os = "linux") {
+                bail!("the uid-range feature is only supported on Linux workers");
+            }
+            let slot = ctx.alloc_uid_slot().context("no free uid range slot")?;
+            return Ok(Self::UidRange(slot));
+        }
+        if a.fixed_output && ctx.pasta.is_some() && cfg!(target_os = "linux") && is_root {
+            let slot = ctx.alloc_uid_slot().context("no free uid slot")?;
+            return Ok(Self::Fod(slot));
+        }
+        Ok(Self::Worker)
+    }
+
+    fn uid_range(&self) -> Option<u32> {
+        match self {
+            Self::UidRange(slot) => Some(slot.base),
+            _ => None,
+        }
+    }
+
+    fn fod_uid(&self) -> Option<u32> {
+        match self {
+            Self::Fod(slot) => Some(slot.base),
+            _ => None,
+        }
+    }
+}
+
 /// Nix's `uid-range` system feature: a full 65536-uid range with the
 /// builder as in-namespace root (containers, systemd-nspawn).
 fn requires_uid_range(env: &HashMap<String, String>) -> bool {
@@ -381,9 +431,8 @@ async fn run_async(opts: WorkerOpts) -> Result<()> {
     for sub in ["store", "builds"] {
         let dir = opts.state_dir.join(sub);
         std::fs::create_dir_all(&dir)?;
-        // Traverse-only: dropped-uid FOD builds must reach their own
-        // build tree and cached inputs, but other local users get no
-        // listing; per-build dirs are chowned and locked down further.
+        // Traverse-only so leased build uids reach their own tree but
+        // other local users get no listing; see BuildOwner.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o711))?;
     }
     sweep_state_dir(&opts.state_dir);
@@ -895,35 +944,9 @@ impl ActiveBuild {
         } else {
             None
         };
-        // The slot lease keeps concurrent uid ranges disjoint; returned
-        // on drop when the build finishes.
-        let uid_slot = if requires_uid_range(&a.env) {
-            if !nix::unistd::geteuid().is_root() {
-                bail!("build requires the uid-range feature, but the worker does not run as root");
-            }
-            if !cfg!(target_os = "linux") {
-                bail!("the uid-range feature is only supported on Linux workers");
-            }
-            Some(
-                self.ctx
-                    .alloc_uid_slot()
-                    .context("no free uid range slot")?,
-            )
-        } else {
-            None
-        };
-        // Root workers back fixed-output builds with an unprivileged
-        // slot uid (pasta is rootless-only; see SandboxSpec::fod_uid).
-        let fod_slot = if a.fixed_output
-            && self.ctx.pasta.is_some()
-            && uid_slot.is_none()
-            && cfg!(target_os = "linux")
-            && nix::unistd::geteuid().is_root()
-        {
-            Some(self.ctx.alloc_uid_slot().context("no free uid slot")?)
-        } else {
-            None
-        };
+        // The slot lease keeps concurrent uids disjoint; returned on
+        // drop when the build finishes.
+        let owner = BuildOwner::for_build(&self.ctx, a)?;
         let mut spec = sandbox::prepare(
             a,
             &self.dir,
@@ -931,10 +954,10 @@ impl ActiveBuild {
             &sandbox::PrepareOpts {
                 bin_sh: self.ctx.sandbox_bin_sh.as_deref(),
                 secrets: &self.ctx.secret_paths,
-                uid_range: uid_slot.as_ref().map(|s| s.base),
+                uid_range: owner.uid_range(),
                 emulator: self.ctx.emulators.get(&a.system).map(PathBuf::as_path),
                 pasta: self.ctx.pasta.as_deref(),
-                fod_uid: fod_slot.as_ref().map(|s| s.base),
+                fod_uid: owner.fod_uid(),
             },
         )?;
         spec.cgroup = self
@@ -942,10 +965,10 @@ impl ActiveBuild {
             .cgroup_base
             .as_deref()
             .and_then(|base| cgroup::create(base, &a.build_id, self.ctx.build_memory_max));
-        if let (Some(slot), Some(cg)) = (&uid_slot, &spec.cgroup) {
+        if let (Some(base), Some(cg)) = (owner.uid_range(), &spec.cgroup) {
             // the build manages its own delegated cgroup (Nix's
             // `cgroups` setting); needed by nspawn inside the sandbox
-            cgroup::chown_to_builder(cg, slot.base);
+            cgroup::chown_to_builder(cg, base);
         }
         let deadline = std::time::Instant::now() + timeout;
         let mut child = sandbox::spawn(&spec)?;
