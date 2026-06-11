@@ -95,6 +95,9 @@ struct HubState {
     queue: Mutex<VecDeque<Job>>,
     inflight: Mutex<Inflight>,
     notify: Notify,
+    /// system -> number of connected workers serving it; submissions
+    /// for systems with no worker fail fast instead of queueing forever.
+    worker_systems: std::sync::Mutex<HashMap<String, usize>>,
 }
 
 impl HubState {
@@ -114,6 +117,11 @@ impl HubState {
         job.replay.finish().await;
     }
 }
+
+/// If no worker message arrives for this long the job is failed:
+/// heartbeats flow every 30s, so silence means a dead or wedged worker
+/// that would otherwise pin the build (and its dedupe key) forever.
+const WORKER_SILENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// The hub serves exactly the canonical Nix store; clients must not
 /// anchor path validation at an arbitrary prefix.
@@ -292,6 +300,16 @@ impl attach_hub_server::AttachHub for AttachSvc {
         validate_top_tmp_dir(&req.top_tmp_dir, peer_uid)?;
         let key = dedupe_key(&req);
 
+        {
+            let systems = self.state.worker_systems.lock().unwrap();
+            if systems.get(&req.system).copied().unwrap_or(0) == 0 {
+                return Err(Status::failed_precondition(format!(
+                    "no connected worker builds for system {}",
+                    req.system
+                )));
+            }
+        }
+
         let mut inflight = self.state.inflight.lock().await;
         let replay = if let Some(replay) = inflight.by_key.get(&key) {
             tracing::info!(key, "deduplicating build submission");
@@ -330,6 +348,43 @@ impl attach_hub_server::AttachHub for AttachSvc {
 
 struct WorkerSvc {
     state: Arc<HubState>,
+    /// Operator-pinned worker signing keys; when configured, a worker
+    /// registering an unknown key is rejected. Without it the signature
+    /// check only proves the NARs came from whoever registered the key,
+    /// which mTLS already guarantees.
+    trusted_keys: Option<Arc<std::collections::HashSet<[u8; 32]>>>,
+}
+
+/// Registers the worker's systems while alive; removes them on drop so
+/// admission control tracks actual capacity.
+struct SystemsGuard {
+    state: Arc<HubState>,
+    systems: Vec<String>,
+}
+
+impl SystemsGuard {
+    fn new(state: Arc<HubState>, systems: Vec<String>) -> Self {
+        let mut map = state.worker_systems.lock().unwrap();
+        for s in &systems {
+            *map.entry(s.clone()).or_insert(0) += 1;
+        }
+        drop(map);
+        Self { state, systems }
+    }
+}
+
+impl Drop for SystemsGuard {
+    fn drop(&mut self) {
+        let mut map = self.state.worker_systems.lock().unwrap();
+        for s in &self.systems {
+            if let Some(n) = map.get_mut(s) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    map.remove(s);
+                }
+            }
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -354,6 +409,18 @@ impl crate::proto::worker_hub_server::WorkerHub for WorkerSvc {
             .map_err(|_| Status::invalid_argument("signing key must be 32 bytes"))?;
         let vkey = VerifyingKey::from_bytes(&key)
             .map_err(|e| Status::invalid_argument(format!("bad signing key: {e}")))?;
+        if let Some(trusted) = &self.trusted_keys {
+            if !trusted.contains(&key) {
+                tracing::warn!(
+                    worker = register.worker_name,
+                    key = hex::encode(key),
+                    "rejecting worker with unpinned signing key"
+                );
+                return Err(Status::permission_denied(
+                    "signing key not in the hub's trusted-signing-keys",
+                ));
+            }
+        }
         tracing::info!(
             worker = register.worker_name,
             systems = ?register.systems,
@@ -387,11 +454,15 @@ async fn worker_loop(
     out_tx: mpsc::Sender<Result<HubMessage, Status>>,
     mut in_rx: mpsc::Receiver<WorkerMessage>,
 ) {
+    let _systems_guard = SystemsGuard::new(state.clone(), register.systems.clone());
     loop {
         let job = loop {
             if let Some(job) = state.take_job(&register.systems).await {
                 break job;
             }
+            // Drain heartbeats while idle, or the bounded channel (and
+            // then HTTP/2 flow control) would stall the worker stream.
+            while in_rx.try_recv().is_ok() {}
             // notify_waiters() wakes only current waiters; the timeout
             // closes the race between checking the queue and awaiting.
             tokio::select! {
@@ -542,7 +613,15 @@ fn is_stale(msg: &worker_message::Msg, build_id: &str) -> bool {
 
 async fn recv(in_rx: &mut mpsc::Receiver<WorkerMessage>) -> Result<worker_message::Msg> {
     loop {
-        match in_rx.recv().await {
+        let m = tokio::time::timeout(WORKER_SILENCE_TIMEOUT, in_rx.recv())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "worker sent nothing for {}s; assuming it is dead",
+                    WORKER_SILENCE_TIMEOUT.as_secs()
+                )
+            })?;
+        match m {
             Some(WorkerMessage { msg: Some(m) }) => return Ok(m),
             Some(WorkerMessage { msg: None }) => {}
             None => bail!("worker connection lost"),
@@ -779,6 +858,37 @@ async fn run_async(socket: &Path, listen: &str, config_dir: &Path) -> Result<()>
     let ca = Certificate::from_pem(std::fs::read(ca_dir.join("ca.crt")).context("reading ca.crt")?);
     let tls = ServerTlsConfig::new().identity(identity).client_ca_root(ca);
 
+    // Optional operator pinning of worker signing keys (one hex ed25519
+    // public key per line, '#' comments). Without it, output signatures
+    // only authenticate the TLS channel, not a particular worker.
+    let trusted_keys = match std::fs::read_to_string(config_dir.join("trusted-signing-keys")) {
+        Ok(data) => {
+            let mut keys = std::collections::HashSet::new();
+            for line in data.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let bytes: [u8; 32] = hex::decode(line)
+                    .ok()
+                    .and_then(|v| v.try_into().ok())
+                    .with_context(|| format!("bad key in trusted-signing-keys: {line}"))?;
+                keys.insert(bytes);
+            }
+            tracing::info!(count = keys.len(), "worker signing keys pinned");
+            Some(Arc::new(keys))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::warn!(
+                "no trusted-signing-keys file in {}; accepting any signing key from \
+                 mTLS-authenticated workers",
+                config_dir.display()
+            );
+            None
+        }
+        Err(e) => return Err(e).context("reading trusted-signing-keys"),
+    };
+
     // Bind TCP eagerly: a second hub instance must fail here on
     // EADDRINUSE *before* it clobbers the live hub's unix socket below.
     let tcp = tokio::net::TcpListener::bind(
@@ -790,9 +900,14 @@ async fn run_async(socket: &Path, listen: &str, config_dir: &Path) -> Result<()>
     .context("binding worker listen address")?;
     let worker_server = Server::builder()
         .tls_config(tls)?
+        // Detect dead/half-open worker connections instead of relying on
+        // the workers' own traffic.
+        .http2_keepalive_interval(Some(std::time::Duration::from_secs(30)))
+        .http2_keepalive_timeout(Some(std::time::Duration::from_secs(20)))
         .add_service(
             crate::proto::worker_hub_server::WorkerHubServer::new(WorkerSvc {
                 state: state.clone(),
+                trusted_keys,
             })
             .max_decoding_message_size(MAX_MSG_SIZE)
             .max_encoding_message_size(MAX_MSG_SIZE),
