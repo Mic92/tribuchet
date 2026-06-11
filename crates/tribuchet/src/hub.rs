@@ -230,25 +230,16 @@ pub(crate) const STORE_DIR: &str = "/nix/store";
 /// but legitimate closures.
 pub(crate) const MAX_MSG_SIZE: usize = 64 * 1024 * 1024;
 
-/// A store path basename restricted to Nix's name character set
-/// (`checkName` in nix); this also keeps peer-supplied strings free of
-/// shell/SBPL metacharacters, control bytes, and leading dots.
-pub(crate) fn valid_store_name(base: &str) -> bool {
-    !base.is_empty()
-        && !base.starts_with('.')
-        && base.len() <= 211
-        && base
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"+-._?=".contains(&b))
-}
-
 /// A store path directly under the store dir: absolute, exactly one
-/// component, no tricks. The hub runs as root and reads these from disk,
-/// so anything else would be an arbitrary-file-read primitive.
+/// component, hash-prefixed, Nix name charset (no shell/SBPL
+/// metacharacters, control bytes, or path tricks). The hub runs as
+/// root and reads these from disk, so anything else would be an
+/// arbitrary-file-read primitive.
 pub(crate) fn valid_store_path(store_dir: &str, path: &str) -> bool {
-    path.strip_prefix(store_dir)
-        .and_then(|rest| rest.strip_prefix('/'))
-        .is_some_and(valid_store_name)
+    let Ok(dir) = harmonia_store_path::StoreDir::new(store_dir) else {
+        return false;
+    };
+    dir.parse::<harmonia_store_path::StorePath>(path).is_ok()
 }
 
 #[allow(clippy::result_large_err)] // tonic::Status is what the caller needs
@@ -1200,33 +1191,41 @@ mod tests {
         assert!(!caps.serves("i686-linux", &[]));
     }
 
+    /// 32-char base32 hash part for synthetic store paths.
+    const H: &str = "00000000000000000000000000000000";
+
     #[test]
     fn store_path_validation() {
-        let ok = |p| valid_store_path("/nix/store", p);
-        assert!(ok("/nix/store/abc-foo"));
-        assert!(ok("/nix/store/abc-foo_1.2+x?=y"));
+        fn ok(p: &str) -> bool {
+            valid_store_path("/nix/store", p)
+        }
+        assert!(ok(&format!("/nix/store/{H}-foo")));
+        assert!(ok(&format!("/nix/store/{H}-foo_1.2+x?=y")));
+        // hash part is mandatory since harmonia's StorePath parser
+        assert!(!ok("/nix/store/abc-foo"));
         assert!(!ok("/nix/store/"));
         assert!(!ok("/nix/store/.."));
-        assert!(!ok("/nix/store/.hidden"));
-        assert!(!ok("/nix/store/abc/../../etc"));
-        assert!(!ok("/nix/store/abc/bin/sh"));
+        // leading-dot names are valid in modern Nix (and harmonia)
+        assert!(ok(&format!("/nix/store/{H}-.hidden")));
+        assert!(!ok(&format!("/nix/store/{H}-abc/../../etc")));
+        assert!(!ok(&format!("/nix/store/{H}-abc/bin/sh")));
         assert!(!ok("/etc/shadow"));
-        assert!(!ok("/nix/storeX/abc"));
+        assert!(!ok(&format!("/nix/storeX/{H}-abc")));
         // no quotes/parens/control bytes: these strings reach the macOS
         // sandbox profile and log lines verbatim
-        assert!(!ok("/nix/store/a\")(allow-default)(\""));
-        assert!(!ok("/nix/store/a\nb"));
-        assert!(!ok("/nix/store/a,b"));
+        assert!(!ok(&format!("/nix/store/{H}-a\")(allow-default)(\"")));
+        assert!(!ok(&format!("/nix/store/{H}-a\nb")));
+        assert!(!ok(&format!("/nix/store/{H}-a,b")));
     }
 
     fn base_request() -> BuildRequest {
         BuildRequest {
             system: "x86_64-linux".into(),
-            builder: "/nix/store/abc-bash/bin/bash".into(),
+            builder: format!("/nix/store/{H}-bash/bin/bash"),
             args: vec!["-c".into(), "true".into()],
             env: Default::default(),
-            outputs: [("out".to_string(), "/nix/store/abc-out".to_string())].into(),
-            input_paths: vec!["/nix/store/abc-dep".into()],
+            outputs: [("out".to_string(), format!("/nix/store/{H}-out"))].into(),
+            input_paths: vec![format!("/nix/store/{H}-dep")],
             top_tmp_dir: "/tmp/nix-build-x".into(),
             tmp_dir_in_sandbox: "/build".into(),
             store_dir: "/nix/store".into(),
@@ -1262,20 +1261,20 @@ mod tests {
         assert!(validate_request(&req).is_err());
 
         let mut req = base_request();
-        req.tmp_dir_in_sandbox = "/nix/store/abc-x".into();
+        req.tmp_dir_in_sandbox = format!("/nix/store/{H}-x");
         assert!(validate_request(&req).is_err());
 
         let mut req = base_request();
-        req.input_paths = vec!["/nix/store/abc-dep".into(), "/nix/store/abc-dep".into()];
+        req.input_paths = vec![format!("/nix/store/{H}-dep"), format!("/nix/store/{H}-dep")];
         assert!(validate_request(&req).is_err());
 
         let mut req = base_request();
         req.outputs
-            .insert("doc".into(), "/nix/store/abc-out".into());
+            .insert("doc".into(), format!("/nix/store/{H}-out"));
         assert!(validate_request(&req).is_err());
 
         let mut req = base_request();
-        req.outputs = [("out".to_string(), "/nix/store/abc-dep".to_string())].into();
+        req.outputs = [("out".to_string(), format!("/nix/store/{H}-dep"))].into();
         assert!(validate_request(&req).is_err());
     }
 

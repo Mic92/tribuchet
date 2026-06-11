@@ -1372,10 +1372,14 @@ mod tests {
         BuildAssignment {
             build_id: "0123456789abcdef0123456789abcdef".into(),
             system: "x86_64-linux".into(),
-            builder: "/nix/store/abc-bash/bin/bash".into(),
+            builder: "/nix/store/00000000000000000000000000000000-bash/bin/bash".into(),
             args: vec![],
             env: Default::default(),
-            outputs: [("out".to_string(), "/nix/store/abc-out".to_string())].into(),
+            outputs: [(
+                "out".to_string(),
+                "/nix/store/00000000000000000000000000000000-out".to_string(),
+            )]
+            .into(),
             tmp_dir_in_sandbox: "/build".into(),
             store_dir: "/nix/store".into(),
             fixed_output: false,
