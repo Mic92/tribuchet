@@ -59,6 +59,14 @@ enum Command {
         /// Kill builds running longer than this many seconds.
         #[arg(long, default_value_t = 24 * 3600)]
         build_timeout_secs: u64,
+        /// Kill builds producing no log output for this many seconds
+        /// (Nix's max-silent-time); 0 disables.
+        #[arg(long, default_value_t = 0)]
+        max_silent_time_secs: u64,
+        /// Kill builds whose log exceeds this many bytes (Nix's
+        /// max-log-size); 0 disables.
+        #[arg(long, default_value_t = 0)]
+        max_log_size: u64,
         /// Static shell bound at /bin/sh inside the sandbox (Linux),
         /// e.g. a busybox sh; without it #!/bin/sh shebangs fail.
         #[arg(long)]
@@ -125,6 +133,8 @@ fn main() -> anyhow::Result<()> {
             cert,
             key,
             build_timeout_secs,
+            max_silent_time_secs,
+            max_log_size,
             sandbox_bin_sh,
             cache_max_bytes,
             build_memory_max_bytes,
@@ -149,6 +159,8 @@ fn main() -> anyhow::Result<()> {
                 cert,
                 key,
                 build_timeout: std::time::Duration::from_secs(build_timeout_secs),
+                max_silent_time: std::time::Duration::from_secs(max_silent_time_secs),
+                max_log_size,
                 sandbox_bin_sh,
                 cache_max_bytes,
                 build_memory_max: build_memory_max_bytes,

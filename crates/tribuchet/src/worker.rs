@@ -40,6 +40,12 @@ pub struct WorkerOpts {
     /// Hard limit per build; a hung builder would otherwise occupy the
     /// worker forever.
     pub build_timeout: std::time::Duration,
+    /// Kill builds producing no log output for this long (Nix's
+    /// max-silent-time). Zero disables the check.
+    pub max_silent_time: std::time::Duration,
+    /// Kill builds whose log exceeds this many bytes (Nix's
+    /// max-log-size). Zero disables the check.
+    pub max_log_size: u64,
     /// Optional static shell bound at /bin/sh inside the Linux sandbox
     /// (like Nix's busybox sandbox path); #!/bin/sh shebangs and libc
     /// system() fail without it.
@@ -85,6 +91,8 @@ struct WorkerCtx {
     emulators: HashMap<String, PathBuf>,
     /// pasta binary for fixed-output network isolation.
     pasta: Option<PathBuf>,
+    max_silent_time: std::time::Duration,
+    max_log_size: u64,
     /// Slot i maps the uid block [uid_base + i*65536, 65536); disjoint
     /// blocks keep concurrent uid-range builds apart.
     uid_base: u32,
@@ -483,6 +491,8 @@ async fn run_async(opts: WorkerOpts) -> Result<()> {
         running: std::sync::atomic::AtomicU32::new(0),
         emulators,
         pasta: opts.pasta.clone(),
+        max_silent_time: opts.max_silent_time,
+        max_log_size: opts.max_log_size,
         uid_base: opts.auto_allocate_uids_base,
         uid_slots: std::sync::Mutex::new(vec![false; opts.max_jobs.max(1) as usize]),
         shared_link_lock: std::sync::Mutex::new(()),
@@ -973,6 +983,10 @@ impl ActiveBuild {
         let deadline = std::time::Instant::now() + timeout;
         let mut child = sandbox::spawn(&spec)?;
 
+        let log_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // ms since `started`, updated on every log chunk
+        let last_log_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let started = std::time::Instant::now();
         let mut log_threads = Vec::new();
         for pipe in [
             child
@@ -989,13 +1003,19 @@ impl ActiveBuild {
         {
             let tx = out_tx.clone();
             let build_id = a.build_id.clone();
+            let log_bytes = log_bytes.clone();
+            let last_log_ms = last_log_ms.clone();
             log_threads.push(std::thread::spawn(move || {
+                use std::sync::atomic::Ordering;
                 let mut pipe = pipe;
                 let mut buf = [0u8; 8192];
                 loop {
                     match pipe.read(&mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
+                            log_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                            last_log_ms
+                                .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
                             if tx
                                 .blocking_send(msg(worker_message::Msg::Log(LogChunk {
                                     build_id: build_id.clone(),
@@ -1011,13 +1031,29 @@ impl ActiveBuild {
             }));
         }
         let pgrp = nix::unistd::Pid::from_raw(child.id() as i32);
-        let mut timed_out = false;
+        let max_silent_ms = self.ctx.max_silent_time.as_millis() as u64;
+        let max_log = self.ctx.max_log_size;
+        use std::sync::atomic::Ordering;
+        let mut abort: Option<String> = None;
         let status = loop {
             if let Some(status) = child.try_wait()? {
                 break status;
             }
+            // saturating: a log thread may store a newer timestamp
+            // between the elapsed() read and the load
+            let silent_ms = (started.elapsed().as_millis() as u64)
+                .saturating_sub(last_log_ms.load(Ordering::Relaxed));
             if std::time::Instant::now() >= deadline {
-                timed_out = true;
+                abort = Some(format!("build timed out after {}s", timeout.as_secs()));
+            } else if max_log > 0 && log_bytes.load(Ordering::Relaxed) > max_log {
+                abort = Some(format!("build log exceeded the limit of {max_log} bytes"));
+            } else if max_silent_ms > 0 && silent_ms > max_silent_ms {
+                abort = Some(format!(
+                    "build produced no output for {}s",
+                    self.ctx.max_silent_time.as_secs()
+                ));
+            }
+            if abort.is_some() {
                 let _ = nix::sys::signal::killpg(pgrp, nix::sys::signal::Signal::SIGKILL);
                 break child.wait()?;
             }
@@ -1030,8 +1066,8 @@ impl ActiveBuild {
         for t in log_threads {
             let _ = t.join();
         }
-        if timed_out {
-            bail!("build timed out after {}s", timeout.as_secs());
+        if let Some(reason) = abort {
+            bail!("{reason}");
         }
         // Signal deaths become 128 + signo (matching shell conventions),
         // so an OOM SIGKILL (137) is distinguishable from a SIGSEGV (139).

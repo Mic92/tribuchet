@@ -86,6 +86,9 @@ in
             hubIp = "${nodes.hub.networking.primaryIPAddress}";
           }
         '';
+        environment.etc."tt/logbomb.nix".text = ''
+          import ${./tests/logbomb.nix} { bash = "${pkgs.bash}"; }
+        '';
         environment.etc."tt/cross.nix".text = ''
           import ${./tests/cross.nix} {
             busybox = "${pkgs.pkgsCross.aarch64-multiplatform.pkgsStatic.busybox}";
@@ -126,7 +129,7 @@ in
           # started by the test script once certificates exist
           wantedBy = lib.mkForce [ ];
           serviceConfig = {
-            ExecStart = "${tribuchet}/bin/tribuchet worker --hub https://hub:7437 --state-dir /var/lib/tribuchet --max-jobs 2 --emulate aarch64-linux=${pkgs.pkgsStatic.qemu-user}/bin/qemu-aarch64";
+            ExecStart = "${tribuchet}/bin/tribuchet worker --hub https://hub:7437 --state-dir /var/lib/tribuchet --max-jobs 2 --max-log-size 1048576 --emulate aarch64-linux=${pkgs.pkgsStatic.qemu-user}/bin/qemu-aarch64";
             StateDirectory = "tribuchet";
             Environment = "RUST_LOG=info";
             # delegate the cgroup subtree so the worker can apply
@@ -200,6 +203,10 @@ in
         else:
             err = hub.fail("nix-build /etc/tt/kvm.nix --no-out-link 2>&1")
             assert "no connected worker" in err, err
+
+    with subtest("runaway build log is killed at max-log-size"):
+        err = hub.fail("nix-build /etc/tt/logbomb.nix --no-out-link 2>&1")
+        assert "exceeded the limit" in err, err
 
     with subtest("fixed-output build fetches through pasta, isolated from host sockets"):
         hub.succeed("mkdir -p /srv/fod && echo hello-fod > /srv/fod/data")
