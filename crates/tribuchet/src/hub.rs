@@ -181,6 +181,38 @@ impl HubState {
         drop(inflight);
         job.replay.finish().await;
     }
+
+    /// Fail queued jobs no connected worker can serve. The submission
+    /// check alone is not enough: the capable worker can disconnect
+    /// while the job sits in the queue, which would strand it forever.
+    async fn fail_unservable(&self) {
+        let caps: Vec<WorkerCaps> = self.worker_caps.lock().unwrap().values().cloned().collect();
+        let mut queue = self.queue.lock().await;
+        let mut kept = VecDeque::with_capacity(queue.len());
+        let mut failed = Vec::new();
+        for j in queue.drain(..) {
+            if caps.iter().any(|c| c.serves(&j.req.system, &j.features)) {
+                kept.push_back(j);
+            } else {
+                failed.push(j);
+            }
+        }
+        *queue = kept;
+        drop(queue);
+        for job in failed {
+            tracing::warn!(
+                id = job.id,
+                "failing queued build: last capable worker left"
+            );
+            job.replay
+                .publish(attach_event::Event::Error(format!(
+                    "no connected worker builds for system {}",
+                    job.req.system
+                )))
+                .await;
+            self.finish(&job).await;
+        }
+    }
 }
 
 /// No worker message for this long tears the session down and fails
@@ -427,6 +459,10 @@ impl attach_hub_server::AttachHub for AttachSvc {
         // Subscribe outside the global inflight lock: the snapshot clone
         // of a large backlog must not stall every other submission.
         drop(inflight);
+        // Close the check-then-queue race: the last capable worker may
+        // have disconnected (and swept the queue) between the capability
+        // check above and the push.
+        self.state.fail_unservable().await;
         let rx = replay.subscribe().await;
         Ok(Response::new(ReceiverStream::new(rx)))
     }
@@ -600,7 +636,7 @@ async fn worker_loop(
         systems: register.systems.clone(),
         features: register.features.iter().cloned().collect(),
     };
-    let _caps_guard = CapsGuard::new(state.clone(), caps.clone());
+    let caps_guard = CapsGuard::new(state.clone(), caps.clone());
     let router = Router::default();
     let route = tokio::spawn(route_loop(in_rx, router.clone()));
     let slots = Arc::new(tokio::sync::Semaphore::new(max_jobs));
@@ -650,6 +686,8 @@ async fn worker_loop(
     // Builds in flight fail through their closed router channels.
     route.abort();
     router.close_all();
+    drop(caps_guard);
+    state.fail_unservable().await;
     tracing::info!(worker = register.worker_name, "worker disconnected");
 }
 
@@ -1104,6 +1142,32 @@ async fn run_async(socket: &Path, listen: &str, config_dir: &Path) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn queued_job_fails_when_last_capable_worker_leaves() {
+        let state = HubState::default();
+        let replay = Arc::new(Replay::default());
+        let job = Job {
+            id: "j1".into(),
+            key: "k1".into(),
+            req: BuildRequest {
+                system: "x86_64-linux".into(),
+                ..Default::default()
+            },
+            features: vec![],
+            replay: replay.clone(),
+        };
+        state.queue.lock().await.push_back(job);
+        state.fail_unservable().await;
+        assert!(state.queue.lock().await.is_empty());
+        let mut rx = replay.subscribe().await;
+        match rx.recv().await {
+            Some(Ok(AttachEvent {
+                event: Some(attach_event::Event::Error(e)),
+            })) => assert!(e.contains("no connected worker"), "{e}"),
+            other => panic!("expected error event, got {other:?}"),
+        }
+    }
 
     #[test]
     fn worker_caps_feature_matching() {
