@@ -212,6 +212,13 @@ mod platform {
             std::fs::File::create(root.join("dev").join(dev))?;
             spec.binds_dev.push((host.clone(), host)); // dev nodes: bind, rw via node perms
         }
+        // Nix's `kvm` system feature: pass the device through when the
+        // host has it (VM builds, NixOS tests).
+        let kvm = PathBuf::from("/dev/kvm");
+        if kvm.exists() {
+            std::fs::File::create(root.join("dev/kvm"))?;
+            spec.binds_dev.push((kvm.clone(), kvm));
+        }
         for (link, target) in [
             ("dev/fd", "/proc/self/fd"),
             ("dev/stdin", "/proc/self/fd/0"),

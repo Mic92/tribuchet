@@ -84,6 +84,17 @@ in
         environment.etc."tt/nspawn.nix".text = ''
           import ${./nspawn-container.nix} { nixpkgs = ${pkgs.path}; }
         '';
+        environment.etc."tt/kvm.nix".text = ''
+          let
+            bash = builtins.storePath "${pkgs.bash}";
+          in derivation {
+            name = "tt-kvm";
+            system = "x86_64-linux";
+            requiredSystemFeatures = [ "kvm" ];
+            builder = bash + "/bin/bash";
+            args = [ "-c" "[ -e /dev/kvm ] && echo kvm-ok > $out" ];
+          }
+        '';
         environment.etc."tt/uidrange.nix".text = ''
           let
             bash = builtins.storePath "${pkgs.bash}";
@@ -239,6 +250,14 @@ in
     with subtest("uid-range build runs as sandbox root with a cgroup"):
         out = hub.succeed("nix-build /etc/tt/uidrange.nix --no-out-link").strip()
         hub.succeed(f"grep -q uid-range-ok {out}")
+
+    with subtest("kvm feature: scheduled and device passed through, or rejected"):
+        if worker.execute("test -e /dev/kvm")[0] == 0:
+            out = hub.succeed("nix-build /etc/tt/kvm.nix --no-out-link").strip()
+            hub.succeed(f"grep -q kvm-ok {out}")
+        else:
+            err = hub.fail("nix-build /etc/tt/kvm.nix --no-out-link 2>&1")
+            assert "no connected worker" in err, err
 
     with subtest("fixed-output build fetches through pasta, isolated from host sockets"):
         hub.succeed("mkdir -p /srv/fod && echo hello-fod > /srv/fod/data")

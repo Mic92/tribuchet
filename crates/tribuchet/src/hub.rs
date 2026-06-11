@@ -124,6 +124,8 @@ struct Job {
     id: String,
     key: String,
     req: BuildRequest,
+    /// requiredSystemFeatures; only workers advertising them get the job.
+    features: Vec<String>,
     replay: Arc<Replay>,
 }
 
@@ -141,15 +143,32 @@ struct HubState {
     queue: Mutex<VecDeque<Job>>,
     inflight: Mutex<Inflight>,
     notify: Notify,
-    /// system -> number of connected workers serving it; submissions
-    /// for systems with no worker fail fast instead of queueing forever.
-    worker_systems: std::sync::Mutex<HashMap<String, usize>>,
+    /// Connected workers' capabilities, keyed by a per-connection id;
+    /// submissions no worker can serve fail fast instead of queueing
+    /// forever.
+    worker_caps: std::sync::Mutex<HashMap<u64, WorkerCaps>>,
+    next_worker_id: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Clone)]
+struct WorkerCaps {
+    systems: Vec<String>,
+    features: std::collections::HashSet<String>,
+}
+
+impl WorkerCaps {
+    fn serves(&self, system: &str, features: &[String]) -> bool {
+        self.systems.iter().any(|s| s == system)
+            && features.iter().all(|f| self.features.contains(f))
+    }
 }
 
 impl HubState {
-    async fn take_job(&self, systems: &[String]) -> Option<Job> {
+    async fn take_job(&self, caps: &WorkerCaps) -> Option<Job> {
         let mut queue = self.queue.lock().await;
-        let pos = queue.iter().position(|j| systems.contains(&j.req.system))?;
+        let pos = queue
+            .iter()
+            .position(|j| caps.serves(&j.req.system, &j.features))?;
         queue.remove(pos)
     }
 
@@ -359,12 +378,17 @@ impl attach_hub_server::AttachHub for AttachSvc {
         validate_top_tmp_dir(&req.top_tmp_dir, peer_uid)?;
         let key = dedupe_key(&req);
 
+        let features = crate::build_json::required_system_features(&req.env);
         {
-            let systems = self.state.worker_systems.lock().unwrap();
-            if systems.get(&req.system).copied().unwrap_or(0) == 0 {
+            let caps = self.state.worker_caps.lock().unwrap();
+            if !caps.values().any(|c| c.serves(&req.system, &features)) {
+                let what = if features.is_empty() {
+                    format!("system {}", req.system)
+                } else {
+                    format!("system {} with features {features:?}", req.system)
+                };
                 return Err(Status::failed_precondition(format!(
-                    "no connected worker builds for system {}",
-                    req.system
+                    "no connected worker builds for {what}"
                 )));
             }
         }
@@ -392,6 +416,7 @@ impl attach_hub_server::AttachHub for AttachSvc {
                 id: new_id(),
                 key,
                 req,
+                features,
                 replay: replay.clone(),
             };
             tracing::info!(id = job.id, system = job.req.system, "queueing build");
@@ -416,40 +441,26 @@ struct WorkerSvc {
     trusted_keys: Option<Arc<std::collections::HashSet<[u8; 32]>>>,
 }
 
-/// Registers the worker's job slots per system while alive; removes
-/// them on drop so admission control tracks actual capacity.
-struct SystemsGuard {
+/// Registers the worker's capabilities while alive; removes them on
+/// drop so admission control tracks actual capacity.
+struct CapsGuard {
     state: Arc<HubState>,
-    systems: Vec<String>,
-    slots: usize,
+    id: u64,
 }
 
-impl SystemsGuard {
-    fn new(state: Arc<HubState>, systems: Vec<String>, slots: usize) -> Self {
-        let mut map = state.worker_systems.lock().unwrap();
-        for s in &systems {
-            *map.entry(s.clone()).or_insert(0) += slots;
-        }
-        drop(map);
-        Self {
-            state,
-            systems,
-            slots,
-        }
+impl CapsGuard {
+    fn new(state: Arc<HubState>, caps: WorkerCaps) -> Self {
+        let id = state
+            .next_worker_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        state.worker_caps.lock().unwrap().insert(id, caps);
+        Self { state, id }
     }
 }
 
-impl Drop for SystemsGuard {
+impl Drop for CapsGuard {
     fn drop(&mut self) {
-        let mut map = self.state.worker_systems.lock().unwrap();
-        for s in &self.systems {
-            if let Some(n) = map.get_mut(s) {
-                *n = n.saturating_sub(self.slots);
-                if *n == 0 {
-                    map.remove(s);
-                }
-            }
-        }
+        self.state.worker_caps.lock().unwrap().remove(&self.id);
     }
 }
 
@@ -585,7 +596,11 @@ async fn worker_loop(
     in_rx: mpsc::Receiver<WorkerMessage>,
 ) {
     let max_jobs = register.max_jobs.clamp(1, MAX_WORKER_JOBS) as usize;
-    let _systems_guard = SystemsGuard::new(state.clone(), register.systems.clone(), max_jobs);
+    let caps = WorkerCaps {
+        systems: register.systems.clone(),
+        features: register.features.iter().cloned().collect(),
+    };
+    let _caps_guard = CapsGuard::new(state.clone(), caps.clone());
     let router = Router::default();
     let route = tokio::spawn(route_loop(in_rx, router.clone()));
     let slots = Arc::new(tokio::sync::Semaphore::new(max_jobs));
@@ -598,7 +613,7 @@ async fn worker_loop(
             if out_tx.is_closed() || route.is_finished() {
                 break 'outer;
             }
-            if let Some(job) = state.take_job(&register.systems).await {
+            if let Some(job) = state.take_job(&caps).await {
                 break job;
             }
             // notify_waiters() wakes only current waiters; the timeout
@@ -1089,6 +1104,18 @@ async fn run_async(socket: &Path, listen: &str, config_dir: &Path) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_caps_feature_matching() {
+        let caps = WorkerCaps {
+            systems: vec!["x86_64-linux".into()],
+            features: ["kvm".to_owned()].into(),
+        };
+        assert!(caps.serves("x86_64-linux", &[]));
+        assert!(caps.serves("x86_64-linux", &["kvm".into()]));
+        assert!(!caps.serves("x86_64-linux", &["kvm".into(), "uid-range".into()]));
+        assert!(!caps.serves("aarch64-linux", &[]));
+    }
 
     #[test]
     fn store_path_validation() {

@@ -146,22 +146,29 @@ impl Drop for UidSlot {
 /// Nix's `uid-range` system feature: a full 65536-uid range with the
 /// builder as in-namespace root (containers, systemd-nspawn).
 fn requires_uid_range(env: &HashMap<String, String>) -> bool {
-    if let Some(features) = env.get("requiredSystemFeatures") {
-        if features.split_whitespace().any(|f| f == "uid-range") {
-            return true;
+    crate::build_json::required_system_features(env)
+        .iter()
+        .any(|f| f == "uid-range")
+}
+
+/// System features this worker can honor, advertised to the hub for
+/// scheduling. Mirrors Nix's defaults; `kvm` needs the device node and
+/// `uid-range` needs root for the 65536-uid mapping.
+fn local_features() -> Vec<String> {
+    let mut features = vec![
+        "nixos-test".to_owned(),
+        "benchmark".to_owned(),
+        "big-parallel".to_owned(),
+    ];
+    if cfg!(target_os = "linux") {
+        if std::path::Path::new("/dev/kvm").exists() {
+            features.push("kvm".to_owned());
+        }
+        if nix::unistd::geteuid().is_root() {
+            features.push("uid-range".to_owned());
         }
     }
-    if let Some(json) = env.get("__json") {
-        if let Ok(attrs) = serde_json::from_str::<serde_json::Value>(json) {
-            if let Some(features) = attrs
-                .get("requiredSystemFeatures")
-                .and_then(|v| v.as_array())
-            {
-                return features.iter().any(|f| f.as_str() == Some("uid-range"));
-            }
-        }
-    }
-    false
+    features
 }
 
 /// Cap on a single NAR transfer in either direction; a `truncate -s 1P
@@ -484,7 +491,7 @@ async fn session(
                 .and_then(|h| h.into_string().ok())
                 .unwrap_or_else(|| "worker".into()),
             systems: opts.systems.clone(),
-            features: vec![],
+            features: local_features(),
             max_jobs: opts.max_jobs.max(1),
             signing_public_key: signing_key.verifying_key().to_bytes().to_vec(),
         })))
