@@ -27,7 +27,7 @@ use crate::nar;
 use crate::proto::{
     hub_message, nar_transfer, worker_hub_client::WorkerHubClient, worker_message, BuildAssignment,
     BuildResult, Heartbeat, LogChunk, MissingPaths, NarTransfer, OutputSignature, Register,
-    WorkerMessage,
+    RequestJob, WorkerMessage,
 };
 
 pub struct WorkerOpts {
@@ -494,6 +494,10 @@ fn msg(m: worker_message::Msg) -> WorkerMessage {
     WorkerMessage { msg: Some(m) }
 }
 
+fn request_job() -> WorkerMessage {
+    msg(worker_message::Msg::RequestJob(RequestJob {}))
+}
+
 pub fn run(opts: WorkerOpts) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run_async(opts))
@@ -615,10 +619,14 @@ async fn session(
                 .and_then(|h| h.into_string().ok())
                 .unwrap_or_else(|| "worker".into()),
             caps: system_caps(opts, ctx),
-            max_jobs: opts.max_jobs.max(1),
             signing_public_key: signing_key.verifying_key().to_bytes().to_vec(),
         })))
         .await?;
+    // One outstanding RequestJob per build slot; every finished build
+    // sends the next one, keeping the sum constant.
+    for _ in 0..opts.max_jobs.max(1) {
+        out_tx.send(request_job()).await?;
+    }
 
     let heartbeat_tx = out_tx.clone();
     let heartbeat_ctx = ctx.clone();
@@ -756,6 +764,7 @@ async fn session_loop(
                                 build.cleanup();
                                 ctx.running
                                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                let _ = out_tx.blocking_send(request_job());
                             });
                         }
                     }
@@ -783,6 +792,10 @@ async fn fail_build(
             outputs: vec![],
             error: format!("{err:#}"),
         })))
+        .await
+        .map_err(|_| anyhow::anyhow!("hub connection lost"))?;
+    out_tx
+        .send(request_job())
         .await
         .map_err(|_| anyhow::anyhow!("hub connection lost"))
 }

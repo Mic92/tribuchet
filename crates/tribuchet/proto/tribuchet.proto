@@ -20,8 +20,13 @@ message WorkerMessage {
     BuildResult result = 5;
     // Output NARs streamed back after BuildResult announces them.
     NarTransfer nar = 6;
+    // One free build slot: the hub answers each request with at most
+    // one BuildAssignment (worker-side admission).
+    RequestJob request_job = 7;
   }
 }
+
+message RequestJob {}
 
 message HubMessage {
   oneof msg {
@@ -43,10 +48,10 @@ message SystemCaps {
 }
 
 message Register {
-  reserved 2, 3; // formerly flat systems + features lists
+  // 2, 3: flat systems + features lists; 4: max_jobs (see RequestJob)
+  reserved 2, 3, 4;
   string worker_name = 1;
   repeated SystemCaps caps = 6;
-  uint32 max_jobs = 4;
   // ed25519 public key used to sign output NARs.
   bytes signing_public_key = 5;
 }

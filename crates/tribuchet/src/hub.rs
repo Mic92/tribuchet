@@ -221,10 +221,6 @@ impl HubState {
 /// worker that would otherwise pin its builds (and dedupe keys) forever.
 const WORKER_SILENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
-/// Cap on advertised job slots; a bogus Register must not let one
-/// worker absorb the whole queue.
-const MAX_WORKER_JOBS: u32 = 256;
-
 /// The hub serves exactly the canonical Nix store; clients must not
 /// anchor path validation at an arbitrary prefix.
 pub(crate) const STORE_DIR: &str = "/nix/store";
@@ -531,13 +527,19 @@ fn msg_build_id(msg: &worker_message::Msg) -> Option<&str> {
         worker_message::Msg::Result(r) => Some(&r.build_id),
         worker_message::Msg::Nar(n) => Some(&n.build_id),
         worker_message::Msg::MissingPaths(m) => Some(&m.build_id),
-        worker_message::Msg::Register(_) | worker_message::Msg::Heartbeat(_) => None,
+        worker_message::Msg::Register(_)
+        | worker_message::Msg::Heartbeat(_)
+        | worker_message::Msg::RequestJob(_) => None,
     }
 }
 
 /// Demux worker messages to their builds and enforce the session-wide
 /// silence deadline; closes every build channel on the way out.
-async fn route_loop(mut in_rx: mpsc::Receiver<WorkerMessage>, router: Router) {
+async fn route_loop(
+    mut in_rx: mpsc::Receiver<WorkerMessage>,
+    router: Router,
+    req_tx: mpsc::Sender<()>,
+) {
     loop {
         let m = match tokio::time::timeout(WORKER_SILENCE_TIMEOUT, in_rx.recv()).await {
             Err(_) => {
@@ -551,6 +553,13 @@ async fn route_loop(mut in_rx: mpsc::Receiver<WorkerMessage>, router: Router) {
             Ok(Some(WorkerMessage { msg: Some(m) })) => m,
             Ok(Some(WorkerMessage { msg: None })) => continue,
         };
+        if matches!(m, worker_message::Msg::RequestJob(_)) {
+            // try_send: routing must never block behind a request flood;
+            // a worker with more outstanding requests than the channel
+            // holds is misbehaving and only loses its own slots
+            let _ = req_tx.try_send(());
+            continue;
+        }
         let Some(id) = msg_build_id(&m).map(str::to_string) else {
             continue; // heartbeat: any traffic counts as liveness
         };
@@ -632,7 +641,6 @@ async fn worker_loop(
     out_tx: mpsc::Sender<Result<HubMessage, Status>>,
     in_rx: mpsc::Receiver<WorkerMessage>,
 ) {
-    let max_jobs = register.max_jobs.clamp(1, MAX_WORKER_JOBS) as usize;
     let caps = WorkerCaps {
         systems: register
             .caps
@@ -642,13 +650,14 @@ async fn worker_loop(
     };
     let caps_guard = CapsGuard::new(state.clone(), caps.clone());
     let router = Router::default();
-    let route = tokio::spawn(route_loop(in_rx, router.clone()));
-    let slots = Arc::new(tokio::sync::Semaphore::new(max_jobs));
+    // each received RequestJob funds at most one assignment
+    let (req_tx, mut req_rx) = mpsc::channel::<()>(1024);
+    let route = tokio::spawn(route_loop(in_rx, router.clone(), req_tx));
 
     'outer: loop {
-        // A free slot first, then a job: a job must never wait assigned
-        // to a busy worker while another worker has capacity.
-        let permit = slots.clone().acquire_owned().await.expect("never closed");
+        let Some(()) = req_rx.recv().await else {
+            break; // route_loop ended: worker gone
+        };
         let job = loop {
             if out_tx.is_closed() || route.is_finished() {
                 break 'outer;
@@ -684,7 +693,6 @@ async fn worker_loop(
             }
             router.unregister(&job.id);
             state.finish(&job).await;
-            drop(permit);
         });
     }
     // Builds in flight fail through their closed router channels.
@@ -785,6 +793,7 @@ fn msg_name(msg: &worker_message::Msg) -> &'static str {
         worker_message::Msg::Log(_) => "Log",
         worker_message::Msg::Result(_) => "Result",
         worker_message::Msg::Nar(_) => "Nar",
+        worker_message::Msg::RequestJob(_) => "RequestJob",
     }
 }
 
