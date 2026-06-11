@@ -100,7 +100,11 @@ Reference implementations: `nix/src/libstore/unix/build/` and
   worker's cgroup is delegated (systemd `Delegate=yes`), each build runs
   in its own cgroup with `pids.max` (and optional `memory.max`), torn
   down via `cgroup.kill`. `--sandbox-bin-sh` binds a static shell at
-  `/bin/sh` like Nix's busybox sandbox path.
+  `/bin/sh` like Nix's busybox sandbox path. Builds requiring the
+  `uid-range` system feature get a disjoint 65536-uid block (Nix's
+  auto-allocate-uids scheme, root worker required), run as in-namespace
+  root, and see their own delegated cgroup subtree at `/sys/fs/cgroup`
+  — enough for systemd-nspawn inside the sandbox.
 * macOS: no mount namespace, so inputs are materialized in the host
   /nix/store, `/build` is a symlink to the build dir, and the builder
   runs under `/usr/bin/sandbox-exec` with a deny-default write profile
@@ -151,6 +155,9 @@ streaming later without a protocol break.
   build attempt: it only catches concurrent duplicate submissions of the
   same goal, not the same derivation submitted twice. Proper dedupe
   needs a derivation identity in build.json (upstream patch).
+* Workers run up to `--max-jobs` concurrent builds over one session;
+  on macOS, builds sharing the daemon-pinned `/build` symlink are
+  serialized per worker (no mount namespace to give each its own).
 * A worker dying mid-build (detected via heartbeat silence and HTTP/2
   keepalive) fails the build instead of requeueing it.
 * When a worker reconnects, the previous session's scheduler loop may
