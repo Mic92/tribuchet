@@ -74,6 +74,11 @@ enum Command {
         /// Concurrent build slots.
         #[arg(long, default_value_t = 1)]
         max_jobs: u32,
+        /// First uid of the per-slot 65536-uid ranges for builds that
+        /// require the uid-range feature (Nix's auto-allocate-uids
+        /// start-id; needs a root worker).
+        #[arg(long, default_value_t = 872415232)]
+        auto_allocate_uids_base: u32,
     },
     /// Certificate authority management (init CA, issue worker certs).
     Ca {
@@ -109,6 +114,7 @@ fn main() -> anyhow::Result<()> {
             cache_max_bytes,
             build_memory_max_bytes,
             max_jobs,
+            auto_allocate_uids_base,
         } => {
             if systems.is_empty() {
                 systems.push(worker::host_system());
@@ -125,6 +131,7 @@ fn main() -> anyhow::Result<()> {
                 cache_max_bytes,
                 build_memory_max: build_memory_max_bytes,
                 max_jobs,
+                auto_allocate_uids_base,
             })
         }
         Command::Ca { action } => ca::run(action),

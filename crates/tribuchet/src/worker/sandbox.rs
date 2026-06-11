@@ -44,6 +44,11 @@ pub struct SandboxSpec {
     /// memory limits cover the whole build, including the setup phase.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub cgroup: Option<PathBuf>,
+    /// uid-range feature: host base of a 65536-uid block mapped into
+    /// the user namespace, builder as in-namespace root. None = single
+    /// uid mapped to 1000, like Nix without auto-allocate-uids.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub uid_range: Option<u32>,
     /// Secret files the build must never read (worker signing/TLS
     /// keys). macOS: Seatbelt deny rules; Linux: defense in depth, the
     /// mount namespace already hides them.
@@ -66,6 +71,7 @@ pub fn prepare(
     sources: &HashMap<String, PathBuf>,
     bin_sh: Option<&Path>,
     secrets: &[PathBuf],
+    uid_range: Option<u32>,
 ) -> Result<SandboxSpec> {
     let build_dir = dir.join("top").join("build");
     std::fs::create_dir_all(&build_dir)?;
@@ -84,6 +90,7 @@ pub fn prepare(
         binds_dev: Vec::new(),
         outputs: a.outputs.values().cloned().collect(),
         cgroup: None,
+        uid_range,
         deny_read: secrets.to_vec(),
     };
     if cfg!(target_os = "linux") {
@@ -139,6 +146,7 @@ mod platform {
             "dev/shm",
             "dev/pts",
             "proc",
+            "sys/fs/cgroup",
             "etc",
             "tmp",
         ] {
@@ -177,6 +185,34 @@ mod platform {
             let resolv = std::fs::read("/etc/resolv.conf").unwrap_or_default();
             std::fs::write(root.join("etc/resolv.conf"), resolv)?;
         }
+        if let Some(base) = spec.uid_range {
+            // The builder is root inside the namespace but uid `base`
+            // on the host; writable trees must be owned by the range
+            // (Nix's chownToBuilder).
+            for dir in [
+                root.join("nix/store"),
+                root.join("etc"),
+                root.join("tmp"),
+                spec.build_dir
+                    .parent()
+                    .unwrap_or(&spec.build_dir)
+                    .to_path_buf(),
+            ] {
+                chown_recursive(&dir, base)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn chown_recursive(path: &Path, uid: u32) -> Result<()> {
+        use std::os::unix::fs::lchown;
+        lchown(path, Some(uid), Some(uid))
+            .with_context(|| format!("chowning {}", path.display()))?;
+        if path.is_dir() && !path.is_symlink() {
+            for entry in std::fs::read_dir(path)? {
+                chown_recursive(&entry?.path(), uid)?;
+            }
+        }
         Ok(())
     }
 
@@ -214,10 +250,19 @@ mod platform {
         let binds: Vec<(PathBuf, PathBuf)> = spec.binds_ro.clone();
         let binds_dev: Vec<(PathBuf, PathBuf)> = spec.binds_dev.clone();
         let cgroup_procs = spec.cgroup.as_ref().map(|c| c.join("cgroup.procs"));
+        let has_cgroup = spec.cgroup.is_some();
         let cwd = spec.cwd.clone();
         let network = spec.network;
-        let uid = getuid().as_raw();
-        let gid = getgid().as_raw();
+        // Single uid 1000 (Nix default) or, for uid-range builds,
+        // in-namespace root over a 65536-uid block.
+        let (sandbox_uid, host_uid, uid_count) = match spec.uid_range {
+            Some(base) => (0, base, 65536u32),
+            None => (1000, getuid().as_raw(), 1),
+        };
+        let (sandbox_gid, host_gid) = match spec.uid_range {
+            Some(base) => (0, base),
+            None => (100, getgid().as_raw()),
+        };
 
         // Pre-open the error file: an fd keeps working after pivot_root
         // detaches the host filesystem, a path would not.
@@ -230,9 +275,20 @@ mod platform {
                     std::fs::write(procs, "0")
                         .map_err(|e| io::Error::other(format!("entering build cgroup: {e}")))?;
                 }
-                setup(
-                    &root, &build_dir, &binds, &binds_dev, &cwd, network, uid, gid,
-                )
+                setup(&SetupParams {
+                    root: &root,
+                    build_dir: &build_dir,
+                    binds: &binds,
+                    binds_dev: &binds_dev,
+                    cwd: &cwd,
+                    network,
+                    has_cgroup,
+                    sandbox_uid,
+                    host_uid,
+                    sandbox_gid,
+                    host_gid,
+                    uid_count,
+                })
                 .inspect_err(|e| {
                     // std forwards only the errno from pre_exec to the
                     // parent, dropping our message; leave the failing
@@ -267,6 +323,62 @@ mod platform {
 
     fn ioerr(step: &str) -> impl Fn(nix::errno::Errno) -> io::Error + '_ {
         move |e| io::Error::other(format!("{step}: {e}"))
+    }
+
+    /// Unshare and have a forked helper, still in the parent user
+    /// namespace, write this process's uid/gid maps: multi-uid ranges
+    /// need CAP_SETUID *there*, which the unshared process no longer
+    /// has (hence uid-range requires a root worker).
+    fn map_uid_range_via_helper(
+        flags: CloneFlags,
+        sandbox_uid: u32,
+        host_uid: u32,
+        sandbox_gid: u32,
+        host_gid: u32,
+        uid_count: u32,
+    ) -> io::Result<()> {
+        use nix::unistd::{read, write};
+        use std::os::fd::AsRawFd;
+        let target = nix::unistd::getpid();
+        let (req_r, req_w) = nix::unistd::pipe().map_err(ioerr("pipe"))?;
+        let (ack_r, ack_w) = nix::unistd::pipe().map_err(ioerr("pipe"))?;
+        match unsafe { nix::unistd::fork() }.map_err(ioerr("fork mapper"))? {
+            nix::unistd::ForkResult::Child => {
+                // Mapper: wait until the target has unshared, then map.
+                let mut buf = [0u8; 1];
+                let ok = read(req_r.as_raw_fd(), &mut buf)
+                    .map(|n| n == 1)
+                    .unwrap_or(false)
+                    && std::fs::write(
+                        format!("/proc/{target}/uid_map"),
+                        format!("{sandbox_uid} {host_uid} {uid_count}"),
+                    )
+                    .is_ok()
+                    && std::fs::write(
+                        format!("/proc/{target}/gid_map"),
+                        format!("{sandbox_gid} {host_gid} {uid_count}"),
+                    )
+                    .is_ok();
+                let _ = write(&ack_w, if ok { b"K" } else { b"E" });
+                unsafe { libc::_exit(0) }
+            }
+            nix::unistd::ForkResult::Parent { child } => {
+                drop(req_r);
+                drop(ack_w);
+                unshare(flags).map_err(ioerr("unshare"))?;
+                write(&req_w, b"x").map_err(ioerr("signaling uid mapper"))?;
+                let mut buf = [0u8; 1];
+                let n =
+                    read(ack_r.as_raw_fd(), &mut buf).map_err(ioerr("reading uid mapper ack"))?;
+                let _ = nix::sys::wait::waitpid(child, None);
+                if n != 1 || buf[0] != b'K' {
+                    return Err(io::Error::other(
+                        "uid-range mapping failed (is the worker root?)",
+                    ));
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Bring the loopback interface up. A fresh network namespace has
@@ -323,17 +435,36 @@ mod platform {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn setup(
-        root: &Path,
-        build_dir: &Path,
-        binds: &[(PathBuf, PathBuf)],
-        binds_dev: &[(PathBuf, PathBuf)],
-        cwd: &str,
+    struct SetupParams<'a> {
+        root: &'a Path,
+        build_dir: &'a Path,
+        binds: &'a [(PathBuf, PathBuf)],
+        binds_dev: &'a [(PathBuf, PathBuf)],
+        cwd: &'a str,
         network: bool,
-        uid: u32,
-        gid: u32,
-    ) -> io::Result<()> {
+        has_cgroup: bool,
+        sandbox_uid: u32,
+        host_uid: u32,
+        sandbox_gid: u32,
+        host_gid: u32,
+        uid_count: u32,
+    }
+
+    fn setup(p: &SetupParams) -> io::Result<()> {
+        let SetupParams {
+            root,
+            build_dir,
+            binds,
+            binds_dev,
+            cwd,
+            network,
+            has_cgroup,
+            sandbox_uid,
+            host_uid,
+            sandbox_gid,
+            host_gid,
+            uid_count,
+        } = *p;
         let mut flags = CloneFlags::CLONE_NEWUSER
             | CloneFlags::CLONE_NEWNS
             | CloneFlags::CLONE_NEWPID
@@ -342,15 +473,40 @@ mod platform {
         if !network {
             flags |= CloneFlags::CLONE_NEWNET;
         }
-        unshare(flags).map_err(ioerr("unshare"))?;
-
+        if has_cgroup {
+            // Cgroup namespace rooted at the just-entered build cgroup:
+            // the cgroup2 mount below then exposes only the build's own
+            // delegated subtree (usable by nspawn inside the sandbox).
+            flags |= CloneFlags::CLONE_NEWCGROUP;
+        }
         let werr = |step: &str| {
             let step = step.to_string();
             move |e: io::Error| io::Error::other(format!("{step}: {e}"))
         };
-        std::fs::write("/proc/self/setgroups", "deny").map_err(werr("setgroups"))?;
-        std::fs::write("/proc/self/uid_map", format!("1000 {uid} 1")).map_err(werr("uid_map"))?;
-        std::fs::write("/proc/self/gid_map", format!("100 {gid} 1")).map_err(werr("gid_map"))?;
+        if uid_count == 1 {
+            // Unprivileged self-mapping of the caller's own uid.
+            unshare(flags).map_err(ioerr("unshare"))?;
+            std::fs::write("/proc/self/setgroups", "deny").map_err(werr("setgroups"))?;
+            std::fs::write(
+                "/proc/self/uid_map",
+                format!("{sandbox_uid} {host_uid} {uid_count}"),
+            )
+            .map_err(werr("uid_map"))?;
+            std::fs::write(
+                "/proc/self/gid_map",
+                format!("{sandbox_gid} {host_gid} {uid_count}"),
+            )
+            .map_err(werr("gid_map"))?;
+        } else {
+            map_uid_range_via_helper(
+                flags,
+                sandbox_uid,
+                host_uid,
+                sandbox_gid,
+                host_gid,
+                uid_count,
+            )?;
+        }
         sethostname("localhost").map_err(ioerr("sethostname"))?;
         if !network {
             loopback_up().map_err(werr("bringing lo up"))?;
@@ -438,6 +594,18 @@ mod platform {
         )
         .map_err(ioerr("mounting /proc"))?;
 
+        if has_cgroup {
+            // the cgroup namespace makes the build's own cgroup the root
+            mount(
+                Some("cgroup2"),
+                &root.join("sys/fs/cgroup"),
+                Some("cgroup2"),
+                MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+                none,
+            )
+            .map_err(ioerr("mounting /sys/fs/cgroup"))?;
+        }
+
         // pivot_root + detach the old root: unlike a bare chroot, the
         // host filesystem is no longer reachable in this namespace.
         std::env::set_current_dir(root)
@@ -456,6 +624,17 @@ mod platform {
         let (_, hard) = getrlimit(Resource::RLIMIT_NPROC).map_err(ioerr("getrlimit NPROC"))?;
         let limit = hard.min(4096);
         setrlimit(Resource::RLIMIT_NPROC, limit, limit).map_err(ioerr("setting RLIMIT_NPROC"))?;
+
+        // uid-range: become the in-namespace root the mapping promised;
+        // the worker's own uid is outside the mapped block. Single-uid
+        // builds already run as the mapped uid.
+        if uid_count > 1 {
+            nix::unistd::setgroups(&[]).map_err(ioerr("setgroups"))?;
+            nix::unistd::setgid(nix::unistd::Gid::from_raw(sandbox_gid))
+                .map_err(ioerr("setgid"))?;
+            nix::unistd::setuid(nix::unistd::Uid::from_raw(sandbox_uid))
+                .map_err(ioerr("setuid"))?;
+        }
         Ok(())
     }
 
@@ -646,6 +825,7 @@ mod tests {
             binds_dev: vec![],
             outputs: vec![],
             cgroup: None,
+            uid_range: None,
             deny_read: vec![],
         };
         std::fs::create_dir_all(&spec.build_dir)?;

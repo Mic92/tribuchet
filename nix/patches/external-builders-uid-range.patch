@@ -1,0 +1,27 @@
+From: Tribuchet contributors
+Subject: [PATCH] external builders: don't reject uid-range derivations
+
+DerivationBuilderImpl::prepareSandbox() throws "feature 'uid-range' is
+not supported on this platform" for any derivation requiring the
+uid-range system feature. ExternalDerivationBuilder inherits it, so the
+daemon rejects such derivations before the external builder program is
+even invoked -- but sandboxing (including uid ranges) is exactly what an
+external builder provides itself. Make prepareSandbox a no-op for
+external builders and let them decide.
+
+--- a/src/libstore/unix/build/external-derivation-builder.cc
++++ b/src/libstore/unix/build/external-derivation-builder.cc
+@@ -15,6 +15,13 @@
+         experimentalFeatureSettings.require(Xp::ExternalBuilders);
+     }
+ 
++    void prepareSandbox() override
++    {
++        /* Sandboxing (including uid-range support) is the external
++           builder's responsibility; don't reject derivations the
++           local platform could not sandbox itself. */
++    }
++
+     std::filesystem::path tmpDirInSandbox() override
+     {
+         /* In a sandbox, for determinism, always use the same temporary

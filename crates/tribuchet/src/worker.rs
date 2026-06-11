@@ -51,6 +51,9 @@ pub struct WorkerOpts {
     pub build_memory_max: Option<u64>,
     /// Concurrent build slots advertised to the hub.
     pub max_jobs: u32,
+    /// First uid of the per-slot 65536-uid ranges for uid-range builds
+    /// (Nix's auto-allocate-uids scheme; needs a root worker).
+    pub auto_allocate_uids_base: u32,
 }
 
 /// Per-process context threaded through builds.
@@ -71,6 +74,10 @@ struct WorkerCtx {
     pinned: std::sync::Mutex<HashMap<String, u32>>,
     /// Builds currently executing, reported in heartbeats.
     running: std::sync::atomic::AtomicU32,
+    /// Slot i maps the uid block [uid_base + i*65536, 65536); disjoint
+    /// blocks keep concurrent uid-range builds apart.
+    uid_base: u32,
+    uid_slots: std::sync::Mutex<Vec<bool>>,
     /// macOS: tmpDirInSandbox=/build is one global symlink (no mount
     /// namespace); builds sharing it run one at a time.
     shared_link_lock: std::sync::Mutex<()>,
@@ -99,6 +106,51 @@ impl WorkerCtx {
     fn pinned_bases(&self) -> HashSet<String> {
         self.pinned.lock().unwrap().keys().cloned().collect()
     }
+
+    fn alloc_uid_slot(self: &std::sync::Arc<Self>) -> Option<UidSlot> {
+        let mut slots = self.uid_slots.lock().unwrap();
+        let idx = slots.iter().position(|used| !used)?;
+        slots[idx] = true;
+        Some(UidSlot {
+            ctx: self.clone(),
+            base: self.uid_base + (idx as u32) * 65536,
+            idx,
+        })
+    }
+}
+
+/// A leased 65536-uid range; returned to the pool on drop.
+struct UidSlot {
+    ctx: std::sync::Arc<WorkerCtx>,
+    base: u32,
+    idx: usize,
+}
+
+impl Drop for UidSlot {
+    fn drop(&mut self) {
+        self.ctx.uid_slots.lock().unwrap()[self.idx] = false;
+    }
+}
+
+/// Nix's `uid-range` system feature: a full 65536-uid range with the
+/// builder as in-namespace root (containers, systemd-nspawn).
+fn requires_uid_range(env: &HashMap<String, String>) -> bool {
+    if let Some(features) = env.get("requiredSystemFeatures") {
+        if features.split_whitespace().any(|f| f == "uid-range") {
+            return true;
+        }
+    }
+    if let Some(json) = env.get("__json") {
+        if let Ok(attrs) = serde_json::from_str::<serde_json::Value>(json) {
+            if let Some(features) = attrs
+                .get("requiredSystemFeatures")
+                .and_then(|v| v.as_array())
+            {
+                return features.iter().any(|f| f.as_str() == Some("uid-range"));
+            }
+        }
+    }
+    false
 }
 
 /// Cap on a single NAR transfer in either direction; a `truncate -s 1P
@@ -330,6 +382,8 @@ async fn run_async(opts: WorkerOpts) -> Result<()> {
         cache_lock: std::sync::Mutex::new(()),
         pinned: std::sync::Mutex::new(HashMap::new()),
         running: std::sync::atomic::AtomicU32::new(0),
+        uid_base: opts.auto_allocate_uids_base,
+        uid_slots: std::sync::Mutex::new(vec![false; opts.max_jobs.max(1) as usize]),
         shared_link_lock: std::sync::Mutex::new(()),
     });
 
@@ -789,18 +843,41 @@ impl ActiveBuild {
         } else {
             None
         };
+        // The slot lease keeps concurrent uid ranges disjoint; returned
+        // on drop when the build finishes.
+        let uid_slot = if requires_uid_range(&a.env) {
+            if !nix::unistd::geteuid().is_root() {
+                bail!("build requires the uid-range feature, but the worker does not run as root");
+            }
+            if !cfg!(target_os = "linux") {
+                bail!("the uid-range feature is only supported on Linux workers");
+            }
+            Some(
+                self.ctx
+                    .alloc_uid_slot()
+                    .context("no free uid range slot")?,
+            )
+        } else {
+            None
+        };
         let mut spec = sandbox::prepare(
             a,
             &self.dir,
             &self.sources,
             self.ctx.sandbox_bin_sh.as_deref(),
             &self.ctx.secret_paths,
+            uid_slot.as_ref().map(|s| s.base),
         )?;
         spec.cgroup = self
             .ctx
             .cgroup_base
             .as_deref()
             .and_then(|base| cgroup::create(base, &a.build_id, self.ctx.build_memory_max));
+        if let (Some(slot), Some(cg)) = (&uid_slot, &spec.cgroup) {
+            // the build manages its own delegated cgroup (Nix's
+            // `cgroups` setting); needed by nspawn inside the sandbox
+            cgroup::chown_to_builder(cg, slot.base);
+        }
         let deadline = std::time::Instant::now() + timeout;
         let mut child = sandbox::spawn(&spec)?;
 
@@ -1118,6 +1195,27 @@ mod tests {
         let mut a = base_assignment();
         a.builder = "-p".into();
         assert!(validate_assignment(&a).is_err());
+    }
+
+    #[test]
+    fn uid_range_detection() {
+        let mut env = HashMap::new();
+        assert!(!requires_uid_range(&env));
+        env.insert(
+            "requiredSystemFeatures".into(),
+            "big-parallel uid-range".into(),
+        );
+        assert!(requires_uid_range(&env));
+
+        let mut env = HashMap::new();
+        env.insert(
+            "__json".into(),
+            r#"{"requiredSystemFeatures":["uid-range"]}"#.into(),
+        );
+        assert!(requires_uid_range(&env));
+        let mut env = HashMap::new();
+        env.insert("__json".into(), r#"{"outputHash":"x"}"#.into());
+        assert!(!requires_uid_range(&env));
     }
 
     #[test]

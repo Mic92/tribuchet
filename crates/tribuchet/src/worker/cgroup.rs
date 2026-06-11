@@ -75,6 +75,22 @@ pub fn create(base: &Path, build_id: &str, memory_max: Option<u64>) -> Option<Pa
     }
 }
 
+/// Hand the build's cgroup to the builder uid (Nix's `cgroups`
+/// setting); nspawn inside the sandbox needs it. Best effort: without
+/// it only nested container managers fail.
+pub fn chown_to_builder(dir: &Path, uid: u32) {
+    for p in [
+        dir.to_path_buf(),
+        dir.join("cgroup.procs"),
+        dir.join("cgroup.threads"),
+        dir.join("cgroup.subtree_control"),
+    ] {
+        if let Err(e) = std::os::unix::fs::chown(&p, Some(uid), Some(uid)) {
+            tracing::warn!("chowning {}: {e}", p.display());
+        }
+    }
+}
+
 /// Kill everything left in the build's cgroup and remove it. cgroup.kill
 /// reaches setsid'd survivors that escape process-group signals.
 pub fn kill_and_remove(base: &Path, build_id: &str) {

@@ -22,9 +22,16 @@ in
         virtualisation.writableStore = true;
         virtualisation.additionalPaths = [ pkgs.bash ];
 
-        nix.package = pkgs.nixVersions.latest;
+        # patched so uid-range derivations reach the external builder
+        # (upstream rejects them before invoking it)
+        nix.package = pkgs.nixVersions.latest.appendPatches [
+          ./patches/external-builders-uid-range.patch
+        ];
         nix.settings = {
           experimental-features = [ "external-builders" ];
+          # let the daemon accept uid-range builds; tribuchet's worker
+          # provides the actual uid range
+          system-features = [ "uid-range" ];
           external-builders = builtins.toJSON [
             {
               systems = [ "x86_64-linux" ];
@@ -50,6 +57,18 @@ in
             };
           in [ (mk "a") (mk "b") ]
         '';
+        environment.etc."tt/uidrange.nix".text = ''
+          let
+            bash = builtins.storePath "${pkgs.bash}";
+          in derivation {
+            name = "tt-uid-range";
+            system = "x86_64-linux";
+            requiredSystemFeatures = [ "uid-range" ];
+            builder = bash + "/bin/bash";
+            args = [ "-c" "[ \"$EUID\" = 0 ] && [ -w /sys/fs/cgroup/cgroup.procs ] && echo uid-range-ok > $out" ];
+          }
+        '';
+
         systemd.services.tribuchet-hub = {
           # started by the test script once certificates exist
           wantedBy = lib.mkForce [ ];
@@ -136,6 +155,10 @@ in
         hub.succeed("nix-build /etc/tt/par.nix --no-out-link --max-jobs 2")
         elapsed = time.time() - t0
         assert elapsed < 27, f"builds did not overlap: {elapsed:.0f}s (serial would be >=30s)"
+
+    with subtest("uid-range build runs as sandbox root with a cgroup"):
+        out = hub.succeed("nix-build /etc/tt/uidrange.nix --no-out-link").strip()
+        hub.succeed(f"grep -q uid-range-ok {out}")
 
     with subtest("build really ran on the worker"):
         worker.succeed("journalctl -u tribuchet-worker | grep -q 'builder finished'")
