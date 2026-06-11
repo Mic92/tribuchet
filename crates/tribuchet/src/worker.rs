@@ -7,6 +7,7 @@
 //!
 //! One build at a time (max_jobs = 1) for the MVP.
 
+mod cgroup;
 pub mod sandbox;
 
 use std::collections::{HashMap, HashSet};
@@ -42,6 +43,24 @@ pub struct WorkerOpts {
     /// (like Nix's busybox sandbox path); #!/bin/sh shebangs and libc
     /// system() fail without it.
     pub sandbox_bin_sh: Option<PathBuf>,
+    /// Total byte budget for the input NAR cache (`state_dir/store`);
+    /// least-recently-used entries are evicted past it.
+    pub cache_max_bytes: u64,
+    /// Optional memory.max for the per-build cgroup (Linux, requires a
+    /// delegated cgroup; see worker/cgroup.rs).
+    pub build_memory_max: Option<u64>,
+}
+
+/// Per-process context threaded through builds.
+struct WorkerCtx {
+    state_dir: PathBuf,
+    sandbox_bin_sh: Option<PathBuf>,
+    cache_max_bytes: u64,
+    cgroup_base: Option<PathBuf>,
+    build_memory_max: Option<u64>,
+    /// Files a build must never read even where DAC would allow it
+    /// (macOS Seatbelt deny rules; Linux relies on the mount namespace).
+    secret_paths: Vec<PathBuf>,
 }
 
 /// Cap on a single NAR transfer in either direction; a `truncate -s 1P
@@ -90,8 +109,9 @@ fn load_signing_key(state_dir: &Path) -> Result<SigningKey> {
     }
 }
 
-/// Remove leftovers from interrupted runs: abandoned build dirs and
-/// stale staging entries in the input cache.
+/// Remove leftovers from interrupted runs: abandoned build dirs, stale
+/// staging entries, and cache entries without a completion marker (a
+/// crash mid-install may have left them truncated).
 fn sweep_state_dir(state_dir: &Path) {
     if let Ok(entries) = std::fs::read_dir(state_dir.join("builds")) {
         for entry in entries.flatten() {
@@ -101,12 +121,122 @@ fn sweep_state_dir(state_dir: &Path) {
     }
     if let Ok(entries) = std::fs::read_dir(state_dir.join("store")) {
         for entry in entries.flatten() {
-            if entry.file_name().to_string_lossy().starts_with(".tmp-") {
-                tracing::info!("removing stale partial transfer {}", entry.path().display());
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let stale = if name.starts_with(".tmp-") {
+                true
+            } else if let Some(base) = name.strip_prefix(MARKER_PREFIX) {
+                // marker without its entry
+                state_dir
+                    .join("store")
+                    .join(base)
+                    .symlink_metadata()
+                    .is_err()
+            } else {
+                // entry without its marker
+                cache_marker(state_dir, &name).symlink_metadata().is_err()
+            };
+            if stale {
+                tracing::info!("removing stale cache item {}", entry.path().display());
                 remove_path_all(&entry.path());
             }
         }
     }
+}
+
+/// Completion marker of a cache entry: written (after syncing the
+/// filesystem) only once the entry is fully installed, so a crash can
+/// never leave a truncated tree that passes for a valid input. Content
+/// is the entry's byte size; mtime doubles as the LRU clock.
+const MARKER_PREFIX: &str = ".ok-";
+
+fn cache_marker(state_dir: &Path, base: &str) -> PathBuf {
+    state_dir
+        .join("store")
+        .join(format!("{MARKER_PREFIX}{base}"))
+}
+
+fn tree_size(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if !meta.is_dir() {
+        return meta.len();
+    }
+    let mut total = meta.len();
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            total += tree_size(&entry.path());
+        }
+    }
+    total
+}
+
+/// Install a fully-unpacked transfer into the cache: sync, rename,
+/// marker, then evict least-recently-used entries past the byte budget
+/// (skipping entries the current build uses).
+fn cache_install(
+    state_dir: &Path,
+    partial: &Path,
+    base: &str,
+    max_bytes: u64,
+    in_use: &HashSet<String>,
+) -> Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+    let store = state_dir.join("store");
+    let cached = store.join(base);
+    remove_path_all(&cached); // stale/truncated leftover
+    let size = tree_size(partial);
+    // One syncfs instead of per-file fsync: the marker below must not
+    // hit disk before the data it vouches for.
+    let dirfd = std::fs::File::open(&store)?;
+    unsafe { libc::syncfs(dirfd.as_raw_fd()) };
+    std::fs::rename(partial, &cached)?;
+    let marker = cache_marker(state_dir, base);
+    let mut f = std::fs::File::create(&marker)?;
+    f.write_all(size.to_string().as_bytes())?;
+    f.sync_all()?;
+
+    // LRU eviction by marker mtime.
+    let mut entries: Vec<(std::time::SystemTime, String, u64)> = Vec::new();
+    let mut total: u64 = 0;
+    if let Ok(dir) = std::fs::read_dir(&store) {
+        for entry in dir.flatten() {
+            let name = entry.file_name();
+            let Some(entry_base) = name
+                .to_string_lossy()
+                .strip_prefix(MARKER_PREFIX)
+                .map(String::from)
+            else {
+                continue;
+            };
+            let Ok(meta) = entry.metadata() else { continue };
+            let size: u64 = std::fs::read_to_string(entry.path())
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0);
+            total += size;
+            entries.push((
+                meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                entry_base,
+                size,
+            ));
+        }
+    }
+    entries.sort();
+    for (_, entry_base, size) in entries {
+        if total <= max_bytes {
+            break;
+        }
+        if entry_base == base || in_use.contains(&entry_base) {
+            continue;
+        }
+        tracing::info!("evicting cache entry {entry_base} ({size} bytes)");
+        remove_path_all(&cache_marker(state_dir, &entry_base));
+        remove_path_all(&store.join(&entry_base));
+        total = total.saturating_sub(size);
+    }
+    Ok(cached)
 }
 
 /// Remove whatever is at `path` without following a symlink at `path`.
@@ -141,12 +271,24 @@ async fn run_async(opts: WorkerOpts) -> Result<()> {
     }
     sweep_state_dir(&opts.state_dir);
     let signing_key = load_signing_key(&opts.state_dir)?;
+    let ctx = std::sync::Arc::new(WorkerCtx {
+        state_dir: opts.state_dir.clone(),
+        sandbox_bin_sh: opts.sandbox_bin_sh.clone(),
+        cache_max_bytes: opts.cache_max_bytes,
+        cgroup_base: if cfg!(target_os = "linux") {
+            cgroup::init()
+        } else {
+            None
+        },
+        build_memory_max: opts.build_memory_max,
+        secret_paths: vec![opts.key.clone(), opts.state_dir.join("signing.key")],
+    });
 
     // Reconnect with backoff: a hub restart must not drain the fleet.
     let mut backoff = std::time::Duration::from_secs(1);
     loop {
         let started = std::time::Instant::now();
-        match session(&opts, &signing_key).await {
+        match session(&opts, &signing_key, &ctx).await {
             Ok(()) => unreachable!("session only returns on error"),
             Err(e) => tracing::warn!("hub session ended: {e:#}"),
         }
@@ -159,7 +301,11 @@ async fn run_async(opts: WorkerOpts) -> Result<()> {
     }
 }
 
-async fn session(opts: &WorkerOpts, signing_key: &SigningKey) -> Result<()> {
+async fn session(
+    opts: &WorkerOpts,
+    signing_key: &SigningKey,
+    ctx: &std::sync::Arc<WorkerCtx>,
+) -> Result<()> {
     let tls = ClientTlsConfig::new()
         .ca_certificate(Certificate::from_pem(
             std::fs::read(&opts.ca_cert).context("reading CA cert")?,
@@ -233,9 +379,7 @@ async fn session(opts: &WorkerOpts, signing_key: &SigningKey) -> Result<()> {
                     old.abort().await;
                 }
                 let build_id = a.build_id.clone();
-                match validate_assignment(&a).and_then(|()| {
-                    ActiveBuild::new(a, &opts.state_dir, opts.sandbox_bin_sh.clone())
-                }) {
+                match validate_assignment(&a).and_then(|()| ActiveBuild::new(a, ctx.clone())) {
                     Ok(b) => active = Some(b),
                     Err(e) => fail_build(&out_tx, &build_id, &e).await?,
                 }
@@ -244,7 +388,7 @@ async fn session(opts: &WorkerOpts, signing_key: &SigningKey) -> Result<()> {
                 let Some(build) = active.as_mut() else {
                     continue;
                 };
-                match build.negotiate(&offer.store_paths, &opts.state_dir) {
+                match build.negotiate(&offer.store_paths) {
                     Ok(missing) => {
                         out_tx
                             .send(msg(worker_message::Msg::MissingPaths(MissingPaths {
@@ -264,7 +408,7 @@ async fn session(opts: &WorkerOpts, signing_key: &SigningKey) -> Result<()> {
             hub_message::Msg::Nar(n) => {
                 if let Some(build) = active.as_mut() {
                     // A bad transfer fails this build, not the session.
-                    if let Err(e) = build.feed_nar(n, &opts.state_dir).await {
+                    if let Err(e) = build.feed_nar(n).await {
                         let build = active.take().unwrap();
                         let id = build.assignment.build_id.clone();
                         build.abort().await;
@@ -365,7 +509,7 @@ type Unpacker = (mpsc::Sender<Vec<u8>>, tokio::task::JoinHandle<Result<()>>);
 struct ActiveBuild {
     assignment: BuildAssignment,
     dir: PathBuf, // state_dir/builds/<id>
-    sandbox_bin_sh: Option<PathBuf>,
+    ctx: std::sync::Arc<WorkerCtx>,
     /// Input store path -> host filesystem source.
     sources: HashMap<String, PathBuf>,
     pending: HashSet<String>,
@@ -378,12 +522,8 @@ fn store_base(store_path: &str) -> &str {
 }
 
 impl ActiveBuild {
-    fn new(
-        assignment: BuildAssignment,
-        state_dir: &Path,
-        sandbox_bin_sh: Option<PathBuf>,
-    ) -> Result<Self> {
-        let dir = state_dir.join("builds").join(&assignment.build_id);
+    fn new(assignment: BuildAssignment, ctx: std::sync::Arc<WorkerCtx>) -> Result<Self> {
+        let dir = ctx.state_dir.join("builds").join(&assignment.build_id);
         if dir.exists() {
             std::fs::remove_dir_all(&dir)?;
         }
@@ -391,7 +531,7 @@ impl ActiveBuild {
         Ok(Self {
             assignment,
             dir,
-            sandbox_bin_sh,
+            ctx,
             sources: HashMap::new(),
             pending: HashSet::new(),
             nar_unpackers: HashMap::new(),
@@ -399,7 +539,8 @@ impl ActiveBuild {
         })
     }
 
-    fn negotiate(&mut self, offered: &[String], state_dir: &Path) -> Result<Vec<String>> {
+    fn negotiate(&mut self, offered: &[String]) -> Result<Vec<String>> {
+        let state_dir = &self.ctx.state_dir;
         let mut missing = Vec::new();
         for p in offered {
             // Only real store paths may become bind-mount sources; a
@@ -410,11 +551,16 @@ impl ActiveBuild {
             }
             let host = PathBuf::from(p);
             let cached = state_dir.join("store").join(store_base(p));
+            let marker = cache_marker(state_dir, store_base(p));
             // symlink_metadata: store paths that are dangling symlinks
             // are legitimate and must count as present.
             if host.symlink_metadata().is_ok() {
                 self.sources.insert(p.clone(), host);
-            } else if cached.symlink_metadata().is_ok() {
+            } else if cached.symlink_metadata().is_ok() && marker.symlink_metadata().is_ok() {
+                // bump the LRU clock
+                if let Ok(f) = std::fs::File::options().write(true).open(&marker) {
+                    let _ = f.set_modified(std::time::SystemTime::now());
+                }
                 self.sources.insert(p.clone(), cached);
             } else {
                 self.pending.insert(p.clone());
@@ -424,7 +570,8 @@ impl ActiveBuild {
         Ok(missing)
     }
 
-    async fn feed_nar(&mut self, n: NarTransfer, state_dir: &Path) -> Result<()> {
+    async fn feed_nar(&mut self, n: NarTransfer) -> Result<()> {
+        let state_dir = &self.ctx.state_dir;
         if !self.pending.contains(&n.store_path) && !self.nar_unpackers.contains_key(&n.store_path)
         {
             bail!("hub sent NAR for unrequested path {}", n.store_path);
@@ -463,9 +610,18 @@ impl ActiveBuild {
             let (tx, task) = self.nar_unpackers.remove(&n.store_path).unwrap();
             drop(tx);
             task.await??;
-            let cached = state_dir.join("store").join(store_base(&n.store_path));
-            remove_path_all(&cached); // stale/truncated leftover
-            std::fs::rename(&partial, &cached)?;
+            let in_use: HashSet<String> = self
+                .sources
+                .values()
+                .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .collect();
+            let cached = cache_install(
+                state_dir,
+                &partial,
+                store_base(&n.store_path),
+                self.ctx.cache_max_bytes,
+                &in_use,
+            )?;
             self.pending.remove(&n.store_path);
             self.sources.insert(n.store_path, cached);
         }
@@ -510,7 +666,18 @@ impl ActiveBuild {
         timeout: std::time::Duration,
     ) -> Result<()> {
         let a = &self.assignment;
-        let spec = sandbox::prepare(a, &self.dir, &self.sources, self.sandbox_bin_sh.as_deref())?;
+        let mut spec = sandbox::prepare(
+            a,
+            &self.dir,
+            &self.sources,
+            self.ctx.sandbox_bin_sh.as_deref(),
+            &self.ctx.secret_paths,
+        )?;
+        spec.cgroup = self
+            .ctx
+            .cgroup_base
+            .as_deref()
+            .and_then(|base| cgroup::create(base, &a.build_id, self.ctx.build_memory_max));
         let deadline = std::time::Instant::now() + timeout;
         let mut child = sandbox::spawn(&spec)?;
 
@@ -672,6 +839,10 @@ impl ActiveBuild {
     }
 
     fn cleanup(&self) {
+        if let Some(base) = self.ctx.cgroup_base.as_deref() {
+            // cgroup.kill reaches setsid'd survivors that escaped killpg.
+            cgroup::kill_and_remove(base, &self.assignment.build_id);
+        }
         sandbox::cleanup(&self.assignment, &self.dir);
         if let Err(e) = std::fs::remove_dir_all(&self.dir) {
             tracing::warn!("cleaning up {}: {e}", self.dir.display());
@@ -824,6 +995,72 @@ mod tests {
         let mut a = base_assignment();
         a.builder = "-p".into();
         assert!(validate_assignment(&a).is_err());
+    }
+
+    #[test]
+    fn cache_install_marks_and_evicts() -> Result<()> {
+        let state = tempfile::tempdir()?;
+        std::fs::create_dir_all(state.path().join("store"))?;
+        let mk = |name: &str, bytes: usize| -> Result<PathBuf> {
+            let p = state.path().join("store").join(format!(".tmp-{name}"));
+            std::fs::create_dir(&p)?;
+            std::fs::write(p.join("data"), vec![0u8; bytes])?;
+            Ok(p)
+        };
+        let empty = HashSet::new();
+
+        // install two entries under a generous budget: both survive
+        let p = mk("aaa-one", 1000)?;
+        cache_install(state.path(), &p, "aaa-one", 1 << 20, &empty)?;
+        std::thread::sleep(std::time::Duration::from_millis(20)); // distinct mtimes
+        let p = mk("bbb-two", 1000)?;
+        cache_install(state.path(), &p, "bbb-two", 1 << 20, &empty)?;
+        assert!(cache_marker(state.path(), "aaa-one").exists());
+        assert!(cache_marker(state.path(), "bbb-two").exists());
+
+        // a third install under a tight budget evicts the oldest entry;
+        // entry sizes are fs-dependent, so derive the budget from a marker
+        let entry_size: u64 = std::fs::read_to_string(cache_marker(state.path(), "aaa-one"))?
+            .parse()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let p = mk("ccc-three", 1000)?;
+        cache_install(state.path(), &p, "ccc-three", entry_size * 5 / 2, &empty)?;
+        assert!(
+            !state.path().join("store/aaa-one").exists(),
+            "oldest evicted"
+        );
+        assert!(!cache_marker(state.path(), "aaa-one").exists());
+        // the just-installed entry is never evicted
+        assert!(state.path().join("store/ccc-three").exists());
+
+        // in-use entries are skipped by eviction
+        let in_use: HashSet<String> = ["bbb-two".to_string()].into();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let p = mk("ddd-four", 1000)?;
+        cache_install(state.path(), &p, "ddd-four", 1, &in_use)?;
+        assert!(state.path().join("store/bbb-two").exists(), "in-use kept");
+        Ok(())
+    }
+
+    #[test]
+    fn sweep_removes_unmarked_cache_entries() -> Result<()> {
+        let state = tempfile::tempdir()?;
+        std::fs::create_dir_all(state.path().join("store"))?;
+        std::fs::create_dir_all(state.path().join("builds"))?;
+        // entry without marker: possibly truncated, must go
+        std::fs::create_dir(state.path().join("store/xxx-unmarked"))?;
+        // orphan marker without entry: must go
+        std::fs::write(state.path().join("store/.ok-yyy-gone"), "1")?;
+        // complete pair: stays
+        std::fs::create_dir(state.path().join("store/zzz-good"))?;
+        std::fs::write(state.path().join("store/.ok-zzz-good"), "1")?;
+        sweep_state_dir(state.path());
+        assert!(!state.path().join("store/xxx-unmarked").exists());
+        assert!(!state.path().join("store/.ok-yyy-gone").exists());
+        assert!(state.path().join("store/zzz-good").exists());
+        assert!(state.path().join("store/.ok-zzz-good").exists());
+        Ok(())
     }
 
     #[test]

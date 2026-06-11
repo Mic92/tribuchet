@@ -39,6 +39,15 @@ pub struct SandboxSpec {
     /// Scratch output store paths (used by the macOS profile).
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub outputs: Vec<String>,
+    /// Per-build cgroup; the builder enters it from pre_exec so pids/
+    /// memory limits cover the whole build, including the setup phase.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub cgroup: Option<PathBuf>,
+    /// Secret files the build must never read (worker signing/TLS
+    /// keys). macOS: Seatbelt deny rules; Linux: defense in depth, the
+    /// mount namespace already hides them.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    pub deny_read: Vec<PathBuf>,
 }
 
 /// Host path where the builder's output for `scratch` lands.
@@ -55,6 +64,7 @@ pub fn prepare(
     dir: &Path,
     sources: &HashMap<String, PathBuf>,
     bin_sh: Option<&Path>,
+    secrets: &[PathBuf],
 ) -> Result<SandboxSpec> {
     let build_dir = dir.join("top").join("build");
     std::fs::create_dir_all(&build_dir)?;
@@ -72,6 +82,8 @@ pub fn prepare(
             .collect(),
         binds_dev: Vec::new(),
         outputs: a.outputs.values().cloned().collect(),
+        cgroup: None,
+        deny_read: secrets.to_vec(),
     };
     if cfg!(target_os = "linux") {
         if let Some(sh) = bin_sh {
@@ -200,6 +212,7 @@ mod platform {
         let build_dir = spec.build_dir.clone();
         let binds: Vec<(PathBuf, PathBuf)> = spec.binds_ro.clone();
         let binds_dev: Vec<(PathBuf, PathBuf)> = spec.binds_dev.clone();
+        let cgroup_procs = spec.cgroup.as_ref().map(|c| c.join("cgroup.procs"));
         let cwd = spec.cwd.clone();
         let network = spec.network;
         let uid = getuid().as_raw();
@@ -210,6 +223,12 @@ mod platform {
         let err_file: std::fs::File = std::fs::File::create(setup_error_file(&spec.root))?;
         unsafe {
             cmd.pre_exec(move || {
+                // Enter the build cgroup first, with the worker's full
+                // credentials and before any namespace changes.
+                if let Some(procs) = &cgroup_procs {
+                    std::fs::write(procs, "0")
+                        .map_err(|e| io::Error::other(format!("entering build cgroup: {e}")))?;
+                }
                 setup(
                     &root, &build_dir, &binds, &binds_dev, &cwd, network, uid, gid,
                 )
@@ -586,6 +605,8 @@ mod tests {
                 .collect(),
             binds_dev: vec![],
             outputs: vec![],
+            cgroup: None,
+            deny_read: vec![],
         };
         std::fs::create_dir_all(&spec.build_dir)?;
         platform::prepare(&mut spec)?;

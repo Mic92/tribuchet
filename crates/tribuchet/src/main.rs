@@ -63,6 +63,14 @@ enum Command {
         /// e.g. a busybox sh; without it #!/bin/sh shebangs fail.
         #[arg(long)]
         sandbox_bin_sh: Option<PathBuf>,
+        /// Byte budget for the input NAR cache; least-recently-used
+        /// entries are evicted past it.
+        #[arg(long, default_value_t = 100 * 1024 * 1024 * 1024)]
+        cache_max_bytes: u64,
+        /// memory.max for each build's cgroup (Linux; needs a delegated
+        /// cgroup, e.g. systemd Delegate=yes). Unlimited when unset.
+        #[arg(long)]
+        build_memory_max_bytes: Option<u64>,
     },
     /// Certificate authority management (init CA, issue worker certs).
     Ca {
@@ -95,6 +103,8 @@ fn main() -> anyhow::Result<()> {
             key,
             build_timeout_secs,
             sandbox_bin_sh,
+            cache_max_bytes,
+            build_memory_max_bytes,
         } => {
             if systems.is_empty() {
                 systems.push(worker::host_system());
@@ -108,6 +118,8 @@ fn main() -> anyhow::Result<()> {
                 key,
                 build_timeout: std::time::Duration::from_secs(build_timeout_secs),
                 sandbox_bin_sh,
+                cache_max_bytes,
+                build_memory_max: build_memory_max_bytes,
             })
         }
         Command::Ca { action } => ca::run(action),

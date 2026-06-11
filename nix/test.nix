@@ -62,6 +62,10 @@ in
             ExecStart = "${tribuchet}/bin/tribuchet worker --hub https://hub:7437 --state-dir /var/lib/tribuchet";
             StateDirectory = "tribuchet";
             Environment = "RUST_LOG=info";
+            # delegate the cgroup subtree so the worker can apply
+            # per-build pids/memory limits and cgroup.kill teardown
+            Delegate = true;
+            Restart = "on-failure";
           };
         };
       };
@@ -113,6 +117,7 @@ in
 
     with subtest("build really ran on the worker"):
         worker.succeed("journalctl -u tribuchet-worker | grep -q 'builder finished'")
+        worker.succeed("journalctl -u tribuchet-worker | grep -q 'per-build cgroup limits enabled'")
         hub.succeed("journalctl -u tribuchet-hub | grep -q 'dispatching build'")
         import os
         worker.succeed(f"test -e /var/lib/tribuchet/store/{os.path.basename(unique)}")
