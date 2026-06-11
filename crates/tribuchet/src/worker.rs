@@ -1019,11 +1019,16 @@ impl ActiveBuild {
         tracing::info!(id = a.build_id, exit_code, "builder finished");
 
         if exit_code != 0 {
+            // present on Linux when the sandbox setup stage failed
+            let error = sandbox::setup_error_detail(&spec).unwrap_or_default();
+            if !error.is_empty() {
+                tracing::warn!(id = a.build_id, error, "sandbox setup failed");
+            }
             out_tx.blocking_send(msg(worker_message::Msg::Result(BuildResult {
                 build_id: a.build_id.clone(),
                 exit_code,
                 outputs: vec![],
-                error: String::new(),
+                error,
             })))?;
             return Ok(());
         }

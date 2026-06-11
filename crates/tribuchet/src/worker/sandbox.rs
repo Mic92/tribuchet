@@ -26,6 +26,7 @@ use crate::worker::binfmt;
 /// the sandbox resolv.conf for fixed-output builds.
 pub const PASTA_DNS: &str = "169.254.1.53";
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct SandboxSpec {
     pub builder: String,
     /// Derivation system, e.g. "i686-linux" (drives Linux personality).
@@ -153,16 +154,35 @@ pub fn spawn(spec: &SandboxSpec) -> Result<Child> {
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     cmd.env_clear()
         .envs(&spec.env)
-        .stdin(Stdio::null())
+        .stdin(platform::stdin_mode())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    cmd.spawn().with_context(|| {
-        let detail = platform::spawn_error_detail(spec)
-            .map(|d| format!(" ({d})"))
-            .unwrap_or_default();
-        format!("spawning builder {}{detail}", spec.builder)
-    })
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("spawning builder {}", spec.builder))?;
+    platform::send_spec(&mut child, spec)?;
+    Ok(child)
 }
+
+/// Setup-stage failure message, written by the stage before the host
+/// filesystem became unreachable. Read by the worker when the build
+/// exits nonzero.
+pub fn setup_error_detail(spec: &SandboxSpec) -> Option<String> {
+    platform::setup_error_detail_impl(spec)
+}
+
+/// Entry point of the re-exec'd setup stage: builds run as
+/// `/proc/self/exe __sandbox_setup` with the spec on stdin, so the
+/// namespace/mount/uid work runs in a fresh process instead of a
+/// post-fork `pre_exec` closure, where only async-signal-safe code is
+/// allowed.
+#[cfg(target_os = "linux")]
+pub fn setup_stage() -> ! {
+    platform::setup_stage()
+}
+
+#[cfg(target_os = "linux")]
+pub use platform::SETUP_STAGE_ARG;
 
 pub fn cleanup(a: &BuildAssignment, dir: &Path) {
     platform::cleanup(a, dir);
@@ -175,7 +195,6 @@ mod platform {
     use nix::sched::{unshare, CloneFlags};
     use nix::unistd::{getgid, getuid, pivot_root, sethostname};
     use std::io;
-    use std::os::unix::process::CommandExt;
 
     pub fn prepare(spec: &mut SandboxSpec) -> Result<()> {
         let root = &spec.root;
@@ -328,22 +347,66 @@ mod platform {
             }
         }
 
-        let mut cmd = Command::new(&spec.builder);
-        cmd.args(&spec.args);
+        if spec.emulator.is_some() && binfmt::register_line(&spec.system).is_none() {
+            anyhow::bail!("no binfmt magic known for system {}", spec.system);
+        }
 
-        let root = spec.root.clone();
-        let build_dir = spec.build_dir.clone();
-        let binds: Vec<(PathBuf, PathBuf)> = spec.binds_ro.clone();
-        let binds_dev: Vec<(PathBuf, PathBuf)> = spec.binds_dev.clone();
-        let cgroup_procs = spec.cgroup.as_ref().map(|c| c.join("cgroup.procs"));
-        let has_cgroup = spec.cgroup.is_some();
-        let cwd = spec.cwd.clone();
-        let network = spec.network;
-        let pasta = spec.pasta.clone();
-        let system = spec.system.clone();
+        // see setup_stage() for why builds re-exec this binary
+        let mut cmd = Command::new("/proc/self/exe");
+        cmd.arg(SETUP_STAGE_ARG);
+        Ok(cmd)
+    }
+
+    // Underscore form so that, in unit tests, libtest interprets it as
+    // a filter selecting the dispatch test below.
+    pub const SETUP_STAGE_ARG: &str = "__sandbox_setup";
+
+    pub fn stdin_mode() -> Stdio {
+        Stdio::piped() // carries the serialized spec
+    }
+
+    pub fn send_spec(child: &mut Child, spec: &SandboxSpec) -> Result<()> {
+        let stdin = child.stdin.take().context("setup stage stdin missing")?;
+        serde_json::to_writer(stdin, spec).context("sending sandbox spec")?;
+        Ok(())
+    }
+
+    pub fn setup_stage() -> ! {
+        let err = (|| -> io::Result<std::convert::Infallible> {
+            let mut json = String::new();
+            use std::io::Read;
+            std::io::stdin().read_to_string(&mut json)?;
+            let spec: SandboxSpec = serde_json::from_str(&json).map_err(io::Error::other)?;
+            // The builder gets /dev/null as stdin, like under Nix.
+            let null = std::fs::File::open("/dev/null")?;
+            nix::unistd::dup2_stdin(&null).map_err(ioerr("dup2 stdin"))?;
+            // Pre-open the error file: the fd keeps working after
+            // pivot_root detaches the host filesystem, a path would not.
+            let err_file = std::fs::File::create(setup_error_file(&spec.root))?;
+            enter_and_exec(&spec).inspect_err(|e| {
+                use std::io::Write;
+                let _ = (&err_file).write_all(e.to_string().as_bytes());
+            })
+        })()
+        .unwrap_err();
+        // stderr is the build log pipe; the client sees the message.
+        // Write to the fd, not via eprintln!: under the unit test the
+        // stage runs inside libtest, which captures macro output.
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "sandbox setup: {err}");
+        std::process::exit(121);
+    }
+
+    fn enter_and_exec(spec: &SandboxSpec) -> io::Result<std::convert::Infallible> {
+        // Enter the build cgroup first, with the worker's full
+        // credentials and before any namespace changes.
+        if let Some(cg) = &spec.cgroup {
+            std::fs::write(cg.join("cgroup.procs"), "0")
+                .map_err(|e| io::Error::other(format!("entering build cgroup: {e}")))?;
+        }
         let binfmt_line = match &spec.emulator {
             Some(_) => Some(binfmt::register_line(&spec.system).ok_or_else(|| {
-                anyhow::anyhow!("no binfmt magic known for system {}", spec.system)
+                io::Error::other(format!("no binfmt magic known for system {}", spec.system))
             })?),
             None => None,
         };
@@ -362,47 +425,31 @@ mod platform {
             None if binfmt_line.is_some() => (0, backing_gid),
             None => (100, backing_gid),
         };
-        let fod_uid = spec.fod_uid;
-
-        // Pre-open the error file: an fd keeps working after pivot_root
-        // detaches the host filesystem, a path would not.
-        let err_file: std::fs::File = std::fs::File::create(setup_error_file(&spec.root))?;
-        unsafe {
-            cmd.pre_exec(move || {
-                // Enter the build cgroup first, with the worker's full
-                // credentials and before any namespace changes.
-                if let Some(procs) = &cgroup_procs {
-                    std::fs::write(procs, "0")
-                        .map_err(|e| io::Error::other(format!("entering build cgroup: {e}")))?;
-                }
-                setup(&SetupParams {
-                    root: &root,
-                    system: &system,
-                    binfmt_line: binfmt_line.as_deref(),
-                    pasta: pasta.as_deref(),
-                    fod_uid,
-                    build_dir: &build_dir,
-                    binds: &binds,
-                    binds_dev: &binds_dev,
-                    cwd: &cwd,
-                    network,
-                    has_cgroup,
-                    sandbox_uid,
-                    host_uid,
-                    sandbox_gid,
-                    host_gid,
-                    uid_count,
-                })
-                .inspect_err(|e| {
-                    // std forwards only the errno from pre_exec to the
-                    // parent, dropping our message; leave the failing
-                    // step in a file the parent reads on spawn failure.
-                    use std::io::Write;
-                    let _ = (&err_file).write_all(e.to_string().as_bytes());
-                })
-            });
-        }
-        Ok(cmd)
+        setup(&SetupParams {
+            root: &spec.root,
+            system: &spec.system,
+            binfmt_line: binfmt_line.as_deref(),
+            pasta: spec.pasta.as_deref(),
+            fod_uid: spec.fod_uid,
+            build_dir: &spec.build_dir,
+            binds: &spec.binds_ro,
+            binds_dev: &spec.binds_dev,
+            cwd: &spec.cwd,
+            network: spec.network,
+            has_cgroup: spec.cgroup.is_some(),
+            sandbox_uid,
+            host_uid,
+            sandbox_gid,
+            host_gid,
+            uid_count,
+        })?;
+        let prog = std::ffi::CString::new(spec.builder.as_str())
+            .map_err(|_| io::Error::other("NUL in builder path"))?;
+        let args: Vec<std::ffi::CString> = std::iter::once(Ok(prog.clone()))
+            .chain(spec.args.iter().map(|a| std::ffi::CString::new(a.as_str())))
+            .collect::<Result<_, _>>()
+            .map_err(|_| io::Error::other("NUL in builder argument"))?;
+        nix::unistd::execv(&prog, &args).map_err(ioerr("exec builder"))
     }
 
     fn existing_mount_flags(target: &Path) -> io::Result<MsFlags> {
@@ -495,6 +542,10 @@ mod platform {
         let (req_r, req_w) = nix::unistd::pipe().map_err(ioerr("pipe"))?;
         match unsafe { nix::unistd::fork() }.map_err(ioerr("fork pasta helper"))? {
             nix::unistd::ForkResult::Child => {
+                // Close our copy of the write end, or a build process
+                // dying before attach() would never EOF the read below
+                // and leak this helper forever.
+                drop(req_w);
                 let mut buf = [0u8; 1];
                 let ok = nix::unistd::read(&req_r, &mut buf)
                     .map(|n| n == 1)
@@ -527,6 +578,7 @@ mod platform {
                 .iter()
                 .map(|s| std::ffi::CString::new(*s).unwrap())
                 .collect();
+                drop(req_r); // do not leak the pipe into pasta
                 let _ = nix::unistd::execv(&args[0], &args);
                 unsafe { libc::_exit(127) }
             }
@@ -583,10 +635,9 @@ mod platform {
             nix::unistd::ForkResult::Child => Ok(true),
             nix::unistd::ForkResult::Parent { child } => {
                 use nix::sys::wait::{waitpid, WaitStatus};
-                // Drop every inherited fd, most importantly std's CLOEXEC
-                // status pipe: while the shim holds it, Command::spawn in
-                // the worker would block until the build finishes (and
-                // deadlock against a full, unread log pipe).
+                // Drop every inherited fd: the long-lived shim must not
+                // hold the log pipes (or the setup error file) open for
+                // the build's whole lifetime.
                 unsafe {
                     libc::syscall(libc::SYS_close_range, 3, libc::c_uint::MAX, 0);
                 }
@@ -909,7 +960,7 @@ mod platform {
         root.with_file_name("setup-error")
     }
 
-    pub fn spawn_error_detail(spec: &SandboxSpec) -> Option<String> {
+    pub fn setup_error_detail_impl(spec: &SandboxSpec) -> Option<String> {
         std::fs::read_to_string(setup_error_file(&spec.root))
             .ok()
             .filter(|s| !s.is_empty())
@@ -1039,8 +1090,16 @@ mod platform {
         Ok(cmd)
     }
 
-    pub fn spawn_error_detail(_spec: &SandboxSpec) -> Option<String> {
+    pub fn setup_error_detail_impl(_spec: &SandboxSpec) -> Option<String> {
         None
+    }
+
+    pub fn stdin_mode() -> Stdio {
+        Stdio::null()
+    }
+
+    pub fn send_spec(_child: &mut Child, _spec: &SandboxSpec) -> Result<()> {
+        Ok(())
     }
 
     pub fn cleanup(a: &BuildAssignment, _dir: &Path) {
@@ -1058,6 +1117,31 @@ mod platform {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    /// Not a test: re-exec target for `sandbox_runs_builder`. There
+    /// `/proc/self/exe` is the libtest binary, which treats the stage
+    /// argument as a name filter selecting exactly this function.
+    /// No-op in normal test runs.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn __sandbox_setup() {
+        if std::env::args().any(|a| a == SETUP_STAGE_ARG) {
+            // CLONE_NEWUSER requires a single-threaded process and
+            // libtest has already spawned threads; a forked child is
+            // single-threaded again.
+            match unsafe { nix::unistd::fork() }.expect("fork") {
+                nix::unistd::ForkResult::Child => setup_stage(),
+                nix::unistd::ForkResult::Parent { child } => {
+                    use nix::sys::wait::{waitpid, WaitStatus};
+                    let code = match waitpid(child, None) {
+                        Ok(WaitStatus::Exited(_, code)) => code,
+                        other => panic!("setup stage: {other:?}"),
+                    };
+                    std::process::exit(code);
+                }
+            }
+        }
+    }
 
     /// End-to-end smoke test of the Linux sandbox: namespaces, mounts,
     /// pivot_root, /proc, loopback, and exit-code plumbing through the
@@ -1110,8 +1194,11 @@ mod tests {
             started.elapsed() < std::time::Duration::from_millis(900),
             "spawn blocked until builder exit"
         );
+        let mut stderr = String::new();
+        use std::io::Read;
+        child.stderr.take().unwrap().read_to_string(&mut stderr)?;
         let status = child.wait()?;
-        assert_eq!(status.code(), Some(7), "{status:?}");
+        assert_eq!(status.code(), Some(7), "{status:?} stderr: {stderr}");
         Ok(())
     }
 }
