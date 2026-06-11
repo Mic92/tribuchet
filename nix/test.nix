@@ -66,87 +66,29 @@ in
           substituters = lib.mkForce [ ];
         };
 
-        # test derivations (etc files avoid heredoc quoting in testScript)
+        # Test derivations are real files in nix/tests/ (single level
+        # of quoting); the shims inject store paths and node addresses.
         environment.etc."tt/par.nix".text = ''
-          let
-            bash = builtins.storePath "${pkgs.bash}";
-            mk = n: derivation {
-              name = "tt-par-''${n}";
-              system = "x86_64-linux";
-              builder = bash + "/bin/bash";
-              # busy-wait 15s of wall clock; two of these finishing in
-              # well under 30s proves they overlapped on the worker
-              args = [ "-c" "while [ $SECONDS -lt 15 ]; do :; done; echo done-$n > $out" ];
-              inherit n;
-            };
-          in [ (mk "a") (mk "b") ]
+          import ${./tests/par.nix} { bash = "${pkgs.bash}"; }
         '';
         environment.etc."tt/nspawn.nix".text = ''
           import ${./nspawn-container.nix} { nixpkgs = ${pkgs.path}; }
         '';
         environment.etc."tt/kvm.nix".text = ''
-          let
-            bash = builtins.storePath "${pkgs.bash}";
-          in derivation {
-            name = "tt-kvm";
-            system = "x86_64-linux";
-            requiredSystemFeatures = [ "kvm" ];
-            builder = bash + "/bin/bash";
-            args = [ "-c" "[ -e /dev/kvm ] && echo kvm-ok > $out" ];
-          }
+          import ${./tests/kvm.nix} { bash = "${pkgs.bash}"; }
         '';
         environment.etc."tt/uidrange.nix".text = ''
-          let
-            bash = builtins.storePath "${pkgs.bash}";
-          in derivation {
-            name = "tt-uid-range";
-            system = "x86_64-linux";
-            requiredSystemFeatures = [ "uid-range" ];
-            builder = bash + "/bin/bash";
-            args = [ "-c" "[ \"$EUID\" = 0 ] && [ -w /sys/fs/cgroup/cgroup.procs ] && echo uid-range-ok > $out" ];
-          }
+          import ${./tests/uidrange.nix} { bash = "${pkgs.bash}"; }
         '';
-
-        # Fetches from the hub's HTTP server through pasta and asserts
-        # the worker's loopback service is unreachable from the sandbox.
         environment.etc."tt/fod.nix".text = ''
-          let
-            bash = builtins.storePath "${pkgs.bash}";
-          in
-          derivation {
-            name = "tt-fod";
-            system = "x86_64-linux";
-            builder = bash + "/bin/bash";
-            args = [
-              "-c"
-              '''
-                if (exec 3<>/dev/tcp/127.0.0.1/9999) 2>/dev/null; then
-                  echo "worker loopback leaked into FOD netns" >&2
-                  exit 1
-                fi
-                exec 3<>/dev/tcp/${nodes.hub.networking.primaryIPAddress}/8765
-                while IFS= read -r l <&3; do printf '%s\n' "$l"; done > $out
-              '''
-            ];
-            outputHashAlgo = "sha256";
-            outputHashMode = "flat";
-            outputHash = "fba0ea84c93fbcbfff10a9b33bc33409b5fd15eff0540b7b4389d691cde59fe8";
+          import ${./tests/fod.nix} {
+            bash = "${pkgs.bash}";
+            hubIp = "${nodes.hub.networking.primaryIPAddress}";
           }
         '';
-
         environment.etc."tt/cross.nix".text = ''
-          let
-            busybox = builtins.storePath "${pkgs.pkgsCross.aarch64-multiplatform.pkgsStatic.busybox}";
-          in
-          derivation {
-            name = "tt-cross";
-            system = "aarch64-linux";
-            builder = busybox + "/bin/busybox";
-            args = [
-              "sh"
-              "-c"
-              "\"$builder\" uname -m > $out; \"$builder\" id -u >> $out"
-            ];
+          import ${./tests/cross.nix} {
+            busybox = "${pkgs.pkgsCross.aarch64-multiplatform.pkgsStatic.busybox}";
           }
         '';
 
