@@ -26,6 +26,7 @@ tracing-subscriber.workspace = true
 time.workspace = true
 zstd.workspace = true
 nix.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

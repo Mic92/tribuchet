@@ -102,15 +102,24 @@ pub fn cleanup(a: &BuildAssignment, dir: &Path) {
 #[cfg(target_os = "linux")]
 mod platform {
     use super::*;
-    use nix::mount::{mount, MsFlags};
+    use nix::mount::{mount, umount2, MntFlags, MsFlags};
     use nix::sched::{unshare, CloneFlags};
-    use nix::unistd::{chroot, getgid, getuid, sethostname};
+    use nix::unistd::{getgid, getuid, pivot_root, sethostname};
     use std::io;
     use std::os::unix::process::CommandExt;
 
     pub fn prepare(spec: &mut SandboxSpec) -> Result<()> {
         let root = &spec.root;
-        for sub in ["nix/store", "build", "dev", "proc", "etc", "tmp"] {
+        for sub in [
+            "nix/store",
+            "build",
+            "dev",
+            "dev/shm",
+            "dev/pts",
+            "proc",
+            "etc",
+            "tmp",
+        ] {
             std::fs::create_dir_all(root.join(sub))?;
         }
         std::fs::write(
@@ -138,6 +147,7 @@ mod platform {
             ("dev/stdin", "/proc/self/fd/0"),
             ("dev/stdout", "/proc/self/fd/1"),
             ("dev/stderr", "/proc/self/fd/2"),
+            ("dev/ptmx", "/dev/pts/ptmx"),
         ] {
             std::os::unix::fs::symlink(target, root.join(link))?;
         }
@@ -186,7 +196,9 @@ mod platform {
         let uid = getuid().as_raw();
         let gid = getgid().as_raw();
 
-        let err_file = setup_error_file(&spec.root);
+        // Pre-open the error file: an fd keeps working after pivot_root
+        // detaches the host filesystem, a path would not.
+        let err_file: std::fs::File = std::fs::File::create(setup_error_file(&spec.root))?;
         unsafe {
             cmd.pre_exec(move || {
                 setup(
@@ -196,7 +208,8 @@ mod platform {
                     // std forwards only the errno from pre_exec to the
                     // parent, dropping our message; leave the failing
                     // step in a file the parent reads on spawn failure.
-                    let _ = std::fs::write(&err_file, e.to_string());
+                    use std::io::Write;
+                    let _ = (&err_file).write_all(e.to_string().as_bytes());
                 })
             });
         }
@@ -227,6 +240,60 @@ mod platform {
         move |e| io::Error::other(format!("{step}: {e}"))
     }
 
+    /// Bring the loopback interface up. A fresh network namespace has
+    /// `lo` down; builders that talk to 127.0.0.1 (test suites) would
+    /// otherwise fail, unlike under Nix's own sandbox.
+    fn loopback_up() -> io::Result<()> {
+        unsafe {
+            let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut ifr: libc::ifreq = std::mem::zeroed();
+            for (i, b) in b"lo".iter().enumerate() {
+                ifr.ifr_name[i] = *b as libc::c_char;
+            }
+            ifr.ifr_ifru.ifru_flags = (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
+            let res = libc::ioctl(fd, libc::SIOCSIFFLAGS, &ifr);
+            let err = io::Error::last_os_error();
+            libc::close(fd);
+            if res < 0 {
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
+    /// Fork so the exec'd builder is PID 1 of the new PID namespace;
+    /// this process becomes a shim that forwards the builder's exit
+    /// status. When PID 1 dies the kernel kills every namespace member,
+    /// so daemonized/setsid'd builder children cannot outlive the build.
+    fn fork_into_pid_ns() -> io::Result<bool> {
+        match unsafe { nix::unistd::fork() }.map_err(ioerr("fork"))? {
+            nix::unistd::ForkResult::Child => Ok(true),
+            nix::unistd::ForkResult::Parent { child } => {
+                use nix::sys::wait::{waitpid, WaitStatus};
+                // Drop every inherited fd, most importantly std's CLOEXEC
+                // status pipe: while the shim holds it, Command::spawn in
+                // the worker would block until the build finishes (and
+                // deadlock against a full, unread log pipe).
+                unsafe {
+                    libc::syscall(libc::SYS_close_range, 3, libc::c_uint::MAX, 0);
+                }
+                let code = loop {
+                    match waitpid(child, None) {
+                        Ok(WaitStatus::Exited(_, code)) => break code,
+                        Ok(WaitStatus::Signaled(_, sig, _)) => break 128 + sig as i32,
+                        Ok(_) => continue,
+                        Err(nix::errno::Errno::EINTR) => continue,
+                        Err(_) => break 1,
+                    }
+                };
+                unsafe { libc::_exit(code) }
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn setup(
         root: &Path,
@@ -240,6 +307,7 @@ mod platform {
     ) -> io::Result<()> {
         let mut flags = CloneFlags::CLONE_NEWUSER
             | CloneFlags::CLONE_NEWNS
+            | CloneFlags::CLONE_NEWPID
             | CloneFlags::CLONE_NEWIPC
             | CloneFlags::CLONE_NEWUTS;
         if !network {
@@ -255,6 +323,15 @@ mod platform {
         std::fs::write("/proc/self/uid_map", format!("1000 {uid} 1")).map_err(werr("uid_map"))?;
         std::fs::write("/proc/self/gid_map", format!("100 {gid} 1")).map_err(werr("gid_map"))?;
         sethostname("localhost").map_err(ioerr("sethostname"))?;
+        if !network {
+            loopback_up().map_err(werr("bringing lo up"))?;
+        }
+
+        // CLONE_NEWPID only applies to children: fork so the builder
+        // runs as PID 1. Everything below runs in the child.
+        if !fork_into_pid_ns()? {
+            unreachable!("parent never returns");
+        }
 
         let none: Option<&str> = None;
         mount(none, "/", none, MsFlags::MS_REC | MsFlags::MS_PRIVATE, none)
@@ -268,7 +345,7 @@ mod platform {
         )
         .map_err(ioerr("binding root"))?;
 
-        let bind_one = |src: &Path, dst: &Path, ro: bool| -> io::Result<()> {
+        let bind_one = |src: &Path, dst: &Path, ro: bool, extra: MsFlags| -> io::Result<()> {
             let target = root.join(dst.strip_prefix("/").unwrap_or(dst));
             mount(
                 Some(src),
@@ -278,61 +355,78 @@ mod platform {
                 none,
             )
             .map_err(|e| io::Error::other(format!("binding {}: {e}", src.display())))?;
+            // In a user namespace, a bind mount keeps its source's
+            // locked flags (nosuid, nodev, ...); a remount that drops
+            // any of them fails with EPERM, so carry them over.
+            let locked = existing_mount_flags(&target)?;
+            let mut remount = MsFlags::MS_BIND | MsFlags::MS_REMOUNT | locked | extra;
             if ro {
-                // In a user namespace, a bind mount keeps its source's
-                // locked flags (nosuid, nodev, ...); a remount that drops
-                // any of them fails with EPERM, so carry them over.
-                let locked = existing_mount_flags(&target)?;
-                mount(
-                    none,
-                    &target,
-                    none,
-                    MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY | locked,
-                    none,
-                )
-                .map_err(|e| io::Error::other(format!("remounting {} ro: {e}", src.display())))?;
+                remount |= MsFlags::MS_RDONLY;
             }
+            mount(none, &target, none, remount, none)
+                .map_err(|e| io::Error::other(format!("remounting {}: {e}", src.display())))?;
             Ok(())
         };
         // Request-derived binds are always read-only; only the sandbox's
         // own device nodes stay writable. Keying writability on a path
         // prefix of a client-influenced destination would let a request
         // bind host devices read-write.
+        let nosuid_nodev = MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
         for (src, dst) in binds {
-            bind_one(src, dst, true)?;
+            bind_one(src, dst, true, nosuid_nodev)?;
         }
         for (src, dst) in binds_dev {
-            bind_one(src, dst, false)?;
+            bind_one(src, dst, false, MsFlags::MS_NOSUID)?;
         }
-        bind_one(build_dir, Path::new(cwd), false)?;
+        bind_one(build_dir, Path::new(cwd), false, nosuid_nodev)?;
 
-        // A fresh proc mount needs an unmasked host /proc (denied in many
-        // containers); fall back to bind-mounting the host's /proc.
-        if mount(
+        mount(
+            Some("tmpfs"),
+            &root.join("dev/shm"),
+            Some("tmpfs"),
+            nosuid_nodev,
+            Some("mode=1777"),
+        )
+        .map_err(ioerr("mounting /dev/shm"))?;
+        mount(
+            Some("devpts"),
+            &root.join("dev/pts"),
+            Some("devpts"),
+            MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
+            Some("newinstance,mode=0620,ptmxmode=0666"),
+        )
+        .map_err(ioerr("mounting /dev/pts"))?;
+
+        // Inside the fresh PID namespace this shows only the build's own
+        // processes; the old host-/proc bind fallback exposed every host
+        // PID (and /proc/<pid>/root, a chroot escape).
+        mount(
             Some("proc"),
             &root.join("proc"),
             Some("proc"),
-            MsFlags::empty(),
+            MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
             none,
         )
-        .is_err()
-        {
-            mount(
-                Some("/proc"),
-                &root.join("proc"),
-                none,
-                MsFlags::MS_BIND | MsFlags::MS_REC,
-                none,
-            )
-            .map_err(ioerr("bind-mounting /proc"))?;
-        }
+        .map_err(ioerr("mounting /proc"))?;
 
-        chroot(root).map_err(ioerr("chroot"))?;
-        // chroot(2) does not move the cwd; enter the new root first so
-        // no path resolution can start outside it.
+        // pivot_root + detach the old root: unlike a bare chroot, the
+        // host filesystem is no longer reachable in this namespace.
+        std::env::set_current_dir(root)
+            .map_err(|e| io::Error::other(format!("chdir to root: {e}")))?;
+        pivot_root(".", ".").map_err(ioerr("pivot_root"))?;
+        umount2(".", MntFlags::MNT_DETACH).map_err(ioerr("detaching old root"))?;
         std::env::set_current_dir("/").map_err(|e| io::Error::other(format!("chdir /: {e}")))?;
         std::env::set_current_dir(cwd)
             .map_err(|e| io::Error::other(format!("chdir {cwd}: {e}")))?;
+
+        // Last-resort fork-bomb brake; the PID namespace makes the bomb
+        // killable, the rlimit caps how big it can get. Clamp to the
+        // inherited hard limit: raising it needs init-ns CAP_SYS_RESOURCE,
+        // which the child userns does not have.
+        use nix::sys::resource::{getrlimit, setrlimit, Resource};
+        let (_, hard) = getrlimit(Resource::RLIMIT_NPROC).map_err(ioerr("getrlimit NPROC"))?;
+        let limit = hard.min(4096);
+        setrlimit(Resource::RLIMIT_NPROC, limit, limit).map_err(ioerr("setting RLIMIT_NPROC"))?;
         Ok(())
     }
 
@@ -341,7 +435,9 @@ mod platform {
     }
 
     pub fn spawn_error_detail(spec: &SandboxSpec) -> Option<String> {
-        std::fs::read_to_string(setup_error_file(&spec.root)).ok()
+        std::fs::read_to_string(setup_error_file(&spec.root))
+            .ok()
+            .filter(|s| !s.is_empty())
     }
 
     pub fn cleanup(_a: &BuildAssignment, _dir: &Path) {
@@ -442,5 +538,59 @@ mod platform {
             let _ = std::fs::remove_file(p);
         }
         let _ = std::fs::remove_file(Path::new(&a.tmp_dir_in_sandbox));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    /// End-to-end smoke test of the Linux sandbox: namespaces, mounts,
+    /// pivot_root, /proc, loopback, and exit-code plumbing through the
+    /// PID-namespace shim. Requires unprivileged user namespaces.
+    #[test]
+    fn sandbox_runs_builder() -> Result<()> {
+        if nix::sched::unshare(nix::sched::CloneFlags::empty()).is_err() {
+            return Ok(()); // no namespace support in this environment
+        }
+        let dir = tempfile::tempdir()?;
+        let mut spec = SandboxSpec {
+            builder: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                // sleep keeps the builder alive so the timing assertion
+                // below is meaningful; environments without a sleep
+                // binary (Nix's busybox /bin/sh) just exit fast.
+                "test -w /build && test -d /proc/self && test -d /dev/shm || exit 1; \
+                 sleep 1 2>/dev/null; exit 7"
+                    .into(),
+            ],
+            env: HashMap::new(),
+            cwd: "/build".into(),
+            network: false,
+            root: dir.path().join("root"),
+            build_dir: dir.path().join("top/build"),
+            binds_ro: ["/bin", "/usr", "/lib", "/lib64", "/nix/store"]
+                .iter()
+                .filter(|p| Path::new(p).exists())
+                .map(|p| (PathBuf::from(p), PathBuf::from(p)))
+                .collect(),
+            binds_dev: vec![],
+            outputs: vec![],
+        };
+        std::fs::create_dir_all(&spec.build_dir)?;
+        platform::prepare(&mut spec)?;
+        let started = std::time::Instant::now();
+        let mut child = spawn(&spec)?;
+        // spawn must return as soon as the builder execs; if the PID-ns
+        // shim kept std's status pipe open, spawn would block for the
+        // whole build and deadlock against unread log pipes.
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(900),
+            "spawn blocked until builder exit"
+        );
+        let status = child.wait()?;
+        assert_eq!(status.code(), Some(7), "{status:?}");
+        Ok(())
     }
 }

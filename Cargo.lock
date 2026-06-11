@@ -1842,6 +1842,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "hyper-util",
+ "libc",
  "nix",
  "prost",
  "rand",
