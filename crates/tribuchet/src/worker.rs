@@ -38,7 +38,15 @@ pub struct WorkerOpts {
     /// Hard limit per build; a hung builder would otherwise occupy the
     /// worker forever.
     pub build_timeout: std::time::Duration,
+    /// Optional static shell bound at /bin/sh inside the Linux sandbox
+    /// (like Nix's busybox sandbox path); #!/bin/sh shebangs and libc
+    /// system() fail without it.
+    pub sandbox_bin_sh: Option<PathBuf>,
 }
+
+/// Cap on a single NAR transfer in either direction; a `truncate -s 1P
+/// $out` build would otherwise tie up the worker and fill its disk.
+const MAX_NAR_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 pub fn host_system() -> String {
     let arch = std::env::consts::ARCH;
@@ -134,6 +142,24 @@ async fn run_async(opts: WorkerOpts) -> Result<()> {
     sweep_state_dir(&opts.state_dir);
     let signing_key = load_signing_key(&opts.state_dir)?;
 
+    // Reconnect with backoff: a hub restart must not drain the fleet.
+    let mut backoff = std::time::Duration::from_secs(1);
+    loop {
+        let started = std::time::Instant::now();
+        match session(&opts, &signing_key).await {
+            Ok(()) => unreachable!("session only returns on error"),
+            Err(e) => tracing::warn!("hub session ended: {e:#}"),
+        }
+        if started.elapsed() > std::time::Duration::from_secs(60) {
+            backoff = std::time::Duration::from_secs(1);
+        }
+        tracing::info!("reconnecting to hub in {}s", backoff.as_secs());
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(std::time::Duration::from_secs(60));
+    }
+}
+
+async fn session(opts: &WorkerOpts, signing_key: &SigningKey) -> Result<()> {
     let tls = ClientTlsConfig::new()
         .ca_certificate(Certificate::from_pem(
             std::fs::read(&opts.ca_cert).context("reading CA cert")?,
@@ -144,6 +170,11 @@ async fn run_async(opts: WorkerOpts) -> Result<()> {
         ));
     let channel = Endpoint::from_shared(opts.hub.clone())?
         .tls_config(tls)?
+        // Detect a silently dead hub connection instead of waiting on a
+        // half-open TCP session forever.
+        .http2_keep_alive_interval(std::time::Duration::from_secs(30))
+        .keep_alive_timeout(std::time::Duration::from_secs(20))
+        .keep_alive_while_idle(true)
         .connect()
         .await
         .context("connecting to hub")?;
@@ -202,7 +233,9 @@ async fn run_async(opts: WorkerOpts) -> Result<()> {
                     old.abort().await;
                 }
                 let build_id = a.build_id.clone();
-                match validate_assignment(&a).and_then(|()| ActiveBuild::new(a, &opts.state_dir)) {
+                match validate_assignment(&a).and_then(|()| {
+                    ActiveBuild::new(a, &opts.state_dir, opts.sandbox_bin_sh.clone())
+                }) {
                     Ok(b) => active = Some(b),
                     Err(e) => fail_build(&out_tx, &build_id, &e).await?,
                 }
@@ -332,6 +365,7 @@ type Unpacker = (mpsc::Sender<Vec<u8>>, tokio::task::JoinHandle<Result<()>>);
 struct ActiveBuild {
     assignment: BuildAssignment,
     dir: PathBuf, // state_dir/builds/<id>
+    sandbox_bin_sh: Option<PathBuf>,
     /// Input store path -> host filesystem source.
     sources: HashMap<String, PathBuf>,
     pending: HashSet<String>,
@@ -344,7 +378,11 @@ fn store_base(store_path: &str) -> &str {
 }
 
 impl ActiveBuild {
-    fn new(assignment: BuildAssignment, state_dir: &Path) -> Result<Self> {
+    fn new(
+        assignment: BuildAssignment,
+        state_dir: &Path,
+        sandbox_bin_sh: Option<PathBuf>,
+    ) -> Result<Self> {
         let dir = state_dir.join("builds").join(&assignment.build_id);
         if dir.exists() {
             std::fs::remove_dir_all(&dir)?;
@@ -353,6 +391,7 @@ impl ActiveBuild {
         Ok(Self {
             assignment,
             dir,
+            sandbox_bin_sh,
             sources: HashMap::new(),
             pending: HashSet::new(),
             nar_unpackers: HashMap::new(),
@@ -405,7 +444,11 @@ impl ActiveBuild {
                     // stale leftover from a crashed transfer; lstat so a
                     // dangling symlink is removed rather than skipped
                     remove_path_all(&dest);
-                    let mut dec = zstd::stream::read::Decoder::new(ChannelReader::new(rx))?;
+                    let dec = zstd::stream::read::Decoder::new(ChannelReader::new(rx))?;
+                    let mut dec = LimitedReader {
+                        inner: dec,
+                        remaining: MAX_NAR_BYTES,
+                    };
                     nar::unpack(&mut dec, &dest)
                         .with_context(|| format!("unpacking {}", dest.display()))
                 });
@@ -467,7 +510,8 @@ impl ActiveBuild {
         timeout: std::time::Duration,
     ) -> Result<()> {
         let a = &self.assignment;
-        let spec = sandbox::prepare(a, &self.dir, &self.sources)?;
+        let spec = sandbox::prepare(a, &self.dir, &self.sources, self.sandbox_bin_sh.as_deref())?;
+        let deadline = std::time::Instant::now() + timeout;
         let mut child = sandbox::spawn(&spec)?;
 
         let mut log_threads = Vec::new();
@@ -508,7 +552,6 @@ impl ActiveBuild {
             }));
         }
         let pgrp = nix::unistd::Pid::from_raw(child.id() as i32);
-        let deadline = std::time::Instant::now() + timeout;
         let mut timed_out = false;
         let status = loop {
             if let Some(status) = child.try_wait()? {
@@ -521,9 +564,9 @@ impl ActiveBuild {
             }
             std::thread::sleep(std::time::Duration::from_millis(200));
         };
-        // Builder children that daemonized would keep the log pipes open
-        // forever (no PID namespace); kill the whole process group so the
-        // log threads see EOF.
+        // The builder is PID 1 of its PID namespace, so its death took
+        // every descendant with it; the killpg also covers the brief
+        // pre-exec window and macOS, where there is no PID namespace.
         let _ = nix::sys::signal::killpg(pgrp, nix::sys::signal::Signal::SIGKILL);
         for t in log_threads {
             let _ = t.join();
@@ -565,7 +608,15 @@ impl ActiveBuild {
                 let f = std::fs::File::create(&nar_file)?;
                 let mut enc = zstd::stream::write::Encoder::new(f, 3)?;
                 let mut tee = TeeWriter(&mut enc, &mut hasher);
-                nar::pack(&host_path, &mut tee)?;
+                // The build deadline also bounds packing: a builder can
+                // exit instantly leaving a multi-TB sparse output.
+                let mut limited = LimitedWriter {
+                    inner: &mut tee,
+                    remaining: MAX_NAR_BYTES,
+                    deadline,
+                };
+                nar::pack(&host_path, &mut limited)
+                    .with_context(|| format!("packing output {scratch}"))?;
                 enc.finish()?.flush()?;
             }
             let hash = hasher.finalize();
@@ -596,6 +647,9 @@ impl ActiveBuild {
             let mut f = std::fs::File::open(nar_file)?;
             let mut buf = vec![0u8; CHUNK_SIZE];
             loop {
+                if std::time::Instant::now() >= deadline {
+                    bail!("build timed out during output upload");
+                }
                 let n = f.read(&mut buf)?;
                 if n == 0 {
                     break;
@@ -668,6 +722,52 @@ fn unpack_tmp_dir_archive(reader: impl Read, dest: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Enforces a byte budget and a wall-clock deadline on a Write chain.
+struct LimitedWriter<W> {
+    inner: W,
+    remaining: u64,
+    deadline: std::time::Instant,
+}
+
+impl<W: Write> Write for LimitedWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if std::time::Instant::now() >= self.deadline {
+            return Err(std::io::Error::other("build timed out"));
+        }
+        if buf.len() as u64 > self.remaining {
+            return Err(std::io::Error::other(format!(
+                "NAR exceeds the {MAX_NAR_BYTES} byte limit"
+            )));
+        }
+        let n = self.inner.write(buf)?;
+        self.remaining -= n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Enforces a byte budget on a Read chain (input NAR transfers).
+struct LimitedReader<R> {
+    inner: R,
+    remaining: u64,
+}
+
+impl<R: Read> Read for LimitedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            return Err(std::io::Error::other(format!(
+                "input NAR exceeds the {MAX_NAR_BYTES} byte limit"
+            )));
+        }
+        let max = buf.len().min(self.remaining as usize);
+        let n = self.inner.read(&mut buf[..max])?;
+        self.remaining -= n as u64;
+        Ok(n)
+    }
 }
 
 struct TeeWriter<'a, A: Write, B: Write>(&'a mut A, &'a mut B);

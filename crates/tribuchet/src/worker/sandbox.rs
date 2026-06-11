@@ -54,6 +54,7 @@ pub fn prepare(
     a: &BuildAssignment,
     dir: &Path,
     sources: &HashMap<String, PathBuf>,
+    bin_sh: Option<&Path>,
 ) -> Result<SandboxSpec> {
     let build_dir = dir.join("top").join("build");
     std::fs::create_dir_all(&build_dir)?;
@@ -72,6 +73,14 @@ pub fn prepare(
         binds_dev: Vec::new(),
         outputs: a.outputs.values().cloned().collect(),
     };
+    if cfg!(target_os = "linux") {
+        if let Some(sh) = bin_sh {
+            // Like Nix's busybox sandbox path: shebangs and system(3)
+            // need a shell at /bin/sh.
+            spec.binds_ro
+                .push((sh.to_owned(), PathBuf::from("/bin/sh")));
+        }
+    }
     spec.binds_ro.sort(); // deterministic mount order
     platform::prepare(&mut spec)?;
     Ok(spec)

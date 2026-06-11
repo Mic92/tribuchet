@@ -59,6 +59,10 @@ enum Command {
         /// Kill builds running longer than this many seconds.
         #[arg(long, default_value_t = 24 * 3600)]
         build_timeout_secs: u64,
+        /// Static shell bound at /bin/sh inside the sandbox (Linux),
+        /// e.g. a busybox sh; without it #!/bin/sh shebangs fail.
+        #[arg(long)]
+        sandbox_bin_sh: Option<PathBuf>,
     },
     /// Certificate authority management (init CA, issue worker certs).
     Ca {
@@ -90,6 +94,7 @@ fn main() -> anyhow::Result<()> {
             cert,
             key,
             build_timeout_secs,
+            sandbox_bin_sh,
         } => {
             if systems.is_empty() {
                 systems.push(worker::host_system());
@@ -102,6 +107,7 @@ fn main() -> anyhow::Result<()> {
                 cert,
                 key,
                 build_timeout: std::time::Duration::from_secs(build_timeout_secs),
+                sandbox_bin_sh,
             })
         }
         Command::Ca { action } => ca::run(action),
