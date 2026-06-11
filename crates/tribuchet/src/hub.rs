@@ -17,7 +17,7 @@ use anyhow::{bail, Context, Result};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, Mutex, Notify};
-use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream, UnixListenerStream};
+use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
 
@@ -29,11 +29,20 @@ use crate::proto::{
     TmpDirArchive, WorkerMessage,
 };
 
-type EventTx = mpsc::UnboundedSender<Result<AttachEvent, Status>>;
+type EventTx = mpsc::Sender<Result<AttachEvent, Status>>;
+
+/// Cap on the replay buffer of one build. Without it a worker that
+/// streams chunks forever grows root-hub memory without bound.
+const MAX_REPLAY_BYTES: usize = 256 * 1024 * 1024;
+
+/// Per-subscriber channel headroom beyond the buffered backlog. A
+/// stalled attach client is dropped once it falls this far behind
+/// instead of buffering the whole build a second time.
+const SUB_CHANNEL_SLACK: usize = 1024;
 
 /// Buffered event log of one in-flight build; late identical submissions
 /// (dedupe) replay the buffer and then follow live. The buffer holds the
-/// compressed output chunks too — acceptable for the targeted scale.
+/// compressed output chunks too, capped at MAX_REPLAY_BYTES.
 #[derive(Default)]
 struct Replay {
     inner: Mutex<ReplayInner>,
@@ -42,23 +51,60 @@ struct Replay {
 #[derive(Default)]
 struct ReplayInner {
     events: Vec<AttachEvent>,
+    bytes: usize,
+    /// Buffer cap hit: the backlog is incomplete, so late dedupe
+    /// subscribers must error instead of getting a truncated stream.
+    overflowed: bool,
     subs: Vec<EventTx>,
     done: bool,
 }
 
+fn event_size(ev: &attach_event::Event) -> usize {
+    match ev {
+        attach_event::Event::Log(d) => d.len(),
+        attach_event::Event::Output(o) => o.zstd_nar_chunk.len(),
+        attach_event::Event::Error(e) => e.len(),
+        attach_event::Event::ExitCode(_) => 0,
+    }
+    .saturating_add(64)
+}
+
 impl Replay {
     async fn publish(&self, ev: attach_event::Event) {
+        let sz = event_size(&ev);
         let ev = AttachEvent { event: Some(ev) };
         let mut inner = self.inner.lock().await;
-        inner.subs.retain(|tx| tx.send(Ok(ev.clone())).is_ok());
+        // try_send: a subscriber that stopped reading is dropped (its
+        // attach errors out) instead of buffering unboundedly.
+        inner.subs.retain(|tx| tx.try_send(Ok(ev.clone())).is_ok());
+        if inner.overflowed {
+            return;
+        }
+        if inner.bytes + sz > MAX_REPLAY_BYTES {
+            tracing::warn!("replay buffer cap reached; late dedupe subscribers will be rejected");
+            inner.overflowed = true;
+            inner.events.clear();
+            inner.bytes = 0;
+            return;
+        }
+        inner.bytes += sz;
         inner.events.push(ev);
     }
 
-    async fn subscribe(&self) -> mpsc::UnboundedReceiver<Result<AttachEvent, Status>> {
-        let (tx, rx) = mpsc::unbounded_channel();
+    async fn subscribe(&self) -> mpsc::Receiver<Result<AttachEvent, Status>> {
         let mut inner = self.inner.lock().await;
+        if inner.overflowed {
+            let (tx, rx) = mpsc::channel(1);
+            let _ = tx.try_send(Err(Status::resource_exhausted(
+                "build output exceeded the replay buffer; retry after it finishes",
+            )));
+            return rx;
+        }
+        // Enough capacity for the whole backlog plus live slack, so the
+        // snapshot below cannot drop events.
+        let (tx, rx) = mpsc::channel(inner.events.len() + SUB_CHANNEL_SLACK);
         for ev in &inner.events {
-            let _ = tx.send(Ok(ev.clone()));
+            let _ = tx.try_send(Ok(ev.clone()));
         }
         if !inner.done {
             inner.subs.push(tx);
@@ -280,7 +326,7 @@ struct AttachSvc {
 
 #[tonic::async_trait]
 impl attach_hub_server::AttachHub for AttachSvc {
-    type BuildStream = UnboundedReceiverStream<Result<AttachEvent, Status>>;
+    type BuildStream = ReceiverStream<Result<AttachEvent, Status>>;
 
     async fn build(
         &self,
@@ -340,9 +386,11 @@ impl attach_hub_server::AttachHub for AttachSvc {
             self.state.notify.notify_waiters();
             replay
         };
-        let rx = replay.subscribe().await;
+        // Subscribe outside the global inflight lock: the snapshot clone
+        // of a large backlog must not stall every other submission.
         drop(inflight);
-        Ok(Response::new(UnboundedReceiverStream::new(rx)))
+        let rx = replay.subscribe().await;
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 }
 
@@ -717,12 +765,35 @@ struct OutputVerify {
     signature: Signature,
 }
 
-#[derive(Default)]
-struct HashWriter(Sha256);
+struct HashWriter {
+    hasher: Sha256,
+    /// Decompressed byte budget: zstd RLE amplifies ~30,000:1, so a
+    /// sub-4MiB message could otherwise expand without bound on the hub
+    /// (and later fill the client's disk).
+    remaining: u64,
+}
+
+impl Default for HashWriter {
+    fn default() -> Self {
+        Self {
+            hasher: Sha256::new(),
+            remaining: MAX_OUTPUT_NAR_BYTES,
+        }
+    }
+}
+
+/// Decompressed size cap per output NAR, matching the worker's pack cap.
+const MAX_OUTPUT_NAR_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 impl Write for HashWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.update(buf);
+        if buf.len() as u64 > self.remaining {
+            return Err(std::io::Error::other(format!(
+                "output NAR exceeds the {MAX_OUTPUT_NAR_BYTES} byte limit"
+            )));
+        }
+        self.remaining -= buf.len() as u64;
+        self.hasher.update(buf);
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -800,7 +871,8 @@ async fn relay_build(
                     bail!("worker sent unexpected output {}", n.store_path);
                 };
                 if let Some(nar_transfer::Payload::ZstdNarChunk(chunk)) = &n.payload {
-                    verify.decoder.write_all(chunk)?;
+                    // CPU work off the shared executor threads
+                    tokio::task::block_in_place(|| verify.decoder.write_all(chunk))?;
                     job.replay
                         .publish(attach_event::Event::Output(OutputNar {
                             store_path: n.store_path.clone(),
@@ -812,7 +884,7 @@ async fn relay_build(
                 if n.eof {
                     let mut verify = pending.remove(&n.store_path).unwrap();
                     verify.decoder.flush()?;
-                    let hash = verify.decoder.into_inner().0.finalize();
+                    let hash = verify.decoder.into_inner().hasher.finalize();
                     let msg = format!("{}:{}", n.store_path, hex::encode(hash));
                     vkey.verify(msg.as_bytes(), &verify.signature)
                         .with_context(|| {
