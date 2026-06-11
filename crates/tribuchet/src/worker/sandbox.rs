@@ -23,6 +23,9 @@ use crate::proto::BuildAssignment;
 
 pub struct SandboxSpec {
     pub builder: String,
+    /// Derivation system, e.g. "i686-linux" (drives Linux personality).
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub system: String,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
     pub cwd: String,
@@ -77,6 +80,7 @@ pub fn prepare(
     std::fs::create_dir_all(&build_dir)?;
     let mut spec = SandboxSpec {
         builder: a.builder.clone(),
+        system: a.system.clone(),
         args: a.args.clone(),
         env: a.env.clone(),
         cwd: a.tmp_dir_in_sandbox.clone(),
@@ -167,7 +171,7 @@ mod platform {
             "127.0.0.1 localhost\n::1 localhost\n",
         )?;
 
-        for dev in ["null", "zero", "random", "urandom", "tty"] {
+        for dev in ["null", "zero", "full", "random", "urandom", "tty"] {
             let host = PathBuf::from("/dev").join(dev);
             std::fs::File::create(root.join("dev").join(dev))?;
             spec.binds_dev.push((host.clone(), host)); // dev nodes: bind, rw via node perms
@@ -182,8 +186,22 @@ mod platform {
             std::os::unix::fs::symlink(target, root.join(link))?;
         }
         if spec.network {
-            let resolv = std::fs::read("/etc/resolv.conf").unwrap_or_default();
-            std::fs::write(root.join("etc/resolv.conf"), resolv)?;
+            // Like Nix's fixed-output setup: name resolution via files
+            // and DNS only, host resolver/services/hosts copied in, host
+            // CA bundle at the standard path for TLS fetches.
+            std::fs::write(
+                root.join("etc/nsswitch.conf"),
+                "hosts: files dns\nservices: files\n",
+            )?;
+            for f in ["resolv.conf", "services", "hosts"] {
+                if let Ok(data) = std::fs::read(Path::new("/etc").join(f)) {
+                    std::fs::write(root.join("etc").join(f), data)?;
+                }
+            }
+            let ca = Path::new("/etc/ssl/certs/ca-certificates.crt");
+            if let Ok(real) = ca.canonicalize() {
+                spec.binds_ro.push((real, ca.to_path_buf()));
+            }
         }
         if let Some(base) = spec.uid_range {
             // The builder is root inside the namespace but uid `base`
@@ -255,6 +273,7 @@ mod platform {
         let has_cgroup = spec.cgroup.is_some();
         let cwd = spec.cwd.clone();
         let network = spec.network;
+        let system = spec.system.clone();
         // Single uid 1000 (Nix default) or, for uid-range builds,
         // in-namespace root over a 65536-uid block.
         let (sandbox_uid, host_uid, uid_count) = match spec.uid_range {
@@ -279,6 +298,7 @@ mod platform {
                 }
                 setup(&SetupParams {
                     root: &root,
+                    system: &system,
                     build_dir: &build_dir,
                     binds: &binds,
                     binds_dev: &binds_dev,
@@ -435,6 +455,7 @@ mod platform {
 
     struct SetupParams<'a> {
         root: &'a Path,
+        system: &'a str,
         build_dir: &'a Path,
         binds: &'a [(PathBuf, PathBuf)],
         binds_dev: &'a [(PathBuf, PathBuf)],
@@ -451,6 +472,7 @@ mod platform {
     fn setup(p: &SetupParams) -> io::Result<()> {
         let SetupParams {
             root,
+            system,
             build_dir,
             binds,
             binds_dev,
@@ -506,6 +528,10 @@ mod platform {
             )?;
         }
         sethostname("localhost").map_err(ioerr("sethostname"))?;
+        // "(none)" is the kernel default; fixed like Nix for determinism
+        if unsafe { libc::setdomainname(c"(none)".as_ptr(), 6) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
         if !network {
             loopback_up().map_err(werr("bringing lo up"))?;
         }
@@ -636,6 +662,32 @@ mod platform {
         let (_, hard) = getrlimit(Resource::RLIMIT_NPROC).map_err(ioerr("getrlimit NPROC"))?;
         let limit = hard.min(4096);
         setrlimit(Resource::RLIMIT_NPROC, limit, limit).map_err(ioerr("setting RLIMIT_NPROC"))?;
+
+        // Like Nix: no core dumps in outputs, a predictable umask
+        // (output modes feed the NAR hash), 32-bit personality for
+        // 32-bit systems, no ASLR for determinism, and no privilege
+        // gain via setuid binaries.
+        setrlimit(Resource::RLIMIT_CORE, 0, nix::sys::resource::RLIM_INFINITY)
+            .map_err(ioerr("setting RLIMIT_CORE"))?;
+        nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o022));
+        if matches!(
+            system,
+            "i686-linux" | "armv7l-linux" | "armv6l-linux" | "armv5tel-linux"
+        ) {
+            // PER_LINUX32 is a base persona, not a flag bit, so the nix
+            // crate's Persona bitflags cannot express it.
+            if unsafe {
+                libc::personality(0x0008 /* PER_LINUX32 */)
+            } == -1
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        use nix::sys::personality::{self, Persona};
+        if let Ok(persona) = personality::get() {
+            let _ = personality::set(persona | Persona::ADDR_NO_RANDOMIZE);
+        }
+        nix::sys::prctl::set_no_new_privs().map_err(ioerr("PR_SET_NO_NEW_PRIVS"))?;
 
         // uid-range: become the in-namespace root the mapping promised;
         // the worker's own uid is outside the mapped block. Single-uid
@@ -815,6 +867,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut spec = SandboxSpec {
             builder: "/bin/sh".into(),
+            system: "x86_64-linux".into(),
             args: vec![
                 "-c".into(),
                 // sleep keeps the builder alive so the timing assertion
