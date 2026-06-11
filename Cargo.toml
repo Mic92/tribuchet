@@ -13,7 +13,7 @@ clap = { version = "4", features = ["derive"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 hex = "0.4"
 hyper-util = "0.1"
-nix = { version = "0.29", features = ["mount", "sched", "user", "fs", "hostname", "signal", "process", "resource"] }
+nix = { version = "0.31", features = ["mount", "sched", "user", "fs", "hostname", "signal", "process", "resource", "personality"] }
 libc = "0.2"
 prost = "0.13"
 rand = "0.8"

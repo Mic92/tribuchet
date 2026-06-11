@@ -340,7 +340,6 @@ mod platform {
         uid_count: u32,
     ) -> io::Result<()> {
         use nix::unistd::{read, write};
-        use std::os::fd::AsRawFd;
         let target = nix::unistd::getpid();
         let (req_r, req_w) = nix::unistd::pipe().map_err(ioerr("pipe"))?;
         let (ack_r, ack_w) = nix::unistd::pipe().map_err(ioerr("pipe"))?;
@@ -348,9 +347,7 @@ mod platform {
             nix::unistd::ForkResult::Child => {
                 // Mapper: wait until the target has unshared, then map.
                 let mut buf = [0u8; 1];
-                let ok = read(req_r.as_raw_fd(), &mut buf)
-                    .map(|n| n == 1)
-                    .unwrap_or(false)
+                let ok = read(&req_r, &mut buf).map(|n| n == 1).unwrap_or(false)
                     && std::fs::write(
                         format!("/proc/{target}/uid_map"),
                         format!("{sandbox_uid} {host_uid} {uid_count}"),
@@ -370,8 +367,7 @@ mod platform {
                 unshare(flags).map_err(ioerr("unshare"))?;
                 write(&req_w, b"x").map_err(ioerr("signaling uid mapper"))?;
                 let mut buf = [0u8; 1];
-                let n =
-                    read(ack_r.as_raw_fd(), &mut buf).map_err(ioerr("reading uid mapper ack"))?;
+                let n = read(&ack_r, &mut buf).map_err(ioerr("reading uid mapper ack"))?;
                 let _ = nix::sys::wait::waitpid(child, None);
                 if n != 1 || buf[0] != b'K' {
                     return Err(io::Error::other(
