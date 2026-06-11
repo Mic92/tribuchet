@@ -82,9 +82,18 @@ struct Job {
 }
 
 #[derive(Default)]
+struct Inflight {
+    /// Dedupe key (hash of the full request) -> replay buffer.
+    by_key: HashMap<String, Arc<Replay>>,
+    /// Scratch output path -> dedupe key; different requests naming the
+    /// same scratch path would unpack into the same destination.
+    by_path: HashMap<String, String>,
+}
+
+#[derive(Default)]
 struct HubState {
     queue: Mutex<VecDeque<Job>>,
-    inflight: Mutex<HashMap<String, Arc<Replay>>>,
+    inflight: Mutex<Inflight>,
     notify: Notify,
 }
 
@@ -96,18 +105,44 @@ impl HubState {
     }
 
     async fn finish(&self, job: &Job) {
-        self.inflight.lock().await.remove(&job.key);
+        let mut inflight = self.inflight.lock().await;
+        inflight.by_key.remove(&job.key);
+        for p in job.req.outputs.values() {
+            inflight.by_path.remove(p);
+        }
+        drop(inflight);
         job.replay.finish().await;
     }
+}
+
+/// The hub serves exactly the canonical Nix store; clients must not
+/// anchor path validation at an arbitrary prefix.
+pub(crate) const STORE_DIR: &str = "/nix/store";
+
+/// gRPC message size cap. Metadata messages (BuildRequest, PathOffer)
+/// carry the whole input closure; tonic's 4 MiB default rejects large
+/// but legitimate closures.
+pub(crate) const MAX_MSG_SIZE: usize = 64 * 1024 * 1024;
+
+/// A store path basename restricted to Nix's name character set
+/// (`checkName` in nix); this also keeps peer-supplied strings free of
+/// shell/SBPL metacharacters, control bytes, and leading dots.
+pub(crate) fn valid_store_name(base: &str) -> bool {
+    !base.is_empty()
+        && !base.starts_with('.')
+        && base.len() <= 211
+        && base
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"+-._?=".contains(&b))
 }
 
 /// A store path directly under the store dir: absolute, exactly one
 /// component, no tricks. The hub runs as root and reads these from disk,
 /// so anything else would be an arbitrary-file-read primitive.
-fn valid_store_path(store_dir: &str, path: &str) -> bool {
+pub(crate) fn valid_store_path(store_dir: &str, path: &str) -> bool {
     path.strip_prefix(store_dir)
         .and_then(|rest| rest.strip_prefix('/'))
-        .is_some_and(|base| !base.is_empty() && base != "." && base != ".." && !base.contains('/'))
+        .is_some_and(valid_store_name)
 }
 
 #[allow(clippy::result_large_err)] // tonic::Status is what the caller needs
@@ -115,18 +150,47 @@ fn validate_request(req: &BuildRequest) -> Result<(), Status> {
     let bad = |what: &str, p: &str| {
         Status::invalid_argument(format!("{what} is not a valid store path: {p}"))
     };
-    if !req.store_dir.starts_with('/') || req.store_dir.contains("..") {
+    // A client-chosen store_dir would turn the root hub into an
+    // arbitrary-file-read (and the worker sandbox into worse).
+    if req.store_dir != STORE_DIR {
         return Err(Status::invalid_argument("invalid store dir"));
     }
+    let mut seen_inputs = std::collections::HashSet::new();
     for p in &req.input_paths {
         if !valid_store_path(&req.store_dir, p) {
             return Err(bad("input path", p));
         }
+        if !seen_inputs.insert(p) {
+            return Err(Status::invalid_argument(format!(
+                "duplicate input path {p}"
+            )));
+        }
     }
+    let mut seen_outputs = std::collections::HashSet::new();
     for p in req.outputs.values() {
         if !valid_store_path(&req.store_dir, p) {
             return Err(bad("output path", p));
         }
+        if !seen_outputs.insert(p) {
+            return Err(Status::invalid_argument(format!(
+                "duplicate output path {p}"
+            )));
+        }
+        if seen_inputs.contains(p) {
+            return Err(Status::invalid_argument(format!(
+                "output path {p} is also an input"
+            )));
+        }
+    }
+    // Nix builders are absolute store paths; anything else would also be
+    // option-injectable into sandbox-exec on Darwin workers.
+    if !req.builder.starts_with('/') {
+        return Err(Status::invalid_argument("builder must be an absolute path"));
+    }
+    // The worker mounts/symlinks the shipped build dir here and chdirs
+    // into it after chroot; pin it to Nix's sandbox-build-dir default.
+    if req.tmp_dir_in_sandbox != "/build" {
+        return Err(Status::invalid_argument("invalid tmpDirInSandbox"));
     }
     let tmp = Path::new(&req.top_tmp_dir);
     if !tmp.is_absolute()
@@ -139,10 +203,61 @@ fn validate_request(req: &BuildRequest) -> Result<(), Status> {
     Ok(())
 }
 
+/// The root hub tars `top_tmp_dir` off local disk; require it to be a
+/// real directory owned by the connecting peer so a client cannot have
+/// the hub ship `/root` or another user's build dir.
+#[allow(clippy::result_large_err)]
+fn validate_top_tmp_dir(top_tmp_dir: &str, peer_uid: u32) -> Result<(), Status> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(top_tmp_dir)
+        .map_err(|e| Status::invalid_argument(format!("topTmpDir {top_tmp_dir}: {e}")))?;
+    if !meta.is_dir() {
+        return Err(Status::invalid_argument("topTmpDir is not a directory"));
+    }
+    if meta.uid() != peer_uid {
+        return Err(Status::permission_denied(
+            "topTmpDir is not owned by the requesting user",
+        ));
+    }
+    Ok(())
+}
+
+/// Dedupe key: hash of the full canonicalized request, so only truly
+/// identical submissions share a build. A key built from output paths
+/// alone would let a colliding (or crafted) request attach to another
+/// client's build.
 fn dedupe_key(req: &BuildRequest) -> String {
-    let mut outs: Vec<&str> = req.outputs.values().map(|s| s.as_str()).collect();
-    outs.sort_unstable();
-    outs.join(",")
+    let mut h = Sha256::new();
+    let mut feed = |s: &str| {
+        h.update((s.len() as u64).to_le_bytes());
+        h.update(s.as_bytes());
+    };
+    feed(&req.system);
+    feed(&req.builder);
+    for a in &req.args {
+        feed(a);
+    }
+    let mut env: Vec<_> = req.env.iter().collect();
+    env.sort();
+    for (k, v) in env {
+        feed(k);
+        feed(v);
+    }
+    let mut outs: Vec<_> = req.outputs.iter().collect();
+    outs.sort();
+    for (k, v) in outs {
+        feed(k);
+        feed(v);
+    }
+    let mut inputs: Vec<_> = req.input_paths.iter().collect();
+    inputs.sort();
+    for p in inputs {
+        feed(p);
+    }
+    feed(&req.store_dir);
+    feed(&req.tmp_dir_in_sandbox);
+    h.update([req.fixed_output as u8]);
+    hex::encode(h.finalize())
 }
 
 fn new_id() -> String {
@@ -163,20 +278,39 @@ impl attach_hub_server::AttachHub for AttachSvc {
         &self,
         request: Request<BuildRequest>,
     ) -> Result<Response<Self::BuildStream>, Status> {
+        let peer_uid = request
+            .extensions()
+            .get::<tonic::transport::server::UdsConnectInfo>()
+            .and_then(|info| info.peer_cred)
+            .map(|cred| cred.uid())
+            .ok_or_else(|| Status::internal("missing unix peer credentials"))?;
         let req = request.into_inner();
         if req.outputs.is_empty() {
             return Err(Status::invalid_argument("build request without outputs"));
         }
         validate_request(&req)?;
+        validate_top_tmp_dir(&req.top_tmp_dir, peer_uid)?;
         let key = dedupe_key(&req);
 
         let mut inflight = self.state.inflight.lock().await;
-        let replay = if let Some(replay) = inflight.get(&key) {
+        let replay = if let Some(replay) = inflight.by_key.get(&key) {
             tracing::info!(key, "deduplicating build submission");
             replay.clone()
         } else {
+            // A different request claiming an in-flight scratch path
+            // would race the other client's unpack at the same dest.
+            for p in req.outputs.values() {
+                if inflight.by_path.contains_key(p) {
+                    return Err(Status::failed_precondition(format!(
+                        "output path {p} is part of a different in-flight build"
+                    )));
+                }
+            }
             let replay = Arc::new(Replay::default());
-            inflight.insert(key.clone(), replay.clone());
+            inflight.by_key.insert(key.clone(), replay.clone());
+            for p in req.outputs.values() {
+                inflight.by_path.insert(p.clone(), key.clone());
+            }
             let job = Job {
                 id: new_id(),
                 key,
@@ -336,12 +470,20 @@ async fn run_job(
         match recv(in_rx).await? {
             worker_message::Msg::MissingPaths(m) if m.build_id == job.id => {
                 // Only ever pack paths we offered: anything else would let
-                // a compromised worker read arbitrary host files.
+                // a compromised worker read arbitrary host files. Dedupe,
+                // so a repeated entry cannot amplify pack work either.
                 let offered: std::collections::HashSet<&String> = req.input_paths.iter().collect();
-                if let Some(p) = m.store_paths.iter().find(|p| !offered.contains(p)) {
-                    bail!("worker requested unoffered path {p}");
+                let mut missing = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+                for p in m.store_paths {
+                    if !offered.contains(&p) {
+                        bail!("worker requested unoffered path {p}");
+                    }
+                    if seen.insert(p.clone()) {
+                        missing.push(p);
+                    }
                 }
-                break m.store_paths;
+                break missing;
             }
             worker_message::Msg::Heartbeat(_) => {}
             other => {
@@ -349,7 +491,10 @@ async fn run_job(
                     tracing::warn!(id = job.id, "dropping stale worker message");
                     continue;
                 }
-                bail!("unexpected worker message while negotiating paths: {other:?}");
+                bail!(
+                    "unexpected worker message while negotiating paths: {}",
+                    msg_name(&other)
+                );
             }
         }
     };
@@ -370,6 +515,20 @@ async fn run_job(
 
 /// Messages that belong to a different (earlier, abandoned) build must
 /// not abort the current one.
+/// Log/error-safe name of a worker message variant. The messages embed
+/// peer-controlled bytes (NAR chunks, log data); Debug-formatting them
+/// into error strings would balloon logs and replay buffers.
+fn msg_name(msg: &worker_message::Msg) -> &'static str {
+    match msg {
+        worker_message::Msg::Register(_) => "Register",
+        worker_message::Msg::Heartbeat(_) => "Heartbeat",
+        worker_message::Msg::MissingPaths(_) => "MissingPaths",
+        worker_message::Msg::Log(_) => "Log",
+        worker_message::Msg::Result(_) => "Result",
+        worker_message::Msg::Nar(_) => "Nar",
+    }
+}
+
 fn is_stale(msg: &worker_message::Msg, build_id: &str) -> bool {
     let id = match msg {
         worker_message::Msg::Log(l) => &l.build_id,
@@ -509,7 +668,15 @@ async fn relay_build(
                 job.replay.publish(attach_event::Event::Log(l.data)).await;
             }
             worker_message::Msg::Result(res) if res.build_id == job.id => {
+                if awaiting_outputs {
+                    bail!("worker sent a duplicate build result");
+                }
                 if res.exit_code != 0 {
+                    // Unix exposes only the low 8 bits to the parent; a
+                    // nonzero multiple of 256 would look like success.
+                    if !(1..=255).contains(&res.exit_code) {
+                        bail!("worker sent invalid exit code {}", res.exit_code);
+                    }
                     if !res.error.is_empty() {
                         job.replay
                             .publish(attach_event::Event::Log(
@@ -548,10 +715,6 @@ async fn relay_build(
                     bail!("worker result contains unrequested outputs: {extra:?}");
                 }
                 awaiting_outputs = true;
-                if pending.is_empty() {
-                    job.replay.publish(attach_event::Event::ExitCode(0)).await;
-                    return Ok(());
-                }
             }
             worker_message::Msg::Nar(n) if n.build_id == job.id && awaiting_outputs => {
                 let Some(verify) = pending.get_mut(&n.store_path) else {
@@ -594,7 +757,7 @@ async fn relay_build(
                     tracing::warn!(id = job.id, "dropping stale worker message");
                     continue;
                 }
-                bail!("unexpected worker message: {other:?}");
+                bail!("unexpected worker message: {}", msg_name(&other));
             }
         }
     }
@@ -616,37 +779,60 @@ async fn run_async(socket: &Path, listen: &str, config_dir: &Path) -> Result<()>
     let ca = Certificate::from_pem(std::fs::read(ca_dir.join("ca.crt")).context("reading ca.crt")?);
     let tls = ServerTlsConfig::new().identity(identity).client_ca_root(ca);
 
+    // Bind TCP eagerly: a second hub instance must fail here on
+    // EADDRINUSE *before* it clobbers the live hub's unix socket below.
+    let tcp = tokio::net::TcpListener::bind(
+        listen
+            .parse::<std::net::SocketAddr>()
+            .context("parsing listen address")?,
+    )
+    .await
+    .context("binding worker listen address")?;
     let worker_server = Server::builder()
         .tls_config(tls)?
-        .add_service(crate::proto::worker_hub_server::WorkerHubServer::new(
-            WorkerSvc {
+        .add_service(
+            crate::proto::worker_hub_server::WorkerHubServer::new(WorkerSvc {
                 state: state.clone(),
-            },
-        ))
-        .serve(listen.parse().context("parsing listen address")?);
+            })
+            .max_decoding_message_size(MAX_MSG_SIZE)
+            .max_encoding_message_size(MAX_MSG_SIZE),
+        )
+        .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(tcp));
 
     if let Some(parent) = socket.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    // Refuse to replace the socket of a live hub: unlinking it would
+    // leave all new attaches with ECONNREFUSED while the old hub runs.
+    if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+        bail!("another hub is already serving {}", socket.display());
+    }
     let _ = std::fs::remove_file(socket);
-    let uds = tokio::net::UnixListener::bind(socket)?;
     // attach runs as a nix build user: restrict the socket to that group
     // (anyone who can reach it can have store paths packed and shipped).
+    // Resolve the group *before* binding and bind with a tight umask so
+    // the socket is never connectable by others, not even briefly.
+    let group = match nix::unistd::Group::from_name("nixbld") {
+        Ok(Some(group)) => group,
+        _ => bail!(
+            "group nixbld not found; refusing to serve a hub socket without a group to restrict it to"
+        ),
+    };
+    let old_umask = nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o117));
+    let uds = tokio::net::UnixListener::bind(socket);
+    nix::sys::stat::umask(old_umask);
+    let uds = uds?;
     {
         use std::os::unix::fs::PermissionsExt;
-        match nix::unistd::Group::from_name("nixbld") {
-            Ok(Some(group)) => {
-                std::os::unix::fs::chown(socket, None, Some(group.gid.as_raw()))?;
-                std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o660))?;
-            }
-            _ => {
-                tracing::warn!("group nixbld not found; hub socket is world-writable");
-                std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o666))?;
-            }
-        }
+        std::os::unix::fs::chown(socket, None, Some(group.gid.as_raw()))?;
+        std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o660))?;
     }
     let attach_server = Server::builder()
-        .add_service(attach_hub_server::AttachHubServer::new(AttachSvc { state }))
+        .add_service(
+            attach_hub_server::AttachHubServer::new(AttachSvc { state })
+                .max_decoding_message_size(MAX_MSG_SIZE)
+                .max_encoding_message_size(MAX_MSG_SIZE),
+        )
         .serve_with_incoming(UnixListenerStream::new(uds));
 
     tracing::info!(listen, socket = %socket.display(), "hub running");
@@ -665,11 +851,77 @@ mod tests {
     fn store_path_validation() {
         let ok = |p| valid_store_path("/nix/store", p);
         assert!(ok("/nix/store/abc-foo"));
+        assert!(ok("/nix/store/abc-foo_1.2+x?=y"));
         assert!(!ok("/nix/store/"));
         assert!(!ok("/nix/store/.."));
+        assert!(!ok("/nix/store/.hidden"));
         assert!(!ok("/nix/store/abc/../../etc"));
         assert!(!ok("/nix/store/abc/bin/sh"));
         assert!(!ok("/etc/shadow"));
         assert!(!ok("/nix/storeX/abc"));
+        // no quotes/parens/control bytes: these strings reach the macOS
+        // sandbox profile and log lines verbatim
+        assert!(!ok("/nix/store/a\")(allow-default)(\""));
+        assert!(!ok("/nix/store/a\nb"));
+        assert!(!ok("/nix/store/a,b"));
+    }
+
+    fn base_request() -> BuildRequest {
+        BuildRequest {
+            system: "x86_64-linux".into(),
+            builder: "/nix/store/abc-bash/bin/bash".into(),
+            args: vec!["-c".into(), "true".into()],
+            env: Default::default(),
+            outputs: [("out".to_string(), "/nix/store/abc-out".to_string())].into(),
+            input_paths: vec!["/nix/store/abc-dep".into()],
+            top_tmp_dir: "/tmp/nix-build-x".into(),
+            tmp_dir_in_sandbox: "/build".into(),
+            store_dir: "/nix/store".into(),
+            fixed_output: false,
+        }
+    }
+
+    #[test]
+    fn request_validation() {
+        assert!(validate_request(&base_request()).is_ok());
+
+        let mut req = base_request();
+        req.store_dir = "/etc".into();
+        req.input_paths = vec!["/etc/shadow".into()];
+        req.outputs = [("out".to_string(), "/etc/out".to_string())].into();
+        assert!(validate_request(&req).is_err());
+
+        let mut req = base_request();
+        req.builder = "-p".into();
+        assert!(validate_request(&req).is_err());
+
+        let mut req = base_request();
+        req.tmp_dir_in_sandbox = "relative".into();
+        assert!(validate_request(&req).is_err());
+
+        let mut req = base_request();
+        req.input_paths = vec!["/nix/store/abc-dep".into(), "/nix/store/abc-dep".into()];
+        assert!(validate_request(&req).is_err());
+
+        let mut req = base_request();
+        req.outputs
+            .insert("doc".into(), "/nix/store/abc-out".into());
+        assert!(validate_request(&req).is_err());
+
+        let mut req = base_request();
+        req.outputs = [("out".to_string(), "/nix/store/abc-dep".to_string())].into();
+        assert!(validate_request(&req).is_err());
+    }
+
+    #[test]
+    fn dedupe_key_binds_full_request() {
+        let a = dedupe_key(&base_request());
+        assert_eq!(a, dedupe_key(&base_request()));
+        let mut req = base_request();
+        req.args = vec!["-c".into(), "false".into()];
+        assert_ne!(a, dedupe_key(&req));
+        let mut req = base_request();
+        req.env.insert("X".into(), "1".into());
+        assert_ne!(a, dedupe_key(&req));
     }
 }
