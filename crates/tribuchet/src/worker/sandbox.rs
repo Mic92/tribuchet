@@ -7,7 +7,8 @@
 //! Reference: `nix/src/libstore/unix/build/derivation-builder.cc`.
 //!
 //! macOS: no bind mounts, so inputs are materialized in the host
-//! /nix/store, /build is a symlink to the build dir, and the builder runs
+//! /nix/store, the per-build tmp dir path (Nix sends the real topTmpDir
+//! on Darwin) is a symlink to the build dir, and the builder runs
 //! under `sandbox-exec` with a deny-default write profile modeled on
 //! Nix's `sandbox-defaults.sb` (reads stay permissive, like Nix's own
 //! comparatively weak Darwin sandbox).
@@ -498,9 +499,33 @@ mod platform {
                 }
             })?;
         }
-        // env refers to tmpDirInSandbox (/build); link it to the real dir.
+        // env refers to tmpDirInSandbox; link it to the real build dir.
         let link = Path::new(&spec.cwd);
-        let _ = std::fs::remove_file(link);
+        // Don't trust the hub: a root worker creating a symlink at an
+        // arbitrary path is a takeover primitive. Allow only tmp
+        // prefixes and the shared /build (serialized by the caller).
+        let allowed = spec.cwd == "/build"
+            || [
+                "/tmp/",
+                "/private/tmp/",
+                "/private/var/folders/",
+                "/var/folders/",
+            ]
+            .iter()
+            .any(|p| spec.cwd.starts_with(p));
+        if !allowed {
+            anyhow::bail!("refusing tmpDirInSandbox outside tmp: {}", spec.cwd);
+        }
+        match std::fs::symlink_metadata(link) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                std::fs::remove_file(link)?; // stale link from a crashed build
+            }
+            Ok(_) => anyhow::bail!("tmpDirInSandbox {} already exists", spec.cwd),
+            Err(_) => {}
+        }
+        if let Some(parent) = link.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         std::os::unix::fs::symlink(&spec.build_dir, link)
             .with_context(|| format!("creating {} symlink", link.display()))?;
         Ok(())

@@ -164,10 +164,14 @@ impl HubState {
     }
 }
 
-/// If no worker message arrives for this long the job is failed:
-/// heartbeats flow every 30s, so silence means a dead or wedged worker
-/// that would otherwise pin the build (and its dedupe key) forever.
+/// No worker message for this long tears the session down and fails
+/// its builds: heartbeats flow every 30s, so silence means a dead
+/// worker that would otherwise pin its builds (and dedupe keys) forever.
 const WORKER_SILENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Cap on advertised job slots; a bogus Register must not let one
+/// worker absorb the whole queue.
+const MAX_WORKER_JOBS: u32 = 256;
 
 /// The hub serves exactly the canonical Nix store; clients must not
 /// anchor path validation at an arbitrary prefix.
@@ -241,9 +245,18 @@ fn validate_request(req: &BuildRequest) -> Result<(), Status> {
     if !req.builder.starts_with('/') {
         return Err(Status::invalid_argument("builder must be an absolute path"));
     }
-    // The worker mounts/symlinks the shipped build dir here and chdirs
-    // into it after chroot; pin it to Nix's sandbox-build-dir default.
-    if req.tmp_dir_in_sandbox != "/build" {
+    // Where the worker mounts/symlinks the shipped build dir: "/build"
+    // from Linux clients, the real per-build topTmpDir from Darwin.
+    let tmp_in_sandbox = Path::new(&req.tmp_dir_in_sandbox);
+    if !tmp_in_sandbox.is_absolute()
+        || tmp_in_sandbox.components().any(|c| {
+            !matches!(
+                c,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        })
+        || req.tmp_dir_in_sandbox.starts_with(STORE_DIR)
+    {
         return Err(Status::invalid_argument("invalid tmpDirInSandbox"));
     }
     let tmp = Path::new(&req.top_tmp_dir);
@@ -403,21 +416,26 @@ struct WorkerSvc {
     trusted_keys: Option<Arc<std::collections::HashSet<[u8; 32]>>>,
 }
 
-/// Registers the worker's systems while alive; removes them on drop so
-/// admission control tracks actual capacity.
+/// Registers the worker's job slots per system while alive; removes
+/// them on drop so admission control tracks actual capacity.
 struct SystemsGuard {
     state: Arc<HubState>,
     systems: Vec<String>,
+    slots: usize,
 }
 
 impl SystemsGuard {
-    fn new(state: Arc<HubState>, systems: Vec<String>) -> Self {
+    fn new(state: Arc<HubState>, systems: Vec<String>, slots: usize) -> Self {
         let mut map = state.worker_systems.lock().unwrap();
         for s in &systems {
-            *map.entry(s.clone()).or_insert(0) += 1;
+            *map.entry(s.clone()).or_insert(0) += slots;
         }
         drop(map);
-        Self { state, systems }
+        Self {
+            state,
+            systems,
+            slots,
+        }
     }
 }
 
@@ -426,13 +444,77 @@ impl Drop for SystemsGuard {
         let mut map = self.state.worker_systems.lock().unwrap();
         for s in &self.systems {
             if let Some(n) = map.get_mut(s) {
-                *n = n.saturating_sub(1);
+                *n = n.saturating_sub(self.slots);
                 if *n == 0 {
                     map.remove(s);
                 }
             }
         }
     }
+}
+
+/// Routes the single worker stream to per-build channels so multiple
+/// jobs share one session. Dropping a sender closes the job's receiver,
+/// which it observes as the worker going away.
+#[derive(Default, Clone)]
+struct Router {
+    builds: Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<worker_message::Msg>>>>,
+}
+
+impl Router {
+    fn register(&self, build_id: &str) -> mpsc::Receiver<worker_message::Msg> {
+        let (tx, rx) = mpsc::channel(64);
+        self.builds.lock().unwrap().insert(build_id.to_string(), tx);
+        rx
+    }
+
+    fn unregister(&self, build_id: &str) {
+        self.builds.lock().unwrap().remove(build_id);
+    }
+
+    fn close_all(&self) {
+        self.builds.lock().unwrap().clear();
+    }
+}
+
+fn msg_build_id(msg: &worker_message::Msg) -> Option<&str> {
+    match msg {
+        worker_message::Msg::Log(l) => Some(&l.build_id),
+        worker_message::Msg::Result(r) => Some(&r.build_id),
+        worker_message::Msg::Nar(n) => Some(&n.build_id),
+        worker_message::Msg::MissingPaths(m) => Some(&m.build_id),
+        worker_message::Msg::Register(_) | worker_message::Msg::Heartbeat(_) => None,
+    }
+}
+
+/// Demux worker messages to their builds and enforce the session-wide
+/// silence deadline; closes every build channel on the way out.
+async fn route_loop(mut in_rx: mpsc::Receiver<WorkerMessage>, router: Router) {
+    loop {
+        let m = match tokio::time::timeout(WORKER_SILENCE_TIMEOUT, in_rx.recv()).await {
+            Err(_) => {
+                tracing::warn!(
+                    "worker sent nothing for {}s; assuming it is dead",
+                    WORKER_SILENCE_TIMEOUT.as_secs()
+                );
+                break;
+            }
+            Ok(None) => break,
+            Ok(Some(WorkerMessage { msg: Some(m) })) => m,
+            Ok(Some(WorkerMessage { msg: None })) => continue,
+        };
+        let Some(id) = msg_build_id(&m).map(str::to_string) else {
+            continue; // heartbeat: any traffic counts as liveness
+        };
+        // clone outside the lock: a send must not block other routing
+        let tx = router.builds.lock().unwrap().get(&id).cloned();
+        match tx {
+            // send error = job already ended; drop the message
+            Some(tx) => drop(tx.send(m).await),
+            None => tracing::warn!(id, "dropping worker message for unknown build"),
+        }
+    }
+    router.close_all();
 }
 
 #[tonic::async_trait]
@@ -500,26 +582,30 @@ async fn worker_loop(
     register: Register,
     vkey: VerifyingKey,
     out_tx: mpsc::Sender<Result<HubMessage, Status>>,
-    mut in_rx: mpsc::Receiver<WorkerMessage>,
+    in_rx: mpsc::Receiver<WorkerMessage>,
 ) {
-    let _systems_guard = SystemsGuard::new(state.clone(), register.systems.clone());
-    loop {
+    let max_jobs = register.max_jobs.clamp(1, MAX_WORKER_JOBS) as usize;
+    let _systems_guard = SystemsGuard::new(state.clone(), register.systems.clone(), max_jobs);
+    let router = Router::default();
+    let route = tokio::spawn(route_loop(in_rx, router.clone()));
+    let slots = Arc::new(tokio::sync::Semaphore::new(max_jobs));
+
+    'outer: loop {
+        // A free slot first, then a job: a job must never wait assigned
+        // to a busy worker while another worker has capacity.
+        let permit = slots.clone().acquire_owned().await.expect("never closed");
         let job = loop {
+            if out_tx.is_closed() || route.is_finished() {
+                break 'outer;
+            }
             if let Some(job) = state.take_job(&register.systems).await {
                 break job;
             }
-            // Drain heartbeats while idle, or the bounded channel (and
-            // then HTTP/2 flow control) would stall the worker stream.
-            while in_rx.try_recv().is_ok() {}
             // notify_waiters() wakes only current waiters; the timeout
             // closes the race between checking the queue and awaiting.
             tokio::select! {
                 _ = state.notify.notified() => {}
                 _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
-            }
-            if out_tx.is_closed() {
-                tracing::info!(worker = register.worker_name, "worker disconnected");
-                return;
             }
         };
         tracing::info!(
@@ -527,21 +613,29 @@ async fn worker_loop(
             worker = register.worker_name,
             "dispatching build"
         );
-        match run_job(&job, &vkey, &out_tx, &mut in_rx).await {
-            Ok(()) => {}
-            Err(e) => {
-                tracing::warn!(id = job.id, "build failed: {e:#}");
-                job.replay
-                    .publish(attach_event::Event::Error(format!("{e:#}")))
-                    .await;
+        let in_rx = router.register(&job.id);
+        let state = state.clone();
+        let router = router.clone();
+        let out_tx = out_tx.clone();
+        tokio::spawn(async move {
+            match run_job(&job, &vkey, &out_tx, in_rx).await {
+                Ok(()) => {}
+                Err(e) => {
+                    tracing::warn!(id = job.id, "build failed: {e:#}");
+                    job.replay
+                        .publish(attach_event::Event::Error(format!("{e:#}")))
+                        .await;
+                }
             }
-        }
-        state.finish(&job).await;
-        if out_tx.is_closed() {
-            tracing::info!(worker = register.worker_name, "worker disconnected");
-            return;
-        }
+            router.unregister(&job.id);
+            state.finish(&job).await;
+            drop(permit);
+        });
     }
+    // Builds in flight fail through their closed router channels.
+    route.abort();
+    router.close_all();
+    tracing::info!(worker = register.worker_name, "worker disconnected");
 }
 
 async fn send(
@@ -558,7 +652,7 @@ async fn run_job(
     job: &Job,
     vkey: &VerifyingKey,
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
-    in_rx: &mut mpsc::Receiver<WorkerMessage>,
+    mut in_rx: mpsc::Receiver<worker_message::Msg>,
 ) -> Result<()> {
     let req = &job.req;
     send(
@@ -585,37 +679,28 @@ async fn run_job(
     )
     .await?;
 
-    let missing = loop {
-        match recv(in_rx).await? {
-            worker_message::Msg::MissingPaths(m) if m.build_id == job.id => {
-                // Only ever pack paths we offered: anything else would let
-                // a compromised worker read arbitrary host files. Dedupe,
-                // so a repeated entry cannot amplify pack work either.
-                let offered: std::collections::HashSet<&String> = req.input_paths.iter().collect();
-                let mut missing = Vec::new();
-                let mut seen = std::collections::HashSet::new();
-                for p in m.store_paths {
-                    if !offered.contains(&p) {
-                        bail!("worker requested unoffered path {p}");
-                    }
-                    if seen.insert(p.clone()) {
-                        missing.push(p);
-                    }
+    let missing = match recv(&mut in_rx).await? {
+        worker_message::Msg::MissingPaths(m) => {
+            // Only ever pack paths we offered: anything else would let
+            // a compromised worker read arbitrary host files. Dedupe,
+            // so a repeated entry cannot amplify pack work either.
+            let offered: std::collections::HashSet<&String> = req.input_paths.iter().collect();
+            let mut missing = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for p in m.store_paths {
+                if !offered.contains(&p) {
+                    bail!("worker requested unoffered path {p}");
                 }
-                break missing;
-            }
-            worker_message::Msg::Heartbeat(_) => {}
-            other => {
-                if is_stale(&other, &job.id) {
-                    tracing::warn!(id = job.id, "dropping stale worker message");
-                    continue;
+                if seen.insert(p.clone()) {
+                    missing.push(p);
                 }
-                bail!(
-                    "unexpected worker message while negotiating paths: {}",
-                    msg_name(&other)
-                );
             }
+            missing
         }
+        other => bail!(
+            "unexpected worker message while negotiating paths: {}",
+            msg_name(&other)
+        ),
     };
     tracing::info!(
         id = job.id,
@@ -629,11 +714,9 @@ async fn run_job(
     }
     stream_tmp_dir(&job.id, Path::new(&req.top_tmp_dir), out_tx).await?;
 
-    relay_build(job, vkey, out_tx, in_rx).await
+    relay_build(job, vkey, out_tx, &mut in_rx).await
 }
 
-/// Messages that belong to a different (earlier, abandoned) build must
-/// not abort the current one.
 /// Log/error-safe name of a worker message variant. The messages embed
 /// peer-controlled bytes (NAR chunks, log data); Debug-formatting them
 /// into error strings would balloon logs and replay buffers.
@@ -648,33 +731,13 @@ fn msg_name(msg: &worker_message::Msg) -> &'static str {
     }
 }
 
-fn is_stale(msg: &worker_message::Msg, build_id: &str) -> bool {
-    let id = match msg {
-        worker_message::Msg::Log(l) => &l.build_id,
-        worker_message::Msg::Result(r) => &r.build_id,
-        worker_message::Msg::Nar(n) => &n.build_id,
-        worker_message::Msg::MissingPaths(m) => &m.build_id,
-        _ => return false,
-    };
-    id != build_id
-}
-
-async fn recv(in_rx: &mut mpsc::Receiver<WorkerMessage>) -> Result<worker_message::Msg> {
-    loop {
-        let m = tokio::time::timeout(WORKER_SILENCE_TIMEOUT, in_rx.recv())
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "worker sent nothing for {}s; assuming it is dead",
-                    WORKER_SILENCE_TIMEOUT.as_secs()
-                )
-            })?;
-        match m {
-            Some(WorkerMessage { msg: Some(m) }) => return Ok(m),
-            Some(WorkerMessage { msg: None }) => {}
-            None => bail!("worker connection lost"),
-        }
-    }
+/// The channel carries only this build's messages (route_loop filters);
+/// it closes when the worker disconnects or goes silent.
+async fn recv(in_rx: &mut mpsc::Receiver<worker_message::Msg>) -> Result<worker_message::Msg> {
+    in_rx
+        .recv()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("worker disconnected or went silent"))
 }
 
 /// NAR-pack a local store path, zstd-compress, and stream it to the worker.
@@ -805,7 +868,7 @@ async fn relay_build(
     job: &Job,
     vkey: &VerifyingKey,
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
-    in_rx: &mut mpsc::Receiver<WorkerMessage>,
+    in_rx: &mut mpsc::Receiver<worker_message::Msg>,
 ) -> Result<()> {
     let _ = out_tx; // cancellation not implemented yet
     let mut pending: HashMap<String, OutputVerify> = HashMap::new();
@@ -813,11 +876,10 @@ async fn relay_build(
 
     loop {
         match recv(in_rx).await? {
-            worker_message::Msg::Heartbeat(_) => {}
-            worker_message::Msg::Log(l) if l.build_id == job.id => {
+            worker_message::Msg::Log(l) => {
                 job.replay.publish(attach_event::Event::Log(l.data)).await;
             }
-            worker_message::Msg::Result(res) if res.build_id == job.id => {
+            worker_message::Msg::Result(res) => {
                 if awaiting_outputs {
                     bail!("worker sent a duplicate build result");
                 }
@@ -866,7 +928,7 @@ async fn relay_build(
                 }
                 awaiting_outputs = true;
             }
-            worker_message::Msg::Nar(n) if n.build_id == job.id && awaiting_outputs => {
+            worker_message::Msg::Nar(n) if awaiting_outputs => {
                 let Some(verify) = pending.get_mut(&n.store_path) else {
                     bail!("worker sent unexpected output {}", n.store_path);
                 };
@@ -903,13 +965,7 @@ async fn relay_build(
                     }
                 }
             }
-            other => {
-                if is_stale(&other, &job.id) {
-                    tracing::warn!(id = job.id, "dropping stale worker message");
-                    continue;
-                }
-                bail!("unexpected worker message: {}", msg_name(&other));
-            }
+            other => bail!("unexpected worker message: {}", msg_name(&other)),
         }
     }
 }
@@ -1084,6 +1140,19 @@ mod tests {
 
         let mut req = base_request();
         req.tmp_dir_in_sandbox = "relative".into();
+        assert!(validate_request(&req).is_err());
+
+        // Darwin clients send the real per-build tmp dir path.
+        let mut req = base_request();
+        req.tmp_dir_in_sandbox = "/private/tmp/nix-build-foo.drv-0".into();
+        assert!(validate_request(&req).is_ok());
+
+        let mut req = base_request();
+        req.tmp_dir_in_sandbox = "/build/../etc".into();
+        assert!(validate_request(&req).is_err());
+
+        let mut req = base_request();
+        req.tmp_dir_in_sandbox = "/nix/store/abc-x".into();
         assert!(validate_request(&req).is_err());
 
         let mut req = base_request();

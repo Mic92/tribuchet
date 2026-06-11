@@ -35,6 +35,21 @@ in
           substituters = lib.mkForce [ ];
         };
 
+        # test derivations (etc files avoid heredoc quoting in testScript)
+        environment.etc."tt/par.nix".text = ''
+          let
+            bash = builtins.storePath "${pkgs.bash}";
+            mk = n: derivation {
+              name = "tt-par-''${n}";
+              system = "x86_64-linux";
+              builder = bash + "/bin/bash";
+              # busy-wait 15s of wall clock; two of these finishing in
+              # well under 30s proves they overlapped on the worker
+              args = [ "-c" "while [ $SECONDS -lt 15 ]; do :; done; echo done-$n > $out" ];
+              inherit n;
+            };
+          in [ (mk "a") (mk "b") ]
+        '';
         systemd.services.tribuchet-hub = {
           # started by the test script once certificates exist
           wantedBy = lib.mkForce [ ];
@@ -59,7 +74,7 @@ in
           # started by the test script once certificates exist
           wantedBy = lib.mkForce [ ];
           serviceConfig = {
-            ExecStart = "${tribuchet}/bin/tribuchet worker --hub https://hub:7437 --state-dir /var/lib/tribuchet";
+            ExecStart = "${tribuchet}/bin/tribuchet worker --hub https://hub:7437 --state-dir /var/lib/tribuchet --max-jobs 2";
             StateDirectory = "tribuchet";
             Environment = "RUST_LOG=info";
             # delegate the cgroup subtree so the worker can apply
@@ -114,6 +129,13 @@ in
         )
         out = hub.succeed("nix-build /root/test.nix --no-out-link").strip()
         hub.succeed(f"grep -q 'tribuchet-payload built-remotely' {out}")
+
+    with subtest("concurrent builds share one worker session"):
+        import time
+        t0 = time.time()
+        hub.succeed("nix-build /etc/tt/par.nix --no-out-link --max-jobs 2")
+        elapsed = time.time() - t0
+        assert elapsed < 27, f"builds did not overlap: {elapsed:.0f}s (serial would be >=30s)"
 
     with subtest("build really ran on the worker"):
         worker.succeed("journalctl -u tribuchet-worker | grep -q 'builder finished'")

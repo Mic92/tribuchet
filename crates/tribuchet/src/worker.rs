@@ -5,7 +5,7 @@
 //! 1. the host's own /nix/store (read-only seed; no transfer needed)
 //! 2. the worker cache (`state_dir/store`), filled from hub NAR streams
 //!
-//! One build at a time (max_jobs = 1) for the MVP.
+//! Runs up to `--max-jobs` builds concurrently over one hub session.
 
 mod cgroup;
 pub mod sandbox;
@@ -49,6 +49,8 @@ pub struct WorkerOpts {
     /// Optional memory.max for the per-build cgroup (Linux, requires a
     /// delegated cgroup; see worker/cgroup.rs).
     pub build_memory_max: Option<u64>,
+    /// Concurrent build slots advertised to the hub.
+    pub max_jobs: u32,
 }
 
 /// Per-process context threaded through builds.
@@ -61,6 +63,42 @@ struct WorkerCtx {
     /// Files a build must never read even where DAC would allow it
     /// (macOS Seatbelt deny rules; Linux relies on the mount namespace).
     secret_paths: Vec<PathBuf>,
+    /// Serializes cache installs; two builds finishing the same input
+    /// concurrently must not rename over each other.
+    cache_lock: std::sync::Mutex<()>,
+    /// Cache entries referenced by running builds (refcounted by store
+    /// basename); eviction skips them.
+    pinned: std::sync::Mutex<HashMap<String, u32>>,
+    /// Builds currently executing, reported in heartbeats.
+    running: std::sync::atomic::AtomicU32,
+    /// macOS: tmpDirInSandbox=/build is one global symlink (no mount
+    /// namespace); builds sharing it run one at a time.
+    shared_link_lock: std::sync::Mutex<()>,
+}
+
+impl WorkerCtx {
+    fn pin(&self, base: &str) {
+        *self
+            .pinned
+            .lock()
+            .unwrap()
+            .entry(base.to_string())
+            .or_insert(0) += 1;
+    }
+
+    fn unpin(&self, base: &str) {
+        let mut pinned = self.pinned.lock().unwrap();
+        if let Some(n) = pinned.get_mut(base) {
+            *n -= 1;
+            if *n == 0 {
+                pinned.remove(base);
+            }
+        }
+    }
+
+    fn pinned_bases(&self) -> HashSet<String> {
+        self.pinned.lock().unwrap().keys().cloned().collect()
+    }
 }
 
 /// Cap on a single NAR transfer in either direction; a `truncate -s 1P
@@ -185,6 +223,13 @@ fn cache_install(
     use std::os::fd::AsRawFd;
     let store = state_dir.join("store");
     let cached = store.join(base);
+    // A concurrent build already installed this entry (and may be using
+    // it); keep theirs, drop ours.
+    if cache_marker(state_dir, base).symlink_metadata().is_ok() && cached.symlink_metadata().is_ok()
+    {
+        remove_path_all(partial);
+        return Ok(cached);
+    }
     remove_path_all(&cached); // stale/truncated leftover
     let size = tree_size(partial);
     // One syncfs instead of per-file fsync: the marker below must not
@@ -282,6 +327,10 @@ async fn run_async(opts: WorkerOpts) -> Result<()> {
         },
         build_memory_max: opts.build_memory_max,
         secret_paths: vec![opts.key.clone(), opts.state_dir.join("signing.key")],
+        cache_lock: std::sync::Mutex::new(()),
+        pinned: std::sync::Mutex::new(HashMap::new()),
+        running: std::sync::atomic::AtomicU32::new(0),
+        shared_link_lock: std::sync::Mutex::new(()),
     });
 
     // Reconnect with backoff: a hub restart must not drain the fleet.
@@ -337,19 +386,22 @@ async fn session(
                 .unwrap_or_else(|| "worker".into()),
             systems: opts.systems.clone(),
             features: vec![],
-            max_jobs: 1,
+            max_jobs: opts.max_jobs.max(1),
             signing_public_key: signing_key.verifying_key().to_bytes().to_vec(),
         })))
         .await?;
 
     let heartbeat_tx = out_tx.clone();
+    let heartbeat_ctx = ctx.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
         loop {
             interval.tick().await;
             if heartbeat_tx
                 .send(msg(worker_message::Msg::Heartbeat(Heartbeat {
-                    running_jobs: 0,
+                    running_jobs: heartbeat_ctx
+                        .running
+                        .load(std::sync::atomic::Ordering::Relaxed),
                     load1: 0.0,
                 })))
                 .await
@@ -366,26 +418,52 @@ async fn session(
         .into_inner();
     tracing::info!(hub = opts.hub, systems = ?opts.systems, "connected to hub");
 
-    let mut active: Option<ActiveBuild> = None;
+    let mut active: HashMap<String, ActiveBuild> = HashMap::new();
+    let result = session_loop(
+        &mut inbound,
+        &mut active,
+        &out_tx,
+        signing_key,
+        ctx,
+        opts.build_timeout,
+    )
+    .await;
+    // Builds still staging when the session dies must not keep their
+    // unpackers writing; executing builds finish on their own threads.
+    for (_, build) in active.drain() {
+        build.abort().await;
+    }
+    result
+}
+
+async fn session_loop(
+    inbound: &mut tonic::Streaming<crate::proto::HubMessage>,
+    active: &mut HashMap<String, ActiveBuild>,
+    out_tx: &mpsc::Sender<WorkerMessage>,
+    signing_key: &SigningKey,
+    ctx: &std::sync::Arc<WorkerCtx>,
+    build_timeout: std::time::Duration,
+) -> Result<()> {
     while let Some(m) = inbound.message().await? {
         let Some(m) = m.msg else { continue };
         match m {
             hub_message::Msg::Assignment(a) => {
                 tracing::info!(id = a.build_id, "build assigned");
-                // The hub never re-dispatches an abandoned build; tear
-                // down anything still staged for the previous one.
-                if let Some(old) = active.take() {
-                    tracing::warn!(id = old.assignment.build_id, "discarding abandoned build");
+                // build ids are never reused; a duplicate is a confused hub
+                if let Some(old) = active.remove(&a.build_id) {
+                    tracing::warn!(id = old.assignment.build_id, "discarding duplicate build");
                     old.abort().await;
                 }
                 let build_id = a.build_id.clone();
                 match validate_assignment(&a).and_then(|()| ActiveBuild::new(a, ctx.clone())) {
-                    Ok(b) => active = Some(b),
-                    Err(e) => fail_build(&out_tx, &build_id, &e).await?,
+                    Ok(b) => {
+                        active.insert(build_id, b);
+                    }
+                    Err(e) => fail_build(out_tx, &build_id, &e).await?,
                 }
             }
             hub_message::Msg::PathOffer(offer) => {
-                let Some(build) = active.as_mut() else {
+                let Some(build) = active.get_mut(&offer.build_id) else {
                     continue;
                 };
                 match build.negotiate(&offer.store_paths) {
@@ -398,41 +476,44 @@ async fn session(
                             .await?;
                     }
                     Err(e) => {
-                        let build = active.take().unwrap();
+                        let build = active.remove(&offer.build_id).unwrap();
                         let id = build.assignment.build_id.clone();
                         build.abort().await;
-                        fail_build(&out_tx, &id, &e).await?;
+                        fail_build(out_tx, &id, &e).await?;
                     }
                 }
             }
             hub_message::Msg::Nar(n) => {
-                if let Some(build) = active.as_mut() {
+                let id = n.build_id.clone();
+                if let Some(build) = active.get_mut(&id) {
                     // A bad transfer fails this build, not the session.
                     if let Err(e) = build.feed_nar(n).await {
-                        let build = active.take().unwrap();
-                        let id = build.assignment.build_id.clone();
+                        let build = active.remove(&id).unwrap();
                         build.abort().await;
-                        fail_build(&out_tx, &id, &e).await?;
+                        fail_build(out_tx, &id, &e).await?;
                     }
                 }
             }
             hub_message::Msg::TmpDir(t) => {
-                if let Some(build) = active.as_mut() {
+                let id = t.build_id.clone();
+                if let Some(build) = active.get_mut(&id) {
                     match build.feed_tmp_dir(t).await {
                         Err(e) => {
-                            let build = active.take().unwrap();
-                            let id = build.assignment.build_id.clone();
+                            let build = active.remove(&id).unwrap();
                             build.abort().await;
-                            fail_build(&out_tx, &id, &e).await?;
+                            fail_build(out_tx, &id, &e).await?;
                         }
                         Ok(false) => {}
                         Ok(true) => {
-                            let build = active.take().unwrap();
+                            let build = active.remove(&id).unwrap();
                             let out_tx = out_tx.clone();
                             let signing_key = signing_key.clone();
-                            let timeout = opts.build_timeout;
+                            let ctx = ctx.clone();
+                            ctx.running
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             tokio::task::spawn_blocking(move || {
-                                if let Err(e) = build.execute(&out_tx, &signing_key, timeout) {
+                                if let Err(e) = build.execute(&out_tx, &signing_key, build_timeout)
+                                {
                                     tracing::error!("build execution failed: {e:#}");
                                     let _ = out_tx.blocking_send(msg(worker_message::Msg::Result(
                                         BuildResult {
@@ -444,6 +525,8 @@ async fn session(
                                     )));
                                 }
                                 build.cleanup();
+                                ctx.running
+                                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                             });
                         }
                     }
@@ -515,6 +598,17 @@ struct ActiveBuild {
     pending: HashSet<String>,
     nar_unpackers: HashMap<String, Unpacker>,
     tmp_unpacker: Option<Unpacker>,
+    /// Cache bases this build pinned against eviction; released on Drop
+    /// (covers execute, abort, and every error path).
+    pinned: HashSet<String>,
+}
+
+impl Drop for ActiveBuild {
+    fn drop(&mut self) {
+        for base in &self.pinned {
+            self.ctx.unpin(base);
+        }
+    }
 }
 
 fn store_base(store_path: &str) -> &str {
@@ -536,11 +630,21 @@ impl ActiveBuild {
             pending: HashSet::new(),
             nar_unpackers: HashMap::new(),
             tmp_unpacker: None,
+            pinned: HashSet::new(),
         })
     }
 
+    /// Pin a cache entry for this build's lifetime so eviction (from
+    /// any concurrent build's install) cannot pull it out from under us.
+    fn pin(&mut self, base: &str) {
+        if self.pinned.insert(base.to_string()) {
+            self.ctx.pin(base);
+        }
+    }
+
     fn negotiate(&mut self, offered: &[String]) -> Result<Vec<String>> {
-        let state_dir = &self.ctx.state_dir;
+        // cloned: self.pin() below needs &mut self
+        let state_dir = self.ctx.state_dir.clone();
         let mut missing = Vec::new();
         for p in offered {
             // Only real store paths may become bind-mount sources; a
@@ -551,7 +655,7 @@ impl ActiveBuild {
             }
             let host = PathBuf::from(p);
             let cached = state_dir.join("store").join(store_base(p));
-            let marker = cache_marker(state_dir, store_base(p));
+            let marker = cache_marker(&state_dir, store_base(p));
             // symlink_metadata: store paths that are dangling symlinks
             // are legitimate and must count as present.
             if host.symlink_metadata().is_ok() {
@@ -561,6 +665,7 @@ impl ActiveBuild {
                 if let Ok(f) = std::fs::File::options().write(true).open(&marker) {
                     let _ = f.set_modified(std::time::SystemTime::now());
                 }
+                self.pin(store_base(p));
                 self.sources.insert(p.clone(), cached);
             } else {
                 self.pending.insert(p.clone());
@@ -571,16 +676,21 @@ impl ActiveBuild {
     }
 
     async fn feed_nar(&mut self, n: NarTransfer) -> Result<()> {
-        let state_dir = &self.ctx.state_dir;
+        // cloned: self.pin() below needs &mut self
+        let state_dir = self.ctx.state_dir.clone();
         if !self.pending.contains(&n.store_path) && !self.nar_unpackers.contains_key(&n.store_path)
         {
             bail!("hub sent NAR for unrequested path {}", n.store_path);
         }
         // Staging name starts with ".": disjoint from finished cache
         // entries, because valid store names never start with a dot.
-        let partial = state_dir
-            .join("store")
-            .join(format!(".tmp-{}", store_base(&n.store_path)));
+        // The build id keeps concurrent transfers of the same input
+        // from writing into one staging tree.
+        let partial = state_dir.join("store").join(format!(
+            ".tmp-{}-{}",
+            self.assignment.build_id,
+            store_base(&n.store_path)
+        ));
         let (tx, _) = self
             .nar_unpackers
             .entry(n.store_path.clone())
@@ -610,18 +720,19 @@ impl ActiveBuild {
             let (tx, task) = self.nar_unpackers.remove(&n.store_path).unwrap();
             drop(tx);
             task.await??;
-            let in_use: HashSet<String> = self
-                .sources
-                .values()
-                .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-                .collect();
-            let cached = cache_install(
-                state_dir,
-                &partial,
-                store_base(&n.store_path),
-                self.ctx.cache_max_bytes,
-                &in_use,
-            )?;
+            let base = store_base(&n.store_path).to_string();
+            // pin before install: no window where the entry is evictable
+            self.pin(&base);
+            let cached = {
+                let _guard = self.ctx.cache_lock.lock().unwrap();
+                cache_install(
+                    &state_dir,
+                    &partial,
+                    &base,
+                    self.ctx.cache_max_bytes,
+                    &self.ctx.pinned_bases(),
+                )?
+            };
             self.pending.remove(&n.store_path);
             self.sources.insert(n.store_path, cached);
         }
@@ -666,6 +777,18 @@ impl ActiveBuild {
         timeout: std::time::Duration,
     ) -> Result<()> {
         let a = &self.assignment;
+        // Serialize macOS builds sharing the global /build symlink;
+        // Linux mounts it inside a private namespace, no lock needed.
+        let _link_guard = if cfg!(target_os = "macos") && a.tmp_dir_in_sandbox == "/build" {
+            Some(
+                self.ctx
+                    .shared_link_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            )
+        } else {
+            None
+        };
         let mut spec = sandbox::prepare(
             a,
             &self.dir,

@@ -71,6 +71,9 @@ enum Command {
         /// cgroup, e.g. systemd Delegate=yes). Unlimited when unset.
         #[arg(long)]
         build_memory_max_bytes: Option<u64>,
+        /// Concurrent build slots.
+        #[arg(long, default_value_t = 1)]
+        max_jobs: u32,
     },
     /// Certificate authority management (init CA, issue worker certs).
     Ca {
@@ -105,6 +108,7 @@ fn main() -> anyhow::Result<()> {
             sandbox_bin_sh,
             cache_max_bytes,
             build_memory_max_bytes,
+            max_jobs,
         } => {
             if systems.is_empty() {
                 systems.push(worker::host_system());
@@ -120,6 +124,7 @@ fn main() -> anyhow::Result<()> {
                 sandbox_bin_sh,
                 cache_max_bytes,
                 build_memory_max: build_memory_max_bytes,
+                max_jobs,
             })
         }
         Command::Ca { action } => ca::run(action),
