@@ -22,6 +22,10 @@ use anyhow::{Context, Result};
 use crate::proto::BuildAssignment;
 use crate::worker::binfmt;
 
+/// Address pasta's in-namespace DNS forwarder listens on; written to
+/// the sandbox resolv.conf for fixed-output builds.
+pub const PASTA_DNS: &str = "169.254.1.53";
+
 pub struct SandboxSpec {
     pub builder: String,
     /// Derivation system, e.g. "i686-linux" (drives Linux personality).
@@ -53,6 +57,16 @@ pub struct SandboxSpec {
     /// uid mapped to 1000, like Nix without auto-allocate-uids.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub uid_range: Option<u32>,
+    /// Root workers: unprivileged host uid backing fixed-output builds
+    /// (pasta is rootless-only; network builds should not be backed by
+    /// host root anyway).
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub fod_uid: Option<u32>,
+    /// pasta binary: fixed-output builds get a private netns with
+    /// user-mode NAT; host abstract sockets and loopback services
+    /// stay unreachable.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub pasta: Option<PathBuf>,
     /// Static emulator binary for foreign-system builds, bound at
     /// binfmt::INTERP_PATH and registered in a per-userns binfmt_misc
     /// instance (Linux only).
@@ -74,14 +88,22 @@ pub fn output_host_path(spec: &SandboxSpec, scratch: &str) -> PathBuf {
     }
 }
 
+/// Worker-side sandbox configuration for one build.
+#[derive(Default)]
+pub struct PrepareOpts<'a> {
+    pub bin_sh: Option<&'a Path>,
+    pub secrets: &'a [PathBuf],
+    pub uid_range: Option<u32>,
+    pub emulator: Option<&'a Path>,
+    pub pasta: Option<&'a Path>,
+    pub fod_uid: Option<u32>,
+}
+
 pub fn prepare(
     a: &BuildAssignment,
     dir: &Path,
     sources: &HashMap<String, PathBuf>,
-    bin_sh: Option<&Path>,
-    secrets: &[PathBuf],
-    uid_range: Option<u32>,
-    emulator: Option<&Path>,
+    opts: &PrepareOpts,
 ) -> Result<SandboxSpec> {
     let build_dir = dir.join("top").join("build");
     std::fs::create_dir_all(&build_dir)?;
@@ -101,16 +123,18 @@ pub fn prepare(
         binds_dev: Vec::new(),
         outputs: a.outputs.values().cloned().collect(),
         cgroup: None,
-        uid_range,
-        emulator: emulator.map(Path::to_path_buf),
-        deny_read: secrets.to_vec(),
+        uid_range: opts.uid_range,
+        fod_uid: opts.fod_uid.filter(|_| a.fixed_output),
+        pasta: opts.pasta.filter(|_| a.fixed_output).map(Path::to_path_buf),
+        emulator: opts.emulator.map(Path::to_path_buf),
+        deny_read: opts.secrets.to_vec(),
     };
     if cfg!(target_os = "linux") {
-        if let Some(em) = emulator {
+        if let Some(em) = opts.emulator {
             spec.binds_ro
                 .push((em.to_owned(), PathBuf::from(binfmt::INTERP_PATH)));
         }
-        if let Some(sh) = bin_sh {
+        if let Some(sh) = opts.bin_sh {
             // Like Nix's busybox sandbox path: shebangs and system(3)
             // need a shell at /bin/sh.
             spec.binds_ro
@@ -205,14 +229,37 @@ mod platform {
                 root.join("etc/nsswitch.conf"),
                 "hosts: files dns\nservices: files\n",
             )?;
-            for f in ["resolv.conf", "services", "hosts"] {
+            for f in ["services", "hosts"] {
                 if let Ok(data) = std::fs::read(Path::new("/etc").join(f)) {
                     std::fs::write(root.join("etc").join(f), data)?;
                 }
             }
+            if spec.pasta.is_some() {
+                // pasta forwards DNS on this address; the host
+                // resolv.conf may point at an unreachable loopback
+                // stub (systemd-resolved).
+                std::fs::write(
+                    root.join("etc/resolv.conf"),
+                    format!("nameserver {PASTA_DNS}\n"),
+                )?;
+            } else if let Ok(data) = std::fs::read("/etc/resolv.conf") {
+                std::fs::write(root.join("etc/resolv.conf"), data)?;
+            }
             let ca = Path::new("/etc/ssl/certs/ca-certificates.crt");
             if let Ok(real) = ca.canonicalize() {
                 spec.binds_ro.push((real, ca.to_path_buf()));
+            }
+        }
+        if let Some(uid) = spec.fod_uid {
+            // The dropped-uid process performs every mount itself, so it
+            // must own the whole per-build dir; 0700 keeps other FOD
+            // uids out.
+            if let Some(build_root) = root.parent() {
+                chown_recursive(build_root, uid)?;
+                std::fs::set_permissions(
+                    build_root,
+                    std::os::unix::fs::PermissionsExt::from_mode(0o700),
+                )?;
             }
         }
         if let Some(base) = spec.uid_range {
@@ -285,6 +332,7 @@ mod platform {
         let has_cgroup = spec.cgroup.is_some();
         let cwd = spec.cwd.clone();
         let network = spec.network;
+        let pasta = spec.pasta.clone();
         let system = spec.system.clone();
         let binfmt_line = match &spec.emulator {
             Some(_) => Some(binfmt::register_line(&spec.system).ok_or_else(|| {
@@ -295,16 +343,19 @@ mod platform {
         // Single uid 1000 (Nix default) or, for uid-range builds,
         // in-namespace root over a 65536-uid block. Emulated builds map
         // uid 0 for the binfmt registration, dropped to 1000 in setup().
+        let backing_uid = spec.fod_uid.unwrap_or_else(|| getuid().as_raw());
+        let backing_gid = spec.fod_uid.unwrap_or_else(|| getgid().as_raw());
         let (sandbox_uid, host_uid, uid_count) = match spec.uid_range {
             Some(base) => (0, base, 65536u32),
-            None if binfmt_line.is_some() => (0, getuid().as_raw(), 1),
-            None => (1000, getuid().as_raw(), 1),
+            None if binfmt_line.is_some() => (0, backing_uid, 1),
+            None => (1000, backing_uid, 1),
         };
         let (sandbox_gid, host_gid) = match spec.uid_range {
             Some(base) => (0, base),
-            None if binfmt_line.is_some() => (0, getgid().as_raw()),
-            None => (100, getgid().as_raw()),
+            None if binfmt_line.is_some() => (0, backing_gid),
+            None => (100, backing_gid),
         };
+        let fod_uid = spec.fod_uid;
 
         // Pre-open the error file: an fd keeps working after pivot_root
         // detaches the host filesystem, a path would not.
@@ -321,6 +372,8 @@ mod platform {
                     root: &root,
                     system: &system,
                     binfmt_line: binfmt_line.as_deref(),
+                    pasta: pasta.as_deref(),
+                    fod_uid,
                     build_dir: &build_dir,
                     binds: &binds,
                     binds_dev: &binds_dev,
@@ -421,6 +474,75 @@ mod platform {
         }
     }
 
+    struct PastaHelper {
+        child: nix::unistd::Pid,
+        req_w: std::os::fd::OwnedFd,
+    }
+
+    /// Fork a helper that stays in the host namespaces and execs pasta
+    /// against this process once [`PastaHelper::attach`] is called
+    /// (after unshare). pasta's parent exits once the namespace is
+    /// configured, so waiting for the helper is the readiness barrier.
+    fn fork_pasta_helper(bin: &Path) -> io::Result<PastaHelper> {
+        let target = nix::unistd::getpid();
+        let (req_r, req_w) = nix::unistd::pipe().map_err(ioerr("pipe"))?;
+        match unsafe { nix::unistd::fork() }.map_err(ioerr("fork pasta helper"))? {
+            nix::unistd::ForkResult::Child => {
+                let mut buf = [0u8; 1];
+                let ok = nix::unistd::read(&req_r, &mut buf)
+                    .map(|n| n == 1)
+                    .unwrap_or(false);
+                if !ok {
+                    // build process died before signaling; nothing to do
+                    unsafe { libc::_exit(1) }
+                }
+                // pasta's default port forwarding and host-loopback
+                // mapping splice host services into the namespace, the
+                // exact leak the private netns is meant to close.
+                let args: Vec<std::ffi::CString> = [
+                    bin.to_string_lossy().as_ref(),
+                    "--config-net",
+                    "--quiet",
+                    "--dns-forward",
+                    super::PASTA_DNS,
+                    "-t",
+                    "none",
+                    "-u",
+                    "none",
+                    "-T",
+                    "none",
+                    "-U",
+                    "none",
+                    "--map-host-loopback",
+                    "none",
+                    &target.to_string(),
+                ]
+                .iter()
+                .map(|s| std::ffi::CString::new(*s).unwrap())
+                .collect();
+                let _ = nix::unistd::execv(&args[0], &args);
+                unsafe { libc::_exit(127) }
+            }
+            nix::unistd::ForkResult::Parent { child } => {
+                drop(req_r);
+                Ok(PastaHelper { child, req_w })
+            }
+        }
+    }
+
+    impl PastaHelper {
+        fn attach(self) -> io::Result<()> {
+            use nix::sys::wait::{waitpid, WaitStatus};
+            nix::unistd::write(&self.req_w, b"x").map_err(ioerr("signaling pasta helper"))?;
+            match waitpid(self.child, None) {
+                Ok(WaitStatus::Exited(_, 0)) => Ok(()),
+                other => Err(io::Error::other(format!(
+                    "pasta failed to attach to the build netns: {other:?}"
+                ))),
+            }
+        }
+    }
+
     /// Bring the loopback interface up. A fresh network namespace has
     /// `lo` down; builders that talk to 127.0.0.1 (test suites) would
     /// otherwise fail, unlike under Nix's own sandbox.
@@ -479,6 +601,8 @@ mod platform {
         root: &'a Path,
         system: &'a str,
         binfmt_line: Option<&'a str>,
+        pasta: Option<&'a Path>,
+        fod_uid: Option<u32>,
         build_dir: &'a Path,
         binds: &'a [(PathBuf, PathBuf)],
         binds_dev: &'a [(PathBuf, PathBuf)],
@@ -497,6 +621,8 @@ mod platform {
             root,
             system,
             binfmt_line,
+            pasta,
+            fod_uid,
             build_dir,
             binds,
             binds_dev,
@@ -514,9 +640,28 @@ mod platform {
             | CloneFlags::CLONE_NEWPID
             | CloneFlags::CLONE_NEWIPC
             | CloneFlags::CLONE_NEWUTS;
-        if !network {
+        // Network builds keep the host namespace only without pasta;
+        // with it they get a private one plus user-mode NAT.
+        // Drop host root before creating any namespace, so the userns
+        // is owned by the unprivileged uid and rootless pasta can
+        // attach to it.
+        if let Some(uid) = fod_uid {
+            nix::unistd::setgroups(&[]).map_err(ioerr("fod setgroups"))?;
+            nix::unistd::setgid(nix::unistd::Gid::from_raw(uid)).map_err(ioerr("fod setgid"))?;
+            nix::unistd::setuid(nix::unistd::Uid::from_raw(uid)).map_err(ioerr("fod setuid"))?;
+            // setuid cleared the dumpable flag, which makes /proc/self
+            // root-owned; restore it so the uid/gid map writes below
+            // (and pasta's /proc access) work.
+            nix::sys::prctl::set_dumpable(true).map_err(ioerr("set_dumpable"))?;
+        }
+        let private_net = !network || pasta.is_some();
+        if private_net {
             flags |= CloneFlags::CLONE_NEWNET;
         }
+        let pasta_helper = match pasta {
+            Some(bin) if network => Some(fork_pasta_helper(bin)?),
+            _ => None,
+        };
         if has_cgroup {
             // Cgroup namespace rooted at the just-entered build cgroup:
             // the cgroup2 mount below then exposes only the build's own
@@ -556,8 +701,11 @@ mod platform {
         if unsafe { libc::setdomainname(c"(none)".as_ptr(), 6) } == -1 {
             return Err(io::Error::last_os_error());
         }
-        if !network {
+        if private_net {
             loopback_up().map_err(werr("bringing lo up"))?;
+        }
+        if let Some(helper) = pasta_helper {
+            helper.attach()?;
         }
 
         // CLONE_NEWPID only applies to children: fork so the builder
@@ -939,6 +1087,8 @@ mod tests {
             outputs: vec![],
             cgroup: None,
             uid_range: None,
+            fod_uid: None,
+            pasta: None,
             emulator: None,
             deny_read: vec![],
         };

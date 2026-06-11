@@ -108,7 +108,12 @@ Reference implementations: `nix/src/libstore/unix/build/` and
   system=/path/to/static-qemu` advertises foreign systems; such builds
   get the emulator bound into the sandbox and registered in a per-userns
   binfmt_misc instance (kernel 6.7+); a nested user namespace drops the
-  registration-time root back to uid 1000 for the build.
+  registration-time root back to uid 1000 for the build. With a pasta
+  binary configured (baked in by the Nix package), fixed-output builds
+  get a private network namespace with user-mode NAT instead of the
+  host namespace: host abstract sockets and loopback services are
+  unreachable, and root workers back such builds with an unprivileged
+  uid.
 * macOS: no mount namespace, so inputs are materialized in the host
   /nix/store, `/build` is a symlink to the build dir, and the builder
   runs under `/usr/bin/sandbox-exec` with a deny-default write profile

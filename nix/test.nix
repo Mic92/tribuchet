@@ -19,10 +19,20 @@ in
 
   nodes = {
     hub =
-      { pkgs, ... }:
       {
-        environment.systemPackages = [ tribuchet ];
-        networking.firewall.allowedTCPPorts = [ 7437 ];
+        pkgs,
+        nodes,
+        ...
+      }:
+      {
+        environment.systemPackages = [
+          tribuchet
+          pkgs.socat
+        ];
+        networking.firewall.allowedTCPPorts = [
+          7437
+          8765
+        ];
         virtualisation.writableStore = true;
         # container eval and closure streaming need room
         virtualisation.memorySize = 4096;
@@ -86,6 +96,33 @@ in
           }
         '';
 
+        # Fetches from the hub's HTTP server through pasta and asserts
+        # the worker's loopback service is unreachable from the sandbox.
+        environment.etc."tt/fod.nix".text = ''
+          let
+            bash = builtins.storePath "${pkgs.bash}";
+          in
+          derivation {
+            name = "tt-fod";
+            system = "x86_64-linux";
+            builder = bash + "/bin/bash";
+            args = [
+              "-c"
+              '''
+                if (exec 3<>/dev/tcp/127.0.0.1/9999) 2>/dev/null; then
+                  echo "worker loopback leaked into FOD netns" >&2
+                  exit 1
+                fi
+                exec 3<>/dev/tcp/${nodes.hub.networking.primaryIPAddress}/8765
+                while IFS= read -r l <&3; do printf '%s\n' "$l"; done > $out
+              '''
+            ];
+            outputHashAlgo = "sha256";
+            outputHashMode = "flat";
+            outputHash = "fba0ea84c93fbcbfff10a9b33bc33409b5fd15eff0540b7b4389d691cde59fe8";
+          }
+        '';
+
         environment.etc."tt/cross.nix".text = ''
           let
             busybox = builtins.storePath "${pkgs.pkgsCross.aarch64-multiplatform.pkgsStatic.busybox}";
@@ -116,7 +153,10 @@ in
     worker =
       { pkgs, ... }:
       {
-        environment.systemPackages = [ tribuchet ];
+        environment.systemPackages = [
+          tribuchet
+          pkgs.python3
+        ];
         # Private store image instead of the shared host store, so input
         # paths the worker lacks really travel over the wire.
         virtualisation.useNixStoreImage = true;
@@ -199,6 +239,18 @@ in
     with subtest("uid-range build runs as sandbox root with a cgroup"):
         out = hub.succeed("nix-build /etc/tt/uidrange.nix --no-out-link").strip()
         hub.succeed(f"grep -q uid-range-ok {out}")
+
+    with subtest("fixed-output build fetches through pasta, isolated from host sockets"):
+        hub.succeed("mkdir -p /srv/fod && echo hello-fod > /srv/fod/data")
+        hub.succeed(
+            "systemd-run --unit=fodsrv socat -U TCP-LISTEN:8765,fork,reuseaddr OPEN:/srv/fod/data,rdonly"
+        )
+        hub.wait_for_open_port(8765)
+        # loopback service on the worker that must NOT be reachable
+        worker.succeed("systemd-run --unit=loopsrv python3 -m http.server 9999 --bind 127.0.0.1")
+        worker.wait_for_open_port(9999)
+        out = hub.succeed("nix-build /etc/tt/fod.nix --no-out-link").strip()
+        hub.succeed(f"grep -q hello-fod {out}")
 
     with subtest("aarch64 build runs under per-sandbox binfmt emulation"):
         out = hub.succeed("nix-build /etc/tt/cross.nix --no-out-link").strip()

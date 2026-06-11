@@ -15,14 +15,20 @@
     in
     {
       packages = forAllSystems (pkgs: {
-        default = pkgs.rustPlatform.buildRustPackage {
-          pname = "tribuchet";
-          version = "0.1.0";
-          src = self;
-          cargoLock.lockFile = ./Cargo.lock;
-          nativeBuildInputs = [ pkgs.protobuf ];
-          PROTOC = "${pkgs.protobuf}/bin/protoc";
-        };
+        default = pkgs.rustPlatform.buildRustPackage (
+          {
+            pname = "tribuchet";
+            version = "0.1.0";
+            src = self;
+            cargoLock.lockFile = ./Cargo.lock;
+            nativeBuildInputs = [ pkgs.protobuf ];
+            PROTOC = "${pkgs.protobuf}/bin/protoc";
+          }
+          // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+            # default network backend for fixed-output builds
+            TRIBUCHET_PASTA = "${pkgs.passt}/bin/pasta";
+          }
+        );
       });
 
       checks.x86_64-linux.nixos-test = nixpkgs.legacyPackages.x86_64-linux.testers.runNixOSTest (

@@ -83,6 +83,11 @@ enum Command {
         /// (repeatable; Linux, kernel 6.7+).
         #[arg(long)]
         emulate: Vec<String>,
+        /// pasta binary; fixed-output builds then get a private network
+        /// namespace with user-mode NAT (Linux). Defaults to the path
+        /// baked in at build time, if any; "none" disables it.
+        #[arg(long)]
+        pasta: Option<PathBuf>,
     },
     /// Certificate authority management (init CA, issue worker certs).
     Ca {
@@ -120,10 +125,16 @@ fn main() -> anyhow::Result<()> {
             max_jobs,
             auto_allocate_uids_base,
             emulate,
+            pasta,
         } => {
             if systems.is_empty() {
                 systems.push(worker::host_system());
             }
+            let pasta = match pasta {
+                Some(p) if p.as_os_str() == "none" => None,
+                Some(p) => Some(p),
+                None => option_env!("TRIBUCHET_PASTA").map(PathBuf::from),
+            };
             worker::run(worker::WorkerOpts {
                 hub,
                 state_dir,
@@ -138,6 +149,7 @@ fn main() -> anyhow::Result<()> {
                 max_jobs,
                 auto_allocate_uids_base,
                 emulate,
+                pasta,
             })
         }
         Command::Ca { action } => ca::run(action),

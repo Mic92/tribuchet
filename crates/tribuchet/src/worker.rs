@@ -59,6 +59,8 @@ pub struct WorkerOpts {
     /// advertised to the hub and its builds run under a per-sandbox
     /// binfmt_misc registration (Linux, kernel 6.7+).
     pub emulate: Vec<String>,
+    /// pasta binary for fixed-output network isolation (Linux).
+    pub pasta: Option<PathBuf>,
 }
 
 /// Per-process context threaded through builds.
@@ -81,6 +83,8 @@ struct WorkerCtx {
     running: std::sync::atomic::AtomicU32,
     /// system -> static emulator binary, from --emulate.
     emulators: HashMap<String, PathBuf>,
+    /// pasta binary for fixed-output network isolation.
+    pasta: Option<PathBuf>,
     /// Slot i maps the uid block [uid_base + i*65536, 65536); disjoint
     /// blocks keep concurrent uid-range builds apart.
     uid_base: u32,
@@ -370,8 +374,10 @@ async fn run_async(opts: WorkerOpts) -> Result<()> {
     for sub in ["store", "builds"] {
         let dir = opts.state_dir.join(sub);
         std::fs::create_dir_all(&dir)?;
-        // Shipped tmp dirs and staged NARs are not for other local users.
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        // Traverse-only: dropped-uid FOD builds must reach their own
+        // build tree and cached inputs, but other local users get no
+        // listing; per-build dirs are chowned and locked down further.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o711))?;
     }
     sweep_state_dir(&opts.state_dir);
     let signing_key = load_signing_key(&opts.state_dir)?;
@@ -396,6 +402,14 @@ async fn run_async(opts: WorkerOpts) -> Result<()> {
         }
         emulators.insert(system.to_string(), path);
     }
+    if let Some(p) = &opts.pasta {
+        if !cfg!(target_os = "linux") {
+            anyhow::bail!("--pasta requires Linux (network namespaces)");
+        }
+        if !p.is_file() {
+            anyhow::bail!("--pasta: {} not found", p.display());
+        }
+    }
     let opts = opts;
     let ctx = std::sync::Arc::new(WorkerCtx {
         state_dir: opts.state_dir.clone(),
@@ -412,6 +426,7 @@ async fn run_async(opts: WorkerOpts) -> Result<()> {
         pinned: std::sync::Mutex::new(HashMap::new()),
         running: std::sync::atomic::AtomicU32::new(0),
         emulators,
+        pasta: opts.pasta.clone(),
         uid_base: opts.auto_allocate_uids_base,
         uid_slots: std::sync::Mutex::new(vec![false; opts.max_jobs.max(1) as usize]),
         shared_link_lock: std::sync::Mutex::new(()),
@@ -890,14 +905,30 @@ impl ActiveBuild {
         } else {
             None
         };
+        // Root workers back fixed-output builds with an unprivileged
+        // slot uid (pasta is rootless-only; see SandboxSpec::fod_uid).
+        let fod_slot = if a.fixed_output
+            && self.ctx.pasta.is_some()
+            && uid_slot.is_none()
+            && cfg!(target_os = "linux")
+            && nix::unistd::geteuid().is_root()
+        {
+            Some(self.ctx.alloc_uid_slot().context("no free uid slot")?)
+        } else {
+            None
+        };
         let mut spec = sandbox::prepare(
             a,
             &self.dir,
             &self.sources,
-            self.ctx.sandbox_bin_sh.as_deref(),
-            &self.ctx.secret_paths,
-            uid_slot.as_ref().map(|s| s.base),
-            self.ctx.emulators.get(&a.system).map(PathBuf::as_path),
+            &sandbox::PrepareOpts {
+                bin_sh: self.ctx.sandbox_bin_sh.as_deref(),
+                secrets: &self.ctx.secret_paths,
+                uid_range: uid_slot.as_ref().map(|s| s.base),
+                emulator: self.ctx.emulators.get(&a.system).map(PathBuf::as_path),
+                pasta: self.ctx.pasta.as_deref(),
+                fod_uid: fod_slot.as_ref().map(|s| s.base),
+            },
         )?;
         spec.cgroup = self
             .ctx
