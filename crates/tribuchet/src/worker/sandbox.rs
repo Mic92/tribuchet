@@ -517,24 +517,39 @@ mod platform {
     }
 
     pub fn command(spec: &SandboxSpec) -> Result<Command> {
+        // Reads stay broad (matching Nix's Darwin sandbox) except for
+        // the worker's key material; writes and signals are scoped:
+        // unfiltered `(allow signal)` would let builds kill worker-uid
+        // host processes, and `(subpath \"/dev\")` write access meant
+        // raw-disk writes for a root worker.
         let mut profile = String::from(
             "(version 1)\n\
              (deny default)\n\
              (allow process*)\n\
-             (allow signal)\n\
+             (allow signal (target same-sandbox))\n\
              (allow sysctl-read)\n\
              (allow mach-lookup)\n\
              (allow file-read*)\n\
              (allow file-ioctl)\n",
         );
+        for secret in &spec.deny_read {
+            profile.push_str(&format!(
+                "(deny file-read* (literal \"{}\"))\n",
+                sb_escape(&secret.to_string_lossy())?
+            ));
+        }
         profile.push_str("(allow file-write*\n");
-        for path in [
-            spec.cwd.as_str(),
-            &spec.build_dir.to_string_lossy(),
-            "/private/tmp",
-            "/dev",
-        ] {
+        for path in [spec.cwd.as_str(), &spec.build_dir.to_string_lossy()] {
             profile.push_str(&format!("  (subpath \"{}\")\n", sb_escape(path)?));
+        }
+        for dev in [
+            "/dev/null",
+            "/dev/zero",
+            "/dev/random",
+            "/dev/urandom",
+            "/dev/tty",
+        ] {
+            profile.push_str(&format!("  (literal \"{dev}\")\n"));
         }
         for out in &spec.outputs {
             profile.push_str(&format!("  (subpath \"{}\")\n", sb_escape(out)?));
