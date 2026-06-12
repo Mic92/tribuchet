@@ -22,7 +22,6 @@ use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::chunkio::ChunkWriter;
-use crate::nar;
 use crate::proto::{
     attach_event, attach_hub_server, hub_message, nar_transfer, worker_message, AttachEvent,
     BuildAssignment, BuildRequest, HubMessage, NarTransfer, OutputNar, PathInfoMsg, PathOffer,
@@ -847,34 +846,40 @@ async fn query_path_infos(paths: &[String]) -> Result<Vec<PathInfoMsg>> {
     Ok(out)
 }
 
-/// NAR-pack a local store path, zstd-compress, and stream it to the worker.
+/// NAR-pack a local store path, zstd-compress, and stream it to the
+/// worker. Filesystem reads run on harmonia's blocking pool; the zstd
+/// level-3 encode here is cheap relative to the per-chunk awaits.
 async fn stream_store_path(
     build_id: &str,
     store_path: &str,
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
 ) -> Result<()> {
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
-    let path = PathBuf::from(store_path);
-    let task = tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut enc = zstd::stream::write::Encoder::new(ChunkWriter::new(tx), 3)?;
-        nar::pack(&path, &mut enc)?;
-        enc.finish()?.flush()?;
-        Ok(())
-    });
-    while let Some(chunk) = rx.recv().await {
+    use tokio::io::AsyncReadExt as _;
+    let nar = harmonia_file_nar::archive::NarByteStream::new(PathBuf::from(store_path));
+    let mut enc = async_compression::tokio::bufread::ZstdEncoder::with_quality(
+        tokio_util::io::StreamReader::new(nar),
+        async_compression::Level::Precise(3),
+    );
+    let mut buf = vec![0u8; crate::chunkio::CHUNK_SIZE];
+    loop {
+        let n = enc
+            .read(&mut buf)
+            .await
+            .with_context(|| format!("packing {store_path}"))?;
+        if n == 0 {
+            break;
+        }
         send(
             out_tx,
             hub_message::Msg::Nar(NarTransfer {
                 build_id: build_id.into(),
                 store_path: store_path.into(),
-                payload: Some(nar_transfer::Payload::ZstdNarChunk(chunk)),
+                payload: Some(nar_transfer::Payload::ZstdNarChunk(buf[..n].to_vec())),
                 eof: false,
             }),
         )
         .await?;
     }
-    task.await?
-        .with_context(|| format!("packing {store_path}"))?;
     send(
         out_tx,
         hub_message::Msg::Nar(NarTransfer {

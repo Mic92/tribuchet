@@ -16,7 +16,6 @@ use tonic::transport::{Endpoint, Uri};
 use tower::service_fn;
 
 use crate::build_json::BuildJson;
-use crate::chunkio::ChannelReader;
 use crate::nar;
 use crate::proto::{attach_event, attach_hub_client::AttachHubClient, BuildRequest};
 
@@ -89,11 +88,7 @@ async fn run_async(build: BuildJson, socket: PathBuf) -> Result<i32> {
                     // eof: the scratch path never holds a partial or
                     // unverified tree.
                     let tmp = unpack_temp_path(&out.store_path);
-                    let task = tokio::task::spawn_blocking(move || -> Result<()> {
-                        let mut dec = zstd::stream::read::Decoder::new(ChannelReader::new(rx))?;
-                        nar::unpack(&mut dec, &tmp)
-                            .with_context(|| format!("unpacking {}", tmp.display()))
-                    });
+                    let task = tokio::spawn(async move { nar::unpack_zstd_chunks(rx, &tmp).await });
                     (tx, task)
                 });
                 if !out.zstd_nar_chunk.is_empty() {
