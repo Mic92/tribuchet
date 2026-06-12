@@ -126,7 +126,16 @@ struct Job {
     /// requiredSystemFeatures; only workers advertising them get the job.
     features: Vec<String>,
     replay: Arc<Replay>,
+    /// Times the job went back to the queue after its worker session
+    /// died; capped so a crash-looping build cannot bounce forever.
+    attempts: u32,
+    /// Set on requeue: protects the job from fail_unservable() while
+    /// its worker reconnects (reload or crash respawn).
+    requeued_at: Option<std::time::Instant>,
 }
+
+/// A worker-session loss requeues a job at most this many times.
+const MAX_JOB_ATTEMPTS: u32 = 3;
 
 #[derive(Default)]
 struct Inflight {
@@ -221,7 +230,11 @@ impl HubState {
         let mut kept = VecDeque::with_capacity(queue.len());
         let mut failed = Vec::new();
         for j in queue.drain(..) {
-            if caps.iter().any(|c| c.serves(&j.req.system, &j.features)) {
+            // Requeued jobs get a grace period: their worker is mid
+            // reload/restart and will re-announce them; a delayed
+            // recheck is scheduled at requeue time.
+            let protected = j.requeued_at.is_some_and(|t| t.elapsed() < WORKER_GRACE);
+            if protected || caps.iter().any(|c| c.serves(&j.req.system, &j.features)) {
                 kept.push_back(j);
             } else {
                 failed.push(j);
@@ -485,6 +498,8 @@ impl attach_hub_server::AttachHub for AttachSvc {
                 req,
                 features,
                 replay: replay.clone(),
+                attempts: 0,
+                requeued_at: None,
             };
             tracing::info!(id = job.id, system = job.req.system, "queueing build");
             self.state.queue.lock().await.push_back(job);
@@ -735,17 +750,41 @@ async fn worker_loop(
         let out_tx = out_tx.clone();
         let vkey = vkey.clone();
         tokio::spawn(async move {
-            match run_job(&state, &job, &vkey, &out_tx, in_rx).await {
-                Ok(()) => {}
-                Err(e) => {
-                    tracing::warn!(id = job.id, "build failed: {e:#}");
-                    job.replay
-                        .publish(attach_event::Event::Error(format!("{e:#}")))
-                        .await;
+            let err = match run_job(&state, &job, &vkey, &out_tx, in_rx).await {
+                Ok(()) => {
+                    router.unregister(&job.id);
+                    state.finish(&job).await;
+                    return;
                 }
-            }
+                Err(e) => e,
+            };
             router.unregister(&job.id);
-            state.finish(&job).await;
+            // A dead worker session is not a build verdict: requeue so
+            // the worker (or its replacement) can resume the build by
+            // dedupe key, or another worker can start over.
+            if out_tx.is_closed() && job.attempts < MAX_JOB_ATTEMPTS {
+                tracing::warn!(
+                    id = job.id,
+                    "worker session lost; requeueing build: {err:#}"
+                );
+                let mut job = job;
+                job.attempts += 1;
+                job.requeued_at = Some(std::time::Instant::now());
+                state.queue.lock().await.push_back(job);
+                state.notify.notify_waiters();
+                // Re-evaluate once the grace expired, or the job would
+                // strand forever if no worker ever returns.
+                tokio::spawn(async move {
+                    tokio::time::sleep(WORKER_GRACE + std::time::Duration::from_secs(1)).await;
+                    state.fail_unservable().await;
+                });
+            } else {
+                tracing::warn!(id = job.id, "build failed: {err:#}");
+                job.replay
+                    .publish(attach_event::Event::Error(format!("{err:#}")))
+                    .await;
+                state.finish(&job).await;
+            }
         });
     }
     // Builds in flight fail through their closed router channels.
@@ -1331,6 +1370,8 @@ mod tests {
             },
             features: vec![],
             replay: replay.clone(),
+            attempts: 0,
+            requeued_at: None,
         };
         state.queue.lock().await.push_back(job);
         state.fail_unservable().await;
