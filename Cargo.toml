@@ -33,6 +33,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 time = "0.3"
 zstd = "0.13"
 futures-util = "0.3"
+async-compression = { version = "0.4", features = ["tokio", "zstd"] }
+tokio-util = { version = "0.7", features = ["io"] }
+bytes = "1"
 harmonia-file-nar = { git = "https://github.com/nix-community/harmonia", rev = "f0dd1094cdc8d72e038cf9347cacfa9272a8f72d" }
 harmonia-store-path = { git = "https://github.com/nix-community/harmonia", rev = "f0dd1094cdc8d72e038cf9347cacfa9272a8f72d" }
 harmonia-store-path-info = { git = "https://github.com/nix-community/harmonia", rev = "f0dd1094cdc8d72e038cf9347cacfa9272a8f72d" }

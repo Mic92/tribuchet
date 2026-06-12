@@ -1,9 +1,12 @@
-//! `tribuchet worker`: dials the hub over mTLS, caches input paths,
-//! executes builds in a local sandbox, signs and returns output NARs.
+//! `tribuchet worker`: dials the hub over mTLS, imports input paths
+//! into the local /nix/store via the Nix daemon, executes builds in a
+//! local sandbox, signs and returns output NARs.
 //!
-//! Input sources, in order of preference:
-//! 1. the host's own /nix/store (read-only seed; no transfer needed)
-//! 2. the worker cache (`state_dir/store`), filled from hub NAR streams
+//! Inputs the local store already has (per the daemon) are reused;
+//! missing ones are imported from hub NAR streams with AddToStoreNar,
+//! so they are registered in the Nix database and protected from GC
+//! by per-build temp roots. The worker user must be trusted by the
+//! local nix-daemon (inputs are imported without signature checks).
 //!
 //! Runs up to `--max-jobs` builds concurrently over one hub session.
 
@@ -11,11 +14,14 @@ pub mod binfmt;
 mod cgroup;
 pub mod sandbox;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use harmonia_store_path::{StoreDir, StorePath};
+use harmonia_store_path_info::{NarHash, UnkeyedValidPathInfo, ValidPathInfo};
+use harmonia_store_remote::{DaemonClient, DaemonStore};
 use harmonia_utils_signature::SecretKey;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
@@ -26,9 +32,13 @@ use crate::chunkio::{ChannelReader, CHUNK_SIZE};
 use crate::nar;
 use crate::proto::{
     hub_message, nar_transfer, worker_hub_client::WorkerHubClient, worker_message, BuildAssignment,
-    BuildResult, Heartbeat, LogChunk, MissingPaths, NarTransfer, OutputSignature, Register,
-    RequestJob, WorkerMessage,
+    BuildResult, Heartbeat, LogChunk, MissingPaths, NarTransfer, OutputSignature, PathInfoMsg,
+    Register, RequestJob, WorkerMessage,
 };
+
+/// Connection to the local nix-daemon; one per active build so its
+/// temp roots live exactly as long as the build.
+type DaemonConn = DaemonClient<tokio::net::unix::OwnedReadHalf, tokio::net::unix::OwnedWriteHalf>;
 
 pub struct WorkerOpts {
     pub hub: String,
@@ -50,9 +60,7 @@ pub struct WorkerOpts {
     /// (like Nix's busybox sandbox path); #!/bin/sh shebangs and libc
     /// system() fail without it.
     pub sandbox_bin_sh: Option<PathBuf>,
-    /// Total byte budget for the input NAR cache (`state_dir/store`);
-    /// least-recently-used entries are evicted past it.
-    pub cache_max_bytes: u64,
+
     /// Optional memory.max for the per-build cgroup (Linux, requires a
     /// delegated cgroup; see worker/cgroup.rs).
     pub build_memory_max: Option<u64>,
@@ -73,18 +81,11 @@ pub struct WorkerOpts {
 struct WorkerCtx {
     state_dir: PathBuf,
     sandbox_bin_sh: Option<PathBuf>,
-    cache_max_bytes: u64,
     cgroup_base: Option<PathBuf>,
     build_memory_max: Option<u64>,
     /// Files a build must never read even where DAC would allow it
     /// (macOS Seatbelt deny rules; Linux relies on the mount namespace).
     secret_paths: Vec<PathBuf>,
-    /// Serializes cache installs; two builds finishing the same input
-    /// concurrently must not rename over each other.
-    cache_lock: std::sync::Mutex<()>,
-    /// Cache entries referenced by running builds (refcounted by store
-    /// basename); eviction skips them.
-    pinned: std::sync::Mutex<HashMap<String, u32>>,
     /// Builds currently executing, reported in heartbeats.
     running: std::sync::atomic::AtomicU32,
     /// system -> static emulator binary, from --emulate.
@@ -103,29 +104,6 @@ struct WorkerCtx {
 }
 
 impl WorkerCtx {
-    fn pin(&self, base: &str) {
-        *self
-            .pinned
-            .lock()
-            .unwrap()
-            .entry(base.to_string())
-            .or_insert(0) += 1;
-    }
-
-    fn unpin(&self, base: &str) {
-        let mut pinned = self.pinned.lock().unwrap();
-        if let Some(n) = pinned.get_mut(base) {
-            *n -= 1;
-            if *n == 0 {
-                pinned.remove(base);
-            }
-        }
-    }
-
-    fn pinned_bases(&self) -> HashSet<String> {
-        self.pinned.lock().unwrap().keys().cloned().collect()
-    }
-
     fn alloc_uid_slot(self: &std::sync::Arc<Self>) -> Option<UidSlot> {
         let mut slots = self.uid_slots.lock().unwrap();
         let idx = slots.iter().position(|used| !used)?;
@@ -357,9 +335,7 @@ fn load_signing_key(state_dir: &Path) -> Result<SecretKey> {
     }
 }
 
-/// Remove leftovers from interrupted runs: abandoned build dirs, stale
-/// staging entries, and cache entries without a completion marker (a
-/// crash mid-install may have left them truncated).
+/// Remove leftovers from interrupted runs: abandoned build dirs.
 fn sweep_state_dir(state_dir: &Path) {
     if let Ok(entries) = std::fs::read_dir(state_dir.join("builds")) {
         for entry in entries.flatten() {
@@ -367,131 +343,13 @@ fn sweep_state_dir(state_dir: &Path) {
             remove_path_all(&entry.path());
         }
     }
-    if let Ok(entries) = std::fs::read_dir(state_dir.join("store")) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            let stale = if name.starts_with(".tmp-") {
-                true
-            } else if let Some(base) = name.strip_prefix(MARKER_PREFIX) {
-                // marker without its entry
-                state_dir
-                    .join("store")
-                    .join(base)
-                    .symlink_metadata()
-                    .is_err()
-            } else {
-                // entry without its marker
-                cache_marker(state_dir, &name).symlink_metadata().is_err()
-            };
-            if stale {
-                tracing::info!("removing stale cache item {}", entry.path().display());
-                remove_path_all(&entry.path());
-            }
-        }
+    // Input caching moved into the real /nix/store (daemon import);
+    // clear the legacy cache directory left by older versions.
+    let legacy = state_dir.join("store");
+    if legacy.symlink_metadata().is_ok() {
+        tracing::info!("removing legacy input cache {}", legacy.display());
+        remove_path_all(&legacy);
     }
-}
-
-/// Completion marker of a cache entry: written (after syncing the
-/// filesystem) only once the entry is fully installed, so a crash can
-/// never leave a truncated tree that passes for a valid input. Content
-/// is the entry's byte size; mtime doubles as the LRU clock.
-const MARKER_PREFIX: &str = ".ok-";
-
-fn cache_marker(state_dir: &Path, base: &str) -> PathBuf {
-    state_dir
-        .join("store")
-        .join(format!("{MARKER_PREFIX}{base}"))
-}
-
-fn tree_size(path: &Path) -> u64 {
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return 0;
-    };
-    if !meta.is_dir() {
-        return meta.len();
-    }
-    let mut total = meta.len();
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            total += tree_size(&entry.path());
-        }
-    }
-    total
-}
-
-/// Install a fully-unpacked transfer into the cache: sync, rename,
-/// marker, then evict least-recently-used entries past the byte budget
-/// (skipping entries the current build uses).
-fn cache_install(
-    state_dir: &Path,
-    partial: &Path,
-    base: &str,
-    max_bytes: u64,
-    in_use: &HashSet<String>,
-) -> Result<PathBuf> {
-    use std::os::fd::AsRawFd;
-    let store = state_dir.join("store");
-    let cached = store.join(base);
-    // A concurrent build already installed this entry (and may be using
-    // it); keep theirs, drop ours.
-    if cache_marker(state_dir, base).symlink_metadata().is_ok() && cached.symlink_metadata().is_ok()
-    {
-        remove_path_all(partial);
-        return Ok(cached);
-    }
-    remove_path_all(&cached); // stale/truncated leftover
-    let size = tree_size(partial);
-    // One syncfs instead of per-file fsync: the marker below must not
-    // hit disk before the data it vouches for.
-    let dirfd = std::fs::File::open(&store)?;
-    unsafe { libc::syncfs(dirfd.as_raw_fd()) };
-    std::fs::rename(partial, &cached)?;
-    let marker = cache_marker(state_dir, base);
-    let mut f = std::fs::File::create(&marker)?;
-    f.write_all(size.to_string().as_bytes())?;
-    f.sync_all()?;
-
-    // LRU eviction by marker mtime.
-    let mut entries: Vec<(std::time::SystemTime, String, u64)> = Vec::new();
-    let mut total: u64 = 0;
-    if let Ok(dir) = std::fs::read_dir(&store) {
-        for entry in dir.flatten() {
-            let name = entry.file_name();
-            let Some(entry_base) = name
-                .to_string_lossy()
-                .strip_prefix(MARKER_PREFIX)
-                .map(String::from)
-            else {
-                continue;
-            };
-            let Ok(meta) = entry.metadata() else { continue };
-            let size: u64 = std::fs::read_to_string(entry.path())
-                .ok()
-                .and_then(|s| s.trim().parse().ok())
-                .unwrap_or(0);
-            total += size;
-            entries.push((
-                meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
-                entry_base,
-                size,
-            ));
-        }
-    }
-    entries.sort();
-    for (_, entry_base, size) in entries {
-        if total <= max_bytes {
-            break;
-        }
-        if entry_base == base || in_use.contains(&entry_base) {
-            continue;
-        }
-        tracing::info!("evicting cache entry {entry_base} ({size} bytes)");
-        remove_path_all(&cache_marker(state_dir, &entry_base));
-        remove_path_all(&store.join(&entry_base));
-        total = total.saturating_sub(size);
-    }
-    Ok(cached)
 }
 
 /// Remove whatever is at `path` without following a symlink at `path`.
@@ -522,13 +380,11 @@ pub fn run(opts: WorkerOpts) -> Result<()> {
 
 async fn run_async(opts: WorkerOpts) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    for sub in ["store", "builds"] {
-        let dir = opts.state_dir.join(sub);
-        std::fs::create_dir_all(&dir)?;
-        // Traverse-only so leased build uids reach their own tree but
-        // other local users get no listing; see BuildOwner.
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o711))?;
-    }
+    let builds_dir = opts.state_dir.join("builds");
+    std::fs::create_dir_all(&builds_dir)?;
+    // Traverse-only so leased build uids reach their own tree but
+    // other local users get no listing; see BuildOwner.
+    std::fs::set_permissions(&builds_dir, std::fs::Permissions::from_mode(0o711))?;
     sweep_state_dir(&opts.state_dir);
     // Arc: SecretKey is not Clone (zeroized on drop); build threads share it.
     let signing_key = std::sync::Arc::new(load_signing_key(&opts.state_dir)?);
@@ -565,7 +421,6 @@ async fn run_async(opts: WorkerOpts) -> Result<()> {
     let ctx = std::sync::Arc::new(WorkerCtx {
         state_dir: opts.state_dir.clone(),
         sandbox_bin_sh: opts.sandbox_bin_sh.clone(),
-        cache_max_bytes: opts.cache_max_bytes,
         cgroup_base: if cfg!(target_os = "linux") {
             cgroup::init()
         } else {
@@ -573,8 +428,6 @@ async fn run_async(opts: WorkerOpts) -> Result<()> {
         },
         build_memory_max: opts.build_memory_max,
         secret_paths: vec![opts.key.clone(), opts.state_dir.join("signing.key")],
-        cache_lock: std::sync::Mutex::new(()),
-        pinned: std::sync::Mutex::new(HashMap::new()),
         running: std::sync::atomic::AtomicU32::new(0),
         emulators,
         pasta: opts.pasta.clone(),
@@ -718,7 +571,7 @@ async fn session_loop(
                 let Some(build) = active.get_mut(&offer.build_id) else {
                     continue;
                 };
-                match build.negotiate(&offer.store_paths) {
+                match build.negotiate(&offer.store_paths).await {
                     Ok(missing) => {
                         out_tx
                             .send(msg(worker_message::Msg::MissingPaths(MissingPaths {
@@ -785,6 +638,16 @@ async fn session_loop(
                     }
                 }
             }
+            hub_message::Msg::PathInfo(pi) => {
+                let id = pi.build_id.clone();
+                if let Some(build) = active.get_mut(&id) {
+                    if let Err(e) = build.feed_path_info(pi) {
+                        let build = active.remove(&id).unwrap();
+                        build.abort().await;
+                        fail_build(out_tx, &id, &e).await?;
+                    }
+                }
+            }
             hub_message::Msg::Cancel(_) => {
                 tracing::warn!("build cancellation not implemented yet");
             }
@@ -846,30 +709,85 @@ fn validate_assignment(a: &BuildAssignment) -> Result<()> {
 
 type Unpacker = (mpsc::Sender<Vec<u8>>, tokio::task::JoinHandle<Result<()>>);
 
+/// In-flight daemon import of one input NAR. Owns the build's daemon
+/// connection while streaming (AddToStoreNar holds the protocol);
+/// the connection comes back when the transfer finishes.
+struct Importer {
+    store_path: String,
+    tx: mpsc::Sender<bytes::Bytes>,
+    task: tokio::task::JoinHandle<(DaemonConn, Result<()>)>,
+}
+
 struct ActiveBuild {
     assignment: BuildAssignment,
     dir: PathBuf, // state_dir/builds/<id>
     ctx: std::sync::Arc<WorkerCtx>,
-    /// Input store path -> host filesystem source.
-    sources: HashMap<String, PathBuf>,
-    pending: HashSet<String>,
-    nar_unpackers: HashMap<String, Unpacker>,
+    /// Input store paths available in /nix/store (bind-mount sources).
+    inputs: Vec<String>,
+    /// Paths reported missing, waiting for PathInfo + NAR. The value
+    /// holds the parsed metadata once it arrived.
+    pending: HashMap<String, Option<ValidPathInfo>>,
+    /// Daemon connection; carries this build's temp roots, so it must
+    /// outlive the build. None while an Importer borrows it.
+    daemon: Option<DaemonConn>,
+    importer: Option<Importer>,
     tmp_unpacker: Option<Unpacker>,
-    /// Cache bases this build pinned against eviction; released on Drop
-    /// (covers execute, abort, and every error path).
-    pinned: HashSet<String>,
-}
-
-impl Drop for ActiveBuild {
-    fn drop(&mut self) {
-        for base in &self.pinned {
-            self.ctx.unpin(base);
-        }
-    }
 }
 
 fn store_base(store_path: &str) -> &str {
     store_path.rsplit('/').next().unwrap_or(store_path)
+}
+
+/// Wire metadata -> daemon ValidPathInfo.
+fn parse_path_info(msg: &PathInfoMsg) -> Result<ValidPathInfo> {
+    let store_dir = StoreDir::default();
+    Ok(ValidPathInfo {
+        path: store_dir.parse(&msg.store_path)?,
+        info: UnkeyedValidPathInfo {
+            deriver: (!msg.deriver.is_empty())
+                .then(|| store_dir.parse(&msg.deriver))
+                .transpose()?,
+            nar_hash: NarHash::from_slice(&msg.nar_sha256)?,
+            references: msg
+                .references
+                .iter()
+                .map(|r| store_dir.parse(r))
+                .collect::<Result<BTreeSet<StorePath>, _>>()?,
+            registration_time: None,
+            nar_size: msg.nar_size,
+            ultimate: false,
+            signatures: msg
+                .signatures
+                .iter()
+                .map(|s| s.parse())
+                .collect::<Result<BTreeSet<_>, _>>()?,
+            ca: (!msg.ca.is_empty()).then(|| msg.ca.parse()).transpose()?,
+            store_dir,
+        },
+    })
+}
+
+/// Drive one AddToStoreNar: hub chunks -> zstd decode -> daemon. The
+/// daemon verifies the NAR against info.nar_hash and registers the
+/// path, so no separate integrity check is needed here.
+async fn import_nar(
+    conn: &mut DaemonConn,
+    info: &ValidPathInfo,
+    rx: mpsc::Receiver<bytes::Bytes>,
+) -> Result<()> {
+    use futures_util::StreamExt as _;
+    use tokio::io::AsyncReadExt as _;
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(Ok::<_, std::io::Error>);
+    let reader = tokio_util::io::StreamReader::new(stream);
+    let dec =
+        async_compression::tokio::bufread::ZstdDecoder::new(tokio::io::BufReader::new(reader));
+    // take(nar_size): the daemon reads a self-delimiting NAR, but a
+    // malicious hub must not stream unbounded decompressed bytes.
+    let limited = tokio::io::BufReader::new(dec.take(info.info.nar_size));
+    conn.add_to_store_nar(info, limited, false, true)
+        .await
+        .map_err(|e| anyhow::anyhow!("importing {} via the daemon: {e}", info.path))?;
+    Ok(())
 }
 
 impl ActiveBuild {
@@ -883,115 +801,114 @@ impl ActiveBuild {
             assignment,
             dir,
             ctx,
-            sources: HashMap::new(),
-            pending: HashSet::new(),
-            nar_unpackers: HashMap::new(),
+            inputs: Vec::new(),
+            pending: HashMap::new(),
+            daemon: None,
+            importer: None,
             tmp_unpacker: None,
-            pinned: HashSet::new(),
         })
     }
 
-    /// Pin a cache entry for this build's lifetime so eviction (from
-    /// any concurrent build's install) cannot pull it out from under us.
-    fn pin(&mut self, base: &str) {
-        if self.pinned.insert(base.to_string()) {
-            self.ctx.pin(base);
-        }
-    }
-
-    fn negotiate(&mut self, offered: &[String]) -> Result<Vec<String>> {
-        // cloned: self.pin() below needs &mut self
-        let state_dir = self.ctx.state_dir.clone();
+    async fn negotiate(&mut self, offered: &[String]) -> Result<Vec<String>> {
+        let store_dir = StoreDir::default();
+        let mut daemon = DaemonClient::builder()
+            .connect_daemon()
+            .await
+            .context("connecting to the local nix-daemon")?;
         let mut missing = Vec::new();
         for p in offered {
             // Only real store paths may become bind-mount sources; a
             // compromised hub must not get the worker's own files
             // (signing key, TLS key) mounted into a sandbox.
-            if !crate::hub::valid_store_path(crate::hub::STORE_DIR, p) {
-                bail!("offered path {p:?} is not a store path");
-            }
-            let host = PathBuf::from(p);
-            let cached = state_dir.join("store").join(store_base(p));
-            let marker = cache_marker(&state_dir, store_base(p));
-            // symlink_metadata: store paths that are dangling symlinks
-            // are legitimate and must count as present.
-            if host.symlink_metadata().is_ok() {
-                self.sources.insert(p.clone(), host);
-            } else if cached.symlink_metadata().is_ok() && marker.symlink_metadata().is_ok() {
-                // bump the LRU clock
-                if let Ok(f) = std::fs::File::options().write(true).open(&marker) {
-                    let _ = f.set_modified(std::time::SystemTime::now());
-                }
-                self.pin(store_base(p));
-                self.sources.insert(p.clone(), cached);
+            let sp: StorePath = store_dir
+                .parse(p)
+                .with_context(|| format!("offered path {p:?} is not a store path"))?;
+            // Temp root before the validity check: the daemon must not
+            // GC the path between check and build start. Temp roots die
+            // with this connection, which the build keeps open.
+            daemon
+                .add_temp_root(&sp)
+                .await
+                .with_context(|| format!("adding temp root for {p}"))?;
+            if daemon
+                .is_valid_path(&sp)
+                .await
+                .with_context(|| format!("querying validity of {p}"))?
+            {
+                self.inputs.push(p.clone());
             } else {
-                self.pending.insert(p.clone());
+                self.pending.insert(p.clone(), None);
                 missing.push(p.clone());
             }
         }
+        self.daemon = Some(daemon);
         Ok(missing)
     }
 
+    fn feed_path_info(&mut self, pi: PathInfoMsg) -> Result<()> {
+        let Some(slot) = self.pending.get_mut(&pi.store_path) else {
+            bail!("hub sent path info for unrequested path {}", pi.store_path);
+        };
+        if pi.nar_size > MAX_NAR_BYTES {
+            bail!(
+                "input {} exceeds the {MAX_NAR_BYTES} byte NAR limit",
+                pi.store_path
+            );
+        }
+        *slot =
+            Some(parse_path_info(&pi).with_context(|| format!("path info for {}", pi.store_path))?);
+        Ok(())
+    }
+
     async fn feed_nar(&mut self, n: NarTransfer) -> Result<()> {
-        // cloned: self.pin() below needs &mut self
-        let state_dir = self.ctx.state_dir.clone();
-        if !self.pending.contains(&n.store_path) && !self.nar_unpackers.contains_key(&n.store_path)
+        if self
+            .importer
+            .as_ref()
+            .is_none_or(|i| i.store_path != n.store_path)
         {
-            bail!("hub sent NAR for unrequested path {}", n.store_path);
-        }
-        // Staging name starts with ".": disjoint from finished cache
-        // entries, because valid store names never start with a dot.
-        // The build id keeps concurrent transfers of the same input
-        // from writing into one staging tree.
-        let partial = state_dir.join("store").join(format!(
-            ".tmp-{}-{}",
-            self.assignment.build_id,
-            store_base(&n.store_path)
-        ));
-        let (tx, _) = self
-            .nar_unpackers
-            .entry(n.store_path.clone())
-            .or_insert_with(|| {
-                let dest = partial.clone();
-                let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
-                let task = tokio::task::spawn_blocking(move || -> Result<()> {
-                    // stale leftover from a crashed transfer; lstat so a
-                    // dangling symlink is removed rather than skipped
-                    remove_path_all(&dest);
-                    let dec = zstd::stream::read::Decoder::new(ChannelReader::new(rx))?;
-                    let mut dec = LimitedReader {
-                        inner: dec,
-                        remaining: MAX_NAR_BYTES,
-                    };
-                    nar::unpack(&mut dec, &dest)
-                        .with_context(|| format!("unpacking {}", dest.display()))
-                });
-                (tx, task)
-            });
-        if let Some(nar_transfer::Payload::ZstdNarChunk(chunk)) = n.payload {
-            tx.send(chunk)
-                .await
-                .map_err(|_| anyhow::anyhow!("input unpacker died"))?;
-        }
-        if n.eof {
-            let (tx, task) = self.nar_unpackers.remove(&n.store_path).unwrap();
-            drop(tx);
-            task.await??;
-            let base = store_base(&n.store_path).to_string();
-            // pin before install: no window where the entry is evictable
-            self.pin(&base);
-            let cached = {
-                let _guard = self.ctx.cache_lock.lock().unwrap();
-                cache_install(
-                    &state_dir,
-                    &partial,
-                    &base,
-                    self.ctx.cache_max_bytes,
-                    &self.ctx.pinned_bases(),
-                )?
+            // Start a new import; the hub streams one path at a time.
+            if self.importer.is_some() {
+                bail!("hub interleaved NAR transfers for different paths");
+            }
+            let info = match self.pending.remove(&n.store_path) {
+                Some(Some(info)) => info,
+                Some(None) => bail!("hub sent NAR before path info for {}", n.store_path),
+                None => bail!("hub sent NAR for unrequested path {}", n.store_path),
             };
-            self.pending.remove(&n.store_path);
-            self.sources.insert(n.store_path, cached);
+            let mut conn = self
+                .daemon
+                .take()
+                .context("daemon connection missing (no negotiation?)")?;
+            let (tx, rx) = mpsc::channel::<bytes::Bytes>(8);
+            let task = tokio::spawn(async move {
+                let res = import_nar(&mut conn, &info, rx).await;
+                (conn, res)
+            });
+            self.importer = Some(Importer {
+                store_path: n.store_path.clone(),
+                tx,
+                task,
+            });
+        }
+        let importer = self.importer.as_ref().unwrap();
+        let send_failed = match n.payload {
+            Some(nar_transfer::Payload::ZstdNarChunk(chunk)) => {
+                importer.tx.send(chunk.into()).await.is_err()
+            }
+            None => false,
+        };
+        if send_failed || n.eof {
+            // Reap the import task: on eof for its result, on a failed
+            // send for the error that killed it.
+            let Importer { task, tx, .. } = self.importer.take().unwrap();
+            drop(tx);
+            let (conn, res) = task.await?;
+            self.daemon = Some(conn);
+            res?;
+            if send_failed {
+                bail!("input import ended early for {}", n.store_path);
+            }
+            self.inputs.push(n.store_path);
         }
         Ok(())
     }
@@ -1017,7 +934,7 @@ impl ActiveBuild {
             let (tx, task) = self.tmp_unpacker.take().unwrap();
             drop(tx);
             task.await??;
-            if !self.pending.is_empty() {
+            if !self.pending.is_empty() || self.importer.is_some() {
                 bail!("tmp dir transfer finished before all input paths arrived");
             }
             return Ok(true);
@@ -1052,7 +969,7 @@ impl ActiveBuild {
         let mut spec = sandbox::prepare(
             a,
             &self.dir,
-            &self.sources,
+            &self.inputs,
             &sandbox::PrepareOpts {
                 bin_sh: self.ctx.sandbox_bin_sh.as_deref(),
                 secrets: &self.ctx.secret_paths,
@@ -1269,11 +1186,12 @@ impl ActiveBuild {
         }
     }
 
-    /// Tear down a build abandoned before execution: stop the unpacker
-    /// tasks (so none keeps writing into shared staging paths) and
-    /// remove everything staged on disk.
+    /// Tear down a build abandoned before execution: stop the import
+    /// and unpacker tasks and remove everything staged on disk. The
+    /// daemon connection (and with it the temp roots) drops here; a
+    /// half-imported path is the daemon's to clean up.
     async fn abort(mut self) {
-        for (_, (tx, task)) in self.nar_unpackers.drain() {
+        if let Some(Importer { tx, task, .. }) = self.importer.take() {
             drop(tx);
             task.abort();
             let _ = task.await;
@@ -1338,26 +1256,6 @@ impl<W: Write> Write for LimitedWriter<W> {
     }
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
-    }
-}
-
-/// Enforces a byte budget on a Read chain (input NAR transfers).
-struct LimitedReader<R> {
-    inner: R,
-    remaining: u64,
-}
-
-impl<R: Read> Read for LimitedReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.remaining == 0 {
-            return Err(std::io::Error::other(format!(
-                "input NAR exceeds the {MAX_NAR_BYTES} byte limit"
-            )));
-        }
-        let max = buf.len().min(self.remaining as usize);
-        let n = self.inner.read(&mut buf[..max])?;
-        self.remaining -= n as u64;
-        Ok(n)
     }
 }
 
@@ -1443,68 +1341,14 @@ mod tests {
     }
 
     #[test]
-    fn cache_install_marks_and_evicts() -> Result<()> {
+    fn sweep_removes_stale_builds_and_legacy_cache() -> Result<()> {
         let state = tempfile::tempdir()?;
-        std::fs::create_dir_all(state.path().join("store"))?;
-        let mk = |name: &str, bytes: usize| -> Result<PathBuf> {
-            let p = state.path().join("store").join(format!(".tmp-{name}"));
-            std::fs::create_dir(&p)?;
-            std::fs::write(p.join("data"), vec![0u8; bytes])?;
-            Ok(p)
-        };
-        let empty = HashSet::new();
-
-        // install two entries under a generous budget: both survive
-        let p = mk("aaa-one", 1000)?;
-        cache_install(state.path(), &p, "aaa-one", 1 << 20, &empty)?;
-        std::thread::sleep(std::time::Duration::from_millis(20)); // distinct mtimes
-        let p = mk("bbb-two", 1000)?;
-        cache_install(state.path(), &p, "bbb-two", 1 << 20, &empty)?;
-        assert!(cache_marker(state.path(), "aaa-one").exists());
-        assert!(cache_marker(state.path(), "bbb-two").exists());
-
-        // a third install under a tight budget evicts the oldest entry;
-        // entry sizes are fs-dependent, so derive the budget from a marker
-        let entry_size: u64 = std::fs::read_to_string(cache_marker(state.path(), "aaa-one"))?
-            .parse()
-            .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let p = mk("ccc-three", 1000)?;
-        cache_install(state.path(), &p, "ccc-three", entry_size * 5 / 2, &empty)?;
-        assert!(
-            !state.path().join("store/aaa-one").exists(),
-            "oldest evicted"
-        );
-        assert!(!cache_marker(state.path(), "aaa-one").exists());
-        // the just-installed entry is never evicted
-        assert!(state.path().join("store/ccc-three").exists());
-
-        // in-use entries are skipped by eviction
-        let in_use: HashSet<String> = ["bbb-two".to_string()].into();
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let p = mk("ddd-four", 1000)?;
-        cache_install(state.path(), &p, "ddd-four", 1, &in_use)?;
-        assert!(state.path().join("store/bbb-two").exists(), "in-use kept");
-        Ok(())
-    }
-
-    #[test]
-    fn sweep_removes_unmarked_cache_entries() -> Result<()> {
-        let state = tempfile::tempdir()?;
-        std::fs::create_dir_all(state.path().join("store"))?;
-        std::fs::create_dir_all(state.path().join("builds"))?;
-        // entry without marker: possibly truncated, must go
-        std::fs::create_dir(state.path().join("store/xxx-unmarked"))?;
-        // orphan marker without entry: must go
-        std::fs::write(state.path().join("store/.ok-yyy-gone"), "1")?;
-        // complete pair: stays
-        std::fs::create_dir(state.path().join("store/zzz-good"))?;
-        std::fs::write(state.path().join("store/.ok-zzz-good"), "1")?;
+        std::fs::create_dir_all(state.path().join("builds/deadbeef"))?;
+        // legacy input cache from pre-daemon-import versions: must go
+        std::fs::create_dir_all(state.path().join("store/zzz-good"))?;
         sweep_state_dir(state.path());
-        assert!(!state.path().join("store/xxx-unmarked").exists());
-        assert!(!state.path().join("store/.ok-yyy-gone").exists());
-        assert!(state.path().join("store/zzz-good").exists());
-        assert!(state.path().join("store/.ok-zzz-good").exists());
+        assert!(!state.path().join("builds/deadbeef").exists());
+        assert!(!state.path().join("store").exists());
         Ok(())
     }
 

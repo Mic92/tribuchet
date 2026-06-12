@@ -103,7 +103,7 @@ pub struct PrepareOpts<'a> {
 pub fn prepare(
     a: &BuildAssignment,
     dir: &Path,
-    sources: &HashMap<String, PathBuf>,
+    inputs: &[String],
     opts: &PrepareOpts,
 ) -> Result<SandboxSpec> {
     let build_dir = dir.join("top").join("build");
@@ -117,9 +117,10 @@ pub fn prepare(
         network: a.fixed_output,
         root: dir.join("root"),
         build_dir,
-        binds_ro: sources
+        // inputs live at their real store paths (daemon import)
+        binds_ro: inputs
             .iter()
-            .map(|(store_path, src)| (src.clone(), PathBuf::from(store_path)))
+            .map(|p| (PathBuf::from(p), PathBuf::from(p)))
             .collect(),
         binds_dev: Vec::new(),
         outputs: a.outputs.values().cloned().collect(),
@@ -977,25 +978,10 @@ mod platform {
     use super::*;
 
     pub fn prepare(spec: &mut SandboxSpec) -> Result<()> {
-        // No bind mounts on Darwin: materialize cached inputs into the
-        // host /nix/store (this is also the worker's input cache there).
-        for (src, dst) in std::mem::take(&mut spec.binds_ro) {
-            if src == dst || dst.exists() {
-                continue;
-            }
-            std::fs::rename(&src, &dst).or_else(|_| {
-                let status = Command::new("/bin/cp")
-                    .args(["-a"])
-                    .arg(&src)
-                    .arg(&dst)
-                    .status()?;
-                if status.success() {
-                    Ok(())
-                } else {
-                    anyhow::bail!("cp -a {} {} failed", src.display(), dst.display())
-                }
-            })?;
-        }
+        // No bind mounts on Darwin: inputs already live at their real
+        // /nix/store paths (the worker imports them via the daemon),
+        // so there is nothing to materialize.
+        spec.binds_ro.clear();
         // env refers to tmpDirInSandbox; link it to the real build dir.
         let link = Path::new(&spec.cwd);
         // Don't trust the hub: a root worker creating a symlink at an

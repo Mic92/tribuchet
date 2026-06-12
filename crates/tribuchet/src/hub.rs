@@ -25,8 +25,8 @@ use crate::chunkio::ChunkWriter;
 use crate::nar;
 use crate::proto::{
     attach_event, attach_hub_server, hub_message, nar_transfer, worker_message, AttachEvent,
-    BuildAssignment, BuildRequest, HubMessage, NarTransfer, OutputNar, PathOffer, Register,
-    TmpDirArchive, WorkerMessage,
+    BuildAssignment, BuildRequest, HubMessage, NarTransfer, OutputNar, PathInfoMsg, PathOffer,
+    Register, TmpDirArchive, WorkerMessage,
 };
 
 type EventTx = mpsc::Sender<Result<AttachEvent, Status>>;
@@ -763,7 +763,12 @@ async fn run_job(
         "input path negotiation done"
     );
 
-    for path in &missing {
+    // The worker imports missing inputs through its Nix daemon, which
+    // needs the full ValidPathInfo; ask the local nix-daemon for it.
+    let infos = query_path_infos(&missing).await?;
+    for (path, mut info) in missing.iter().zip(infos) {
+        info.build_id = job.id.clone();
+        send(out_tx, hub_message::Msg::PathInfo(info)).await?;
         stream_store_path(&job.id, path, out_tx).await?;
     }
     stream_tmp_dir(&job.id, Path::new(&req.top_tmp_dir), out_tx).await?;
@@ -793,6 +798,53 @@ async fn recv(in_rx: &mut mpsc::Receiver<worker_message::Msg>) -> Result<worker_
         .recv()
         .await
         .ok_or_else(|| anyhow::anyhow!("worker disconnected or went silent"))
+}
+
+/// Nix db metadata for input paths, in wire form, queried over the
+/// daemon protocol rather than db.sqlite: harmonia-store-db opens the
+/// db with sqlite's immutable=1, which skips locking and WAL replay,
+/// so rows still in the WAL -- freshly registered inputs, the common
+/// case for build requests -- would be invisible and concurrent
+/// checkpoints could yield torn reads. The daemon answers from its
+/// own consistent view.
+async fn query_path_infos(paths: &[String]) -> Result<Vec<PathInfoMsg>> {
+    use harmonia_store_path::{StoreDir, StorePath};
+    use harmonia_store_remote::{DaemonClient, DaemonStore as _};
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let store_dir = StoreDir::default();
+    let mut daemon = DaemonClient::builder()
+        .connect_daemon()
+        .await
+        .context("connecting to the local nix-daemon")?;
+    let mut out = Vec::with_capacity(paths.len());
+    for p in paths {
+        let sp: StorePath = store_dir.parse(p)?;
+        let info = daemon
+            .query_path_info(&sp)
+            .await
+            .with_context(|| format!("querying path info for {p}"))?
+            .with_context(|| format!("{p} is not a valid path in the local store"))?;
+        out.push(PathInfoMsg {
+            build_id: String::new(), // filled in by the caller
+            store_path: p.clone(),
+            nar_sha256: info.nar_hash.digest_bytes().to_vec(),
+            nar_size: info.nar_size,
+            references: info
+                .references
+                .iter()
+                .map(|r| store_dir.display(r).to_string())
+                .collect(),
+            signatures: info.signatures.iter().map(|s| s.to_string()).collect(),
+            deriver: info
+                .deriver
+                .map(|d| store_dir.display(&d).to_string())
+                .unwrap_or_default(),
+            ca: info.ca.map(|c| c.to_string()).unwrap_or_default(),
+        });
+    }
+    Ok(out)
 }
 
 /// NAR-pack a local store path, zstd-compress, and stream it to the worker.

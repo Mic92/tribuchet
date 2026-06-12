@@ -71,10 +71,6 @@ enum Command {
         /// e.g. a busybox sh; without it #!/bin/sh shebangs fail.
         #[arg(long)]
         sandbox_bin_sh: Option<PathBuf>,
-        /// Byte budget for the input NAR cache; least-recently-used
-        /// entries are evicted past it.
-        #[arg(long, default_value_t = 100 * 1024 * 1024 * 1024)]
-        cache_max_bytes: u64,
         /// memory.max for each build's cgroup (Linux; needs a delegated
         /// cgroup, e.g. systemd Delegate=yes). Unlimited when unset.
         #[arg(long)]
@@ -136,7 +132,6 @@ fn main() -> anyhow::Result<()> {
             max_silent_time_secs,
             max_log_size,
             sandbox_bin_sh,
-            cache_max_bytes,
             build_memory_max_bytes,
             max_jobs,
             auto_allocate_uids_base,
@@ -162,7 +157,6 @@ fn main() -> anyhow::Result<()> {
                 max_silent_time: std::time::Duration::from_secs(max_silent_time_secs),
                 max_log_size,
                 sandbox_bin_sh,
-                cache_max_bytes,
                 build_memory_max: build_memory_max_bytes,
                 max_jobs,
                 auto_allocate_uids_base,

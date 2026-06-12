@@ -20,8 +20,11 @@ Nix hands the external builder *scratch* output paths and expects them to
 be populated on exit. The worker sandbox writes to the very same scratch
 paths; the shim unpacks the returned NARs at those paths unchanged. Nix
 then performs self-reference rewriting, hashing, and registration itself.
-No store-path rewriting in tribuchet, no drvPath needed, and the worker
-does not need a Nix installation at all.
+No store-path rewriting in tribuchet and no drvPath needed. Workers run a
+nix-daemon of their own: inputs are imported through it (AddToStoreNar),
+so they are registered in the worker's Nix database and protected from
+GC by per-build temp roots. The worker must be a trusted daemon user
+(imports skip signature checks; transport authenticity comes from mTLS).
 
 ## Components (single binary, subcommands)
 
@@ -36,7 +39,7 @@ nix-daemon (external-builders) ──exec──> tribuchet attach
                                               ▲
                                               │ gRPC over mTLS, worker dials in (NAT-friendly)
                                        tribuchet worker     (2–10 machines, internet)
-                                       - input cache keyed by store path
+                                       - inputs imported into /nix/store via nix-daemon
                                        - own sandbox (Linux namespaces / macOS sandbox_init)
                                        - signs output NARs with ed25519
 tribuchet ca                           - init CA, issue worker/hub certificates
@@ -64,11 +67,14 @@ tribuchet ca                           - init CA, issue worker/hub certificates
    later: required features). A system no connected worker serves is
    rejected immediately; otherwise submitters block and Nix's max-jobs
    bounds parallelism.
-3. Path negotiation: hub sends the input path list; worker answers with
-   the missing subset; hub streams those as zstd-compressed NARs read
-   straight from the local /nix/store (hub is colocated with the daemon,
-   all inputs are valid locally).
-4. Worker materializes inputs in its cache, constructs the sandbox, and
+3. Path negotiation: hub sends the input path list; the worker asks its
+   local nix-daemon (taking temp roots so GC cannot race the build) and
+   answers with the missing subset; the hub streams those as
+   zstd-compressed NARs plus their Nix db metadata (hash, size,
+   references, via the daemon protocol) read from the local store (hub is
+   colocated with the daemon, all inputs are valid locally).
+4. Worker imports missing inputs through its nix-daemon (which verifies
+   the NAR hash and registers the path), constructs the sandbox, and
    executes `builder args…` with the env from build.json, cwd
    `/build`. Logs stream back live through hub to the shim's stdout/stderr
    (Nix shows them as ordinary build output).
@@ -83,7 +89,8 @@ tribuchet ca                           - init CA, issue worker/hub certificates
 
 ## Sandbox
 
-We re-implement the sandbox rather than requiring Nix on workers.
+We re-implement the sandbox rather than driving builds through the
+worker's Nix (its daemon serves only as the input store).
 Reference implementations: `nix/src/libstore/unix/build/` and
 `nix/src/libstore/darwin/build/sandbox-defaults.sb`.
 
@@ -114,8 +121,8 @@ Reference implementations: `nix/src/libstore/unix/build/` and
   host namespace: host abstract sockets and loopback services are
   unreachable, and root workers back such builds with an unprivileged
   uid.
-* macOS: no mount namespace, so inputs are materialized in the host
-  /nix/store, `/build` is a symlink to the build dir, and the builder
+* macOS: no mount namespace, but inputs already live at their real
+  /nix/store paths thanks to the daemon import; `/build` is a symlink to the build dir, and the builder
   runs under `/usr/bin/sandbox-exec` with a deny-default write profile
   modeled on Nix's `sandbox-defaults.sb` (reads stay permissive except
   for the worker's key material; writes are scoped to the build dir,

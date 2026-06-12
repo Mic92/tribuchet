@@ -243,7 +243,8 @@ in
         worker.succeed("journalctl -u tribuchet-worker | grep -q 'builder finished'")
         worker.succeed("journalctl -u tribuchet-worker | grep -q 'per-build cgroup limits enabled'")
         hub.succeed("journalctl -u tribuchet-hub | grep -q 'dispatching build'")
-        import os
-        worker.succeed(f"test -e /var/lib/tribuchet/store/{os.path.basename(unique)}")
+        # inputs are imported through the worker's nix-daemon and
+        # registered as valid paths in its Nix database
+        worker.succeed(f"nix-store --check-validity {unique}")
   '';
 }
