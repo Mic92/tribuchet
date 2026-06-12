@@ -137,11 +137,14 @@ struct Inflight {
     by_path: HashMap<String, String>,
 }
 
-#[derive(Default)]
 struct HubState {
     queue: Mutex<VecDeque<Job>>,
     inflight: Mutex<Inflight>,
     notify: Notify,
+    /// Pooled connections to the local nix-daemon (path metadata
+    /// queries); jobs are frequent enough that per-job handshakes
+    /// would add up.
+    daemon_pool: harmonia_store_remote::ConnectionPool,
     /// Connected workers' capabilities, keyed by a per-connection id;
     /// submissions no worker can serve fail fast instead of queueing
     /// forever.
@@ -160,6 +163,22 @@ impl WorkerCaps {
         self.systems
             .get(system)
             .is_some_and(|have| features.iter().all(|f| have.contains(f)))
+    }
+}
+
+impl Default for HubState {
+    fn default() -> Self {
+        Self {
+            queue: Default::default(),
+            inflight: Default::default(),
+            notify: Default::default(),
+            daemon_pool: harmonia_store_remote::ConnectionPool::new(
+                "/nix/var/nix/daemon-socket/socket",
+                Default::default(),
+            ),
+            worker_caps: Default::default(),
+            next_worker_id: Default::default(),
+        }
     }
 }
 
@@ -670,7 +689,7 @@ async fn worker_loop(
         let out_tx = out_tx.clone();
         let vkey = vkey.clone();
         tokio::spawn(async move {
-            match run_job(&job, &vkey, &out_tx, in_rx).await {
+            match run_job(&state, &job, &vkey, &out_tx, in_rx).await {
                 Ok(()) => {}
                 Err(e) => {
                     tracing::warn!(id = job.id, "build failed: {e:#}");
@@ -702,6 +721,7 @@ async fn send(
 }
 
 async fn run_job(
+    state: &HubState,
     job: &Job,
     vkey: &PublicKey,
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
@@ -764,7 +784,7 @@ async fn run_job(
 
     // The worker imports missing inputs through its Nix daemon, which
     // needs the full ValidPathInfo; ask the local nix-daemon for it.
-    let infos = query_path_infos(&missing).await?;
+    let infos = query_path_infos(&state.daemon_pool, &missing).await?;
     for (path, mut info) in missing.iter().zip(infos) {
         info.build_id = job.id.clone();
         send(out_tx, hub_message::Msg::PathInfo(info)).await?;
@@ -806,21 +826,25 @@ async fn recv(in_rx: &mut mpsc::Receiver<worker_message::Msg>) -> Result<worker_
 /// case for build requests -- would be invisible and concurrent
 /// checkpoints could yield torn reads. The daemon answers from its
 /// own consistent view.
-async fn query_path_infos(paths: &[String]) -> Result<Vec<PathInfoMsg>> {
+async fn query_path_infos(
+    pool: &harmonia_store_remote::ConnectionPool,
+    paths: &[String],
+) -> Result<Vec<PathInfoMsg>> {
     use harmonia_store_path::{StoreDir, StorePath};
-    use harmonia_store_remote::{DaemonClient, DaemonStore as _};
+    use harmonia_store_remote::DaemonStore as _;
     if paths.is_empty() {
         return Ok(Vec::new());
     }
     let store_dir = StoreDir::default();
-    let mut daemon = DaemonClient::builder()
-        .connect_daemon()
+    let mut guard = pool
+        .acquire()
         .await
         .context("connecting to the local nix-daemon")?;
     let mut out = Vec::with_capacity(paths.len());
     for p in paths {
         let sp: StorePath = store_dir.parse(p)?;
-        let info = daemon
+        let info = guard
+            .client()
             .query_path_info(&sp)
             .await
             .with_context(|| format!("querying path info for {p}"))?
