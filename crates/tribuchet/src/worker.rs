@@ -16,7 +16,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use ed25519_dalek::{Signer, SigningKey};
+use harmonia_utils_signature::SecretKey;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -326,16 +326,33 @@ pub(crate) fn write_secret(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn load_signing_key(state_dir: &Path) -> Result<SigningKey> {
+/// Load or create the worker's NAR signing key, stored in Nix's
+/// "name:base64" secret key format (nix-store --generate-binary-cache-key)
+/// so operators can inspect it with standard tooling.
+fn hostname() -> String {
+    nix::unistd::gethostname()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .unwrap_or_else(|| "worker".into())
+}
+
+fn load_signing_key(state_dir: &Path) -> Result<SecretKey> {
     let path = state_dir.join("signing.key");
     if path.exists() {
-        let bytes: [u8; 32] = std::fs::read(&path)?
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("signing.key must be 32 bytes"))?;
-        Ok(SigningKey::from_bytes(&bytes))
+        std::fs::read_to_string(&path)?
+            .trim()
+            .parse::<SecretKey>()
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "{}: {e}; expected Nix secret key format (name:base64); \
+                     delete the file to generate a fresh key",
+                    path.display()
+                )
+            })
     } else {
-        let key = SigningKey::generate(&mut rand::rngs::OsRng);
-        write_secret(&path, &key.to_bytes())?;
+        let key = SecretKey::generate(format!("{}-1", hostname()))
+            .map_err(|e| anyhow::anyhow!("generating signing key: {e}"))?;
+        write_secret(&path, format!("{key}\n").as_bytes())?;
         Ok(key)
     }
 }
@@ -513,7 +530,8 @@ async fn run_async(opts: WorkerOpts) -> Result<()> {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o711))?;
     }
     sweep_state_dir(&opts.state_dir);
-    let signing_key = load_signing_key(&opts.state_dir)?;
+    // Arc: SecretKey is not Clone (zeroized on drop); build threads share it.
+    let signing_key = std::sync::Arc::new(load_signing_key(&opts.state_dir)?);
     let mut opts = opts;
     let mut emulators = HashMap::new();
     for pair in &opts.emulate {
@@ -586,7 +604,7 @@ async fn run_async(opts: WorkerOpts) -> Result<()> {
 
 async fn session(
     opts: &WorkerOpts,
-    signing_key: &SigningKey,
+    signing_key: &std::sync::Arc<SecretKey>,
     ctx: &std::sync::Arc<WorkerCtx>,
 ) -> Result<()> {
     let tls = ClientTlsConfig::new()
@@ -614,12 +632,9 @@ async fn session(
     let (out_tx, out_rx) = mpsc::channel::<WorkerMessage>(64);
     out_tx
         .send(msg(worker_message::Msg::Register(Register {
-            worker_name: nix::unistd::gethostname()
-                .ok()
-                .and_then(|h| h.into_string().ok())
-                .unwrap_or_else(|| "worker".into()),
+            worker_name: hostname(),
             caps: system_caps(opts, ctx),
-            signing_public_key: signing_key.verifying_key().to_bytes().to_vec(),
+            signing_public_key: signing_key.to_public_key().to_string(),
         })))
         .await?;
     // One outstanding RequestJob per build slot; every finished build
@@ -677,7 +692,7 @@ async fn session_loop(
     inbound: &mut tonic::Streaming<crate::proto::HubMessage>,
     active: &mut HashMap<String, ActiveBuild>,
     out_tx: &mpsc::Sender<WorkerMessage>,
-    signing_key: &SigningKey,
+    signing_key: &std::sync::Arc<SecretKey>,
     ctx: &std::sync::Arc<WorkerCtx>,
     build_timeout: std::time::Duration,
 ) -> Result<()> {
@@ -1015,7 +1030,7 @@ impl ActiveBuild {
     fn execute(
         &self,
         out_tx: &mpsc::Sender<WorkerMessage>,
-        signing_key: &SigningKey,
+        signing_key: &SecretKey,
         timeout: std::time::Duration,
     ) -> Result<()> {
         let a = &self.assignment;
@@ -1198,12 +1213,7 @@ impl ActiveBuild {
             }
             let hash = hasher.finalize();
             let sig = signing_key.sign(format!("{}:{}", scratch, hex::encode(hash)).as_bytes());
-            packed.push((
-                scratch.clone(),
-                nar_file,
-                hash.to_vec(),
-                sig.to_bytes().to_vec(),
-            ));
+            packed.push((scratch.clone(), nar_file, hash.to_vec(), sig.to_string()));
         }
 
         out_tx.blocking_send(msg(worker_message::Msg::Result(BuildResult {

@@ -138,7 +138,8 @@ signatures).
 * Output authenticity: workers sign output NARs (ed25519); the hub
   verifies while relaying. By default the key is the one the worker
   registers over its mTLS session; with a `trusted-signing-keys` file in
-  the hub config dir (one hex public key per line) registration is
+  the hub config dir (one Nix-format `name:base64` public key per line,
+  same syntax as nix.conf `trusted-public-keys`) registration is
   restricted to pinned keys, so a stolen TLS cert alone cannot serve
   validly-signed outputs.
 * The attach socket is group-restricted to `nixbld` (the hub refuses to

@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use harmonia_utils_signature::{PublicKey, Signature};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
@@ -462,7 +462,7 @@ struct WorkerSvc {
     /// registering an unknown key is rejected. Without it the signature
     /// check only proves the NARs came from whoever registered the key,
     /// which mTLS already guarantees.
-    trusted_keys: Option<Arc<std::collections::HashSet<[u8; 32]>>>,
+    trusted_keys: Option<Arc<Vec<PublicKey>>>,
 }
 
 /// Registers the worker's capabilities while alive; removes them on
@@ -580,18 +580,15 @@ impl crate::proto::worker_hub_server::WorkerHub for WorkerSvc {
             }) => r,
             _ => return Err(Status::invalid_argument("first message must be Register")),
         };
-        let key: [u8; 32] = register
+        let vkey: PublicKey = register
             .signing_public_key
-            .as_slice()
-            .try_into()
-            .map_err(|_| Status::invalid_argument("signing key must be 32 bytes"))?;
-        let vkey = VerifyingKey::from_bytes(&key)
+            .parse()
             .map_err(|e| Status::invalid_argument(format!("bad signing key: {e}")))?;
         if let Some(trusted) = &self.trusted_keys {
-            if !trusted.contains(&key) {
+            if !trusted.contains(&vkey) {
                 tracing::warn!(
                     worker = register.worker_name,
-                    key = hex::encode(key),
+                    key = %vkey,
                     "rejecting worker with unpinned signing key"
                 );
                 return Err(Status::permission_denied(
@@ -617,7 +614,7 @@ impl crate::proto::worker_hub_server::WorkerHub for WorkerSvc {
         tokio::spawn(worker_loop(
             self.state.clone(),
             register,
-            vkey,
+            Arc::new(vkey),
             out_tx,
             in_rx,
         ));
@@ -628,7 +625,7 @@ impl crate::proto::worker_hub_server::WorkerHub for WorkerSvc {
 async fn worker_loop(
     state: Arc<HubState>,
     register: Register,
-    vkey: VerifyingKey,
+    vkey: Arc<PublicKey>,
     out_tx: mpsc::Sender<Result<HubMessage, Status>>,
     in_rx: mpsc::Receiver<WorkerMessage>,
 ) {
@@ -672,6 +669,7 @@ async fn worker_loop(
         let state = state.clone();
         let router = router.clone();
         let out_tx = out_tx.clone();
+        let vkey = vkey.clone();
         tokio::spawn(async move {
             match run_job(&job, &vkey, &out_tx, in_rx).await {
                 Ok(()) => {}
@@ -706,7 +704,7 @@ async fn send(
 
 async fn run_job(
     job: &Job,
-    vkey: &VerifyingKey,
+    vkey: &PublicKey,
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
     mut in_rx: mpsc::Receiver<worker_message::Msg>,
 ) -> Result<()> {
@@ -923,7 +921,7 @@ impl Write for HashWriter {
 
 async fn relay_build(
     job: &Job,
-    vkey: &VerifyingKey,
+    vkey: &PublicKey,
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
     in_rx: &mut mpsc::Receiver<worker_message::Msg>,
 ) -> Result<()> {
@@ -959,7 +957,9 @@ async fn relay_build(
                     return Ok(());
                 }
                 for out in res.outputs {
-                    let sig = Signature::from_slice(&out.signature)
+                    let sig: Signature = out
+                        .signature
+                        .parse()
                         .context("malformed output signature")?;
                     pending.insert(
                         out.store_path,
@@ -1005,10 +1005,9 @@ async fn relay_build(
                     verify.decoder.flush()?;
                     let hash = verify.decoder.into_inner().hasher.finalize();
                     let msg = format!("{}:{}", n.store_path, hex::encode(hash));
-                    vkey.verify(msg.as_bytes(), &verify.signature)
-                        .with_context(|| {
-                            format!("signature verification failed for {}", n.store_path)
-                        })?;
+                    if !vkey.verify(msg.as_bytes(), &verify.signature) {
+                        bail!("signature verification failed for {}", n.store_path);
+                    }
                     job.replay
                         .publish(attach_event::Event::Output(OutputNar {
                             store_path: n.store_path.clone(),
@@ -1043,22 +1042,21 @@ async fn run_async(socket: &Path, listen: &str, config_dir: &Path) -> Result<()>
     let ca = Certificate::from_pem(std::fs::read(ca_dir.join("ca.crt")).context("reading ca.crt")?);
     let tls = ServerTlsConfig::new().identity(identity).client_ca_root(ca);
 
-    // Optional operator pinning of worker signing keys (one hex ed25519
-    // public key per line, '#' comments). Without it, output signatures
-    // only authenticate the TLS channel, not a particular worker.
+    // Optional operator pinning of worker signing keys (one Nix-format
+    // "name:base64" public key per line, '#' comments; same syntax as
+    // nix.conf trusted-public-keys). Without it, output signatures only
+    // authenticate the TLS channel, not a particular worker.
     let trusted_keys = match std::fs::read_to_string(config_dir.join("trusted-signing-keys")) {
         Ok(data) => {
-            let mut keys = std::collections::HashSet::new();
+            let mut keys = Vec::new();
             for line in data.lines() {
                 let line = line.trim();
                 if line.is_empty() || line.starts_with('#') {
                     continue;
                 }
-                let bytes: [u8; 32] = hex::decode(line)
-                    .ok()
-                    .and_then(|v| v.try_into().ok())
-                    .with_context(|| format!("bad key in trusted-signing-keys: {line}"))?;
-                keys.insert(bytes);
+                keys.push(line.parse::<PublicKey>().map_err(|e| {
+                    anyhow::anyhow!("bad key in trusted-signing-keys: {line}: {e}")
+                })?);
             }
             tracing::info!(count = keys.len(), "worker signing keys pinned");
             Some(Arc::new(keys))
