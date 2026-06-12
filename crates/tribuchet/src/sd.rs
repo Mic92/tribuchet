@@ -43,6 +43,13 @@ pub fn activated_sockets() -> Result<ActivatedSockets> {
             family => bail!("activated socket fd {fd} has unsupported family {family}"),
         }
     }
+    if out.tcp.is_some() || out.unix.is_some() {
+        tracing::info!(
+            tcp = out.tcp.is_some(),
+            unix = out.unix.is_some(),
+            "adopted systemd-activated sockets"
+        );
+    }
     Ok(out)
 }
 
@@ -62,6 +69,19 @@ fn socket_family(fd: RawFd) -> Result<libc::c_int> {
 /// new one is actually serving.
 pub fn notify_ready() {
     let _ = sd_notify::notify(&[sd_notify::NotifyState::Ready]);
+}
+
+/// Resolves on SIGTERM, after telling systemd shutdown started
+/// ("deactivating" in systemctl status instead of an apparently hung
+/// stop while builds drain). Never resolves if no handler can be
+/// installed.
+pub async fn stop_requested() {
+    let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    else {
+        return std::future::pending().await;
+    };
+    term.recv().await;
+    let _ = sd_notify::notify(&[sd_notify::NotifyState::Stopping]);
 }
 
 /// Keep the systemd watchdog fed (WatchdogSec=); a wedged runtime

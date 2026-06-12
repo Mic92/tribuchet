@@ -248,6 +248,10 @@ pub(crate) const STORE_DIR: &str = "/nix/store";
 /// but legitimate closures.
 pub(crate) const MAX_MSG_SIZE: usize = 64 * 1024 * 1024;
 
+/// How long a submission waits for a capable worker before being
+/// rejected; covers the re-registration gap after a hub restart.
+const WORKER_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A store path directly under the store dir: absolute, exactly one
 /// component, hash-prefixed, Nix name charset (no shell/SBPL
 /// metacharacters, control bytes, or path tricks). The hub runs as
@@ -417,17 +421,31 @@ impl attach_hub_server::AttachHub for AttachSvc {
         let key = dedupe_key(&req);
 
         let features = crate::build_json::required_system_features(&req.env);
-        {
+        // Reject submissions no worker can serve, but only after a
+        // grace period: right after a hub restart the workers have not
+        // re-registered yet, and that must not fail client builds.
+        let servable = || {
             let caps = self.state.worker_caps.lock().unwrap();
-            if !caps.values().any(|c| c.serves(&req.system, &features)) {
-                let what = if features.is_empty() {
-                    format!("system {}", req.system)
-                } else {
-                    format!("system {} with features {features:?}", req.system)
-                };
-                return Err(Status::failed_precondition(format!(
-                    "no connected worker builds for {what}"
-                )));
+            caps.values().any(|c| c.serves(&req.system, &features))
+        };
+        if !servable() {
+            tracing::info!(system = req.system, "no capable worker yet; waiting");
+            let deadline = std::time::Instant::now() + WORKER_GRACE;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                if servable() {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let what = if features.is_empty() {
+                        format!("system {}", req.system)
+                    } else {
+                        format!("system {} with features {features:?}", req.system)
+                    };
+                    return Err(Status::failed_precondition(format!(
+                        "no connected worker builds for {what}"
+                    )));
+                }
             }
         }
 
@@ -1187,6 +1205,13 @@ async fn run_async(socket: &Path, listen: &str, config_dir: &Path) -> Result<()>
         Err(e) => return Err(e).context("reading trusted-signing-keys"),
     };
 
+    let (shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        crate::sd::stop_requested().await;
+        tracing::info!("SIGTERM: stopping accepts, draining");
+        let _ = shutdown_tx.send(true);
+    });
+
     // Listeners come from systemd socket activation when available
     // (they survive hub restarts; clients queue instead of getting
     // ECONNREFUSED), otherwise we bind ourselves.
@@ -1218,7 +1243,10 @@ async fn run_async(socket: &Path, listen: &str, config_dir: &Path) -> Result<()>
             .max_decoding_message_size(MAX_MSG_SIZE)
             .max_encoding_message_size(MAX_MSG_SIZE),
         )
-        .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(tcp));
+        .serve_with_incoming_shutdown(
+            tokio_stream::wrappers::TcpListenerStream::new(tcp),
+            wait_for(shutdown.clone()),
+        );
 
     let uds = match activated.unix {
         // Activated socket: systemd owns the path, mode and group
@@ -1230,20 +1258,57 @@ async fn run_async(socket: &Path, listen: &str, config_dir: &Path) -> Result<()>
     };
     let attach_server = Server::builder()
         .add_service(
-            attach_hub_server::AttachHubServer::new(AttachSvc { state })
-                .max_decoding_message_size(MAX_MSG_SIZE)
-                .max_encoding_message_size(MAX_MSG_SIZE),
+            attach_hub_server::AttachHubServer::new(AttachSvc {
+                state: state.clone(),
+            })
+            .max_decoding_message_size(MAX_MSG_SIZE)
+            .max_encoding_message_size(MAX_MSG_SIZE),
         )
-        .serve_with_incoming(UnixListenerStream::new(uds));
+        .serve_with_incoming_shutdown(UnixListenerStream::new(uds), wait_for(shutdown.clone()));
 
     tracing::info!(listen, socket = %socket.display(), "hub running");
     crate::sd::notify_ready();
     crate::sd::spawn_watchdog();
-    tokio::try_join!(
-        async { worker_server.await.context("worker gRPC server") },
-        async { attach_server.await.context("attach gRPC server") },
-    )?;
-    Ok(())
+    let servers = async {
+        tokio::try_join!(
+            async { worker_server.await.context("worker gRPC server") },
+            async { attach_server.await.context("attach gRPC server") },
+        )
+    };
+    tokio::select! {
+        res = servers => res.map(|_| ()),
+        () = drain(shutdown, &state) => Ok(()),
+    }
+}
+
+async fn wait_for(mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    let _ = shutdown.wait_for(|&v| v).await;
+}
+
+/// SIGTERM means "hand over", not "die": both servers stop accepting
+/// (new clients queue in the systemd-held sockets for the replacement
+/// instance), already-connected attaches and workers keep going until
+/// every queued and in-flight build finished, then the hub exits.
+/// Requires a TimeoutStopSec covering the longest build.
+async fn drain(shutdown: tokio::sync::watch::Receiver<bool>, state: &HubState) {
+    wait_for(shutdown).await;
+    let mut tick = 0u32;
+    loop {
+        let queued = state.queue.lock().await.len();
+        let inflight = state.inflight.lock().await.by_key.len();
+        if queued == 0 && inflight == 0 {
+            break;
+        }
+        if tick.is_multiple_of(10) {
+            tracing::info!(queued, inflight, "draining");
+        }
+        tick += 1;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    // Final ExitCode events may still be in flight to attach clients;
+    // give the streams a moment to flush before tearing them down.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    tracing::info!("drained, exiting");
 }
 
 #[cfg(test)]

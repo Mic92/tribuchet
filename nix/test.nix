@@ -95,6 +95,9 @@ in
         environment.etc."tt/logbomb.nix".text = ''
           import ${./tests/logbomb.nix} { bash = "${pkgs.bash}"; }
         '';
+        environment.etc."tt/drain.nix".text = ''
+          import ${./tests/drain.nix} { bash = "${pkgs.bash}"; }
+        '';
         environment.etc."tt/cross.nix".text = ''
           import ${./tests/cross.nix} {
             busybox = "${pkgs.pkgsCross.aarch64-multiplatform.pkgsStatic.busybox}";
@@ -125,6 +128,9 @@ in
             RuntimeDirectoryPreserve = true;
             Environment = "RUST_LOG=info";
             WatchdogSec = "30";
+            # On stop the hub drains: it serves existing builds until
+            # they finish and only then exits.
+            TimeoutStopSec = "600";
           };
         };
       };
@@ -154,6 +160,11 @@ in
           serviceConfig = {
             Type = "notify";
             WatchdogSec = "30";
+            # SIGTERM must reach only the worker itself: build children
+            # keep running while the worker drains, and only a drain
+            # overrunning TimeoutStopSec gets the whole cgroup killed.
+            KillMode = "mixed";
+            TimeoutStopSec = "600";
             ExecStart = "${tribuchet}/bin/tribuchet worker --hub https://hub:7437 --state-dir /var/lib/tribuchet --max-jobs 2 --max-log-size 1048576 --emulate aarch64-linux=${pkgs.pkgsStatic.qemu-user}/bin/qemu-aarch64";
             StateDirectory = "tribuchet";
             Environment = "RUST_LOG=info";
@@ -220,6 +231,31 @@ in
             "nix-build /root/test.nix --no-out-link 2>/dev/null"
         ).strip()
         hub.succeed(f"grep -q 'tribuchet-payload built-remotely' {out}")
+
+    with subtest("restarting hub and worker mid-build cancels nothing"):
+        assigned = int(worker.succeed(
+            "journalctl -u tribuchet-worker | grep -c 'build assigned' || true"
+        ).strip())
+        # systemd-run: the build must survive this command returning.
+        hub.succeed(
+            "rm -f /tmp/drain.ok && systemd-run --unit=drainbuild bash -lc "
+            "'nix-build /etc/tt/drain.nix --no-out-link > /tmp/drain.out "
+            "&& touch /tmp/drain.ok'"
+        )
+        worker.wait_until_succeeds(
+            f"[ $(journalctl -u tribuchet-worker | grep -c 'build assigned') -gt {assigned} ]",
+            timeout=60,
+        )
+        # Both restarts at once, mid-build: the old daemons drain (the
+        # worker finishes the build, the hub keeps relaying it) while
+        # systemd holds the sockets for the replacement instances.
+        worker.succeed("systemctl restart --no-block tribuchet-worker")
+        hub.succeed("systemctl restart --no-block tribuchet-hub")
+        hub.wait_until_succeeds("test -f /tmp/drain.ok", timeout=120)
+        out = hub.succeed("cat /tmp/drain.out").strip()
+        hub.succeed(f"grep -q drained-not-cancelled {out}")
+        worker.wait_until_succeeds("systemctl is-active tribuchet-worker")
+        hub.wait_until_succeeds("systemctl is-active tribuchet-hub")
 
     with subtest("concurrent builds share one worker session"):
         import time

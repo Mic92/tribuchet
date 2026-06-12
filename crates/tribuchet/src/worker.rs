@@ -88,6 +88,12 @@ struct WorkerCtx {
     secret_paths: Vec<PathBuf>,
     /// Builds currently executing, reported in heartbeats.
     running: std::sync::atomic::AtomicU32,
+    /// Builds anywhere between assignment and cleanup; drain waits on
+    /// this, not `running`, so builds still staging inputs survive too.
+    busy: std::sync::atomic::AtomicU32,
+    /// Set on SIGTERM: finish what is active, request nothing new,
+    /// exit when idle. systemd then starts the replacement instance.
+    draining: std::sync::atomic::AtomicBool,
     /// system -> static emulator binary, from --emulate.
     emulators: HashMap<String, PathBuf>,
     /// pasta binary for fixed-output network isolation.
@@ -429,6 +435,8 @@ async fn run_async(opts: WorkerOpts) -> Result<()> {
         build_memory_max: opts.build_memory_max,
         secret_paths: vec![opts.key.clone(), opts.state_dir.join("signing.key")],
         running: std::sync::atomic::AtomicU32::new(0),
+        busy: std::sync::atomic::AtomicU32::new(0),
+        draining: std::sync::atomic::AtomicBool::new(false),
         emulators,
         pasta: opts.pasta.clone(),
         max_silent_time: opts.max_silent_time,
@@ -443,6 +451,7 @@ async fn run_async(opts: WorkerOpts) -> Result<()> {
     // hang in "activating" waiting for a hub that may be down.
     crate::sd::notify_ready();
     crate::sd::spawn_watchdog();
+    spawn_drain(ctx.clone());
 
     // Reconnect with backoff: a hub restart must not drain the fleet.
     let mut backoff = std::time::Duration::from_secs(1);
@@ -459,6 +468,36 @@ async fn run_async(opts: WorkerOpts) -> Result<()> {
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(std::time::Duration::from_secs(60));
     }
+}
+
+/// SIGTERM means "hand over to a replacement instance", not "die":
+/// in-flight builds finish and report their results, only then does
+/// the process exit. Requires KillMode=mixed (build children must not
+/// get the SIGTERM) and a TimeoutStopSec covering the longest build.
+fn spawn_drain(ctx: std::sync::Arc<WorkerCtx>) {
+    tokio::spawn(async move {
+        crate::sd::stop_requested().await;
+        ctx.draining
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!("SIGTERM: finishing active builds, requesting no new jobs");
+        let mut tick = 0u32;
+        loop {
+            let busy = ctx.busy.load(std::sync::atomic::Ordering::Relaxed);
+            if busy == 0 {
+                break;
+            }
+            if tick.is_multiple_of(10) {
+                tracing::info!(busy, "draining");
+            }
+            tick += 1;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        // Results queue through the gRPC channel; give it a moment to
+        // flush before the process goes away.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        tracing::info!("drained, exiting");
+        std::process::exit(0);
+    });
 }
 
 async fn session(
@@ -497,9 +536,12 @@ async fn session(
         })))
         .await?;
     // One outstanding RequestJob per build slot; every finished build
-    // sends the next one, keeping the sum constant.
-    for _ in 0..opts.max_jobs.max(1) {
-        out_tx.send(request_job()).await?;
+    // sends the next one, keeping the sum constant. None while
+    // draining: a reconnect mid-drain must not pull in new work.
+    if !ctx.draining.load(std::sync::atomic::Ordering::Relaxed) {
+        for _ in 0..opts.max_jobs.max(1) {
+            out_tx.send(request_job()).await?;
+        }
     }
 
     let heartbeat_tx = out_tx.clone();
@@ -638,7 +680,9 @@ async fn session_loop(
                                 build.cleanup();
                                 ctx.running
                                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                                let _ = out_tx.blocking_send(request_job());
+                                if !ctx.draining.load(std::sync::atomic::Ordering::Relaxed) {
+                                    let _ = out_tx.blocking_send(request_job());
+                                }
                             });
                         }
                     }
@@ -803,6 +847,7 @@ impl ActiveBuild {
             std::fs::remove_dir_all(&dir)?;
         }
         std::fs::create_dir_all(dir.join("top"))?;
+        ctx.busy.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Self {
             assignment,
             dir,
@@ -1210,6 +1255,14 @@ impl ActiveBuild {
         if let Err(e) = std::fs::remove_dir_all(&self.dir) {
             tracing::warn!("cleaning up {}: {e}", self.dir.display());
         }
+    }
+}
+
+impl Drop for ActiveBuild {
+    fn drop(&mut self) {
+        self.ctx
+            .busy
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
