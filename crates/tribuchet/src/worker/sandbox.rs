@@ -15,7 +15,9 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
+#[cfg(test)]
+use std::process::{Child, Stdio};
 
 use anyhow::{Context, Result};
 
@@ -148,9 +150,53 @@ pub fn prepare(
     Ok(spec)
 }
 
-/// Spawn the builder with stdout/stderr appended to `log`: a file,
-/// not a pipe, so log capture does not depend on the process that
-/// spawned the build staying alive to hold the read end.
+/// Turn a prepared sandbox into a reaper spawn request plus, on
+/// Linux, the pipe carrying the serialized spec to the setup stage:
+/// (request, read end for the child's stdin, write end the caller
+/// must fill with `send_spec_to` after the spawn).
+pub fn spawn_request(
+    spec: &SandboxSpec,
+) -> Result<(
+    crate::worker::reaper::SpawnRequest,
+    Option<std::os::fd::OwnedFd>,
+    Option<std::os::fd::OwnedFd>,
+)> {
+    let cmd = platform::command(spec)?;
+    let argv: Vec<String> = std::iter::once(cmd.get_program())
+        .chain(cmd.get_args())
+        .map(|s| s.to_string_lossy().into_owned())
+        .collect();
+    let req = crate::worker::reaper::SpawnRequest {
+        argv,
+        env: spec
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        cwd: cmd
+            .get_current_dir()
+            .map(|p| p.to_string_lossy().into_owned()),
+        has_stdin: platform::SPEC_VIA_STDIN,
+        seq: 0,
+    };
+    if platform::SPEC_VIA_STDIN {
+        let (r, w) = nix::unistd::pipe().context("creating spec pipe")?;
+        Ok((req, Some(r), Some(w)))
+    } else {
+        Ok((req, None, None))
+    }
+}
+
+/// Write the serialized spec into the setup stage's stdin pipe; call
+/// after the reaper confirmed the spawn. No-op platform-wise on macOS
+/// (no pipe exists there).
+pub fn send_spec_to(spec: &SandboxSpec, w: std::os::fd::OwnedFd) -> Result<()> {
+    serde_json::to_writer(std::fs::File::from(w), spec).context("sending sandbox spec")
+}
+
+/// Spawn the builder directly (unit tests only; real builds go
+/// through the reaper) with stdout/stderr on `log`.
+#[cfg(test)]
 pub fn spawn(spec: &SandboxSpec, log: std::fs::File) -> Result<Child> {
     let mut cmd = platform::command(spec)?;
     // Own process group, so orphaned builder children can be killed
@@ -365,10 +411,15 @@ mod platform {
     // a filter selecting the dispatch test below.
     pub const SETUP_STAGE_ARG: &str = "__sandbox_setup";
 
+    /// The spec travels via the setup stage's stdin.
+    pub const SPEC_VIA_STDIN: bool = true;
+
+    #[cfg(test)]
     pub fn stdin_mode() -> Stdio {
         Stdio::piped() // carries the serialized spec
     }
 
+    #[cfg(test)]
     pub fn send_spec(child: &mut Child, spec: &SandboxSpec) -> Result<()> {
         let stdin = child.stdin.take().context("setup stage stdin missing")?;
         serde_json::to_writer(stdin, spec).context("sending sandbox spec")?;
@@ -1083,10 +1134,15 @@ mod platform {
         None
     }
 
+    /// sandbox-exec takes everything on the command line.
+    pub const SPEC_VIA_STDIN: bool = false;
+
+    #[cfg(test)]
     pub fn stdin_mode() -> Stdio {
         Stdio::null()
     }
 
+    #[cfg(test)]
     pub fn send_spec(_child: &mut Child, _spec: &SandboxSpec) -> Result<()> {
         Ok(())
     }

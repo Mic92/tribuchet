@@ -156,6 +156,9 @@ in
           wantedBy = lib.mkForce [ ];
           serviceConfig = {
             Type = "notify";
+            # READY/watchdog come from the worker child; the main pid
+            # is the build reaper it forked off at startup.
+            NotifyAccess = "all";
             WatchdogSec = "30";
             # SIGTERM must reach only the worker itself: build children
             # keep running while the worker drains, and only a drain

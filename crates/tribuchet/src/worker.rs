@@ -12,6 +12,7 @@
 
 pub mod binfmt;
 mod cgroup;
+pub mod reaper;
 pub mod sandbox;
 
 use std::collections::{BTreeSet, HashMap};
@@ -80,6 +81,11 @@ pub struct WorkerOpts {
 /// Per-process context threaded through builds.
 struct WorkerCtx {
     state_dir: PathBuf,
+    /// Handle to the reaper (the pre-fork parent half), which spawns
+    /// and reaps builder processes so they are not our children.
+    spawner: reaper::Spawner,
+    /// Where the reaper records exit codes, one file per pid.
+    status_dir: PathBuf,
     sandbox_bin_sh: Option<PathBuf>,
     cgroup_base: Option<PathBuf>,
     build_memory_max: Option<u64>,
@@ -370,6 +376,12 @@ fn sweep_state_dir(state_dir: &Path) {
             remove_path_all(&entry.path());
         }
     }
+    // Exit statuses recorded by a previous reaper refer to dead pids.
+    if let Ok(entries) = std::fs::read_dir(state_dir.join("exited")) {
+        for entry in entries.flatten() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
     // Input caching moved into the real /nix/store (daemon import);
     // clear the legacy cache directory left by older versions.
     let legacy = state_dir.join("store");
@@ -401,11 +413,26 @@ fn request_job() -> WorkerMessage {
 }
 
 pub fn run(opts: WorkerOpts) -> Result<()> {
+    // Enter the delegated-cgroup leaf before forking: both halves
+    // must leave the unit's root cgroup, or enabling subtree_control
+    // there fails (no-internal-processes rule).
+    let cgroup_base = if cfg!(target_os = "linux") {
+        cgroup::init()
+    } else {
+        None
+    };
+    // Fork the reaper before tokio: forking a multithreaded runtime
+    // is unsafe, and the reaper must be the builds' parent.
+    let spawner = reaper::split(opts.state_dir.join("exited"))?;
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(run_async(opts))
+    rt.block_on(run_async(opts, spawner, cgroup_base))
 }
 
-async fn run_async(opts: WorkerOpts) -> Result<()> {
+async fn run_async(
+    opts: WorkerOpts,
+    spawner: reaper::Spawner,
+    cgroup_base: Option<PathBuf>,
+) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let builds_dir = opts.state_dir.join("builds");
     std::fs::create_dir_all(&builds_dir)?;
@@ -447,12 +474,10 @@ async fn run_async(opts: WorkerOpts) -> Result<()> {
     let opts = opts;
     let ctx = std::sync::Arc::new(WorkerCtx {
         state_dir: opts.state_dir.clone(),
+        spawner,
+        status_dir: opts.state_dir.join("exited"),
         sandbox_bin_sh: opts.sandbox_bin_sh.clone(),
-        cgroup_base: if cfg!(target_os = "linux") {
-            cgroup::init()
-        } else {
-            None
-        },
+        cgroup_base,
         build_memory_max: opts.build_memory_max,
         secret_paths: vec![opts.key.clone(), opts.state_dir.join("signing.key")],
         running: std::sync::atomic::AtomicU32::new(0),
@@ -1135,7 +1160,11 @@ impl ActiveBuild {
         // generation can resume tailing where we stopped.
         let log_path = self.dir.join("build.log");
         let log_file = std::fs::File::create(&log_path)?;
-        let mut child = sandbox::spawn(&spec, log_file)?;
+        let (mut req, child_stdin, spec_w) = sandbox::spawn_request(&spec)?;
+        let pid = self.ctx.spawner.spawn(&mut req, &log_file, child_stdin)?;
+        if let Some(w) = spec_w {
+            sandbox::send_spec_to(&spec, w)?;
+        }
 
         let log_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         // ms since `started`, updated on every log chunk
@@ -1182,14 +1211,14 @@ impl ActiveBuild {
                 }
             })
         };
-        let pgrp = nix::unistd::Pid::from_raw(child.id() as i32);
+        let pgrp = nix::unistd::Pid::from_raw(pid);
         let max_silent_ms = self.ctx.max_silent_time.as_millis() as u64;
         let max_log = self.ctx.max_log_size;
         use std::sync::atomic::Ordering;
         let mut abort: Option<String> = None;
         let status = loop {
-            if let Some(status) = child.try_wait()? {
-                break status;
+            if let Some(code) = reaper::take_status(&self.ctx.status_dir, pid) {
+                break code;
             }
             // saturating: a log thread may store a newer timestamp
             // between the elapsed() read and the load
@@ -1207,7 +1236,13 @@ impl ActiveBuild {
             }
             if abort.is_some() {
                 let _ = nix::sys::signal::killpg(pgrp, nix::sys::signal::Signal::SIGKILL);
-                break child.wait()?;
+                // The reaper collects the kill within its sweep interval.
+                break loop {
+                    if let Some(code) = reaper::take_status(&self.ctx.status_dir, pid) {
+                        break code;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                };
             }
             std::thread::sleep(std::time::Duration::from_millis(200));
         };
@@ -1220,12 +1255,10 @@ impl ActiveBuild {
         if let Some(reason) = abort {
             bail!("{reason}");
         }
-        // Signal deaths become 128 + signo (matching shell conventions),
-        // so an OOM SIGKILL (137) is distinguishable from a SIGSEGV (139).
-        let exit_code = status.code().unwrap_or_else(|| {
-            use std::os::unix::process::ExitStatusExt;
-            128 + status.signal().unwrap_or(0)
-        });
+        // The reaper already folded signal deaths into 128 + signo
+        // (matching shell conventions), so an OOM SIGKILL (137) is
+        // distinguishable from a SIGSEGV (139).
+        let exit_code = status;
         tracing::info!(id = a.build_id, exit_code, "builder finished");
 
         if exit_code != 0 {
