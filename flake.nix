@@ -20,7 +20,12 @@
             pname = "tribuchet";
             version = "0.1.0";
             src = self;
-            cargoLock.lockFile = ./Cargo.lock;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              # harmonia crates come from one pinned git rev; builtin
+              # fetchGit avoids enumerating an outputHash per crate
+              allowBuiltinFetchGit = true;
+            };
             nativeBuildInputs = [ pkgs.protobuf ];
             PROTOC = "${pkgs.protobuf}/bin/protoc";
           }
