@@ -438,6 +438,12 @@ async fn run_async(opts: WorkerOpts) -> Result<()> {
         shared_link_lock: std::sync::Mutex::new(()),
     });
 
+    // Ready once local setup is done, not once the hub answers: the
+    // worker is designed to outlive hub outages, so a restart must not
+    // hang in "activating" waiting for a hub that may be down.
+    crate::sd::notify_ready();
+    crate::sd::spawn_watchdog();
+
     // Reconnect with backoff: a hub restart must not drain the fleet.
     let mut backoff = std::time::Duration::from_secs(1);
     loop {

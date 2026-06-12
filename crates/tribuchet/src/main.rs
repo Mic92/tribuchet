@@ -5,6 +5,7 @@ mod chunkio;
 mod hub;
 mod nar;
 mod proto;
+mod sd;
 mod worker;
 
 use std::path::PathBuf;

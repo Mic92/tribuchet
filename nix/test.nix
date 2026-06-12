@@ -101,13 +101,30 @@ in
           }
         '';
 
-        systemd.services.tribuchet-hub = {
+        # systemd holds both listeners: hub restarts never refuse
+        # attach or worker connections, clients just queue.
+        systemd.sockets.tribuchet-hub = {
           # started by the test script once certificates exist
           wantedBy = lib.mkForce [ ];
+          listenStreams = [
+            "/run/tribuchet/hub.sock"
+            "0.0.0.0:7437"
+          ];
+          socketConfig = {
+            SocketGroup = "nixbld";
+            SocketMode = "0660";
+          };
+        };
+        systemd.services.tribuchet-hub = {
           serviceConfig = {
+            Type = "notify";
             ExecStart = "${tribuchet}/bin/tribuchet hub --socket /run/tribuchet/hub.sock --listen 0.0.0.0:7437 --config-dir /etc/tribuchet";
             RuntimeDirectory = "tribuchet";
+            # Never unlink the activated socket's path on service stop;
+            # the listener in systemd must stay reachable across restarts.
+            RuntimeDirectoryPreserve = true;
             Environment = "RUST_LOG=info";
+            WatchdogSec = "30";
           };
         };
       };
@@ -135,6 +152,8 @@ in
           # started by the test script once certificates exist
           wantedBy = lib.mkForce [ ];
           serviceConfig = {
+            Type = "notify";
+            WatchdogSec = "30";
             ExecStart = "${tribuchet}/bin/tribuchet worker --hub https://hub:7437 --state-dir /var/lib/tribuchet --max-jobs 2 --max-log-size 1048576 --emulate aarch64-linux=${pkgs.pkgsStatic.qemu-user}/bin/qemu-aarch64";
             StateDirectory = "tribuchet";
             Environment = "RUST_LOG=info";
@@ -164,6 +183,7 @@ in
             worker.succeed(f"cat > /var/lib/tribuchet/tls/{f} << 'PEMEOF'\n{pem}PEMEOF")
 
     with subtest("worker registers at hub over mTLS"):
+        hub.succeed("systemctl start tribuchet-hub.socket")
         hub.succeed("systemctl start tribuchet-hub")
         worker.succeed("systemctl start tribuchet-worker")
         hub.wait_until_succeeds(
@@ -189,6 +209,16 @@ in
             "NIXEOF"
         )
         out = hub.succeed("nix-build /root/test.nix --no-out-link").strip()
+        hub.succeed(f"grep -q 'tribuchet-payload built-remotely' {out}")
+
+    with subtest("hub restart: socket activation keeps clients connectable"):
+        # Type=notify means this only returns once the new hub serves.
+        hub.succeed("systemctl restart tribuchet-hub")
+        # The activated unix socket accepts immediately; the build
+        # waits for the worker to re-register rather than failing.
+        out = hub.succeed(
+            "nix-build /root/test.nix --no-out-link 2>/dev/null"
+        ).strip()
         hub.succeed(f"grep -q 'tribuchet-payload built-remotely' {out}")
 
     with subtest("concurrent builds share one worker session"):

@@ -1107,6 +1107,40 @@ async fn relay_build(
     }
 }
 
+/// Bind the attach socket ourselves (no socket activation).
+///
+/// attach runs as a nix build user: restrict the socket to that group
+/// (anyone who can reach it can have store paths packed and shipped).
+/// Resolve the group *before* binding and bind with a tight umask so
+/// the socket is never connectable by others, not even briefly.
+fn bind_attach_socket(socket: &Path) -> Result<tokio::net::UnixListener> {
+    if let Some(parent) = socket.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Refuse to replace the socket of a live hub: unlinking it would
+    // leave all new attaches with ECONNREFUSED while the old hub runs.
+    if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+        bail!("another hub is already serving {}", socket.display());
+    }
+    let _ = std::fs::remove_file(socket);
+    let group = match nix::unistd::Group::from_name("nixbld") {
+        Ok(Some(group)) => group,
+        _ => bail!(
+            "group nixbld not found; refusing to serve a hub socket without a group to restrict it to"
+        ),
+    };
+    let old_umask = nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o117));
+    let uds = tokio::net::UnixListener::bind(socket);
+    nix::sys::stat::umask(old_umask);
+    let uds = uds?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::os::unix::fs::chown(socket, None, Some(group.gid.as_raw()))?;
+        std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o660))?;
+    }
+    Ok(uds)
+}
+
 pub fn run(socket: &Path, listen: &str, config_dir: &Path) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run_async(socket, listen, config_dir))
@@ -1153,15 +1187,23 @@ async fn run_async(socket: &Path, listen: &str, config_dir: &Path) -> Result<()>
         Err(e) => return Err(e).context("reading trusted-signing-keys"),
     };
 
-    // Bind TCP eagerly: a second hub instance must fail here on
-    // EADDRINUSE *before* it clobbers the live hub's unix socket below.
-    let tcp = tokio::net::TcpListener::bind(
-        listen
-            .parse::<std::net::SocketAddr>()
-            .context("parsing listen address")?,
-    )
-    .await
-    .context("binding worker listen address")?;
+    // Listeners come from systemd socket activation when available
+    // (they survive hub restarts; clients queue instead of getting
+    // ECONNREFUSED), otherwise we bind ourselves.
+    let activated = crate::sd::activated_sockets()?;
+    let tcp = match activated.tcp {
+        Some(l) => tokio::net::TcpListener::from_std(l).context("adopting activated TCP socket")?,
+        // Bind TCP eagerly: a second hub instance must fail here on
+        // EADDRINUSE *before* it clobbers the live hub's unix socket
+        // below.
+        None => tokio::net::TcpListener::bind(
+            listen
+                .parse::<std::net::SocketAddr>()
+                .context("parsing listen address")?,
+        )
+        .await
+        .context("binding worker listen address")?,
+    };
     let worker_server = Server::builder()
         .tls_config(tls)?
         // Detect dead/half-open worker connections instead of relying on
@@ -1178,34 +1220,14 @@ async fn run_async(socket: &Path, listen: &str, config_dir: &Path) -> Result<()>
         )
         .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(tcp));
 
-    if let Some(parent) = socket.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    // Refuse to replace the socket of a live hub: unlinking it would
-    // leave all new attaches with ECONNREFUSED while the old hub runs.
-    if std::os::unix::net::UnixStream::connect(socket).is_ok() {
-        bail!("another hub is already serving {}", socket.display());
-    }
-    let _ = std::fs::remove_file(socket);
-    // attach runs as a nix build user: restrict the socket to that group
-    // (anyone who can reach it can have store paths packed and shipped).
-    // Resolve the group *before* binding and bind with a tight umask so
-    // the socket is never connectable by others, not even briefly.
-    let group = match nix::unistd::Group::from_name("nixbld") {
-        Ok(Some(group)) => group,
-        _ => bail!(
-            "group nixbld not found; refusing to serve a hub socket without a group to restrict it to"
-        ),
+    let uds = match activated.unix {
+        // Activated socket: systemd owns the path, mode and group
+        // (SocketGroup=/SocketMode= in the .socket unit).
+        Some(l) => {
+            tokio::net::UnixListener::from_std(l).context("adopting activated unix socket")?
+        }
+        None => bind_attach_socket(socket)?,
     };
-    let old_umask = nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o117));
-    let uds = tokio::net::UnixListener::bind(socket);
-    nix::sys::stat::umask(old_umask);
-    let uds = uds?;
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::os::unix::fs::chown(socket, None, Some(group.gid.as_raw()))?;
-        std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o660))?;
-    }
     let attach_server = Server::builder()
         .add_service(
             attach_hub_server::AttachHubServer::new(AttachSvc { state })
@@ -1215,6 +1237,8 @@ async fn run_async(socket: &Path, listen: &str, config_dir: &Path) -> Result<()>
         .serve_with_incoming(UnixListenerStream::new(uds));
 
     tracing::info!(listen, socket = %socket.display(), "hub running");
+    crate::sd::notify_ready();
+    crate::sd::spawn_watchdog();
     tokio::try_join!(
         async { worker_server.await.context("worker gRPC server") },
         async { attach_server.await.context("attach gRPC server") },
