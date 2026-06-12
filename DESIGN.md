@@ -159,12 +159,21 @@ signatures).
 ## Scale & state
 
 MVP targets 2–10 workers and a few clients: all scheduler state is in
-memory (no database). The worker's input NAR cache is bounded
-(`--cache-max-bytes`, LRU eviction, crash-safe completion markers); the
-hub's replay buffer is capped at 256 MiB per build and slow dedupe
-subscribers are dropped rather than buffered. The transfer protocol keeps a
-`oneof` payload so a chunked CAS (FastCDC + blake3) can replace whole-NAR
-streaming later without a protocol break.
+memory (no database). The hub's replay buffer is capped at 256 MiB per
+build and slow dedupe subscribers are dropped rather than buffered. The
+transfer protocol keeps a `oneof` payload so a chunked CAS (FastCDC +
+blake3) can replace whole-NAR streaming later without a protocol break.
+
+Hub restarts cancel nothing, without any state handoff: on SIGTERM the
+hub exits immediately and the replacement reconstructs its state from
+the edges. Workers re-register and announce the dedupe keys of builds
+they still hold (running, or finished but undelivered); attach clients
+reconnect and resubmit the identical request, whose deterministic
+dedupe key routes it back to the worker holding the build, which
+resumes (or just re-delivers the finished result) instead of building
+again. Worker restarts drain instead: builds are the worker's child
+processes, so systemd stops it with KillMode=mixed and the worker exits
+only once active builds finished and their results were delivered.
 
 ## Known limitations (MVP)
 
@@ -185,9 +194,6 @@ streaming later without a protocol break.
 * Dedupe attaches duplicates to the first attempt, so a transient
   failure propagates to all attached submitters (same as Buck2's RE
   dedupe behaviour).
-* Inputs taken from the worker's host /nix/store are not protected by GC
-  roots; a concurrent `nix-collect-garbage` on the worker can delete
-  them mid-build.
 * The Linux builder keeps the worker's kernel uid (remapped in the user
   namespace); there is no dedicated unprivileged build user yet.
 * Input NARs are not verified against an expected content hash; the

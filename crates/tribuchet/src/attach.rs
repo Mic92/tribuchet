@@ -32,28 +32,13 @@ pub fn run(build_json: &Path, socket: &Path) -> Result<()> {
     });
 }
 
+/// Reconnect budget across the whole build: a restarting hub is back
+/// within seconds, and the worker holds finished results for resume
+/// far longer than this.
+const RECONNECT_ATTEMPTS: u32 = 30;
+const RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
 async fn run_async(build: BuildJson, socket: PathBuf) -> Result<i32> {
-    // The URI is ignored; the connector always dials the unix socket.
-    let channel = Endpoint::try_from("http://hub.invalid")?
-        .connect_with_connector(service_fn(move |_: Uri| {
-            let socket = socket.clone();
-            async move {
-                Ok::<_, std::io::Error>(TokioIo::new(
-                    tokio::net::UnixStream::connect(socket).await?,
-                ))
-            }
-        }))
-        .await
-        .context("connecting to hub socket")?;
-    let mut client = AttachHubClient::new(channel)
-        .max_decoding_message_size(crate::hub::MAX_MSG_SIZE)
-        .max_encoding_message_size(crate::hub::MAX_MSG_SIZE);
-
-    // Ready marker for Nix; emitted only after the hub connection
-    // exists so connect failures surface as setup errors, not build
-    // failures.
-    std::io::stderr().write_all(b"\x02\n")?;
-
     let fixed_output = build.is_fixed_output();
     let req = BuildRequest {
         system: build.system,
@@ -67,13 +52,103 @@ async fn run_async(build: BuildJson, socket: PathBuf) -> Result<i32> {
         store_dir: build.store_dir,
         fixed_output,
     };
-
     let expected_outputs: Vec<String> = req.outputs.values().cloned().collect();
-    let mut stream = client.build(req).await?.into_inner();
+
+    // The hub holds no durable state: when it restarts mid-build we
+    // reconnect and resubmit the identical request. Its dedupe key
+    // matches the build still running on the worker, which resumes
+    // instead of building twice.
+    let mut attempts = 0u32;
+    loop {
+        match attempt_build(&req, &socket, &expected_outputs).await? {
+            Outcome::Done(code) => return Ok(code),
+            Outcome::Retry(e) => {
+                attempts += 1;
+                if attempts > RECONNECT_ATTEMPTS {
+                    return Err(e.context("giving up reconnecting to the hub"));
+                }
+                eprintln!("tribuchet: hub connection lost ({e:#}); reconnecting");
+                tokio::time::sleep(RECONNECT_DELAY).await;
+            }
+        }
+    }
+}
+
+enum Outcome {
+    Done(i32),
+    /// Transport-level failure: hub restarting or briefly unreachable.
+    /// Build failures never take this path.
+    Retry(anyhow::Error),
+}
+
+async fn attempt_build(
+    req: &BuildRequest,
+    socket: &Path,
+    expected_outputs: &[String],
+) -> Result<Outcome> {
+    // The URI is ignored; the connector always dials the unix socket.
+    let socket_owned = socket.to_owned();
+    let channel = match Endpoint::try_from("http://hub.invalid")?
+        .connect_with_connector(service_fn(move |_: Uri| {
+            let socket = socket_owned.clone();
+            async move {
+                Ok::<_, std::io::Error>(TokioIo::new(
+                    tokio::net::UnixStream::connect(socket).await?,
+                ))
+            }
+        }))
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok(Outcome::Retry(
+                anyhow::Error::new(e).context("connecting to hub socket"),
+            ))
+        }
+    };
+    let mut client = AttachHubClient::new(channel)
+        .max_decoding_message_size(crate::hub::MAX_MSG_SIZE)
+        .max_encoding_message_size(crate::hub::MAX_MSG_SIZE);
+
+    // Ready marker for Nix; emitted only after a hub connection
+    // exists so persistent connect failures surface as setup errors,
+    // not build failures.
+    ready_marker()?;
+
+    let mut stream = match client.build(req.clone()).await {
+        Ok(s) => s.into_inner(),
+        Err(e) if retryable(&e) => {
+            return Ok(Outcome::Retry(
+                anyhow::Error::new(e).context("submitting build"),
+            ))
+        }
+        Err(e) => return Err(e).context("submitting build"),
+    };
 
     let mut unpackers: std::collections::HashMap<String, Unpacker> = Default::default();
 
-    while let Some(ev) = stream.message().await? {
+    loop {
+        let ev = match stream.message().await {
+            Ok(Some(ev)) => ev,
+            // Stream ended or broke without a result: the hub went
+            // away; clean up partial output trees and resubmit.
+            Ok(None) => {
+                cleanup_unpackers(&mut unpackers).await;
+                return Ok(Outcome::Retry(anyhow::anyhow!(
+                    "hub closed event stream without a result"
+                )));
+            }
+            Err(e) if retryable(&e) => {
+                cleanup_unpackers(&mut unpackers).await;
+                return Ok(Outcome::Retry(
+                    anyhow::Error::new(e).context("event stream"),
+                ));
+            }
+            Err(e) => {
+                cleanup_unpackers(&mut unpackers).await;
+                return Err(e).context("build event stream");
+            }
+        };
         match ev.event {
             Some(attach_event::Event::Log(data)) => {
                 std::io::stderr().write_all(&data)?;
@@ -104,6 +179,9 @@ async fn run_async(build: BuildJson, socket: PathBuf) -> Result<i32> {
                         remove_tree(&tmp);
                         return Err(e);
                     }
+                    // A pre-reconnect attempt may have placed this
+                    // output already; the re-delivered NAR replaces it.
+                    remove_tree(Path::new(&out.store_path));
                     std::fs::rename(&tmp, &out.store_path).with_context(|| {
                         format!("moving output into place at {}", out.store_path)
                     })?;
@@ -114,7 +192,7 @@ async fn run_async(build: BuildJson, socket: PathBuf) -> Result<i32> {
                 if !unpackers.is_empty() {
                     bail!("hub closed build with unfinished output transfers");
                 }
-                return Ok(code);
+                return Ok(Outcome::Done(code));
             }
             Some(attach_event::Event::Error(e)) => {
                 cleanup_unpackers(&mut unpackers).await;
@@ -123,8 +201,35 @@ async fn run_async(build: BuildJson, socket: PathBuf) -> Result<i32> {
             None => {}
         }
     }
-    cleanup_unpackers(&mut unpackers).await;
-    bail!("hub closed event stream without a result");
+}
+
+/// Deliberate hub rejections (no capable worker, bad request, output
+/// path conflict) are final; everything else is the transport dying
+/// around a hub restart and worth resubmitting.
+fn retryable(status: &tonic::Status) -> bool {
+    use tonic::Code;
+    !matches!(
+        status.code(),
+        Code::FailedPrecondition
+            | Code::InvalidArgument
+            | Code::PermissionDenied
+            | Code::NotFound
+            | Code::AlreadyExists
+            | Code::ResourceExhausted
+            | Code::Unimplemented
+    )
+}
+
+/// Print Nix's \x02 ready marker exactly once, however many
+/// reconnect attempts the build takes.
+fn ready_marker() -> Result<()> {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    let mut res = Ok(());
+    ONCE.call_once(|| {
+        res = std::io::stderr().write_all(b"\x02\n").map_err(Into::into);
+    });
+    res
 }
 
 /// (chunk sender, unpack task) for one in-flight output transfer.

@@ -23,7 +23,16 @@ message WorkerMessage {
     // One free build slot: the hub answers each request with at most
     // one BuildAssignment (worker-side admission).
     RequestJob request_job = 7;
+    // Answer to a BuildAssignment whose dedupe_key matches a build the
+    // worker already runs (or has finished but not delivered): the hub
+    // skips staging and waits for the result, which arrives under the
+    // new build_id. This is how builds survive a hub restart.
+    Resumed resumed = 8;
   }
+}
+
+message Resumed {
+  string build_id = 1;
 }
 
 message RequestJob {}
@@ -68,6 +77,11 @@ message Register {
   reserved 2, 3, 4;
   string worker_name = 1;
   repeated SystemCaps caps = 6;
+  // Dedupe keys of builds this worker still holds (running or finished
+  // but undelivered). A freshly started hub assigns resubmitted jobs
+  // with these keys to this worker, credit-free, instead of building
+  // them again elsewhere.
+  repeated string resumable_keys = 7;
   // ed25519 public key used to sign output NARs, in Nix's
   // "name:base64" format (nix-store --generate-binary-cache-key).
   string signing_public_key = 5;
@@ -89,6 +103,9 @@ message BuildAssignment {
   string tmp_dir_in_sandbox = 7; // "/build"
   string store_dir = 8; // "/nix/store"
   bool fixed_output = 9; // grants network inside the sandbox
+  // Hash of the full BuildRequest; stable across hub restarts, unlike
+  // build_id. Keys the worker's resume bookkeeping.
+  string dedupe_key = 10;
 }
 
 message PathOffer {

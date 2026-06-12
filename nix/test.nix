@@ -128,9 +128,6 @@ in
             RuntimeDirectoryPreserve = true;
             Environment = "RUST_LOG=info";
             WatchdogSec = "30";
-            # On stop the hub drains: it serves existing builds until
-            # they finish and only then exits.
-            TimeoutStopSec = "600";
           };
         };
       };
@@ -246,9 +243,10 @@ in
             f"[ $(journalctl -u tribuchet-worker | grep -c 'build assigned') -gt {assigned} ]",
             timeout=60,
         )
-        # Both restarts at once, mid-build: the old daemons drain (the
-        # worker finishes the build, the hub keeps relaying it) while
-        # systemd holds the sockets for the replacement instances.
+        # Both restarts at once, mid-build: the hub exits immediately
+        # (attach reconnects and resubmits; the worker resumes by
+        # dedupe key) and the old worker drains until the build's
+        # result is delivered.
         worker.succeed("systemctl restart --no-block tribuchet-worker")
         hub.succeed("systemctl restart --no-block tribuchet-hub")
         hub.wait_until_succeeds("test -f /tmp/drain.ok", timeout=120)

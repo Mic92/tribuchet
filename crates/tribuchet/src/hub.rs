@@ -191,6 +191,17 @@ impl HubState {
         queue.remove(pos)
     }
 
+    /// Take a queued job whose dedupe key is in `keys` (builds the
+    /// calling worker can resume), regardless of RequestJob credits.
+    async fn take_job_by_key(&self, keys: &std::collections::HashSet<String>) -> Option<Job> {
+        if keys.is_empty() {
+            return None;
+        }
+        let mut queue = self.queue.lock().await;
+        let pos = queue.iter().position(|j| keys.contains(&j.key))?;
+        queue.remove(pos)
+    }
+
     async fn finish(&self, job: &Job) {
         let mut inflight = self.inflight.lock().await;
         inflight.by_key.remove(&job.key);
@@ -554,6 +565,7 @@ fn msg_build_id(msg: &worker_message::Msg) -> Option<&str> {
         worker_message::Msg::Result(r) => Some(&r.build_id),
         worker_message::Msg::Nar(n) => Some(&n.build_id),
         worker_message::Msg::MissingPaths(m) => Some(&m.build_id),
+        worker_message::Msg::Resumed(r) => Some(&r.build_id),
         worker_message::Msg::Register(_)
         | worker_message::Msg::Heartbeat(_)
         | worker_message::Msg::RequestJob(_) => None,
@@ -674,26 +686,42 @@ async fn worker_loop(
     };
     let caps_guard = CapsGuard::new(state.clone(), caps.clone());
     let router = Router::default();
+    // Builds this worker still holds from before a hub restart; jobs
+    // with these keys go to it credit-free (it is the only worker that
+    // can resume them, and its slots are already occupied by them).
+    let resumable: std::collections::HashSet<String> =
+        register.resumable_keys.iter().cloned().collect();
     // each received RequestJob funds at most one assignment
     let (req_tx, mut req_rx) = mpsc::channel::<()>(1024);
     let route = tokio::spawn(route_loop(in_rx, router.clone(), req_tx));
 
+    let mut credits: usize = 0;
     'outer: loop {
-        let Some(()) = req_rx.recv().await else {
-            break; // route_loop ended: worker gone
-        };
         let job = loop {
             if out_tx.is_closed() || route.is_finished() {
                 break 'outer;
             }
-            if let Some(job) = state.take_job(&caps).await {
+            while req_rx.try_recv().is_ok() {
+                credits += 1;
+            }
+            if let Some(job) = state.take_job_by_key(&resumable).await {
                 break job;
+            }
+            if credits > 0 {
+                if let Some(job) = state.take_job(&caps).await {
+                    credits -= 1;
+                    break job;
+                }
             }
             // notify_waiters() wakes only current waiters; the timeout
             // closes the race between checking the queue and awaiting.
             tokio::select! {
                 _ = state.notify.notified() => {}
                 _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                r = req_rx.recv() => match r {
+                    Some(()) => credits += 1,
+                    None => break 'outer, // route_loop ended: worker gone
+                },
             }
         };
         tracing::info!(
@@ -758,6 +786,7 @@ async fn run_job(
             tmp_dir_in_sandbox: req.tmp_dir_in_sandbox.clone(),
             store_dir: req.store_dir.clone(),
             fixed_output: req.fixed_output,
+            dedupe_key: job.key.clone(),
         }),
     )
     .await?;
@@ -771,6 +800,12 @@ async fn run_job(
     .await?;
 
     let missing = match recv(&mut in_rx).await? {
+        // The worker already holds this build (it survived a hub
+        // restart); skip staging, its result arrives like any other.
+        worker_message::Msg::Resumed(_) => {
+            tracing::info!(id = job.id, "worker resumed an in-flight build");
+            return relay_build(job, vkey, out_tx, &mut in_rx).await;
+        }
         worker_message::Msg::MissingPaths(m) => {
             // Only ever pack paths we offered: anything else would let
             // a compromised worker read arbitrary host files. Dedupe,
@@ -825,6 +860,7 @@ fn msg_name(msg: &worker_message::Msg) -> &'static str {
         worker_message::Msg::Result(_) => "Result",
         worker_message::Msg::Nar(_) => "Nar",
         worker_message::Msg::RequestJob(_) => "RequestJob",
+        worker_message::Msg::Resumed(_) => "Resumed",
     }
 }
 
@@ -1205,13 +1241,6 @@ async fn run_async(socket: &Path, listen: &str, config_dir: &Path) -> Result<()>
         Err(e) => return Err(e).context("reading trusted-signing-keys"),
     };
 
-    let (shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
-    tokio::spawn(async move {
-        crate::sd::stop_requested().await;
-        tracing::info!("SIGTERM: stopping accepts, draining");
-        let _ = shutdown_tx.send(true);
-    });
-
     // Listeners come from systemd socket activation when available
     // (they survive hub restarts; clients queue instead of getting
     // ECONNREFUSED), otherwise we bind ourselves.
@@ -1243,10 +1272,7 @@ async fn run_async(socket: &Path, listen: &str, config_dir: &Path) -> Result<()>
             .max_decoding_message_size(MAX_MSG_SIZE)
             .max_encoding_message_size(MAX_MSG_SIZE),
         )
-        .serve_with_incoming_shutdown(
-            tokio_stream::wrappers::TcpListenerStream::new(tcp),
-            wait_for(shutdown.clone()),
-        );
+        .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(tcp));
 
     let uds = match activated.unix {
         // Activated socket: systemd owns the path, mode and group
@@ -1264,7 +1290,7 @@ async fn run_async(socket: &Path, listen: &str, config_dir: &Path) -> Result<()>
             .max_decoding_message_size(MAX_MSG_SIZE)
             .max_encoding_message_size(MAX_MSG_SIZE),
         )
-        .serve_with_incoming_shutdown(UnixListenerStream::new(uds), wait_for(shutdown.clone()));
+        .serve_with_incoming(UnixListenerStream::new(uds));
 
     tracing::info!(listen, socket = %socket.display(), "hub running");
     crate::sd::notify_ready();
@@ -1275,40 +1301,17 @@ async fn run_async(socket: &Path, listen: &str, config_dir: &Path) -> Result<()>
             async { attach_server.await.context("attach gRPC server") },
         )
     };
+    // No drain on SIGTERM: hub state is reconstructed by the
+    // replacement instance from worker re-registration (resumable
+    // build keys) and attach resubmission (deterministic dedupe
+    // keys), so exiting immediately cancels nothing.
     tokio::select! {
         res = servers => res.map(|_| ()),
-        () = drain(shutdown, &state) => Ok(()),
-    }
-}
-
-async fn wait_for(mut shutdown: tokio::sync::watch::Receiver<bool>) {
-    let _ = shutdown.wait_for(|&v| v).await;
-}
-
-/// SIGTERM means "hand over", not "die": both servers stop accepting
-/// (new clients queue in the systemd-held sockets for the replacement
-/// instance), already-connected attaches and workers keep going until
-/// every queued and in-flight build finished, then the hub exits.
-/// Requires a TimeoutStopSec covering the longest build.
-async fn drain(shutdown: tokio::sync::watch::Receiver<bool>, state: &HubState) {
-    wait_for(shutdown).await;
-    let mut tick = 0u32;
-    loop {
-        let queued = state.queue.lock().await.len();
-        let inflight = state.inflight.lock().await.by_key.len();
-        if queued == 0 && inflight == 0 {
-            break;
+        () = crate::sd::stop_requested() => {
+            tracing::info!("SIGTERM: exiting, builds resume against the replacement instance");
+            Ok(())
         }
-        if tick.is_multiple_of(10) {
-            tracing::info!(queued, inflight, "draining");
-        }
-        tick += 1;
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
-    // Final ExitCode events may still be in flight to attach clients;
-    // give the streams a moment to flush before tearing them down.
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    tracing::info!("drained, exiting");
 }
 
 #[cfg(test)]

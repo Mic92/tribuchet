@@ -33,7 +33,7 @@ use crate::nar;
 use crate::proto::{
     hub_message, nar_transfer, worker_hub_client::WorkerHubClient, worker_message, BuildAssignment,
     BuildResult, Heartbeat, LogChunk, MissingPaths, NarTransfer, OutputSignature, PathInfoMsg,
-    Register, RequestJob, WorkerMessage,
+    Register, RequestJob, Resumed, WorkerMessage,
 };
 
 /// Connection to the local nix-daemon; one per active build so its
@@ -94,6 +94,9 @@ struct WorkerCtx {
     /// Set on SIGTERM: finish what is active, request nothing new,
     /// exit when idle. systemd then starts the replacement instance.
     draining: std::sync::atomic::AtomicBool,
+    /// dedupe_key -> build past staging; survives session loss so a
+    /// replacement hub can resume instead of rebuilding.
+    resumable: std::sync::Mutex<HashMap<String, ResumableBuild>>,
     /// system -> static emulator binary, from --emulate.
     emulators: HashMap<String, PathBuf>,
     /// pasta binary for fixed-output network isolation.
@@ -119,6 +122,24 @@ impl WorkerCtx {
             base: self.uid_base + (idx as u32) * 65536,
             idx,
         })
+    }
+
+    fn resumable_keys(&self) -> Vec<String> {
+        self.resumable.lock().unwrap().keys().cloned().collect()
+    }
+
+    /// Re-point an already-held build (same dedupe key) at the
+    /// assignment's new build_id and session; true if one existed.
+    fn adopt_assignment(&self, a: &BuildAssignment, out_tx: &mpsc::Sender<WorkerMessage>) -> bool {
+        let mut map = self.resumable.lock().unwrap();
+        match map.get_mut(&a.dedupe_key) {
+            Some(e) => {
+                e.build_id = a.build_id.clone();
+                e.out_tx = out_tx.clone();
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -437,6 +458,7 @@ async fn run_async(opts: WorkerOpts) -> Result<()> {
         running: std::sync::atomic::AtomicU32::new(0),
         busy: std::sync::atomic::AtomicU32::new(0),
         draining: std::sync::atomic::AtomicBool::new(false),
+        resumable: std::sync::Mutex::new(HashMap::new()),
         emulators,
         pasta: opts.pasta.clone(),
         max_silent_time: opts.max_silent_time,
@@ -452,6 +474,7 @@ async fn run_async(opts: WorkerOpts) -> Result<()> {
     crate::sd::notify_ready();
     crate::sd::spawn_watchdog();
     spawn_drain(ctx.clone());
+    spawn_resumable_reaper(ctx.clone());
 
     // Reconnect with backoff: a hub restart must not drain the fleet.
     let mut backoff = std::time::Duration::from_secs(1);
@@ -468,6 +491,40 @@ async fn run_async(opts: WorkerOpts) -> Result<()> {
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(std::time::Duration::from_secs(60));
     }
+}
+
+/// Forget finished builds nobody resumed. Without a client
+/// resubmitting (it gave up or died), the result has no taker; the
+/// entry would otherwise pin the build dir and block drain forever.
+fn spawn_resumable_reaper(ctx: std::sync::Arc<WorkerCtx>) {
+    // Must undercut the service's stop timeout with reaper-interval
+    // slack: an undelivered result keeps a draining worker alive, and
+    // outliving TimeoutStopSec means SIGKILL instead of a clean exit.
+    const TTL: std::time::Duration = std::time::Duration::from_secs(300);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            let mut expired = Vec::new();
+            {
+                let mut map = ctx.resumable.lock().unwrap();
+                map.retain(|key, e| match &e.finished {
+                    Some(fin) if !e.delivering && fin.finished_at.elapsed() > TTL => {
+                        expired.push((key.clone(), fin.dir.clone()));
+                        false
+                    }
+                    _ => true,
+                });
+            }
+            for (key, dir) in expired {
+                ctx.busy.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                let _ = std::fs::remove_dir_all(&dir);
+                tracing::warn!(
+                    key,
+                    "dropping undelivered build result (no resume within TTL)"
+                );
+            }
+        }
+    });
 }
 
 /// SIGTERM means "hand over to a replacement instance", not "die":
@@ -533,6 +590,7 @@ async fn session(
             worker_name: hostname(),
             caps: system_caps(opts, ctx),
             signing_public_key: signing_key.to_public_key().to_string(),
+            resumable_keys: ctx.resumable_keys(),
         })))
         .await?;
     // One outstanding RequestJob per build slot; every finished build
@@ -601,6 +659,22 @@ async fn session_loop(
         let Some(m) = m.msg else { continue };
         match m {
             hub_message::Msg::Assignment(a) => {
+                // A key we already hold means a hub (likely freshly
+                // restarted) re-dispatched a build we are running or
+                // have finished: adopt the new build_id and deliver
+                // the result when there is one, instead of building
+                // again.
+                if ctx.adopt_assignment(&a, out_tx) {
+                    tracing::info!(id = a.build_id, key = a.dedupe_key, "build resumed");
+                    out_tx
+                        .send(msg(worker_message::Msg::Resumed(Resumed {
+                            build_id: a.build_id.clone(),
+                        })))
+                        .await?;
+                    let ctx = ctx.clone();
+                    tokio::task::spawn_blocking(move || try_deliver(&ctx, &a.dedupe_key));
+                    continue;
+                }
                 tracing::info!(id = a.build_id, "build assigned");
                 // build ids are never reused; a duplicate is a confused hub
                 if let Some(old) = active.remove(&a.build_id) {
@@ -662,24 +736,37 @@ async fn session_loop(
                             let out_tx = out_tx.clone();
                             let signing_key = signing_key.clone();
                             let ctx = ctx.clone();
+                            let key = build.assignment.dedupe_key.clone();
+                            // From here the build outlives the session:
+                            // it is resumable until its result reaches
+                            // some hub. busy stays up with the entry.
+                            ctx.busy.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            ctx.resumable.lock().unwrap().insert(
+                                key.clone(),
+                                ResumableBuild {
+                                    build_id: id.clone(),
+                                    out_tx: out_tx.clone(),
+                                    finished: None,
+                                    delivering: false,
+                                },
+                            );
                             ctx.running
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             tokio::task::spawn_blocking(move || {
-                                if let Err(e) = build.execute(&out_tx, &signing_key, build_timeout)
-                                {
-                                    tracing::error!("build execution failed: {e:#}");
-                                    let _ = out_tx.blocking_send(msg(worker_message::Msg::Result(
-                                        BuildResult {
-                                            build_id: build.assignment.build_id.clone(),
-                                            exit_code: 1,
-                                            outputs: vec![],
-                                            error: format!("{e:#}"),
-                                        },
-                                    )));
-                                }
-                                build.cleanup();
+                                let fin = execute_to_finished(
+                                    &build,
+                                    &out_tx,
+                                    &signing_key,
+                                    build_timeout,
+                                );
+                                build.teardown();
+                                drop(build);
                                 ctx.running
                                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                if let Some(e) = ctx.resumable.lock().unwrap().get_mut(&key) {
+                                    e.finished = Some(fin);
+                                }
+                                try_deliver(&ctx, &key);
                                 if !ctx.draining.load(std::sync::atomic::Ordering::Relaxed) {
                                     let _ = out_tx.blocking_send(request_job());
                                 }
@@ -994,13 +1081,15 @@ impl ActiveBuild {
     }
 
     /// Runs on a blocking thread: sandboxed build, live log streaming,
-    /// output packing/signing/upload.
+    /// output packing and signing. Sends only logs; the result and
+    /// output NARs go through deliver(), which can run again on a
+    /// later session if this one dies first.
     fn execute(
         &self,
         out_tx: &mpsc::Sender<WorkerMessage>,
         signing_key: &SecretKey,
         timeout: std::time::Duration,
-    ) -> Result<()> {
+    ) -> Result<FinishedBuild> {
         let a = &self.assignment;
         // Serialize macOS builds sharing the global /build symlink;
         // Linux mounts it inside a private namespace, no lock needed.
@@ -1143,13 +1232,13 @@ impl ActiveBuild {
             if !error.is_empty() {
                 tracing::warn!(id = a.build_id, error, "sandbox setup failed");
             }
-            out_tx.blocking_send(msg(worker_message::Msg::Result(BuildResult {
-                build_id: a.build_id.clone(),
+            return Ok(FinishedBuild {
                 exit_code,
-                outputs: vec![],
                 error,
-            })))?;
-            return Ok(());
+                outputs: Vec::new(),
+                dir: self.dir.clone(),
+                finished_at: std::time::Instant::now(),
+            });
         }
 
         // Pack, hash and sign every output before announcing the result,
@@ -1181,60 +1270,30 @@ impl ActiveBuild {
             }
             let hash = hasher.finalize();
             let sig = signing_key.sign(format!("{}:{}", scratch, hex::encode(hash)).as_bytes());
-            packed.push((scratch.clone(), nar_file, hash.to_vec(), sig.to_string()));
+            packed.push(PackedOutput {
+                scratch: scratch.clone(),
+                nar_file,
+                nar_sha256: hash.to_vec(),
+                signature: sig.to_string(),
+            });
         }
-
-        out_tx.blocking_send(msg(worker_message::Msg::Result(BuildResult {
-            build_id: a.build_id.clone(),
+        Ok(FinishedBuild {
             exit_code: 0,
-            outputs: packed
-                .iter()
-                .map(|(path, _, hash, sig)| OutputSignature {
-                    store_path: path.clone(),
-                    nar_sha256: hash.clone(),
-                    signature: sig.clone(),
-                })
-                .collect(),
             error: String::new(),
-        })))?;
-
-        for (path, nar_file, _, _) in &packed {
-            let mut f = std::fs::File::open(nar_file)?;
-            let mut buf = vec![0u8; CHUNK_SIZE];
-            loop {
-                if std::time::Instant::now() >= deadline {
-                    bail!("build timed out during output upload");
-                }
-                let n = f.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                out_tx.blocking_send(msg(worker_message::Msg::Nar(NarTransfer {
-                    build_id: a.build_id.clone(),
-                    store_path: path.clone(),
-                    payload: Some(nar_transfer::Payload::ZstdNarChunk(buf[..n].to_vec())),
-                    eof: false,
-                })))?;
-            }
-            out_tx.blocking_send(msg(worker_message::Msg::Nar(NarTransfer {
-                build_id: a.build_id.clone(),
-                store_path: path.clone(),
-                payload: None,
-                eof: true,
-            })))?;
-        }
-        Ok(())
+            outputs: packed,
+            dir: self.dir.clone(),
+            finished_at: std::time::Instant::now(),
+        })
     }
 
-    fn cleanup(&self) {
+    /// Tear down sandbox and cgroup, keeping the build dir: it holds
+    /// the packed output NARs until they are delivered to a hub.
+    fn teardown(&self) {
         if let Some(base) = self.ctx.cgroup_base.as_deref() {
             // cgroup.kill reaches setsid'd survivors that escaped killpg.
             cgroup::kill_and_remove(base, &self.assignment.build_id);
         }
         sandbox::cleanup(&self.assignment, &self.dir);
-        if let Err(e) = std::fs::remove_dir_all(&self.dir) {
-            tracing::warn!("cleaning up {}: {e}", self.dir.display());
-        }
     }
 
     /// Tear down a build abandoned before execution: stop the import
@@ -1263,6 +1322,152 @@ impl Drop for ActiveBuild {
         self.ctx
             .busy
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// A build past staging: running, or finished with its result not yet
+/// delivered to any hub. Keyed by the assignment's dedupe_key, which
+/// survives hub restarts (build ids do not).
+struct ResumableBuild {
+    /// From the latest assignment; result messages carry this id.
+    build_id: String,
+    /// Sender of the session that issued that assignment. Kept here,
+    /// not captured by the build thread: the session alive when the
+    /// build *finishes* may not be the one that assigned it.
+    out_tx: mpsc::Sender<WorkerMessage>,
+    finished: Option<FinishedBuild>,
+    /// A delivery is in flight; a concurrent re-assignment must not
+    /// start a second one.
+    delivering: bool,
+}
+
+#[derive(Clone)]
+struct FinishedBuild {
+    exit_code: i32,
+    error: String,
+    outputs: Vec<PackedOutput>,
+    /// Build dir holding the packed NARs; removed after delivery.
+    dir: PathBuf,
+    finished_at: std::time::Instant,
+}
+
+#[derive(Clone)]
+struct PackedOutput {
+    scratch: String,
+    nar_file: PathBuf,
+    nar_sha256: Vec<u8>,
+    signature: String,
+}
+
+/// Run a build to a FinishedBuild, whatever happens: errors and even
+/// panics become a failed result. Nothing else reports it -- the
+/// JoinHandle is dropped, so a leaked panic would leave the registry
+/// entry unfinished and the client waiting forever.
+fn execute_to_finished(
+    build: &ActiveBuild,
+    out_tx: &mpsc::Sender<WorkerMessage>,
+    signing_key: &SecretKey,
+    timeout: std::time::Duration,
+) -> FinishedBuild {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        build.execute(out_tx, signing_key, timeout)
+    }))
+    .unwrap_or_else(|_| Err(anyhow::anyhow!("build execution panicked")))
+    .unwrap_or_else(|e| {
+        tracing::error!("build execution failed: {e:#}");
+        FinishedBuild {
+            exit_code: 1,
+            error: format!("{e:#}"),
+            outputs: vec![],
+            dir: build.dir.clone(),
+            finished_at: std::time::Instant::now(),
+        }
+    })
+}
+
+/// Send a finished build's result and output NARs. Blocking; runs on
+/// a blocking thread.
+fn deliver(
+    fin: &FinishedBuild,
+    build_id: &str,
+    out_tx: &mpsc::Sender<WorkerMessage>,
+) -> Result<()> {
+    out_tx.blocking_send(msg(worker_message::Msg::Result(BuildResult {
+        build_id: build_id.into(),
+        exit_code: fin.exit_code,
+        outputs: fin
+            .outputs
+            .iter()
+            .map(|o| OutputSignature {
+                store_path: o.scratch.clone(),
+                nar_sha256: o.nar_sha256.clone(),
+                signature: o.signature.clone(),
+            })
+            .collect(),
+        error: fin.error.clone(),
+    })))?;
+    for o in &fin.outputs {
+        let mut f = std::fs::File::open(&o.nar_file)?;
+        let mut buf = vec![0u8; CHUNK_SIZE];
+        loop {
+            let n = f.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            out_tx.blocking_send(msg(worker_message::Msg::Nar(NarTransfer {
+                build_id: build_id.into(),
+                store_path: o.scratch.clone(),
+                payload: Some(nar_transfer::Payload::ZstdNarChunk(buf[..n].to_vec())),
+                eof: false,
+            })))?;
+        }
+        out_tx.blocking_send(msg(worker_message::Msg::Nar(NarTransfer {
+            build_id: build_id.into(),
+            store_path: o.scratch.clone(),
+            payload: None,
+            eof: true,
+        })))?;
+    }
+    Ok(())
+}
+
+/// Deliver `key`'s finished result if there is one and no other
+/// delivery is running, over the session that issued its latest
+/// assignment. On success the build is forgotten and its dir removed;
+/// on failure it stays for the next assignment.
+fn try_deliver(ctx: &std::sync::Arc<WorkerCtx>, key: &str) {
+    let (build_id, out_tx, fin) = {
+        let mut map = ctx.resumable.lock().unwrap();
+        let Some(e) = map.get_mut(key) else { return };
+        if e.delivering {
+            return;
+        }
+        let Some(fin) = e.finished.clone() else {
+            return;
+        };
+        e.delivering = true;
+        (e.build_id.clone(), e.out_tx.clone(), fin)
+    };
+    let result = deliver(&fin, &build_id, &out_tx);
+    let mut map = ctx.resumable.lock().unwrap();
+    match result {
+        Ok(()) => {
+            map.remove(key);
+            ctx.busy.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            if let Err(e) = std::fs::remove_dir_all(&fin.dir) {
+                tracing::warn!("cleaning up {}: {e}", fin.dir.display());
+            }
+            tracing::info!(id = build_id, "build result delivered");
+        }
+        Err(e) => {
+            if let Some(entry) = map.get_mut(key) {
+                entry.delivering = false;
+            }
+            tracing::warn!(
+                id = build_id,
+                "result delivery failed, keeping for resume: {e:#}"
+            );
+        }
     }
 }
 
@@ -1338,6 +1543,7 @@ mod tests {
     fn base_assignment() -> BuildAssignment {
         BuildAssignment {
             build_id: "0123456789abcdef0123456789abcdef".into(),
+            dedupe_key: "test-key".into(),
             system: "x86_64-linux".into(),
             builder: "/nix/store/00000000000000000000000000000000-bash/bin/bash".into(),
             args: vec![],
