@@ -28,7 +28,7 @@ use crate::worker::binfmt;
 /// the sandbox resolv.conf for fixed-output builds.
 pub const PASTA_DNS: &str = "169.254.1.53";
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct SandboxSpec {
     pub builder: String,
     /// Derivation system, e.g. "i686-linux" (drives Linux personality).

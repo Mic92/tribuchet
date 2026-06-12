@@ -13,6 +13,12 @@
 //! a status directory of `<pid>` files containing the exit code. The
 //! reaper never parses build specs; those travel through an fd it
 //! passes along untouched.
+//!
+//! The reaper outlives worker generations: SIGHUP makes it hand the
+//! worker a fast-exit signal and exec a fresh one (zero-downtime
+//! reload), and a crashed worker is respawned. Builds keep running
+//! either way; the replacement worker re-adopts them from the state
+//! they persisted on disk, matching the reaper generation id.
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixDatagram;
@@ -96,41 +102,95 @@ pub fn take_status(status_dir: &Path, pid: i32) -> Option<i32> {
     Some(code)
 }
 
-/// Fork off the reaper. Returns the worker-side spawner in the child;
-/// the parent never returns (it exits with the worker's exit code).
-pub fn split(status_dir: PathBuf) -> Result<Spawner> {
+/// Spawner socket fd, handed to exec'd worker children.
+pub const FD_ENV: &str = "TRIBUCHET_REAPER_FD";
+/// Delegated cgroup base, entered by the reaper before any child.
+pub const CGROUP_ENV: &str = "TRIBUCHET_CGROUP_BASE";
+/// Identifies the reaper generation: persisted build state is only
+/// adoptable while the reaper that spawned those pids is still our
+/// parent, otherwise pids and statuses are meaningless.
+pub const ID_ENV: &str = "TRIBUCHET_REAPER_ID";
+
+/// Become the reaper, or return the spawner handle if this process
+/// already is a worker child exec'd by one. The reaper half never
+/// returns: it serves spawn requests and respawns worker generations
+/// until told to stop, then exits with the last worker's code.
+pub fn ensure(status_dir: PathBuf) -> Result<Spawner> {
+    if let Ok(s) = std::env::var(FD_ENV) {
+        let fd: RawFd = s.parse().context("parsing TRIBUCHET_REAPER_FD")?;
+        let sock = unsafe { UnixDatagram::from_raw_fd(fd) };
+        // Drop replies addressed to a previous worker generation.
+        sock.set_nonblocking(true)?;
+        let mut scratch = [0u8; 64];
+        while sock.recv(&mut scratch).is_ok() {}
+        sock.set_nonblocking(false)?;
+        return Ok(Spawner {
+            sock: std::sync::Mutex::new(sock),
+            seq: std::sync::atomic::AtomicU64::new(1),
+        });
+    }
     std::fs::create_dir_all(&status_dir)?;
-    let (reaper_sock, worker_sock) = UnixDatagram::pair().context("creating reaper socketpair")?;
-    match unsafe { nix::unistd::fork() }.context("forking reaper")? {
-        nix::unistd::ForkResult::Child => {
-            drop(reaper_sock);
-            Ok(Spawner {
-                sock: std::sync::Mutex::new(worker_sock),
-                seq: std::sync::atomic::AtomicU64::new(1),
-            })
-        }
-        nix::unistd::ForkResult::Parent { child } => {
-            drop(worker_sock);
-            let code = reaper_main(reaper_sock, &status_dir, child.as_raw());
-            std::process::exit(code);
+    // Fresh reaper: previous statuses refer to pids it never spawned.
+    if let Ok(entries) = std::fs::read_dir(&status_dir) {
+        for entry in entries.flatten() {
+            let _ = std::fs::remove_file(entry.path());
         }
     }
+    // Enter the delegated-cgroup leaf before spawning anything: every
+    // process must leave the unit's root cgroup, or enabling
+    // subtree_control there fails (no-internal-processes rule).
+    #[cfg(target_os = "linux")]
+    if let Some(base) = super::cgroup::init() {
+        std::env::set_var(CGROUP_ENV, &base);
+    }
+    std::env::set_var(
+        ID_ENV,
+        format!("{}-{}", std::process::id(), super::unix_now()),
+    );
+    let (reaper_sock, worker_sock) = UnixDatagram::pair().context("creating reaper socketpair")?;
+    let code = reaper_main(reaper_sock, worker_sock, &status_dir);
+    std::process::exit(code);
+}
+
+/// Exec a worker generation: same binary, same arguments, with the
+/// spawner socket passed by fd number.
+fn spawn_worker(worker_sock: &UnixDatagram) -> Result<i32> {
+    let exe = std::env::current_exe().context("resolving own binary")?;
+    // dup() clears CLOEXEC, so the fd survives the exec.
+    let fd = nix::unistd::dup(worker_sock).context("duping spawner socket")?;
+    let child = std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .env(FD_ENV, fd.as_raw_fd().to_string())
+        .spawn()
+        .context("spawning worker")?;
+    drop(fd);
+    Ok(child.id() as i32)
 }
 
 /// The reaper loop: serve spawn requests, reap children, persist
-/// statuses. Returns the worker child's exit code once it is gone and
-/// every remaining build has been killed and reaped.
-fn reaper_main(sock: UnixDatagram, status_dir: &Path, worker_pid: i32) -> i32 {
-    // systemd signals the main pid, which is the reaper: forward
-    // termination to the worker (which owns drain policy) and keep
-    // reaping until it exits.
+/// statuses, and respawn the worker generation when it exits or is
+/// reloaded. Returns the last worker's exit code once a stop was
+/// requested and every remaining build has been killed and reaped.
+fn reaper_main(sock: UnixDatagram, worker_sock: UnixDatagram, status_dir: &Path) -> i32 {
+    // systemd signals the main pid, which is the reaper. SIGTERM is
+    // forwarded to the worker, which owns the drain policy; SIGHUP
+    // (ExecReload) asks the worker to exit fast and gets a fresh one
+    // exec'd while its builds keep running.
     static TERM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static HUP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     extern "C" fn on_term(_: i32) {
         TERM.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    for sig in [nix::sys::signal::SIGTERM, nix::sys::signal::SIGINT] {
+    extern "C" fn on_hup(_: i32) {
+        HUP.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    for (sig, handler) in [
+        (nix::sys::signal::SIGTERM, on_term as extern "C" fn(i32)),
+        (nix::sys::signal::SIGINT, on_term),
+        (nix::sys::signal::SIGHUP, on_hup),
+    ] {
         let action = nix::sys::signal::SigAction::new(
-            nix::sys::signal::SigHandler::Handler(on_term),
+            nix::sys::signal::SigHandler::Handler(handler),
             nix::sys::signal::SaFlags::SA_RESTART,
             nix::sys::signal::SigSet::empty(),
         );
@@ -138,16 +198,33 @@ fn reaper_main(sock: UnixDatagram, status_dir: &Path, worker_pid: i32) -> i32 {
             let _ = nix::sys::signal::sigaction(sig, &action);
         }
     }
+    let mut worker_pid = match spawn_worker(&worker_sock) {
+        Ok(pid) => pid,
+        Err(e) => {
+            eprintln!("tribuchet reaper: {e:#}");
+            return 1;
+        }
+    };
     let mut builds: Vec<i32> = Vec::new();
     let mut worker_code: Option<i32> = None;
+    let mut stopping = false;
     let mut buf = vec![0u8; MAX_MSG];
     sock.set_read_timeout(Some(std::time::Duration::from_millis(200)))
         .ok();
     loop {
         if TERM.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            stopping = true;
             let _ = nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(worker_pid),
                 nix::sys::signal::Signal::SIGTERM,
+            );
+        }
+        if HUP.swap(false, std::sync::atomic::Ordering::Relaxed) && !stopping {
+            // Fast handover: state is already on disk, the builds are
+            // ours, the replacement re-adopts them.
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(worker_pid),
+                nix::sys::signal::Signal::SIGUSR1,
             );
         }
         // Reap everything that exited.
@@ -168,20 +245,32 @@ fn reaper_main(sock: UnixDatagram, status_dir: &Path, worker_pid: i32) -> i32 {
                 let _ = std::fs::write(status_dir.join(pid.to_string()), format!("{code}\n"));
             }
         }
-        if let Some(code) = worker_code {
-            // Worker gone: today builds do not outlive it; kill the
-            // process groups and reap before exiting. (Re-adoption
-            // after a worker restart will lift this.)
-            for pid in &builds {
-                let _ = nix::sys::signal::killpg(
-                    nix::unistd::Pid::from_raw(*pid),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
+        if let Some(code) = worker_code.take() {
+            if stopping {
+                // Unit stop: the worker drained first, so normally no
+                // builds remain; kill stragglers rather than leak them.
+                for pid in &builds {
+                    let _ = nix::sys::signal::killpg(
+                        nix::unistd::Pid::from_raw(*pid),
+                        nix::sys::signal::Signal::SIGKILL,
+                    );
+                }
+                for pid in builds.drain(..) {
+                    let _ = nix::sys::wait::waitpid(Some(nix::unistd::Pid::from_raw(pid)), None);
+                }
+                return code;
             }
-            for pid in builds.drain(..) {
-                let _ = nix::sys::wait::waitpid(Some(nix::unistd::Pid::from_raw(pid)), None);
+            // Reload handover or worker crash: builds keep running,
+            // the next generation re-adopts them.
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            match spawn_worker(&worker_sock) {
+                Ok(pid) => worker_pid = pid,
+                Err(e) => {
+                    eprintln!("tribuchet reaper: respawn failed: {e:#}");
+                    return 1;
+                }
             }
-            return code;
+            continue;
         }
         match recv_with_fds(&sock, &mut buf) {
             Ok((n, fds)) => {

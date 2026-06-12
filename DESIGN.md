@@ -171,9 +171,19 @@ they still hold (running, or finished but undelivered); attach clients
 reconnect and resubmit the identical request, whose deterministic
 dedupe key routes it back to the worker holding the build, which
 resumes (or just re-delivers the finished result) instead of building
-again. Worker restarts drain instead: builds are the worker's child
-processes, so systemd stops it with KillMode=mixed and the worker exits
-only once active builds finished and their results were delivered.
+again.
+
+Worker restarts come in two flavours. Reload (SIGHUP to the unit) is
+the zero-downtime path: builds are children of a small reaper process
+the worker forks off at startup, with resume state and logs persisted
+in their build dirs, so the reaper just execs a fresh worker that
+re-adopts them — running builds are supervised to completion, finished
+ones redelivered. The hub covers the session gap by requeueing instead
+of failing jobs whose worker session died; the attached client sees a
+pause, not an error. A full stop (SIGTERM) drains instead: the worker
+exits only once active builds finished and their results were
+delivered, because a stopped unit takes the reaper — and with it the
+build processes — down.
 
 ## Known limitations (MVP)
 
@@ -184,10 +194,16 @@ only once active builds finished and their results were delivered.
 * Workers run up to `--max-jobs` concurrent builds over one session;
   on macOS, builds sharing the daemon-pinned `/build` symlink are
   serialized per worker (no mount namespace to give each its own).
-* A worker dying mid-build (detected via heartbeat silence and HTTP/2
-  keepalive) fails the build instead of requeueing it.
-* When a worker reconnects, the previous session's scheduler loop may
-  still grab one job and fail it before noticing the closed channel.
+* The reaper execs the worker from its own binary path, so a reload
+  picks up new code only if that path is a stable indirection (e.g. a
+  profile symlink); on NixOS the store path in ExecStart changes per
+  deploy and needs `reloadIfChanged` plus such a symlink to benefit.
+* Resumed and re-adopted builds deliver their result but not live
+  logs: the log file and offset survive on disk, streaming them to the
+  new session is not implemented.
+* A delivered result is forgotten once it sits in the session's send
+  buffer; a hub dying in that window costs a full rebuild (no
+  delivery acknowledgement).
 * No build cancellation: Nix killing the attach process does not yet
   stop the remote build. A submission whose attach client is gone also
   stays queued until a matching worker picks it up.

@@ -141,7 +141,7 @@ impl WorkerCtx {
         match map.get_mut(&a.dedupe_key) {
             Some(e) => {
                 e.build_id = a.build_id.clone();
-                e.out_tx = out_tx.clone();
+                e.out_tx = Some(out_tx.clone());
                 true
             }
             None => false,
@@ -208,6 +208,15 @@ impl BuildOwner {
         match self {
             Self::Fod(slot) => Some(slot.base),
             _ => None,
+        }
+    }
+
+    /// Slot index for resume state: a re-adopting worker must mark it
+    /// used again so new builds get disjoint uid ranges.
+    fn slot_idx(&self) -> Option<usize> {
+        match self {
+            Self::UidRange(slot) | Self::Fod(slot) => Some(slot.idx),
+            Self::Worker => None,
         }
     }
 }
@@ -372,14 +381,14 @@ fn load_signing_key(state_dir: &Path) -> Result<SecretKey> {
 fn sweep_state_dir(state_dir: &Path) {
     if let Ok(entries) = std::fs::read_dir(state_dir.join("builds")) {
         for entry in entries.flatten() {
-            tracing::info!("removing stale build dir {}", entry.path().display());
-            remove_path_all(&entry.path());
-        }
-    }
-    // Exit statuses recorded by a previous reaper refer to dead pids.
-    if let Ok(entries) = std::fs::read_dir(state_dir.join("exited")) {
-        for entry in entries.flatten() {
-            let _ = std::fs::remove_file(entry.path());
+            // Dirs with persisted resume/finished state belong to
+            // builds another worker generation left for adoption.
+            let dir = entry.path();
+            if dir.join("resume.json").exists() || dir.join("finished.json").exists() {
+                continue;
+            }
+            tracing::info!("removing stale build dir {}", dir.display());
+            remove_path_all(&dir);
         }
     }
     // Input caching moved into the real /nix/store (daemon import);
@@ -413,17 +422,11 @@ fn request_job() -> WorkerMessage {
 }
 
 pub fn run(opts: WorkerOpts) -> Result<()> {
-    // Enter the delegated-cgroup leaf before forking: both halves
-    // must leave the unit's root cgroup, or enabling subtree_control
-    // there fails (no-internal-processes rule).
-    let cgroup_base = if cfg!(target_os = "linux") {
-        cgroup::init()
-    } else {
-        None
-    };
-    // Fork the reaper before tokio: forking a multithreaded runtime
-    // is unsafe, and the reaper must be the builds' parent.
-    let spawner = reaper::split(opts.state_dir.join("exited"))?;
+    // ensure() either becomes the reaper (never returns) or, in the
+    // worker generation it exec'd, hands back the spawner. It runs
+    // before tokio because the reaper must stay single-threaded.
+    let spawner = reaper::ensure(opts.state_dir.join("exited"))?;
+    let cgroup_base = std::env::var(reaper::CGROUP_ENV).ok().map(PathBuf::from);
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run_async(opts, spawner, cgroup_base))
 }
@@ -500,6 +503,8 @@ async fn run_async(
     crate::sd::spawn_watchdog();
     spawn_drain(ctx.clone());
     spawn_resumable_reaper(ctx.clone());
+    spawn_handover();
+    adopt_builds(&ctx, &signing_key);
 
     // Reconnect with backoff: a hub restart must not drain the fleet.
     let mut backoff = std::time::Duration::from_secs(1);
@@ -515,6 +520,139 @@ async fn run_async(
         tracing::info!("reconnecting to hub in {}s", backoff.as_secs());
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(std::time::Duration::from_secs(60));
+    }
+}
+
+/// Pick up builds a previous worker generation left behind: still
+/// running (same reaper, so their pids and exit statuses are valid)
+/// or finished but undelivered. Anything stale is swept.
+fn adopt_builds(ctx: &std::sync::Arc<WorkerCtx>, signing_key: &std::sync::Arc<SecretKey>) {
+    let reaper_id = std::env::var(reaper::ID_ENV).unwrap_or_default();
+    let Ok(entries) = std::fs::read_dir(ctx.state_dir.join("builds")) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if let Ok(s) = std::fs::read_to_string(dir.join("finished.json")) {
+            let Ok(f) = serde_json::from_str::<FinishedState>(&s) else {
+                remove_path_all(&dir);
+                continue;
+            };
+            tracing::info!(id = f.build_id, "adopted finished build awaiting delivery");
+            ctx.busy.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ctx.resumable.lock().unwrap().insert(
+                f.dedupe_key.clone(),
+                ResumableBuild {
+                    build_id: f.build_id,
+                    out_tx: None,
+                    finished: Some(FinishedBuild {
+                        exit_code: f.exit_code,
+                        error: f.error,
+                        outputs: f.outputs,
+                        dir,
+                        finished_at: std::time::Instant::now(),
+                    }),
+                    delivering: false,
+                },
+            );
+            continue;
+        }
+        let Ok(s) = std::fs::read_to_string(dir.join("resume.json")) else {
+            continue; // already swept by sweep_state_dir
+        };
+        let st = match serde_json::from_str::<ResumeState>(&s) {
+            Ok(st) if st.reaper_id == reaper_id => st,
+            // Different reaper: the pid is meaningless and the build
+            // died with the old unit; the client will resubmit.
+            _ => {
+                remove_path_all(&dir);
+                continue;
+            }
+        };
+        set_uid_slot(ctx, st.uid_slot, true);
+        tracing::info!(id = st.build_id, pid = st.pid, "adopted running build");
+        ctx.busy.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ctx.resumable.lock().unwrap().insert(
+            st.dedupe_key.clone(),
+            ResumableBuild {
+                build_id: st.build_id.clone(),
+                out_tx: None,
+                finished: None,
+                delivering: false,
+            },
+        );
+        ctx.running
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let task_ctx = ctx.clone();
+        let signing_key = signing_key.clone();
+        tokio::task::spawn_blocking(move || {
+            let ctx = task_ctx;
+            let key = st.dedupe_key.clone();
+            let fin = supervise_adopted(&ctx, st, dir, &signing_key);
+            ctx.running
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            record_finished(&ctx, &key, fin);
+        });
+    }
+}
+
+/// Wait out a re-adopted build and pack its outputs, mirroring the
+/// tail end of execute(). Logs are not streamed live (the original
+/// offset is lost with the old worker); only the result travels.
+fn supervise_adopted(
+    ctx: &std::sync::Arc<WorkerCtx>,
+    st: ResumeState,
+    dir: PathBuf,
+    signing_key: &SecretKey,
+) -> FinishedBuild {
+    let pgrp = nix::unistd::Pid::from_raw(st.pid);
+    let mut timed_out = false;
+    let code = loop {
+        if let Some(code) = reaper::take_status(&ctx.status_dir, st.pid) {
+            break code;
+        }
+        if !timed_out && unix_now() >= st.deadline_unix {
+            timed_out = true;
+            let _ = nix::sys::signal::killpg(pgrp, nix::sys::signal::Signal::SIGKILL);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    let _ = nix::sys::signal::killpg(pgrp, nix::sys::signal::Signal::SIGKILL);
+    // Tear down cgroup and sandbox like teardown() would.
+    if let Some(base) = ctx.cgroup_base.as_deref() {
+        cgroup::kill_and_remove(base, &st.build_id);
+    }
+    let synth = BuildAssignment {
+        build_id: st.build_id.clone(),
+        outputs: st.outputs.clone(),
+        ..Default::default()
+    };
+    sandbox::cleanup(&synth, &dir);
+    set_uid_slot(ctx, st.uid_slot, false);
+    let (exit_code, error, outputs) = if timed_out {
+        (1, "build timed out".into(), vec![])
+    } else if code != 0 {
+        (
+            code,
+            sandbox::setup_error_detail(&st.spec).unwrap_or_default(),
+            vec![],
+        )
+    } else {
+        // Fresh deadline: the build's own one bounded execution; this
+        // one only stops packing a pathological (e.g. sparse-file)
+        // output from running away.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        match pack_outputs(&dir, &st.spec, deadline, signing_key) {
+            Ok(outputs) => (0, String::new(), outputs),
+            Err(e) => (1, format!("{e:#}"), vec![]),
+        }
+    };
+    FinishedBuild {
+        exit_code,
+        error,
+        outputs,
+        dir,
+        finished_at: std::time::Instant::now(),
     }
 }
 
@@ -549,6 +687,23 @@ fn spawn_resumable_reaper(ctx: std::sync::Arc<WorkerCtx>) {
                 );
             }
         }
+    });
+}
+
+/// SIGUSR1 from the reaper: a new worker generation is about to be
+/// exec'd (reload/upgrade). All resumable state is already on disk,
+/// so exit immediately; builds keep running under the reaper and the
+/// replacement re-adopts them.
+fn spawn_handover() {
+    tokio::spawn(async {
+        let Ok(mut sig) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+        else {
+            return;
+        };
+        sig.recv().await;
+        tracing::info!("handover requested; exiting, builds keep running");
+        std::process::exit(0);
     });
 }
 
@@ -770,7 +925,7 @@ async fn session_loop(
                                 key.clone(),
                                 ResumableBuild {
                                     build_id: id.clone(),
-                                    out_tx: out_tx.clone(),
+                                    out_tx: Some(out_tx.clone()),
                                     finished: None,
                                     delivering: false,
                                 },
@@ -788,10 +943,7 @@ async fn session_loop(
                                 drop(build);
                                 ctx.running
                                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                                if let Some(e) = ctx.resumable.lock().unwrap().get_mut(&key) {
-                                    e.finished = Some(fin);
-                                }
-                                try_deliver(&ctx, &key);
+                                record_finished(&ctx, &key, fin);
                                 if !ctx.draining.load(std::sync::atomic::Ordering::Relaxed) {
                                     let _ = out_tx.blocking_send(request_job());
                                 }
@@ -1165,6 +1317,19 @@ impl ActiveBuild {
         if let Some(w) = spec_w {
             sandbox::send_spec_to(&spec, w)?;
         }
+        // From here the build can be re-adopted by a replacement
+        // worker generation under the same reaper.
+        let resume = ResumeState {
+            reaper_id: std::env::var(reaper::ID_ENV).unwrap_or_default(),
+            dedupe_key: a.dedupe_key.clone(),
+            build_id: a.build_id.clone(),
+            pid,
+            spec: spec.clone(),
+            outputs: a.outputs.clone(),
+            deadline_unix: unix_now() + timeout.as_secs(),
+            uid_slot: owner.slot_idx(),
+        };
+        std::fs::write(self.dir.join("resume.json"), serde_json::to_vec(&resume)?)?;
 
         let log_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         // ms since `started`, updated on every log chunk
@@ -1276,42 +1441,7 @@ impl ActiveBuild {
             });
         }
 
-        // Pack, hash and sign every output before announcing the result,
-        // because signatures travel in BuildResult ahead of the NAR data.
-        let mut packed = Vec::new();
-        for scratch in a.outputs.values() {
-            let host_path = sandbox::output_host_path(&spec, scratch);
-            // lstat: a symlink output whose target only resolves inside
-            // the sandbox is still a valid output.
-            if host_path.symlink_metadata().is_err() {
-                bail!("builder did not produce output {scratch}");
-            }
-            let nar_file = self.dir.join(format!("{}.nar.zst", store_base(scratch)));
-            let mut hasher = Sha256::new();
-            {
-                let f = std::fs::File::create(&nar_file)?;
-                let mut enc = zstd::stream::write::Encoder::new(f, 3)?;
-                let mut tee = TeeWriter(&mut enc, &mut hasher);
-                // The build deadline also bounds packing: a builder can
-                // exit instantly leaving a multi-TB sparse output.
-                let mut limited = LimitedWriter {
-                    inner: &mut tee,
-                    remaining: MAX_NAR_BYTES,
-                    deadline,
-                };
-                nar::pack(&host_path, &mut limited)
-                    .with_context(|| format!("packing output {scratch}"))?;
-                enc.finish()?.flush()?;
-            }
-            let hash = hasher.finalize();
-            let sig = signing_key.sign(format!("{}:{}", scratch, hex::encode(hash)).as_bytes());
-            packed.push(PackedOutput {
-                scratch: scratch.clone(),
-                nar_file,
-                nar_sha256: hash.to_vec(),
-                signature: sig.to_string(),
-            });
-        }
+        let packed = pack_outputs(&self.dir, &spec, deadline, signing_key)?;
         Ok(FinishedBuild {
             exit_code: 0,
             error: String::new(),
@@ -1368,8 +1498,9 @@ struct ResumableBuild {
     build_id: String,
     /// Sender of the session that issued that assignment. Kept here,
     /// not captured by the build thread: the session alive when the
-    /// build *finishes* may not be the one that assigned it.
-    out_tx: mpsc::Sender<WorkerMessage>,
+    /// build *finishes* may not be the one that assigned it. None for
+    /// a freshly re-adopted build no session has assigned yet.
+    out_tx: Option<mpsc::Sender<WorkerMessage>>,
     finished: Option<FinishedBuild>,
     /// A delivery is in flight; a concurrent re-assignment must not
     /// start a second one.
@@ -1386,12 +1517,133 @@ struct FinishedBuild {
     finished_at: std::time::Instant,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct PackedOutput {
     scratch: String,
     nar_file: PathBuf,
     nar_sha256: Vec<u8>,
     signature: String,
+}
+
+/// On-disk state for re-adopting a running build after a worker
+/// handover. Only valid within one reaper generation: a different
+/// reaper never spawned these pids, so their statuses cannot come.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ResumeState {
+    reaper_id: String,
+    dedupe_key: String,
+    /// Original assignment id: names the cgroup and the log file.
+    build_id: String,
+    pid: i32,
+    spec: sandbox::SandboxSpec,
+    /// Assignment outputs (name -> scratch path), for cleanup.
+    outputs: HashMap<String, String>,
+    deadline_unix: u64,
+    uid_slot: Option<usize>,
+}
+
+/// On-disk form of a finished-but-undelivered result; the packed NARs
+/// sit next to it in the build dir.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct FinishedState {
+    dedupe_key: String,
+    build_id: String,
+    exit_code: i32,
+    error: String,
+    outputs: Vec<PackedOutput>,
+}
+
+/// Pack, hash and sign every output before announcing the result,
+/// because signatures travel in BuildResult ahead of the NAR data.
+fn pack_outputs(
+    dir: &Path,
+    spec: &sandbox::SandboxSpec,
+    deadline: std::time::Instant,
+    signing_key: &SecretKey,
+) -> Result<Vec<PackedOutput>> {
+    let mut packed = Vec::new();
+    for scratch in &spec.outputs {
+        let host_path = sandbox::output_host_path(spec, scratch);
+        // lstat: a symlink output whose target only resolves inside
+        // the sandbox is still a valid output.
+        if host_path.symlink_metadata().is_err() {
+            bail!("builder did not produce output {scratch}");
+        }
+        let nar_file = dir.join(format!("{}.nar.zst", store_base(scratch)));
+        let mut hasher = Sha256::new();
+        {
+            let f = std::fs::File::create(&nar_file)?;
+            let mut enc = zstd::stream::write::Encoder::new(f, 3)?;
+            let mut tee = TeeWriter(&mut enc, &mut hasher);
+            // The build deadline also bounds packing: a builder can
+            // exit instantly leaving a multi-TB sparse output.
+            let mut limited = LimitedWriter {
+                inner: &mut tee,
+                remaining: MAX_NAR_BYTES,
+                deadline,
+            };
+            nar::pack(&host_path, &mut limited)
+                .with_context(|| format!("packing output {scratch}"))?;
+            enc.finish()?.flush()?;
+        }
+        let hash = hasher.finalize();
+        let sig = signing_key.sign(format!("{}:{}", scratch, hex::encode(hash)).as_bytes());
+        packed.push(PackedOutput {
+            scratch: scratch.clone(),
+            nar_file,
+            nar_sha256: hash.to_vec(),
+            signature: sig.to_string(),
+        });
+    }
+    Ok(packed)
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Record a build's result in the registry (persisted for redelivery
+/// across worker generations) and start delivering it. Shared by the
+/// normal execute path and re-adopted builds.
+fn record_finished(ctx: &std::sync::Arc<WorkerCtx>, key: &str, fin: FinishedBuild) {
+    {
+        let mut map = ctx.resumable.lock().unwrap();
+        if let Some(e) = map.get_mut(key) {
+            // build_id may have changed via a resume assignment meanwhile
+            persist_finished(key, &e.build_id, &fin);
+            e.finished = Some(fin);
+        }
+    }
+    try_deliver(ctx, key);
+}
+
+/// Mark or release a leased uid slot by index (re-adopted builds,
+/// where no BuildOwner exists to do it on drop).
+fn set_uid_slot(ctx: &WorkerCtx, idx: Option<usize>, used: bool) {
+    if let Some(idx) = idx {
+        if let Some(s) = ctx.uid_slots.lock().unwrap().get_mut(idx) {
+            *s = used;
+        }
+    }
+}
+
+/// Persist a finished result so a replacement worker can redeliver
+/// it; supersedes the running-build resume state.
+fn persist_finished(key: &str, build_id: &str, fin: &FinishedBuild) {
+    let state = FinishedState {
+        dedupe_key: key.to_string(),
+        build_id: build_id.to_string(),
+        exit_code: fin.exit_code,
+        error: fin.error.clone(),
+        outputs: fin.outputs.clone(),
+    };
+    if let Ok(json) = serde_json::to_vec(&state) {
+        let _ = std::fs::write(fin.dir.join("finished.json"), json);
+    }
+    let _ = std::fs::remove_file(fin.dir.join("resume.json"));
 }
 
 /// Run a build to a FinishedBuild, whatever happens: errors and even
@@ -1477,11 +1729,11 @@ fn try_deliver(ctx: &std::sync::Arc<WorkerCtx>, key: &str) {
         if e.delivering {
             return;
         }
-        let Some(fin) = e.finished.clone() else {
+        let (Some(fin), Some(out_tx)) = (e.finished.clone(), e.out_tx.clone()) else {
             return;
         };
         e.delivering = true;
-        (e.build_id.clone(), e.out_tx.clone(), fin)
+        (e.build_id.clone(), out_tx, fin)
     };
     let result = deliver(&fin, &build_id, &out_tx);
     let mut map = ctx.resumable.lock().unwrap();

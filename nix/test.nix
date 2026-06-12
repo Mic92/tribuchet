@@ -98,6 +98,9 @@ in
         environment.etc."tt/drain.nix".text = ''
           import ${./tests/drain.nix} { bash = "${pkgs.bash}"; }
         '';
+        environment.etc."tt/reload.nix".text = ''
+          import ${./tests/reload.nix} { bash = "${pkgs.bash}"; }
+        '';
         environment.etc."tt/cross.nix".text = ''
           import ${./tests/cross.nix} {
             busybox = "${pkgs.pkgsCross.aarch64-multiplatform.pkgsStatic.busybox}";
@@ -165,6 +168,9 @@ in
             # overrunning TimeoutStopSec gets the whole cgroup killed.
             KillMode = "mixed";
             TimeoutStopSec = "600";
+            # Zero-downtime handover: the reaper (main pid) execs a
+            # fresh worker generation; running builds are re-adopted.
+            ExecReload = "${pkgs.coreutils}/bin/kill -HUP $MAINPID";
             ExecStart = "${tribuchet}/bin/tribuchet worker --hub https://hub:7437 --state-dir /var/lib/tribuchet --max-jobs 2 --max-log-size 1048576 --emulate aarch64-linux=${pkgs.pkgsStatic.qemu-user}/bin/qemu-aarch64";
             StateDirectory = "tribuchet";
             Environment = "RUST_LOG=info";
@@ -257,6 +263,28 @@ in
         hub.succeed(f"grep -q drained-not-cancelled {out}")
         worker.wait_until_succeeds("systemctl is-active tribuchet-worker")
         hub.wait_until_succeeds("systemctl is-active tribuchet-hub")
+
+    with subtest("worker reload mid-build re-adopts the running build"):
+        assigned = int(worker.succeed(
+            "journalctl -u tribuchet-worker | grep -c 'build assigned' || true"
+        ).strip())
+        hub.succeed(
+            "rm -f /tmp/reload.ok && systemd-run --unit=reloadbuild bash -lc "
+            "'nix-build /etc/tt/reload.nix --no-out-link > /tmp/reload.out "
+            "&& touch /tmp/reload.ok'"
+        )
+        worker.wait_until_succeeds(
+            f"[ $(journalctl -u tribuchet-worker | grep -c 'build assigned') -gt {assigned} ]",
+            timeout=60,
+        )
+        # Reload mid-build: the reaper execs a new worker generation;
+        # the builder process keeps running and the new worker adopts
+        # it, delivering the result when it finishes.
+        worker.succeed("systemctl reload tribuchet-worker")
+        hub.wait_until_succeeds("test -f /tmp/reload.ok", timeout=120)
+        out = hub.succeed("cat /tmp/reload.out").strip()
+        hub.succeed(f"grep -q reload-survived {out}")
+        worker.succeed("journalctl -u tribuchet-worker | grep -q 'adopted running build'")
 
     with subtest("concurrent builds share one worker session"):
         import time
