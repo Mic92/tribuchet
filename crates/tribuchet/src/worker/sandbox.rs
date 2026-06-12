@@ -148,7 +148,10 @@ pub fn prepare(
     Ok(spec)
 }
 
-pub fn spawn(spec: &SandboxSpec) -> Result<Child> {
+/// Spawn the builder with stdout/stderr appended to `log`: a file,
+/// not a pipe, so log capture does not depend on the process that
+/// spawned the build staying alive to hold the read end.
+pub fn spawn(spec: &SandboxSpec, log: std::fs::File) -> Result<Child> {
     let mut cmd = platform::command(spec)?;
     // Own process group, so orphaned builder children can be killed
     // after the builder exits (there is no PID namespace to do it).
@@ -156,8 +159,8 @@ pub fn spawn(spec: &SandboxSpec) -> Result<Child> {
     cmd.env_clear()
         .envs(&spec.env)
         .stdin(platform::stdin_mode())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(Stdio::from(log.try_clone()?))
+        .stderr(Stdio::from(log));
     let mut child = cmd
         .spawn()
         .with_context(|| format!("spawning builder {}", spec.builder))?;
@@ -1171,20 +1174,19 @@ mod tests {
         };
         std::fs::create_dir_all(&spec.build_dir)?;
         platform::prepare(&mut spec)?;
+        let log_path = dir.path().join("build.log");
         let started = std::time::Instant::now();
-        let mut child = spawn(&spec)?;
+        let mut child = spawn(&spec, std::fs::File::create(&log_path)?)?;
         // spawn must return as soon as the builder execs; if the PID-ns
         // shim kept std's status pipe open, spawn would block for the
-        // whole build and deadlock against unread log pipes.
+        // whole build and deadlock against the unread pipe.
         assert!(
             started.elapsed() < std::time::Duration::from_millis(900),
             "spawn blocked until builder exit"
         );
-        let mut stderr = String::new();
-        use std::io::Read;
-        child.stderr.take().unwrap().read_to_string(&mut stderr)?;
         let status = child.wait()?;
-        assert_eq!(status.code(), Some(7), "{status:?} stderr: {stderr}");
+        let stderr = std::fs::read_to_string(&log_path)?;
+        assert_eq!(status.code(), Some(7), "{status:?} log: {stderr}");
         Ok(())
     }
 }

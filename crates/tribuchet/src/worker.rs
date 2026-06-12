@@ -1130,37 +1130,40 @@ impl ActiveBuild {
             cgroup::chown_to_builder(cg, base);
         }
         let deadline = std::time::Instant::now() + timeout;
-        let mut child = sandbox::spawn(&spec)?;
+        // Logs go through a file in the build dir, not pipes: capture
+        // is decoupled from this process's lifetime, so a later worker
+        // generation can resume tailing where we stopped.
+        let log_path = self.dir.join("build.log");
+        let log_file = std::fs::File::create(&log_path)?;
+        let mut child = sandbox::spawn(&spec, log_file)?;
 
         let log_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         // ms since `started`, updated on every log chunk
         let last_log_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let started = std::time::Instant::now();
-        let mut log_threads = Vec::new();
-        for pipe in [
-            child
-                .stdout
-                .take()
-                .map(|p| Box::new(p) as Box<dyn Read + Send>),
-            child
-                .stderr
-                .take()
-                .map(|p| Box::new(p) as Box<dyn Read + Send>),
-        ]
-        .into_iter()
-        .flatten()
-        {
+        let log_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tailer = {
             let tx = out_tx.clone();
             let build_id = a.build_id.clone();
             let log_bytes = log_bytes.clone();
             let last_log_ms = last_log_ms.clone();
-            log_threads.push(std::thread::spawn(move || {
+            let log_done = log_done.clone();
+            let mut file = std::fs::File::open(&log_path)?;
+            std::thread::spawn(move || {
                 use std::sync::atomic::Ordering;
-                let mut pipe = pipe;
                 let mut buf = [0u8; 8192];
                 loop {
-                    match pipe.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
+                    match file.read(&mut buf) {
+                        Ok(0) => {
+                            // At EOF after the builder died nothing
+                            // more can arrive; one final read above
+                            // already drained what was flushed.
+                            if log_done.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                        Err(_) => break,
                         Ok(n) => {
                             log_bytes.fetch_add(n as u64, Ordering::Relaxed);
                             last_log_ms
@@ -1177,8 +1180,8 @@ impl ActiveBuild {
                         }
                     }
                 }
-            }));
-        }
+            })
+        };
         let pgrp = nix::unistd::Pid::from_raw(child.id() as i32);
         let max_silent_ms = self.ctx.max_silent_time.as_millis() as u64;
         let max_log = self.ctx.max_log_size;
@@ -1212,9 +1215,8 @@ impl ActiveBuild {
         // every descendant with it; the killpg also covers the brief
         // pre-exec window and macOS, where there is no PID namespace.
         let _ = nix::sys::signal::killpg(pgrp, nix::sys::signal::Signal::SIGKILL);
-        for t in log_threads {
-            let _ = t.join();
-        }
+        log_done.store(true, Ordering::Relaxed);
+        let _ = tailer.join();
         if let Some(reason) = abort {
             bail!("{reason}");
         }
