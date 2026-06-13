@@ -725,7 +725,10 @@ async fn worker_loop(
     // Builds this worker still holds from before a hub restart; jobs
     // with these keys go to it credit-free (it is the only worker that
     // can resume them, and its slots are already occupied by them).
-    let resumable: std::collections::HashSet<String> =
+    // Each key is honored once: dedupe keys are stable per derivation,
+    // so a later identical submission must go through the normal
+    // credit and capability checks, not this fast path.
+    let mut resumable: std::collections::HashSet<String> =
         register.resumable_keys.iter().cloned().collect();
     // each received RequestJob funds at most one assignment
     let (req_tx, mut req_rx) = mpsc::channel::<()>(1024);
@@ -741,6 +744,7 @@ async fn worker_loop(
                 credits += 1;
             }
             if let Some(job) = state.take_job_by_key(&resumable).await {
+                resumable.remove(&job.key);
                 break job;
             }
             if credits > 0 {
