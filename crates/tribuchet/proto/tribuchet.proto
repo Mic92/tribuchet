@@ -50,7 +50,14 @@ message HubMessage {
     // chunks; the worker needs it to register the path in its own
     // store via the daemon (AddToStoreNar).
     PathInfoMsg path_info = 6;
+    // The hub received and verified the result and output NARs; the
+    // worker keeps the build for redelivery until this arrives.
+    ResultAck result_ack = 7;
   }
+}
+
+message ResultAck {
+  string build_id = 1;
 }
 
 // Subset of Nix's ValidPathInfo needed to import a NAR on the worker.

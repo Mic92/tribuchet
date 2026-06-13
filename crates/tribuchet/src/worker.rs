@@ -1045,6 +1045,9 @@ async fn session_loop(
             hub_message::Msg::Cancel(_) => {
                 tracing::warn!("build cancellation not implemented yet");
             }
+            hub_message::Msg::ResultAck(a) => {
+                ack_delivery(ctx, &a.build_id);
+            }
         }
     }
     bail!("hub closed the session");
@@ -1775,10 +1778,31 @@ fn deliver(
     Ok(())
 }
 
+/// Drop a build whose result the hub confirmed: only now is it safe
+/// to forget it, a result merely handed to a dying session would
+/// otherwise be lost and cost a rebuild.
+fn ack_delivery(ctx: &std::sync::Arc<WorkerCtx>, build_id: &str) {
+    let removed = {
+        let mut map = ctx.resumable.lock().unwrap();
+        let key = map
+            .iter()
+            .find(|(_, e)| e.build_id == build_id && e.finished.is_some())
+            .map(|(k, _)| k.clone());
+        key.and_then(|k| map.remove(&k))
+    };
+    if let Some(e) = removed {
+        if let Err(err) = std::fs::remove_dir_all(&e.dir) {
+            tracing::warn!("cleaning up {}: {err}", e.dir.display());
+        }
+        tracing::info!(id = build_id, "build result acknowledged");
+    }
+}
+
 /// Deliver `key`'s finished result if there is one and no other
 /// delivery is running, over the session that issued its latest
-/// assignment. On success the build is forgotten and its dir removed;
-/// on failure it stays for the next assignment.
+/// assignment. The build is kept until the hub acknowledges the
+/// result; a failed or unacknowledged delivery is retried on the next
+/// assignment of the same key.
 fn try_deliver(ctx: &std::sync::Arc<WorkerCtx>, key: &str) {
     let (build_id, out_tx, fin, log_tail) = {
         let mut map = ctx.resumable.lock().unwrap();
@@ -1798,18 +1822,15 @@ fn try_deliver(ctx: &std::sync::Arc<WorkerCtx>, key: &str) {
     }
     let result = deliver(&fin, &build_id, &out_tx);
     let mut map = ctx.resumable.lock().unwrap();
+    // The ack may already have removed the entry; nothing to update then.
+    if let Some(entry) = map.get_mut(key) {
+        entry.delivering = false;
+    }
     match result {
         Ok(()) => {
-            map.remove(key);
-            if let Err(e) = std::fs::remove_dir_all(&fin.dir) {
-                tracing::warn!("cleaning up {}: {e}", fin.dir.display());
-            }
-            tracing::info!(id = build_id, "build result delivered");
+            tracing::info!(id = build_id, "build result sent, awaiting ack");
         }
         Err(e) => {
-            if let Some(entry) = map.get_mut(key) {
-                entry.delivering = false;
-            }
             tracing::warn!(
                 id = build_id,
                 "result delivery failed, keeping for resume: {e:#}"

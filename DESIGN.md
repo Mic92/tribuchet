@@ -196,10 +196,9 @@ capable worker is left (or get rebuilt by another one).
 * Reload upgrades the worker but never the reaper itself; picking up
   a new reaper still needs a full restart (which kills running
   builds). The reaper is deliberately small so this rarely matters.
-* A delivered result is forgotten once it sits in the session's send
-  buffer; a hub dying in that window costs a full rebuild (no
-  delivery acknowledgement). Log replay offsets advance the same way,
-  so a few log lines in flight at that moment are skipped on resume.
+* Results are kept until the hub acknowledges them, but log replay
+  offsets advance when a chunk is handed to the session, so a few log
+  lines in flight when a session dies are skipped on resume.
 * No build cancellation: Nix killing the attach process does not yet
   stop the remote build. A submission whose attach client is gone also
   stays queued until a matching worker picks it up.

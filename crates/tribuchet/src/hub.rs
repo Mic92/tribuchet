@@ -25,7 +25,7 @@ use crate::chunkio::ChunkWriter;
 use crate::proto::{
     attach_event, attach_hub_server, hub_message, nar_transfer, worker_message, AttachEvent,
     BuildAssignment, BuildRequest, HubMessage, NarTransfer, OutputNar, PathInfoMsg, PathOffer,
-    Register, TmpDirArchive, WorkerMessage,
+    Register, ResultAck, TmpDirArchive, WorkerMessage,
 };
 
 type EventTx = mpsc::Sender<Result<AttachEvent, Status>>;
@@ -1093,13 +1093,25 @@ impl Write for HashWriter {
     }
 }
 
+/// Tell the worker its result (and all output NARs) arrived intact,
+/// so it can stop keeping the build for redelivery. Best effort: a
+/// lost ack only means the worker holds the build dir until its TTL.
+async fn ack_result(out_tx: &mpsc::Sender<Result<HubMessage, Status>>, build_id: &str) {
+    let _ = send(
+        out_tx,
+        hub_message::Msg::ResultAck(ResultAck {
+            build_id: build_id.into(),
+        }),
+    )
+    .await;
+}
+
 async fn relay_build(
     job: &Job,
     vkey: &PublicKey,
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
     in_rx: &mut mpsc::Receiver<worker_message::Msg>,
 ) -> Result<()> {
-    let _ = out_tx; // cancellation not implemented yet
     let mut pending: HashMap<String, OutputVerify> = HashMap::new();
     let mut awaiting_outputs = false;
 
@@ -1128,6 +1140,7 @@ async fn relay_build(
                     job.replay
                         .publish(attach_event::Event::ExitCode(res.exit_code))
                         .await;
+                    ack_result(out_tx, &res.build_id).await;
                     return Ok(());
                 }
                 for out in res.outputs {
@@ -1191,6 +1204,7 @@ async fn relay_build(
                         .await;
                     if pending.is_empty() {
                         job.replay.publish(attach_event::Event::ExitCode(0)).await;
+                        ack_result(out_tx, &n.build_id).await;
                         return Ok(());
                     }
                 }
