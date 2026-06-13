@@ -1,6 +1,7 @@
-//! systemd integration: socket activation and readiness/watchdog
-//! notification. Every function degrades to a no-op outside systemd
-//! (no NOTIFY_SOCKET / LISTEN_FDS), so plain CLI runs are unaffected.
+//! Service-manager integration: socket activation (systemd LISTEN_FDS
+//! and launchd's launch_activate_socket) and readiness/watchdog
+//! notification. Every function degrades to a no-op outside the
+//! respective service manager, so plain CLI runs are unaffected.
 
 use std::os::fd::{FromRawFd as _, RawFd};
 
@@ -19,38 +20,96 @@ pub struct ActivatedSockets {
 /// Claim activated sockets, at most one TCP and one unix listener.
 pub fn activated_sockets() -> Result<ActivatedSockets> {
     let mut out = ActivatedSockets::default();
-    let fds = sd_notify::listen_fds().context("inspecting LISTEN_FDS")?;
-    for fd in fds {
-        match socket_family(fd)? {
-            libc::AF_INET | libc::AF_INET6 => {
-                if out.tcp.is_some() {
-                    bail!("more than one activated TCP socket");
-                }
-                // Safety: systemd passed this fd for us to own.
-                let l = unsafe { std::net::TcpListener::from_raw_fd(fd) };
-                l.set_nonblocking(true)?;
-                out.tcp = Some(l);
-            }
-            libc::AF_UNIX => {
-                if out.unix.is_some() {
-                    bail!("more than one activated unix socket");
-                }
-                // Safety: systemd passed this fd for us to own.
-                let l = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
-                l.set_nonblocking(true)?;
-                out.unix = Some(l);
-            }
-            family => bail!("activated socket fd {fd} has unsupported family {family}"),
-        }
+    for fd in sd_notify::listen_fds().context("inspecting LISTEN_FDS")? {
+        out.adopt(fd)?;
+    }
+    #[cfg(target_os = "macos")]
+    if out.tcp.is_none() && out.unix.is_none() {
+        launchd_sockets(&mut out)?;
     }
     if out.tcp.is_some() || out.unix.is_some() {
         tracing::info!(
             tcp = out.tcp.is_some(),
             unix = out.unix.is_some(),
-            "adopted systemd-activated sockets"
+            "adopted activated sockets"
         );
     }
     Ok(out)
+}
+
+impl ActivatedSockets {
+    /// Take ownership of one activated listener fd, classified by
+    /// address family.
+    fn adopt(&mut self, fd: RawFd) -> Result<()> {
+        match socket_family(fd)? {
+            libc::AF_INET | libc::AF_INET6 => {
+                if self.tcp.is_some() {
+                    bail!("more than one activated TCP socket");
+                }
+                // Safety: the service manager passed this fd for us to own.
+                let l = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+                l.set_nonblocking(true)?;
+                self.tcp = Some(l);
+            }
+            libc::AF_UNIX => {
+                if self.unix.is_some() {
+                    bail!("more than one activated unix socket");
+                }
+                // Safety: the service manager passed this fd for us to own.
+                let l = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
+                l.set_nonblocking(true)?;
+                self.unix = Some(l);
+            }
+            family => bail!("activated socket fd {fd} has unsupported family {family}"),
+        }
+        Ok(())
+    }
+}
+
+/// Adopt listeners launchd holds for this daemon (named "attach" and
+/// "workers" in the plist's `Sockets` dictionary, the analogue of a
+/// systemd .socket unit), so hub restarts keep the sockets accepting
+/// and clients queue in launchd instead of seeing ECONNREFUSED.
+/// No-op when not launched by launchd or the plist declares no
+/// sockets.
+#[cfg(target_os = "macos")]
+fn launchd_sockets(out: &mut ActivatedSockets) -> Result<()> {
+    extern "C" {
+        fn launch_activate_socket(
+            name: *const libc::c_char,
+            fds: *mut *mut libc::c_int,
+            cnt: *mut libc::size_t,
+        ) -> libc::c_int;
+    }
+    for name in ["attach", "workers"] {
+        let cname = std::ffi::CString::new(name).unwrap();
+        let mut fds: *mut libc::c_int = std::ptr::null_mut();
+        let mut cnt: libc::size_t = 0;
+        let rc = unsafe { launch_activate_socket(cname.as_ptr(), &mut fds, &mut cnt) };
+        match rc {
+            0 => {}
+            // Not running under launchd, or no socket of this name in
+            // the plist: fall back to self-binding.
+            libc::ESRCH | libc::ENOENT => continue,
+            _ => {
+                return Err(std::io::Error::from_raw_os_error(rc))
+                    .with_context(|| format!("launch_activate_socket({name})"))
+            }
+        }
+        if fds.is_null() || cnt == 0 {
+            continue;
+        }
+        let adopted: Result<()> = (|| {
+            for &fd in unsafe { std::slice::from_raw_parts(fds, cnt) } {
+                out.adopt(fd)?;
+            }
+            Ok(())
+        })();
+        // launch_activate_socket allocates the fd array with malloc.
+        unsafe { libc::free(fds.cast()) };
+        adopted?;
+    }
+    Ok(())
 }
 
 fn socket_family(fd: RawFd) -> Result<libc::c_int> {

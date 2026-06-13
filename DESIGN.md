@@ -223,7 +223,10 @@ per-build limits and execs the worker through a stable /run symlink
 with `reloadIfChanged`, so package bumps and settings changes reload
 instead of restarting (the fresh worker generation re-reads the
 config file).
-The e2e test consumes the same module. macOS workers use the
-`darwinModules.worker` nix-darwin module: the launchd daemon execs a
-stable symlink and activation flips it and SIGHUPs the reaper, again
-reloading on package bumps.
+The e2e test consumes the same module. macOS hosts use the
+`darwinModules.default` nix-darwin module, which ships both services:
+the hub adopts its listeners from launchd (`launch_activate_socket`,
+the analogue of the socket-activated NixOS unit), and the worker's
+launchd daemon execs a stable symlink that activation flips and
+SIGHUPs the reaper, again reloading on package bumps and settings
+changes.

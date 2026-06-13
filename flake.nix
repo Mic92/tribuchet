@@ -45,8 +45,7 @@
         );
       });
 
-      darwinModules.worker = import ./nix/darwin-module.nix self;
-      darwinModules.default = self.darwinModules.worker;
+      darwinModules.default = import ./nix/darwin-module.nix self;
 
       nixosModules.default = import ./nix/nixos-module.nix self;
 
@@ -59,14 +58,15 @@
 
       # Evaluation-only check of the darwin module (the launchd plist
       # and activation script); building a darwin system needs a mac.
-      checks.x86_64-linux.darwin-worker-module =
+      checks.x86_64-linux.darwin-module =
         let
           eval = nix-darwin.lib.darwinSystem {
             modules = [
-              self.darwinModules.worker
+              self.darwinModules.default
               {
                 nixpkgs.hostPlatform = "aarch64-darwin";
                 system.stateVersion = 6;
+                services.tribuchet-hub.enable = true;
                 services.tribuchet-worker = {
                   enable = true;
                   settings.hub = "https://hub.example.org:7437";
@@ -75,11 +75,16 @@
             ];
           };
         in
-        nixpkgs.legacyPackages.x86_64-linux.writeText "tribuchet-darwin-worker-module" (
-          builtins.toJSON {
-            daemon = eval.config.launchd.daemons.tribuchet-worker.serviceConfig;
-            activation = eval.config.system.activationScripts.postActivation.text;
-          }
+        nixpkgs.legacyPackages.x86_64-linux.writeText "tribuchet-darwin-module" (
+          # plists reference the aarch64-darwin package; drop the
+          # context so the check stays eval-only on Linux
+          builtins.unsafeDiscardStringContext (
+            builtins.toJSON {
+              hub = eval.config.launchd.daemons.tribuchet-hub.serviceConfig;
+              worker = eval.config.launchd.daemons.tribuchet-worker.serviceConfig;
+              activation = eval.config.system.activationScripts.postActivation.text;
+            }
+          )
         );
 
       devShells = forAllSystems (pkgs: {
