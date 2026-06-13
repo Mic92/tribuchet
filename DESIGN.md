@@ -211,9 +211,12 @@ capable worker is left (or get rebuilt by another one).
 * Input NARs are not verified against an expected content hash; the
   worker trusts the mTLS-authenticated hub for input content.
 
-## Deployment (planned)
+## Deployment
 
-No NixOS modules or launchd plists ship yet; `nix/test.nix` contains
-reference systemd units for hub and worker (the worker unit should set
-`Delegate=yes` for per-build cgroup limits). macOS workers are a plain
-binary (no nix required).
+No NixOS module ships yet; `nix/test.nix` contains reference systemd
+units for hub and worker (the worker unit should set `Delegate=yes`
+for per-build cgroup limits and exec the worker through a stable
+symlink with `reloadIfChanged` for zero-downtime upgrades). macOS
+workers use the `darwinModules.worker` nix-darwin module: the launchd
+daemon execs a stable symlink and activation flips it and SIGHUPs the
+reaper, so a package bump reloads instead of restarting.
