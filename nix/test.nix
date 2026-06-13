@@ -49,7 +49,11 @@ in
           ./patches/external-builders-uid-range.patch
         ];
         nix.settings = {
-          experimental-features = [ "external-builders" ];
+          experimental-features = [
+            "external-builders"
+            "ca-derivations"
+            "impure-derivations"
+          ];
           # let the daemon accept uid-range builds; tribuchet's worker
           # provides the actual uid range
           system-features = [ "uid-range" ];
@@ -106,6 +110,18 @@ in
         '';
         environment.etc."tt/slowlog.nix".text = ''
           import ${./tests/slowlog.nix} { bash = "${pkgs.bash}"; }
+        '';
+        environment.etc."tt/refgraph.nix".text = ''
+          import ${./tests/refgraph.nix} { bash = "${pkgs.bash}"; }
+        '';
+        environment.etc."tt/structured.nix".text = ''
+          import ${./tests/structured.nix} { bash = "${pkgs.bash}"; }
+        '';
+        environment.etc."tt/ca.nix".text = ''
+          import ${./tests/ca.nix} { bash = "${pkgs.bash}"; }
+        '';
+        environment.etc."tt/impure.nix".text = ''
+          import ${./tests/impure.nix} { bash = "${pkgs.bash}"; }
         '';
         environment.etc."tt/cross.nix".text = ''
           import ${./tests/cross.nix} {
@@ -334,6 +350,27 @@ in
     with subtest("uid-range build runs as sandbox root with a cgroup"):
         out = hub.succeed("nix-build /etc/tt/uidrange.nix --no-out-link").strip()
         hub.succeed(f"grep -q uid-range-ok {out}")
+
+    with subtest("exportReferencesGraph file reaches the remote builder"):
+        out = hub.succeed("nix-build /etc/tt/refgraph.nix --no-out-link").strip()
+        hub.succeed(f"grep -q refgraph-ok {out}")
+
+    with subtest("structured-attrs build reads .attrs.json with the exported closure"):
+        out = hub.succeed("nix-build /etc/tt/structured.nix --no-out-link").strip()
+        hub.succeed(f"grep -q structured-ok {out}")
+
+    with subtest("floating content-addressed derivation"):
+        out = hub.succeed("nix-build /etc/tt/ca.nix --no-out-link").strip()
+        hub.succeed(f"grep -q ca-ok {out}")
+
+    with subtest("impure derivation"):
+        # nix-build cannot print impure output paths (asserts on
+        # maybeOutputPath), so use nix build here.
+        out = hub.succeed(
+            "nix build --extra-experimental-features nix-command "
+            "-f /etc/tt/impure.nix --no-link --print-out-paths"
+        ).strip()
+        hub.succeed(f"grep -q impure-ok {out}")
 
     with subtest("kvm feature: scheduled and device passed through, or rejected"):
         if worker.execute("test -e /dev/kvm")[0] == 0:
