@@ -1,17 +1,13 @@
 # NixOS VM test: a real nix-daemon on `hub` routes a build through the
 # external-builders feature to tribuchet, which dispatches it to `worker`
 # over mTLS and unpacks the signed outputs back into the hub's store.
-{ tribuchet }:
+{ tribuchet, nixosModule }:
 { pkgs, lib, ... }:
 let
   attachWrapper = pkgs.writeShellScript "tribuchet-attach" ''
     export RUST_LOG=info
     exec ${tribuchet}/bin/tribuchet attach "$1" --socket /run/tribuchet/hub.sock
   '';
-
-  # stable exec path: deploys flip the symlink and reload, the reaper
-  # execs the new binary, running builds keep going
-  flipWorkerExec = "${pkgs.coreutils}/bin/ln -sfn ${tribuchet}/bin/tribuchet /run/tribuchet-worker/exec";
 
   # evaluated here so the container closure can be pre-seeded into both
   # VM stores; the hub re-evaluates the same expression at test time
@@ -114,32 +110,14 @@ in
           }
         '';
 
-        # systemd holds both listeners: hub restarts never refuse
-        # attach or worker connections, clients just queue.
-        systemd.sockets.tribuchet-hub = {
-          # started by the test script once certificates exist
-          wantedBy = lib.mkForce [ ];
-          listenStreams = [
-            "/run/tribuchet/hub.sock"
-            "0.0.0.0:7437"
-          ];
-          socketConfig = {
-            SocketGroup = "nixbld";
-            SocketMode = "0660";
-          };
+        imports = [ nixosModule ];
+        services.tribuchet-hub = {
+          enable = true;
+          package = tribuchet;
         };
-        systemd.services.tribuchet-hub = {
-          serviceConfig = {
-            Type = "notify";
-            ExecStart = "${tribuchet}/bin/tribuchet hub --socket /run/tribuchet/hub.sock --listen 0.0.0.0:7437 --config-dir /etc/tribuchet";
-            RuntimeDirectory = "tribuchet";
-            # Never unlink the activated socket's path on service stop;
-            # the listener in systemd must stay reachable across restarts.
-            RuntimeDirectoryPreserve = true;
-            Environment = "RUST_LOG=info";
-            WatchdogSec = "30";
-          };
-        };
+        # started by the test script once certificates exist
+        systemd.sockets.tribuchet-hub.wantedBy = lib.mkForce [ ];
+        systemd.services.tribuchet-hub.wantedBy = lib.mkForce [ ];
       };
 
     worker =
@@ -161,33 +139,17 @@ in
           nspawn.toplevel
         ];
 
-        systemd.services.tribuchet-worker = {
-          # started by the test script once certificates exist
-          wantedBy = lib.mkForce [ ];
-          # only ExecReload carries the package store path, so a new
-          # package reloads instead of restarting
-          reloadIfChanged = true;
-          serviceConfig = {
-            Type = "notify";
-            # READY/watchdog come from the worker child; the main pid
-            # is the build reaper it forked off at startup.
-            NotifyAccess = "all";
-            WatchdogSec = "30";
-            ExecStartPre = flipWorkerExec;
-            ExecReload = [
-              flipWorkerExec
-              "${pkgs.coreutils}/bin/kill -HUP $MAINPID"
-            ];
-            ExecStart = "/run/tribuchet-worker/exec worker --hub https://hub:7437 --state-dir /var/lib/tribuchet --max-jobs 2 --max-log-size 1048576 --emulate aarch64-linux=${pkgs.pkgsStatic.qemu-user}/bin/qemu-aarch64";
-            RuntimeDirectory = "tribuchet-worker";
-            StateDirectory = "tribuchet";
-            Environment = "RUST_LOG=info";
-            # delegate the cgroup subtree so the worker can apply
-            # per-build pids/memory limits and cgroup.kill teardown
-            Delegate = true;
-            Restart = "on-failure";
-          };
+        imports = [ nixosModule ];
+        services.tribuchet-worker = {
+          enable = true;
+          package = tribuchet;
+          hub = "https://hub:7437";
+          maxJobs = 2;
+          maxLogSize = 1048576;
+          emulate.aarch64-linux = "${pkgs.pkgsStatic.qemu-user}/bin/qemu-aarch64";
         };
+        # started by the test script once certificates exist
+        systemd.services.tribuchet-worker.wantedBy = lib.mkForce [ ];
       };
   };
 

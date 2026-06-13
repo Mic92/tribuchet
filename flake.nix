@@ -48,8 +48,13 @@
       darwinModules.worker = import ./nix/darwin-module.nix self;
       darwinModules.default = self.darwinModules.worker;
 
+      nixosModules.default = import ./nix/nixos-module.nix self;
+
       checks.x86_64-linux.nixos-test = nixpkgs.legacyPackages.x86_64-linux.testers.runNixOSTest (
-        import ./nix/test.nix { tribuchet = self.packages.x86_64-linux.default; }
+        import ./nix/test.nix {
+          tribuchet = self.packages.x86_64-linux.default;
+          nixosModule = self.nixosModules.default;
+        }
       );
 
       # Evaluation-only check of the darwin module (the launchd plist

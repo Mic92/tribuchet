@@ -213,10 +213,12 @@ capable worker is left (or get rebuilt by another one).
 
 ## Deployment
 
-No NixOS module ships yet; `nix/test.nix` contains reference systemd
-units for hub and worker (the worker unit should set `Delegate=yes`
-for per-build cgroup limits and exec the worker through a stable
-symlink with `reloadIfChanged` for zero-downtime upgrades). macOS
-workers use the `darwinModules.worker` nix-darwin module: the launchd
-daemon execs a stable symlink and activation flips it and SIGHUPs the
-reaper, so a package bump reloads instead of restarting.
+`nixosModules.default` ships hub and worker services
+(`services.tribuchet-hub`, `services.tribuchet-worker`): the hub is
+socket-activated, the worker unit delegates its cgroup subtree for
+per-build limits and execs the worker through a stable /run symlink
+with `reloadIfChanged`, so package bumps reload instead of restarting.
+The e2e test consumes the same module. macOS workers use the
+`darwinModules.worker` nix-darwin module: the launchd daemon execs a
+stable symlink and activation flips it and SIGHUPs the reaper, again
+reloading on package bumps.
