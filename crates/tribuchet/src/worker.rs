@@ -110,6 +110,10 @@ struct WorkerCtx {
     /// macOS: tmpDirInSandbox=/build is one global symlink (no mount
     /// namespace); builds sharing it run one at a time.
     shared_link_lock: std::sync::Mutex<()>,
+    /// Dedupe keys of builds the hub cancelled; the supervising loops
+    /// abort them. Keyed like the registry, since a resumed build's
+    /// build_id changes while it runs.
+    cancelled: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl WorkerCtx {
@@ -598,6 +602,7 @@ async fn run_async(
         build_memory_max: opts.build_memory_max,
         secret_paths: vec![opts.key.clone(), opts.state_dir.join("signing.key")],
         running: std::sync::atomic::AtomicU32::new(0),
+        cancelled: std::sync::Mutex::new(std::collections::HashSet::new()),
         resumable: std::sync::Mutex::new(HashMap::new()),
         emulators,
         pasta: opts.pasta.clone(),
@@ -719,14 +724,20 @@ fn supervise_adopted(
     signing_key: &SecretKey,
 ) -> FinishedBuild {
     let pgrp = nix::unistd::Pid::from_raw(st.pid);
-    let mut timed_out = false;
+    let mut aborted: Option<&str> = None;
     let code = loop {
         if let Some(code) = reaper::take_status(&ctx.status_dir, st.pid) {
             break code;
         }
-        if !timed_out && unix_now() >= st.deadline_unix {
-            timed_out = true;
-            let _ = nix::sys::signal::killpg(pgrp, nix::sys::signal::Signal::SIGKILL);
+        if aborted.is_none() {
+            if ctx.cancelled.lock().unwrap().remove(&st.dedupe_key) {
+                aborted = Some("build cancelled");
+            } else if unix_now() >= st.deadline_unix {
+                aborted = Some("build timed out");
+            }
+            if aborted.is_some() {
+                let _ = nix::sys::signal::killpg(pgrp, nix::sys::signal::Signal::SIGKILL);
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     };
@@ -742,8 +753,8 @@ fn supervise_adopted(
     };
     sandbox::cleanup(&synth, &dir);
     set_uid_slot(ctx, st.uid_slot, false);
-    let (exit_code, error, outputs) = if timed_out {
-        (1, "build timed out".into(), vec![])
+    let (exit_code, error, outputs) = if let Some(reason) = aborted {
+        (1, reason.into(), vec![])
     } else if code != 0 {
         (
             code,
@@ -1042,8 +1053,25 @@ async fn session_loop(
                     }
                 }
             }
-            hub_message::Msg::Cancel(_) => {
-                tracing::warn!("build cancellation not implemented yet");
+            hub_message::Msg::Cancel(c) => {
+                tracing::info!(id = c.build_id, "hub cancelled the build");
+                // Still staging: tear it down right here. Already
+                // executing: flag its dedupe key for the supervising
+                // loop (the registry maps the current build_id to it).
+                if let Some(build) = active.remove(&c.build_id) {
+                    build.abort().await;
+                    fail_build(out_tx, &c.build_id, &anyhow::anyhow!("build cancelled")).await?;
+                } else {
+                    let key = {
+                        let map = ctx.resumable.lock().unwrap();
+                        map.iter()
+                            .find(|(_, e)| e.build_id == c.build_id)
+                            .map(|(k, _)| k.clone())
+                    };
+                    if let Some(key) = key {
+                        ctx.cancelled.lock().unwrap().insert(key);
+                    }
+                }
             }
             hub_message::Msg::ResultAck(a) => {
                 ack_delivery(ctx, &a.build_id);
@@ -1452,7 +1480,9 @@ impl ActiveBuild {
             // between the elapsed() read and the load
             let silent_ms = (started.elapsed().as_millis() as u64)
                 .saturating_sub(last_log_ms.load(Ordering::Relaxed));
-            if std::time::Instant::now() >= deadline {
+            if self.ctx.cancelled.lock().unwrap().remove(&a.dedupe_key) {
+                abort = Some("build cancelled".into());
+            } else if std::time::Instant::now() >= deadline {
                 abort = Some(format!("build timed out after {}s", timeout.as_secs()));
             } else if max_log > 0 && log_bytes.load(Ordering::Relaxed) > max_log {
                 abort = Some(format!("build log exceeded the limit of {max_log} bytes"));

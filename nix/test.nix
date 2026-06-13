@@ -105,6 +105,9 @@ in
         environment.etc."tt/reload.nix".text = ''
           import ${./tests/reload.nix} { bash = "${pkgs.bash}"; }
         '';
+        environment.etc."tt/cancel.nix".text = ''
+          import ${./tests/cancel.nix} { bash = "${pkgs.bash}"; }
+        '';
         environment.etc."tt/cross.nix".text = ''
           import ${./tests/cross.nix} {
             busybox = "${pkgs.pkgsCross.aarch64-multiplatform.pkgsStatic.busybox}";
@@ -294,6 +297,19 @@ in
         # the client's build log means the adopted build streamed live
         # logs through the new worker generation
         hub.succeed("journalctl -u reloadbuild | grep -q log-after-reload")
+
+    with subtest("killing the client cancels the build on the worker"):
+        hub.succeed(
+            "systemd-run --unit=cancelbuild bash -lc "
+            "'nix-build /etc/tt/cancel.nix --no-out-link'"
+        )
+        # bracket trick: do not match the pgrep wrapper's own cmdline
+        worker.wait_until_succeeds("pgrep -f 'cancel-marker-runnin[g]'", timeout=60)
+        hub.succeed("systemctl kill --signal=SIGKILL cancelbuild")
+        # the hub notices the lost attach client and tells the worker;
+        # the builder process must disappear without a worker restart
+        worker.wait_until_succeeds("! pgrep -f 'cancel-marker-runnin[g]'", timeout=60)
+        hub.succeed("journalctl -u tribuchet-hub | grep -q 'cancelling build'")
 
     with subtest("concurrent builds share one worker session"):
         import time

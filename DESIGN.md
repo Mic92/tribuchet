@@ -199,9 +199,10 @@ capable worker is left (or get rebuilt by another one).
 * Results are kept until the hub acknowledges them, but log replay
   offsets advance when a chunk is handed to the session, so a few log
   lines in flight when a session dies are skipped on resume.
-* No build cancellation: Nix killing the attach process does not yet
-  stop the remote build. A submission whose attach client is gone also
-  stays queued until a matching worker picks it up.
+* Cancellation is lazy: a dispatched build whose attach clients are
+  all gone is killed only after a grace period, and an abandoned
+  queued job is dropped when a worker would have picked it up, not
+  immediately.
 * Dedupe attaches duplicates to the first attempt, so a transient
   failure propagates to all attached submitters (same as Buck2's RE
   dedupe behaviour).

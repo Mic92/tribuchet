@@ -24,8 +24,8 @@ use tonic::{Request, Response, Status, Streaming};
 use crate::chunkio::ChunkWriter;
 use crate::proto::{
     attach_event, attach_hub_server, hub_message, nar_transfer, worker_message, AttachEvent,
-    BuildAssignment, BuildRequest, HubMessage, NarTransfer, OutputNar, PathInfoMsg, PathOffer,
-    Register, ResultAck, TmpDirArchive, WorkerMessage,
+    BuildAssignment, BuildRequest, CancelBuild, HubMessage, NarTransfer, OutputNar, PathInfoMsg,
+    PathOffer, Register, ResultAck, TmpDirArchive, WorkerMessage,
 };
 
 type EventTx = mpsc::Sender<Result<AttachEvent, Status>>;
@@ -117,6 +117,13 @@ impl Replay {
         inner.done = true;
         inner.subs.clear();
     }
+
+    /// Any attach client still listening? Subscribers whose stream was
+    /// dropped count as gone even before publish() prunes them.
+    async fn has_subscribers(&self) -> bool {
+        let inner = self.inner.lock().await;
+        inner.subs.iter().any(|tx| !tx.is_closed())
+    }
 }
 
 struct Job {
@@ -136,6 +143,10 @@ struct Job {
 
 /// A worker-session loss requeues a job at most this many times.
 const MAX_JOB_ATTEMPTS: u32 = 3;
+
+/// How long a dispatched build may run with no attach client listening
+/// before the hub cancels it on the worker.
+const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Default)]
 struct Inflight {
@@ -193,11 +204,21 @@ impl Default for HubState {
 
 impl HubState {
     async fn take_job(&self, caps: &WorkerCaps) -> Option<Job> {
-        let mut queue = self.queue.lock().await;
-        let pos = queue
-            .iter()
-            .position(|j| caps.serves(&j.req.system, &j.features))?;
-        queue.remove(pos)
+        let job = {
+            let mut queue = self.queue.lock().await;
+            let pos = queue
+                .iter()
+                .position(|j| caps.serves(&j.req.system, &j.features))?;
+            queue.remove(pos)?
+        };
+        // Abandoned while queued (every attach client gone): drop it
+        // here, at the moment it would have occupied a build slot.
+        if !job.replay.has_subscribers().await {
+            tracing::info!(id = job.id, "dropping queued build: no client attached");
+            self.finish(&job).await;
+            return None;
+        }
+        Some(job)
     }
 
     /// Take a queued job whose dedupe key is in `keys` (builds the
@@ -1114,9 +1135,36 @@ async fn relay_build(
 ) -> Result<()> {
     let mut pending: HashMap<String, OutputVerify> = HashMap::new();
     let mut awaiting_outputs = false;
+    let mut abandoned_since: Option<std::time::Instant> = None;
+    let mut cancel_sent = false;
 
     loop {
-        match recv(in_rx).await? {
+        // Between worker messages, watch for the last attach client
+        // going away; after a grace period the worker is told to kill
+        // the build. Its "cancelled" result then flows back through
+        // the arms below like any other failure.
+        let m = tokio::select! {
+            m = recv(in_rx) => m?,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)), if !cancel_sent => {
+                if job.replay.has_subscribers().await {
+                    abandoned_since = None;
+                } else if abandoned_since.get_or_insert_with(std::time::Instant::now).elapsed()
+                    > CANCEL_GRACE
+                {
+                    tracing::info!(id = job.id, "no attach client left; cancelling build");
+                    send(
+                        out_tx,
+                        hub_message::Msg::Cancel(CancelBuild {
+                            build_id: job.id.clone(),
+                        }),
+                    )
+                    .await?;
+                    cancel_sent = true;
+                }
+                continue;
+            }
+        };
+        match m {
             worker_message::Msg::Log(l) => {
                 job.replay.publish(attach_event::Event::Log(l.data)).await;
             }
