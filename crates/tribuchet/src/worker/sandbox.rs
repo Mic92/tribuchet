@@ -177,7 +177,7 @@ pub fn spawn_request(
             .get_current_dir()
             .map(|p| p.to_string_lossy().into_owned()),
         has_stdin: platform::SPEC_VIA_STDIN,
-        seq: 0,
+        token: String::new(),
     };
     if platform::SPEC_VIA_STDIN {
         let (r, w) = nix::unistd::pipe().context("creating spec pipe")?;

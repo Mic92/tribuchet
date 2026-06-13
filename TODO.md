@@ -1,10 +1,5 @@
 # TODO
 
-- Reaper status files are keyed by pid: a recycled pid can make the
-  spawn path delete a finished build's not-yet-consumed exit status,
-  which is then reported as a timeout. Key statuses by a per-spawn
-  token instead.
-
 - ResultAck and CancelBuild match the registry by build_id, which a
   concurrent resume rotates: a stale id means the ack is dropped (the
   build dir lingers until the TTL) or the cancel is lost. Match by

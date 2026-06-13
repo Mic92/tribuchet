@@ -10,7 +10,9 @@
 //!
 //! The interface between the halves is deliberately dumb: a datagram
 //! socketpair carrying a JSON spawn request plus fds (SCM_RIGHTS), and
-//! a status directory of `<pid>` files containing the exit code. The
+//! a status directory of per-spawn `<token>` files containing the
+//! exit code (tokens, not pids: a recycled pid must not be able to
+//! shadow or clobber another build's status). The
 //! reaper never parses build specs; those travel through an fd it
 //! passes along untouched.
 //!
@@ -37,10 +39,12 @@ pub struct SpawnRequest {
     pub cwd: Option<String>,
     /// fds passed alongside: [log] or [log, stdin]
     pub has_stdin: bool,
-    /// Echoed in the reply so a request whose reply was never read
-    /// (interrupted recv) cannot shift all later replies by one.
+    /// Unique per spawn: names the status file the exit code is
+    /// written to (pid reuse cannot mix up statuses) and is echoed in
+    /// the reply so a request whose reply was never read (interrupted
+    /// recv) cannot shift all later replies by one.
     #[serde(default)]
-    pub seq: u64,
+    pub token: String,
 }
 
 /// Generous bound for one request datagram (argv + env; the sandbox
@@ -49,7 +53,7 @@ const MAX_MSG: usize = 1 << 20;
 
 #[derive(Serialize, Deserialize)]
 struct SpawnReply {
-    seq: u64,
+    token: String,
     pid: Option<i32>,
     error: String,
 }
@@ -57,19 +61,19 @@ struct SpawnReply {
 /// Worker-side handle; one in-flight request at a time.
 pub struct Spawner {
     sock: std::sync::Mutex<UnixDatagram>,
-    seq: std::sync::atomic::AtomicU64,
 }
 
 impl Spawner {
     /// Ask the reaper to spawn a build (own process group). Returns
-    /// the pid, whose exit status will appear in the status dir.
+    /// the pid; the exit status will appear in the status dir under
+    /// `req.token`, which this fills in.
     pub fn spawn(
         &self,
         req: &mut SpawnRequest,
         log: &std::fs::File,
         stdin: Option<OwnedFd>,
     ) -> Result<i32> {
-        req.seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        req.token = hex::encode(rand::random::<[u8; 16]>());
         let sock = self.sock.lock().unwrap();
         let payload = serde_json::to_vec(req)?;
         let mut fds = vec![log.as_raw_fd()];
@@ -82,7 +86,7 @@ impl Spawner {
             let (n, _) = recv_with_fds(&sock, &mut buf).context("reading reaper reply")?;
             let reply: SpawnReply = serde_json::from_slice(&buf[..n])?;
             // Discard replies to earlier requests whose recv failed.
-            if reply.seq == req.seq {
+            if reply.token == req.token {
                 break reply;
             }
         };
@@ -93,10 +97,10 @@ impl Spawner {
     }
 }
 
-/// Exit code recorded for `pid`, if it has been reaped. The file is
-/// consumed (removed) on read.
-pub fn take_status(status_dir: &Path, pid: i32) -> Option<i32> {
-    let path = status_dir.join(pid.to_string());
+/// Exit code recorded under a spawn token, if that build has been
+/// reaped. The file is consumed (removed) on read.
+pub fn take_status(status_dir: &Path, token: &str) -> Option<i32> {
+    let path = status_dir.join(token);
     let code = std::fs::read_to_string(&path).ok()?.trim().parse().ok()?;
     let _ = std::fs::remove_file(&path);
     Some(code)
@@ -126,7 +130,6 @@ pub fn ensure(status_dir: PathBuf) -> Result<Spawner> {
         sock.set_nonblocking(false)?;
         return Ok(Spawner {
             sock: std::sync::Mutex::new(sock),
-            seq: std::sync::atomic::AtomicU64::new(1),
         });
     }
     std::fs::create_dir_all(&status_dir)?;
@@ -207,7 +210,8 @@ fn reaper_main(sock: UnixDatagram, worker_sock: UnixDatagram, status_dir: &Path)
             return 1;
         }
     };
-    let mut builds: Vec<i32> = Vec::new();
+    // pid and status token of every build spawned and not yet reaped
+    let mut builds: Vec<(i32, String)> = Vec::new();
     let mut worker_code: Option<i32> = None;
     let mut stopping = false;
     // Crash-loop guard: respawning a worker that keeps dying instantly
@@ -249,9 +253,9 @@ fn reaper_main(sock: UnixDatagram, worker_sock: UnixDatagram, status_dir: &Path)
             let Some((pid, code)) = code else { break };
             if pid == worker_pid {
                 worker_code = Some(code);
-            } else {
-                builds.retain(|p| *p != pid);
-                let _ = std::fs::write(status_dir.join(pid.to_string()), format!("{code}\n"));
+            } else if let Some(i) = builds.iter().position(|(p, _)| *p == pid) {
+                let (_, token) = builds.swap_remove(i);
+                let _ = std::fs::write(status_dir.join(token), format!("{code}\n"));
             }
         }
         if let Some(code) = worker_code.take() {
@@ -287,23 +291,20 @@ fn reaper_main(sock: UnixDatagram, worker_sock: UnixDatagram, status_dir: &Path)
         }
         match recv_with_fds(&sock, &mut buf) {
             Ok((n, fds)) => {
-                let seq = serde_json::from_slice::<SpawnRequest>(&buf[..n])
-                    .map(|r| r.seq)
-                    .unwrap_or(0);
+                let token = serde_json::from_slice::<SpawnRequest>(&buf[..n])
+                    .map(|r| r.token)
+                    .unwrap_or_default();
                 let reply = match handle_spawn(&buf[..n], fds) {
                     Ok(pid) => {
-                        builds.push(pid);
-                        // A pid recycled from an abandoned earlier build
-                        // must not inherit its stale exit status.
-                        let _ = std::fs::remove_file(status_dir.join(pid.to_string()));
+                        builds.push((pid, token.clone()));
                         SpawnReply {
-                            seq,
+                            token,
                             pid: Some(pid),
                             error: String::new(),
                         }
                     }
                     Err(e) => SpawnReply {
-                        seq,
+                        token,
                         pid: None,
                         error: format!("{e:#}"),
                     },
@@ -317,14 +318,14 @@ fn reaper_main(sock: UnixDatagram, worker_sock: UnixDatagram, status_dir: &Path)
 
 /// Kill and reap the remaining build process groups: the reaper is
 /// about to exit, and builds that outlive it would leak unreaped.
-fn kill_builds(builds: &mut Vec<i32>) {
-    for pid in builds.iter() {
+fn kill_builds(builds: &mut Vec<(i32, String)>) {
+    for (pid, _) in builds.iter() {
         let _ = nix::sys::signal::killpg(
             nix::unistd::Pid::from_raw(*pid),
             nix::sys::signal::Signal::SIGKILL,
         );
     }
-    for pid in builds.drain(..) {
+    for (pid, _) in builds.drain(..) {
         let _ = nix::sys::wait::waitpid(Some(nix::unistd::Pid::from_raw(pid)), None);
     }
 }

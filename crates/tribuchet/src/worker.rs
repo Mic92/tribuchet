@@ -697,7 +697,7 @@ fn supervise_adopted(
     let mut aborted: Option<String> = None;
     let log_path = dir.join("build.log");
     let code = loop {
-        if let Some(code) = reaper::take_status(&ctx.status_dir, st.pid) {
+        if let Some(code) = reaper::take_status(&ctx.status_dir, &st.status_token) {
             break code;
         }
         if aborted.is_none() {
@@ -1429,6 +1429,7 @@ impl ActiveBuild {
             dedupe_key: a.dedupe_key.clone(),
             build_id: a.build_id.clone(),
             pid,
+            status_token: req.token.clone(),
             spec: spec.clone(),
             outputs: a.outputs.clone(),
             deadline_unix: unix_now() + timeout.as_secs(),
@@ -1468,7 +1469,7 @@ impl ActiveBuild {
         use std::sync::atomic::Ordering;
         let mut abort: Option<String> = None;
         let status = loop {
-            if let Some(code) = reaper::take_status(&self.ctx.status_dir, pid) {
+            if let Some(code) = reaper::take_status(&self.ctx.status_dir, &req.token) {
                 break code;
             }
             // saturating: a log thread may store a newer timestamp
@@ -1491,7 +1492,7 @@ impl ActiveBuild {
                 let _ = nix::sys::signal::killpg(pgrp, nix::sys::signal::Signal::SIGKILL);
                 // The reaper collects the kill within its sweep interval.
                 break loop {
-                    if let Some(code) = reaper::take_status(&self.ctx.status_dir, pid) {
+                    if let Some(code) = reaper::take_status(&self.ctx.status_dir, &req.token) {
                         break code;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1620,6 +1621,8 @@ struct ResumeState {
     /// Original assignment id: names the cgroup and the log file.
     build_id: String,
     pid: i32,
+    /// Status-file name the reaper records the exit code under.
+    status_token: String,
     spec: sandbox::SandboxSpec,
     /// Assignment outputs (name -> scratch path), for cleanup.
     outputs: HashMap<String, String>,
