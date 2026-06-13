@@ -104,6 +104,9 @@ in
         environment.etc."tt/cancel.nix".text = ''
           import ${./tests/cancel.nix} { bash = "${pkgs.bash}"; }
         '';
+        environment.etc."tt/slowlog.nix".text = ''
+          import ${./tests/slowlog.nix} { bash = "${pkgs.bash}"; }
+        '';
         environment.etc."tt/cross.nix".text = ''
           import ${./tests/cross.nix} {
             busybox = "${pkgs.pkgsCross.aarch64-multiplatform.pkgsStatic.busybox}";
@@ -234,6 +237,31 @@ in
         worker.wait_until_succeeds("systemctl is-active tribuchet-worker")
         hub.wait_until_succeeds("systemctl is-active tribuchet-hub")
 
+    with subtest("resubmitting a previously resumed derivation builds again"):
+        # Same dedupe key as the resumed build above: it must go
+        # through normal admission, not the one-shot resumable fast
+        # path of the worker's registration.
+        hub.succeed("nix-build /etc/tt/drain.nix --no-out-link --check", timeout=120)
+
+    with subtest("max-log-size applies to a build adopted across a reload"):
+        assigned = int(worker.succeed(
+            "journalctl -u tribuchet-worker | grep -c 'build assigned' || true"
+        ).strip())
+        hub.succeed(
+            "systemd-run --unit=slowlogbuild bash -lc "
+            "'nix-build /etc/tt/slowlog.nix --no-out-link'"
+        )
+        worker.wait_until_succeeds(
+            f"[ $(journalctl -u tribuchet-worker | grep -c 'build assigned') -gt {assigned} ]",
+            timeout=60,
+        )
+        # ~64KB/s of log: the reload lands well before the 1MB limit,
+        # so only the re-adopted build can exceed it.
+        worker.succeed("systemctl reload tribuchet-worker")
+        hub.wait_until_succeeds(
+            "journalctl -u slowlogbuild | grep -q 'exceeded the limit'", timeout=120
+        )
+
     with subtest("worker reload mid-build re-adopts the running build"):
         assigned = int(worker.succeed(
             "journalctl -u tribuchet-worker | grep -c 'build assigned' || true"
@@ -278,6 +306,12 @@ in
         # the builder process must disappear without a worker restart
         worker.wait_until_succeeds("! pgrep -f 'cancel-marker-runnin[g]'", timeout=60)
         hub.succeed("journalctl -u tribuchet-hub | grep -q 'cancelling build'")
+
+    with subtest("the cancelled derivation builds fine when asked again"):
+        # Same dedupe key as the build cancelled above: a stale cancel
+        # flag would kill it on its first supervision tick.
+        out = hub.succeed("nix-build /etc/tt/cancel.nix --no-out-link", timeout=120).strip()
+        hub.succeed(f"grep -q cancel-done {out}")
 
     with subtest("concurrent builds share one worker session"):
         import time
