@@ -146,10 +146,12 @@ in
         services.tribuchet-worker = {
           enable = true;
           package = tribuchet;
-          hub = "https://hub:7437";
-          maxJobs = 2;
-          maxLogSize = 1048576;
-          emulate.aarch64-linux = "${pkgs.pkgsStatic.qemu-user}/bin/qemu-aarch64";
+          settings = {
+            hub = "https://hub:7437";
+            max-jobs = 2;
+            max-log-size = 1048576;
+            emulate.aarch64-linux = "${pkgs.pkgsStatic.qemu-user}/bin/qemu-aarch64";
+          };
         };
         # started by the test script once certificates exist
         systemd.services.tribuchet-worker.wantedBy = lib.mkForce [ ];
@@ -279,6 +281,12 @@ in
             f"[ $(journalctl -u tribuchet-worker | grep -c 'build assigned') -gt {assigned} ]",
             timeout=60,
         )
+        # Settings changes also arrive via reload: the new worker
+        # generation re-reads the config file.
+        worker.succeed(
+            "cp --remove-destination $(readlink -f /etc/tribuchet/worker.toml) /etc/tribuchet/worker.toml"
+            " && sed -i 's/max-jobs = 2/max-jobs = 3/' /etc/tribuchet/worker.toml"
+        )
         # Reload mid-build: the reaper execs a new worker generation;
         # the builder process keeps running and the new worker adopts
         # it, delivering the result when it finishes.
@@ -293,6 +301,9 @@ in
         # the client's build log means the adopted build streamed live
         # logs through the new worker generation
         hub.succeed("journalctl -u reloadbuild | grep -q log-after-reload")
+        # the new generation logs its configuration: the max-jobs bump
+        # made it through the reload
+        worker.succeed("journalctl -u tribuchet-worker | grep -q 'max_jobs: 3'")
 
     with subtest("killing the client cancels the build on the worker"):
         hub.succeed(

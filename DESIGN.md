@@ -190,7 +190,7 @@ capable worker is left (or get rebuilt by another one).
   build attempt: it only catches concurrent duplicate submissions of the
   same goal, not the same derivation submitted twice. Proper dedupe
   needs a derivation identity in build.json (upstream patch).
-* Workers run up to `--max-jobs` concurrent builds over one session;
+* Workers run up to `max-jobs` concurrent builds over one session;
   on macOS, builds sharing the daemon-pinned `/build` symlink are
   serialized per worker (no mount namespace to give each its own).
 * Reload upgrades the worker but never the reaper itself; picking up
@@ -213,11 +213,16 @@ capable worker is left (or get rebuilt by another one).
 
 ## Deployment
 
-`nixosModules.default` ships hub and worker services
+Hub and worker read their settings from TOML config files
+(`--config`, default `/etc/tribuchet/{hub,worker}.toml`); only the
+one-shot `attach` and `ca` commands take their parameters on the
+command line. `nixosModules.default` ships hub and worker services
 (`services.tribuchet-hub`, `services.tribuchet-worker`): the hub is
 socket-activated, the worker unit delegates its cgroup subtree for
 per-build limits and execs the worker through a stable /run symlink
-with `reloadIfChanged`, so package bumps reload instead of restarting.
+with `reloadIfChanged`, so package bumps and settings changes reload
+instead of restarting (the fresh worker generation re-reads the
+config file).
 The e2e test consumes the same module. macOS workers use the
 `darwinModules.worker` nix-darwin module: the launchd daemon execs a
 stable symlink and activation flips it and SIGHUPs the reaper, again

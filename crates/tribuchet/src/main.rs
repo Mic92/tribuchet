@@ -2,6 +2,7 @@ mod attach;
 mod build_json;
 mod ca;
 mod chunkio;
+mod config;
 mod hub;
 mod nar;
 mod proto;
@@ -33,66 +34,15 @@ enum Command {
     },
     /// Scheduler and NAR relay; runs next to nix-daemon.
     Hub {
-        #[arg(long, default_value = "/run/tribuchet/hub.sock")]
-        socket: PathBuf,
-        /// gRPC listen address for workers.
-        #[arg(long, default_value = "0.0.0.0:7437")]
-        listen: String,
-        #[arg(long, default_value = "/etc/tribuchet")]
-        config_dir: PathBuf,
+        /// TOML configuration file.
+        #[arg(long, default_value = "/etc/tribuchet/hub.toml")]
+        config: PathBuf,
     },
     /// Build worker; dials the hub and executes sandboxed builds.
     Worker {
-        /// Hub gRPC address, e.g. https://hub.example.org:7437
-        #[arg(long)]
-        hub: String,
-        #[arg(long, default_value = "/var/lib/tribuchet")]
-        state_dir: PathBuf,
-        /// Systems this worker builds for (default: host system).
-        #[arg(long = "system")]
-        systems: Vec<String>,
-        #[arg(long, default_value = "/var/lib/tribuchet/tls/ca.crt")]
-        ca_cert: PathBuf,
-        #[arg(long, default_value = "/var/lib/tribuchet/tls/worker.crt")]
-        cert: PathBuf,
-        #[arg(long, default_value = "/var/lib/tribuchet/tls/worker.key")]
-        key: PathBuf,
-        /// Kill builds running longer than this many seconds.
-        #[arg(long, default_value_t = 24 * 3600)]
-        build_timeout_secs: u64,
-        /// Kill builds producing no log output for this many seconds
-        /// (Nix's max-silent-time); 0 disables.
-        #[arg(long, default_value_t = 0)]
-        max_silent_time_secs: u64,
-        /// Kill builds whose log exceeds this many bytes (Nix's
-        /// max-log-size); 0 disables.
-        #[arg(long, default_value_t = 0)]
-        max_log_size: u64,
-        /// Static shell bound at /bin/sh inside the sandbox (Linux),
-        /// e.g. a busybox sh; without it #!/bin/sh shebangs fail.
-        #[arg(long)]
-        sandbox_bin_sh: Option<PathBuf>,
-        /// memory.max for each build's cgroup (Linux; needs a delegated
-        /// cgroup, e.g. systemd Delegate=yes). Unlimited when unset.
-        #[arg(long)]
-        build_memory_max_bytes: Option<u64>,
-        /// Concurrent build slots.
-        #[arg(long, default_value_t = 1)]
-        max_jobs: u32,
-        /// First uid of the per-slot 65536-uid ranges for builds that
-        /// require the uid-range feature (Nix's auto-allocate-uids
-        /// start-id; needs a root worker).
-        #[arg(long, default_value_t = 872415232)]
-        auto_allocate_uids_base: u32,
-        /// Emulated system as "system=/path/to/static-emulator"
-        /// (repeatable; Linux, kernel 6.7+).
-        #[arg(long)]
-        emulate: Vec<String>,
-        /// pasta binary; fixed-output builds then get a private network
-        /// namespace with user-mode NAT (Linux). Defaults to the path
-        /// baked in at build time, if any; "none" disables it.
-        #[arg(long)]
-        pasta: Option<PathBuf>,
+        /// TOML configuration file; re-read on every reload.
+        #[arg(long, default_value = "/etc/tribuchet/worker.toml")]
+        config: PathBuf,
     },
     /// Certificate authority management (init CA, issue worker certs).
     Ca {
@@ -117,53 +67,14 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Attach { build_json, socket } => attach::run(&build_json, &socket),
-        Command::Hub {
-            socket,
-            listen,
-            config_dir,
-        } => hub::run(&socket, &listen, &config_dir),
-        Command::Worker {
-            hub,
-            state_dir,
-            mut systems,
-            ca_cert,
-            cert,
-            key,
-            build_timeout_secs,
-            max_silent_time_secs,
-            max_log_size,
-            sandbox_bin_sh,
-            build_memory_max_bytes,
-            max_jobs,
-            auto_allocate_uids_base,
-            emulate,
-            pasta,
-        } => {
-            if systems.is_empty() {
-                systems.push(worker::host_system());
-            }
-            let pasta = match pasta {
-                Some(p) if p.as_os_str() == "none" => None,
-                Some(p) => Some(p),
-                None => option_env!("TRIBUCHET_PASTA").map(PathBuf::from),
-            };
-            worker::run(worker::WorkerOpts {
-                hub,
-                state_dir,
-                systems,
-                ca_cert,
-                cert,
-                key,
-                build_timeout: std::time::Duration::from_secs(build_timeout_secs),
-                max_silent_time: std::time::Duration::from_secs(max_silent_time_secs),
-                max_log_size,
-                sandbox_bin_sh,
-                build_memory_max: build_memory_max_bytes,
-                max_jobs,
-                auto_allocate_uids_base,
-                emulate,
-                pasta,
-            })
+        Command::Hub { config } => {
+            let cfg: config::HubConfig = config::load(&config)?;
+            hub::run(&cfg.socket, &cfg.listen, &cfg.config_dir)
+        }
+        Command::Worker { config } => {
+            let cfg: config::WorkerConfig = config::load(&config)?;
+            tracing::info!(?cfg, "worker configuration");
+            worker::run(cfg)
         }
         Command::Ca { action } => ca::run(action),
     }

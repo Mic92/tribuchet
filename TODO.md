@@ -10,11 +10,6 @@
   build dir lingers until the TTL) or the cancel is lost. Match by
   dedupe key, or accept any build_id the entry has carried.
 
-- With `reloadIfChanged`, changing worker command-line options (e.g.
-  --max-jobs) only reloads the unit, and the reaper re-execs with its
-  original argv, so the change silently never applies until a manual
-  restart. Either restart on argv changes (reloadTriggers on the
-  package only) or have the reaper pick up new argv on reload.
 
 - Support launchd socket activation for the hub on macOS: adopt
   listeners via `launch_activate_socket()` (the launchd analogue of

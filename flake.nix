@@ -69,7 +69,7 @@
                 system.stateVersion = 6;
                 services.tribuchet-worker = {
                   enable = true;
-                  hub = "https://hub.example.org:7437";
+                  settings.hub = "https://hub.example.org:7437";
                 };
               }
             ];

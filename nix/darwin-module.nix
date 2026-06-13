@@ -4,10 +4,10 @@
 # NixOS, just driven from activation: the daemon execs a stable
 # symlink in the state dir, activation flips it to the new package and
 # sends SIGHUP, and the reaper execs a fresh worker generation that
-# re-adopts running builds. The plist never contains the package store
-# path, so a package bump does not make nix-darwin restart the daemon;
-# changing an option that is part of the command line still does (and
-# kills running builds).
+# re-adopts running builds. The plist contains neither the package
+# store path nor the settings (those live in /etc/tribuchet/worker.toml),
+# so neither a package bump nor a settings change makes
+# nix-darwin restart the daemon; both arrive via the SIGHUP reload.
 self:
 {
   config,
@@ -19,6 +19,8 @@ let
   cfg = config.services.tribuchet-worker;
   execLink = "${cfg.stateDir}/exec";
   label = "org.nixos.tribuchet-worker";
+  format = pkgs.formats.toml { };
+  workerToml = format.generate "worker.toml" ({ state-dir = toString cfg.stateDir; } // cfg.settings);
 in
 {
   options.services.tribuchet-worker = {
@@ -29,25 +31,24 @@ in
       defaultText = lib.literalExpression "tribuchet";
       description = "Package providing bin/tribuchet.";
     };
-    hub = lib.mkOption {
-      type = lib.types.str;
-      example = "https://hub.example.org:7437";
-      description = "URL of the hub's worker endpoint.";
-    };
     stateDir = lib.mkOption {
       type = lib.types.path;
       default = "/var/lib/tribuchet";
       description = "State directory: TLS material, build dirs, exec symlink.";
     };
-    maxJobs = lib.mkOption {
-      type = lib.types.ints.positive;
-      default = 1;
-      description = "Concurrent build slots advertised to the hub.";
-    };
-    extraArgs = lib.mkOption {
-      type = lib.types.listOf lib.types.str;
-      default = [ ];
-      description = "Additional arguments passed to `tribuchet worker`.";
+    settings = lib.mkOption {
+      type = format.type;
+      example = lib.literalExpression ''
+        {
+          hub = "https://hub.example.org:7437";
+          max-jobs = 4;
+        }
+      '';
+      description = ''
+        Contents of worker.toml. Changes are applied with a SIGHUP
+        reload, so running builds survive them. The `hub` key is
+        required.
+      '';
     };
     logFile = lib.mkOption {
       type = lib.types.path;
@@ -57,18 +58,14 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    environment.etc."tribuchet/worker.toml".source = workerToml;
     launchd.daemons.tribuchet-worker.serviceConfig = {
       ProgramArguments = [
         execLink
         "worker"
-        "--hub"
-        cfg.hub
-        "--state-dir"
-        (toString cfg.stateDir)
-        "--max-jobs"
-        (toString cfg.maxJobs)
-      ]
-      ++ cfg.extraArgs;
+        "--config"
+        "/etc/tribuchet/worker.toml"
+      ];
       KeepAlive = true;
       RunAtLoad = true;
       StandardOutPath = toString cfg.logFile;

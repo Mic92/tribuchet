@@ -17,6 +17,16 @@ let
   hub = config.services.tribuchet-hub;
   worker = config.services.tribuchet-worker;
   defaultPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+  format = pkgs.formats.toml { };
+  hubToml = format.generate "hub.toml" (
+    {
+      socket = toString hub.socketPath;
+      listen = "${hub.listenAddress}:${toString hub.port}";
+      config-dir = toString hub.configDir;
+    }
+    // hub.settings
+  );
+  workerToml = format.generate "worker.toml" worker.settings;
   workerExec = "/run/tribuchet-worker/exec";
   flipWorkerExec = "${pkgs.coreutils}/bin/ln -sfn ${lib.getExe' worker.package "tribuchet"} ${workerExec}";
 in
@@ -59,10 +69,10 @@ in
       default = "/etc/tribuchet";
       description = "Directory with the CA material and hub TLS key pair.";
     };
-    extraArgs = lib.mkOption {
-      type = lib.types.listOf lib.types.str;
-      default = [ ];
-      description = "Additional arguments passed to `tribuchet hub`.";
+    settings = lib.mkOption {
+      type = format.type;
+      default = { };
+      description = "Extra settings merged into hub.toml.";
     };
   };
 
@@ -74,31 +84,20 @@ in
       defaultText = lib.literalExpression "tribuchet";
       description = "Package providing bin/tribuchet.";
     };
-    hub = lib.mkOption {
-      type = lib.types.str;
-      example = "https://hub.example.org:7437";
-      description = "URL of the hub's worker endpoint.";
-    };
-    maxJobs = lib.mkOption {
-      type = lib.types.ints.positive;
-      default = 1;
-      description = "Concurrent build slots advertised to the hub.";
-    };
-    maxLogSize = lib.mkOption {
-      type = lib.types.ints.unsigned;
-      default = 0;
-      description = "Kill builds whose log exceeds this many bytes (0 disables).";
-    };
-    emulate = lib.mkOption {
-      type = lib.types.attrsOf lib.types.path;
-      default = { };
-      example = lib.literalExpression ''{ aarch64-linux = "''${pkgs.pkgsStatic.qemu-user}/bin/qemu-aarch64"; }'';
-      description = "Extra systems to advertise, built under the given static emulator.";
-    };
-    extraArgs = lib.mkOption {
-      type = lib.types.listOf lib.types.str;
-      default = [ ];
-      description = "Additional arguments passed to `tribuchet worker`.";
+    settings = lib.mkOption {
+      type = format.type;
+      example = lib.literalExpression ''
+        {
+          hub = "https://hub.example.org:7437";
+          max-jobs = 4;
+          max-log-size = 67108864;
+          emulate.aarch64-linux = "''${pkgs.pkgsStatic.qemu-user}/bin/qemu-aarch64";
+        }
+      '';
+      description = ''
+        Contents of worker.toml. Changes are applied with a reload, so
+        running builds survive them. The `hub` key is required.
+      '';
     };
   };
 
@@ -116,23 +115,13 @@ in
           SocketMode = "0660";
         };
       };
+      environment.etc."tribuchet/hub.toml".source = hubToml;
       systemd.services.tribuchet-hub = {
         wantedBy = [ "multi-user.target" ];
+        restartTriggers = [ hubToml ];
         serviceConfig = {
           Type = "notify";
-          ExecStart = lib.escapeShellArgs (
-            [
-              (lib.getExe' hub.package "tribuchet")
-              "hub"
-              "--socket"
-              (toString hub.socketPath)
-              "--listen"
-              "${hub.listenAddress}:${toString hub.port}"
-              "--config-dir"
-              (toString hub.configDir)
-            ]
-            ++ hub.extraArgs
-          );
+          ExecStart = "${lib.getExe' hub.package "tribuchet"} hub --config /etc/tribuchet/hub.toml";
           RuntimeDirectory = "tribuchet";
           # Never unlink the activated socket's path on service stop;
           # the listener in systemd must stay reachable across restarts.
@@ -145,11 +134,17 @@ in
     })
 
     (lib.mkIf worker.enable {
+      environment.etc."tribuchet/worker.toml".source = workerToml;
       systemd.services.tribuchet-worker = {
         wantedBy = [ "multi-user.target" ];
         # only ExecReload carries the package store path, so a new
-        # package reloads instead of restarting
+        # package reloads instead of restarting; settings changes also
+        # arrive via reload (the fresh worker generation re-reads the
+        # config file). With reloadIfChanged a restart trigger causes
+        # a reload, and unlike reloadTriggers it does not warn about
+        # the combination.
         reloadIfChanged = true;
+        restartTriggers = [ workerToml ];
         serviceConfig = {
           Type = "notify";
           # READY/watchdog come from the worker child; the main pid
@@ -161,27 +156,7 @@ in
             flipWorkerExec
             "${pkgs.coreutils}/bin/kill -HUP $MAINPID"
           ];
-          ExecStart = lib.escapeShellArgs (
-            [
-              workerExec
-              "worker"
-              "--hub"
-              worker.hub
-              "--state-dir"
-              "/var/lib/tribuchet"
-              "--max-jobs"
-              (toString worker.maxJobs)
-              "--max-log-size"
-              (toString worker.maxLogSize)
-            ]
-            ++ lib.concatLists (
-              lib.mapAttrsToList (system: emulator: [
-                "--emulate"
-                "${system}=${emulator}"
-              ]) worker.emulate
-            )
-            ++ worker.extraArgs
-          );
+          ExecStart = "${workerExec} worker --config /etc/tribuchet/worker.toml";
           RuntimeDirectory = "tribuchet-worker";
           StateDirectory = "tribuchet";
           Environment = "RUST_LOG=info";

@@ -30,6 +30,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
 use crate::chunkio::{ChannelReader, CHUNK_SIZE};
+use crate::config::WorkerConfig;
 use crate::nar;
 use crate::proto::{
     hub_message, nar_transfer, worker_hub_client::WorkerHubClient, worker_message, BuildAssignment,
@@ -40,43 +41,6 @@ use crate::proto::{
 /// Connection to the local nix-daemon; one per active build so its
 /// temp roots live exactly as long as the build.
 type DaemonConn = DaemonClient<tokio::net::unix::OwnedReadHalf, tokio::net::unix::OwnedWriteHalf>;
-
-pub struct WorkerOpts {
-    pub hub: String,
-    pub state_dir: PathBuf,
-    pub systems: Vec<String>,
-    pub ca_cert: PathBuf,
-    pub cert: PathBuf,
-    pub key: PathBuf,
-    /// Hard limit per build; a hung builder would otherwise occupy the
-    /// worker forever.
-    pub build_timeout: std::time::Duration,
-    /// Kill builds producing no log output for this long (Nix's
-    /// max-silent-time). Zero disables the check.
-    pub max_silent_time: std::time::Duration,
-    /// Kill builds whose log exceeds this many bytes (Nix's
-    /// max-log-size). Zero disables the check.
-    pub max_log_size: u64,
-    /// Optional static shell bound at /bin/sh inside the Linux sandbox
-    /// (like Nix's busybox sandbox path); #!/bin/sh shebangs and libc
-    /// system() fail without it.
-    pub sandbox_bin_sh: Option<PathBuf>,
-
-    /// Optional memory.max for the per-build cgroup (Linux, requires a
-    /// delegated cgroup; see worker/cgroup.rs).
-    pub build_memory_max: Option<u64>,
-    /// Concurrent build slots advertised to the hub.
-    pub max_jobs: u32,
-    /// First uid of the per-slot 65536-uid ranges for uid-range builds
-    /// (Nix's auto-allocate-uids scheme; needs a root worker).
-    pub auto_allocate_uids_base: u32,
-    /// "system=/path/to/static-emulator" pairs; each system is
-    /// advertised to the hub and its builds run under a per-sandbox
-    /// binfmt_misc registration (Linux, kernel 6.7+).
-    pub emulate: Vec<String>,
-    /// pasta binary for fixed-output network isolation (Linux).
-    pub pasta: Option<PathBuf>,
-}
 
 /// Per-process context threaded through builds.
 struct WorkerCtx {
@@ -97,7 +61,7 @@ struct WorkerCtx {
     /// dedupe_key -> build past staging; survives session loss so a
     /// replacement hub can resume instead of rebuilding.
     resumable: std::sync::Mutex<HashMap<String, ResumableBuild>>,
-    /// system -> static emulator binary, from --emulate.
+    /// system -> static emulator binary, from the emulate setting.
     emulators: HashMap<String, PathBuf>,
     /// pasta binary for fixed-output network isolation.
     pasta: Option<PathBuf>,
@@ -370,7 +334,7 @@ fn local_features(native: bool, uid_base: u32) -> Vec<String> {
 
 /// Per-system capability list for Register; native systems get the
 /// probed feature set, emulated ones only the baseline.
-fn system_caps(opts: &WorkerOpts, ctx: &WorkerCtx) -> Vec<crate::proto::SystemCaps> {
+fn system_caps(opts: &WorkerConfig, ctx: &WorkerCtx) -> Vec<crate::proto::SystemCaps> {
     let native = local_features(true, opts.auto_allocate_uids_base);
     let emulated = local_features(false, opts.auto_allocate_uids_base);
     opts.systems
@@ -539,7 +503,7 @@ fn request_job() -> WorkerMessage {
     msg(worker_message::Msg::RequestJob(RequestJob {}))
 }
 
-pub fn run(opts: WorkerOpts) -> Result<()> {
+pub fn run(opts: WorkerConfig) -> Result<()> {
     // ensure() either becomes the reaper (never returns) or, in the
     // worker generation it exec'd, hands back the spawner. It runs
     // before tokio because the reaper must stay single-threaded.
@@ -550,7 +514,7 @@ pub fn run(opts: WorkerOpts) -> Result<()> {
 }
 
 async fn run_async(
-    opts: WorkerOpts,
+    opts: WorkerConfig,
     spawner: reaper::Spawner,
     cgroup_base: Option<PathBuf>,
 ) -> Result<()> {
@@ -564,32 +528,38 @@ async fn run_async(
     // Arc: SecretKey is not Clone (zeroized on drop); build threads share it.
     let signing_key = std::sync::Arc::new(load_signing_key(&opts.state_dir)?);
     let mut opts = opts;
+    if opts.systems.is_empty() {
+        opts.systems.push(host_system());
+    }
+    // "none" disables pasta even when a default path was baked in at
+    // build time.
+    opts.pasta = match opts.pasta.take() {
+        Some(p) if p.as_os_str() == "none" => None,
+        Some(p) => Some(p),
+        None => option_env!("TRIBUCHET_PASTA").map(PathBuf::from),
+    };
     let mut emulators = HashMap::new();
-    for pair in &opts.emulate {
+    for (system, path) in &opts.emulate {
         if !cfg!(target_os = "linux") {
-            anyhow::bail!("--emulate requires Linux (binfmt_misc)");
+            anyhow::bail!("emulate requires Linux (binfmt_misc)");
         }
-        let (system, path) = pair
-            .split_once('=')
-            .with_context(|| format!("--emulate {pair}: expected system=/path"))?;
         if binfmt::register_line(system).is_none() {
-            anyhow::bail!("--emulate {system}: no binfmt magic known");
+            anyhow::bail!("emulate {system}: no binfmt magic known");
         }
-        let path = PathBuf::from(path);
         if !path.is_file() {
-            anyhow::bail!("--emulate {system}: {} not found", path.display());
+            anyhow::bail!("emulate {system}: {} not found", path.display());
         }
-        if !opts.systems.contains(&system.to_string()) {
-            opts.systems.push(system.to_string());
+        if !opts.systems.contains(system) {
+            opts.systems.push(system.clone());
         }
-        emulators.insert(system.to_string(), path);
+        emulators.insert(system.clone(), path.clone());
     }
     if let Some(p) = &opts.pasta {
         if !cfg!(target_os = "linux") {
-            anyhow::bail!("--pasta requires Linux (network namespaces)");
+            anyhow::bail!("pasta requires Linux (network namespaces)");
         }
         if !p.is_file() {
-            anyhow::bail!("--pasta: {} not found", p.display());
+            anyhow::bail!("pasta: {} not found", p.display());
         }
     }
     let opts = opts;
@@ -599,14 +569,14 @@ async fn run_async(
         status_dir: opts.state_dir.join("exited"),
         sandbox_bin_sh: opts.sandbox_bin_sh.clone(),
         cgroup_base,
-        build_memory_max: opts.build_memory_max,
+        build_memory_max: opts.build_memory_max_bytes,
         secret_paths: vec![opts.key.clone(), opts.state_dir.join("signing.key")],
         running: std::sync::atomic::AtomicU32::new(0),
         cancelled: std::sync::Mutex::new(std::collections::HashSet::new()),
         resumable: std::sync::Mutex::new(HashMap::new()),
         emulators,
         pasta: opts.pasta.clone(),
-        max_silent_time: opts.max_silent_time,
+        max_silent_time: std::time::Duration::from_secs(opts.max_silent_time_secs),
         max_log_size: opts.max_log_size,
         uid_base: opts.auto_allocate_uids_base,
         uid_slots: std::sync::Mutex::new(vec![false; opts.max_jobs.max(1) as usize]),
@@ -853,7 +823,7 @@ fn spawn_handover() {
 }
 
 async fn session(
-    opts: &WorkerOpts,
+    opts: &WorkerConfig,
     signing_key: &std::sync::Arc<SecretKey>,
     ctx: &std::sync::Arc<WorkerCtx>,
 ) -> Result<()> {
@@ -928,7 +898,7 @@ async fn session(
         &out_tx,
         signing_key,
         ctx,
-        opts.build_timeout,
+        std::time::Duration::from_secs(opts.build_timeout_secs),
     )
     .await;
     // Builds still staging when the session dies must not keep their
