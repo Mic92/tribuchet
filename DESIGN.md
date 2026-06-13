@@ -193,10 +193,9 @@ capable worker is left (or get rebuilt by another one).
 * Workers run up to `--max-jobs` concurrent builds over one session;
   on macOS, builds sharing the daemon-pinned `/build` symlink are
   serialized per worker (no mount namespace to give each its own).
-* The reaper execs the worker from its own binary path, so a reload
-  picks up new code only if that path is a stable indirection (e.g. a
-  profile symlink); on NixOS the store path in ExecStart changes per
-  deploy and needs `reloadIfChanged` plus such a symlink to benefit.
+* Reload upgrades the worker but never the reaper itself; picking up
+  a new reaper still needs a full restart (which kills running
+  builds). The reaper is deliberately small so this rarely matters.
 * Resumed and re-adopted builds deliver their result but not live
   logs: the log file and offset survive on disk, streaming them to the
   new session is not implemented.

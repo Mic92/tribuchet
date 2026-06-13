@@ -9,6 +9,10 @@ let
     exec ${tribuchet}/bin/tribuchet attach "$1" --socket /run/tribuchet/hub.sock
   '';
 
+  # stable exec path: deploys flip the symlink and reload, the reaper
+  # execs the new binary, running builds keep going
+  flipWorkerExec = "${pkgs.coreutils}/bin/ln -sfn ${tribuchet}/bin/tribuchet /run/tribuchet-worker/exec";
+
   # evaluated here so the container closure can be pre-seeded into both
   # VM stores; the hub re-evaluates the same expression at test time
   nspawn = import ./nspawn-container.nix { nixpkgs = pkgs.path; };
@@ -157,16 +161,22 @@ in
         systemd.services.tribuchet-worker = {
           # started by the test script once certificates exist
           wantedBy = lib.mkForce [ ];
+          # only ExecReload carries the package store path, so a new
+          # package reloads instead of restarting
+          reloadIfChanged = true;
           serviceConfig = {
             Type = "notify";
             # READY/watchdog come from the worker child; the main pid
             # is the build reaper it forked off at startup.
             NotifyAccess = "all";
             WatchdogSec = "30";
-            # Zero-downtime handover: the reaper (main pid) execs a
-            # fresh worker generation; running builds are re-adopted.
-            ExecReload = "${pkgs.coreutils}/bin/kill -HUP $MAINPID";
-            ExecStart = "${tribuchet}/bin/tribuchet worker --hub https://hub:7437 --state-dir /var/lib/tribuchet --max-jobs 2 --max-log-size 1048576 --emulate aarch64-linux=${pkgs.pkgsStatic.qemu-user}/bin/qemu-aarch64";
+            ExecStartPre = flipWorkerExec;
+            ExecReload = [
+              flipWorkerExec
+              "${pkgs.coreutils}/bin/kill -HUP $MAINPID"
+            ];
+            ExecStart = "/run/tribuchet-worker/exec worker --hub https://hub:7437 --state-dir /var/lib/tribuchet --max-jobs 2 --max-log-size 1048576 --emulate aarch64-linux=${pkgs.pkgsStatic.qemu-user}/bin/qemu-aarch64";
+            RuntimeDirectory = "tribuchet-worker";
             StateDirectory = "tribuchet";
             Environment = "RUST_LOG=info";
             # delegate the cgroup subtree so the worker can apply
