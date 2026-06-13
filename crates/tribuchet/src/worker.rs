@@ -130,17 +130,137 @@ impl WorkerCtx {
 
     /// Re-point an already-held build (same dedupe key) at the
     /// assignment's new build_id and session; true if one existed.
-    fn adopt_assignment(&self, a: &BuildAssignment, out_tx: &mpsc::Sender<WorkerMessage>) -> bool {
+    /// A tailer streams the log to the new session from the persisted
+    /// offset and keeps following it.
+    fn adopt_assignment(
+        self: &std::sync::Arc<Self>,
+        a: &BuildAssignment,
+        out_tx: &mpsc::Sender<WorkerMessage>,
+    ) -> bool {
         let mut map = self.resumable.lock().unwrap();
         match map.get_mut(&a.dedupe_key) {
             Some(e) => {
                 e.build_id = a.build_id.clone();
                 e.out_tx = Some(out_tx.clone());
+                if let Some(t) = e.log_tail.take() {
+                    // An earlier resume's tailer feeds a dead session.
+                    // Only flag it (no join): it may be waiting on the
+                    // registry lock held right here.
+                    t.done.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                e.log_tail = Some(spawn_log_tail(
+                    self.clone(),
+                    a.dedupe_key.clone(),
+                    a.build_id.clone(),
+                    e.dir.clone(),
+                    out_tx.clone(),
+                ));
                 true
             }
             None => false,
         }
     }
+}
+
+/// A log-replay thread; `stop()` makes it drain to EOF, then waits
+/// for it.
+struct LogTail {
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+impl LogTail {
+    fn stop(self) {
+        self.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = self.handle.join();
+    }
+}
+
+/// How far of `dir`'s build.log has already been streamed to a hub.
+/// Persisted next to the log so resumed sessions and later worker
+/// generations continue where the previous tailer stopped instead of
+/// repeating the log from the start.
+fn read_log_offset(dir: &std::path::Path) -> u64 {
+    std::fs::read_to_string(dir.join("log.offset"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+fn write_log_offset(dir: &std::path::Path, offset: u64) {
+    let _ = std::fs::write(dir.join("log.offset"), offset.to_string());
+}
+
+/// Stream `dir`'s build.log to `out_tx` as LogChunks for `build_id`,
+/// starting at the persisted offset and advancing it after every
+/// chunk handed to the session. Polls past EOF until `done()` says
+/// nothing more can arrive (one final read has then already drained
+/// what was flushed); a failed send ends it, the offset stays put.
+fn tail_log(
+    dir: &std::path::Path,
+    build_id: &str,
+    out_tx: &mpsc::Sender<WorkerMessage>,
+    done: impl Fn() -> bool,
+    mut on_chunk: impl FnMut(usize),
+) {
+    use std::io::Seek;
+    let Ok(mut file) = std::fs::File::open(dir.join("build.log")) else {
+        return;
+    };
+    let mut sent = read_log_offset(dir);
+    if file.seek(std::io::SeekFrom::Start(sent)).is_err() {
+        return;
+    }
+    let mut buf = [0u8; 8192];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => {
+                if done() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(_) => break,
+            Ok(n) => {
+                on_chunk(n);
+                if out_tx
+                    .blocking_send(msg(worker_message::Msg::Log(LogChunk {
+                        build_id: build_id.into(),
+                        data: buf[..n].to_vec(),
+                    })))
+                    .is_err()
+                {
+                    break;
+                }
+                sent += n as u64;
+                write_log_offset(dir, sent);
+            }
+        }
+    }
+}
+
+/// Tail a resumed build's log on a thread until the registry entry
+/// has finished (or vanished) or `stop()` is called.
+fn spawn_log_tail(
+    ctx: std::sync::Arc<WorkerCtx>,
+    key: String,
+    build_id: String,
+    dir: PathBuf,
+    out_tx: mpsc::Sender<WorkerMessage>,
+) -> LogTail {
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread_done = done.clone();
+    let handle = std::thread::spawn(move || {
+        use std::sync::atomic::Ordering;
+        let done = || {
+            thread_done.load(Ordering::Relaxed) || {
+                let map = ctx.resumable.lock().unwrap();
+                map.get(&key).is_none_or(|e| e.finished.is_some())
+            }
+        };
+        tail_log(&dir, &build_id, &out_tx, done, |_| {});
+    });
+    LogTail { done, handle }
 }
 
 /// A leased 65536-uid range; returned to the pool on drop.
@@ -539,10 +659,12 @@ fn adopt_builds(ctx: &std::sync::Arc<WorkerCtx>, signing_key: &std::sync::Arc<Se
                         exit_code: f.exit_code,
                         error: f.error,
                         outputs: f.outputs,
-                        dir,
+                        dir: dir.clone(),
                         finished_at: std::time::Instant::now(),
                     }),
                     delivering: false,
+                    dir,
+                    log_tail: None,
                 },
             );
             continue;
@@ -568,6 +690,8 @@ fn adopt_builds(ctx: &std::sync::Arc<WorkerCtx>, signing_key: &std::sync::Arc<Se
                 out_tx: None,
                 finished: None,
                 delivering: false,
+                dir: dir.clone(),
+                log_tail: None,
             },
         );
         ctx.running
@@ -586,8 +710,8 @@ fn adopt_builds(ctx: &std::sync::Arc<WorkerCtx>, signing_key: &std::sync::Arc<Se
 }
 
 /// Wait out a re-adopted build and pack its outputs, mirroring the
-/// tail end of execute(). Logs are not streamed live (the original
-/// offset is lost with the old worker); only the result travels.
+/// tail end of execute(). Logs are streamed by the tailer that
+/// adopt_assignment starts once a session re-dispatches the build.
 fn supervise_adopted(
     ctx: &std::sync::Arc<WorkerCtx>,
     st: ResumeState,
@@ -883,6 +1007,9 @@ async fn session_loop(
                                     out_tx: Some(out_tx.clone()),
                                     finished: None,
                                     delivering: false,
+                                    dir: build.dir.clone(),
+                                    // execute() streams the log live itself
+                                    log_tail: None,
                                 },
                             );
                             ctx.running
@@ -1294,38 +1421,19 @@ impl ActiveBuild {
             let log_bytes = log_bytes.clone();
             let last_log_ms = last_log_ms.clone();
             let log_done = log_done.clone();
-            let mut file = std::fs::File::open(&log_path)?;
+            let dir = self.dir.clone();
             std::thread::spawn(move || {
                 use std::sync::atomic::Ordering;
-                let mut buf = [0u8; 8192];
-                loop {
-                    match file.read(&mut buf) {
-                        Ok(0) => {
-                            // At EOF after the builder died nothing
-                            // more can arrive; one final read above
-                            // already drained what was flushed.
-                            if log_done.load(Ordering::Relaxed) {
-                                break;
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                        }
-                        Err(_) => break,
-                        Ok(n) => {
-                            log_bytes.fetch_add(n as u64, Ordering::Relaxed);
-                            last_log_ms
-                                .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
-                            if tx
-                                .blocking_send(msg(worker_message::Msg::Log(LogChunk {
-                                    build_id: build_id.clone(),
-                                    data: buf[..n].to_vec(),
-                                })))
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                    }
-                }
+                tail_log(
+                    &dir,
+                    &build_id,
+                    &tx,
+                    || log_done.load(Ordering::Relaxed),
+                    |n| {
+                        log_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                        last_log_ms.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+                    },
+                );
             })
         };
         let pgrp = nix::unistd::Pid::from_raw(pid);
@@ -1449,6 +1557,11 @@ struct ResumableBuild {
     /// A delivery is in flight; a concurrent re-assignment must not
     /// start a second one.
     delivering: bool,
+    /// Build dir holding build.log, for log replay on resume.
+    dir: PathBuf,
+    /// Replays the log to the resumed session; joined before the
+    /// result is delivered so logs arrive first.
+    log_tail: Option<LogTail>,
 }
 
 #[derive(Clone)]
@@ -1667,7 +1780,7 @@ fn deliver(
 /// assignment. On success the build is forgotten and its dir removed;
 /// on failure it stays for the next assignment.
 fn try_deliver(ctx: &std::sync::Arc<WorkerCtx>, key: &str) {
-    let (build_id, out_tx, fin) = {
+    let (build_id, out_tx, fin, log_tail) = {
         let mut map = ctx.resumable.lock().unwrap();
         let Some(e) = map.get_mut(key) else { return };
         if e.delivering {
@@ -1677,8 +1790,12 @@ fn try_deliver(ctx: &std::sync::Arc<WorkerCtx>, key: &str) {
             return;
         };
         e.delivering = true;
-        (e.build_id.clone(), out_tx, fin)
+        (e.build_id.clone(), out_tx, fin, e.log_tail.take())
     };
+    // Flush any log replay first so the result arrives after the log.
+    if let Some(t) = log_tail {
+        t.stop();
+    }
     let result = deliver(&fin, &build_id, &out_tx);
     let mut map = ctx.resumable.lock().unwrap();
     match result {

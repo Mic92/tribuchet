@@ -290,6 +290,10 @@ in
         out = hub.succeed("cat /tmp/reload.out").strip()
         hub.succeed(f"grep -q reload-survived {out}")
         worker.succeed("journalctl -u tribuchet-worker | grep -q 'adopted running build'")
+        # the marker is only printed after the reload, so seeing it in
+        # the client's build log means the adopted build streamed live
+        # logs through the new worker generation
+        hub.succeed("journalctl -u reloadbuild | grep -q log-after-reload")
 
     with subtest("concurrent builds share one worker session"):
         import time
