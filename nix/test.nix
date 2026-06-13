@@ -276,6 +276,10 @@ in
         assigned = int(worker.succeed(
             "journalctl -u tribuchet-worker | grep -c 'build assigned' || true"
         ).strip())
+        # baseline: the earlier dual-restart subtest also adopts a build
+        adopted = int(worker.succeed(
+            "journalctl -u tribuchet-worker | grep -c 'adopted running build' || true"
+        ).strip())
         hub.succeed(
             "rm -f /tmp/reload.ok && systemd-run --unit=reloadbuild bash -lc "
             "'nix-build /etc/tt/reload.nix --no-out-link > /tmp/reload.out "
@@ -292,7 +296,9 @@ in
         hub.wait_until_succeeds("test -f /tmp/reload.ok", timeout=120)
         out = hub.succeed("cat /tmp/reload.out").strip()
         hub.succeed(f"grep -q reload-survived {out}")
-        worker.succeed("journalctl -u tribuchet-worker | grep -q 'adopted running build'")
+        worker.succeed(
+            f"[ $(journalctl -u tribuchet-worker | grep -c 'adopted running build') -gt {adopted} ]"
+        )
         # the marker is only printed after the reload, so seeing it in
         # the client's build log means the adopted build streamed live
         # logs through the new worker generation
