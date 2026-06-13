@@ -1062,10 +1062,14 @@ async fn session_loop(
                     build.abort().await;
                     fail_build(out_tx, &c.build_id, &anyhow::anyhow!("build cancelled")).await?;
                 } else {
+                    // Only flag builds that are still running: a key
+                    // flagged for an already-finished build would
+                    // never be consumed and would kill the next build
+                    // sharing that dedupe key.
                     let key = {
                         let map = ctx.resumable.lock().unwrap();
                         map.iter()
-                            .find(|(_, e)| e.build_id == c.build_id)
+                            .find(|(_, e)| e.build_id == c.build_id && e.finished.is_none())
                             .map(|(k, _)| k.clone())
                     };
                     if let Some(key) = key {
@@ -1699,6 +1703,10 @@ fn unix_now() -> u64 {
 /// across worker generations) and start delivering it. Shared by the
 /// normal execute path and re-adopted builds.
 fn record_finished(ctx: &std::sync::Arc<WorkerCtx>, key: &str, fin: FinishedBuild) {
+    // A cancel flag the abort loop did not get to consume (the build
+    // beat it to the finish line) must not linger and kill the next
+    // build with this dedupe key.
+    ctx.cancelled.lock().unwrap().remove(key);
     {
         let mut map = ctx.resumable.lock().unwrap();
         if let Some(e) = map.get_mut(key) {
