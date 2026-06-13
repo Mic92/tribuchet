@@ -724,16 +724,37 @@ fn supervise_adopted(
     signing_key: &SecretKey,
 ) -> FinishedBuild {
     let pgrp = nix::unistd::Pid::from_raw(st.pid);
-    let mut aborted: Option<&str> = None;
+    let mut aborted: Option<String> = None;
+    let log_path = dir.join("build.log");
     let code = loop {
         if let Some(code) = reaper::take_status(&ctx.status_dir, st.pid) {
             break code;
         }
         if aborted.is_none() {
+            // The same guards execute() applies, recovered from the log
+            // file: its size for max-log-size, its mtime for
+            // max-silent-time (every chunk the builder writes bumps it).
+            let log = std::fs::metadata(&log_path).ok();
+            let silent = log
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.elapsed().ok())
+                .unwrap_or_default();
+            let log_size = log.map(|m| m.len()).unwrap_or(0);
             if ctx.cancelled.lock().unwrap().remove(&st.dedupe_key) {
-                aborted = Some("build cancelled");
+                aborted = Some("build cancelled".into());
             } else if unix_now() >= st.deadline_unix {
-                aborted = Some("build timed out");
+                aborted = Some("build timed out".into());
+            } else if ctx.max_log_size > 0 && log_size > ctx.max_log_size {
+                aborted = Some(format!(
+                    "build log exceeded the limit of {} bytes",
+                    ctx.max_log_size
+                ));
+            } else if !ctx.max_silent_time.is_zero() && silent > ctx.max_silent_time {
+                aborted = Some(format!(
+                    "build produced no output for {}s",
+                    ctx.max_silent_time.as_secs()
+                ));
             }
             if aborted.is_some() {
                 let _ = nix::sys::signal::killpg(pgrp, nix::sys::signal::Signal::SIGKILL);
@@ -754,7 +775,7 @@ fn supervise_adopted(
     sandbox::cleanup(&synth, &dir);
     set_uid_slot(ctx, st.uid_slot, false);
     let (exit_code, error, outputs) = if let Some(reason) = aborted {
-        (1, reason.into(), vec![])
+        (1, reason, vec![])
     } else if code != 0 {
         (
             code,
