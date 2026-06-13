@@ -210,6 +210,13 @@ fn reaper_main(sock: UnixDatagram, worker_sock: UnixDatagram, status_dir: &Path)
     let mut builds: Vec<i32> = Vec::new();
     let mut worker_code: Option<i32> = None;
     let mut stopping = false;
+    // Crash-loop guard: respawning a worker that keeps dying instantly
+    // would present a broken unit as healthy forever (the reaper is
+    // the main pid systemd/launchd watch). Give up after a few fast
+    // failures so Restart=on-failure / KeepAlive can escalate.
+    let mut spawned_at = std::time::Instant::now();
+    let mut fast_failures = 0u32;
+    const MAX_FAST_FAILURES: u32 = 5;
     let mut buf = vec![0u8; MAX_MSG];
     sock.set_read_timeout(Some(std::time::Duration::from_millis(200)))
         .ok();
@@ -249,26 +256,30 @@ fn reaper_main(sock: UnixDatagram, worker_sock: UnixDatagram, status_dir: &Path)
         }
         if let Some(code) = worker_code.take() {
             if stopping {
-                // Unit stop: the worker drained first, so normally no
-                // builds remain; kill stragglers rather than leak them.
-                for pid in &builds {
-                    let _ = nix::sys::signal::killpg(
-                        nix::unistd::Pid::from_raw(*pid),
-                        nix::sys::signal::Signal::SIGKILL,
-                    );
-                }
-                for pid in builds.drain(..) {
-                    let _ = nix::sys::wait::waitpid(Some(nix::unistd::Pid::from_raw(pid)), None);
-                }
+                kill_builds(&mut builds);
                 return code;
+            }
+            if code != 0 && spawned_at.elapsed() < std::time::Duration::from_secs(60) {
+                fast_failures += 1;
+                if fast_failures >= MAX_FAST_FAILURES {
+                    eprintln!("tribuchet reaper: worker keeps crashing on startup; giving up");
+                    kill_builds(&mut builds);
+                    return code;
+                }
+            } else {
+                fast_failures = 0;
             }
             // Reload handover or worker crash: builds keep running,
             // the next generation re-adopts them.
             std::thread::sleep(std::time::Duration::from_secs(1));
             match spawn_worker(&worker_sock) {
-                Ok(pid) => worker_pid = pid,
+                Ok(pid) => {
+                    worker_pid = pid;
+                    spawned_at = std::time::Instant::now();
+                }
                 Err(e) => {
                     eprintln!("tribuchet reaper: respawn failed: {e:#}");
+                    kill_builds(&mut builds);
                     return 1;
                 }
             }
@@ -301,6 +312,20 @@ fn reaper_main(sock: UnixDatagram, worker_sock: UnixDatagram, status_dir: &Path)
             }
             Err(_) => continue, // timeout or worker not sending; loop re-reaps
         }
+    }
+}
+
+/// Kill and reap the remaining build process groups: the reaper is
+/// about to exit, and builds that outlive it would leak unreaped.
+fn kill_builds(builds: &mut Vec<i32>) {
+    for pid in builds.iter() {
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(*pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+    for pid in builds.drain(..) {
+        let _ = nix::sys::wait::waitpid(Some(nix::unistd::Pid::from_raw(pid)), None);
     }
 }
 
