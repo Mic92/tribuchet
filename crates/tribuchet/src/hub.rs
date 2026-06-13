@@ -99,13 +99,28 @@ impl Replay {
             )));
             return rx;
         }
-        // Enough capacity for the whole backlog plus live slack, so the
-        // snapshot below cannot drop events.
+        // Enough capacity for the whole backlog plus live slack (and
+        // one error slot), so the snapshot below cannot drop events.
         let (tx, rx) = mpsc::channel(inner.events.len() + SUB_CHANNEL_SLACK);
         for ev in &inner.events {
             let _ = tx.try_send(Ok(ev.clone()));
         }
-        if !inner.done {
+        if inner.done {
+            // Finished without a verdict in the backlog (e.g. the job
+            // was dropped as abandoned between the dedupe lookup and
+            // this subscribe): an error beats a silently empty stream.
+            let concluded = inner.events.iter().any(|e| {
+                matches!(
+                    e.event,
+                    Some(attach_event::Event::ExitCode(_)) | Some(attach_event::Event::Error(_))
+                )
+            });
+            if !concluded {
+                let _ = tx.try_send(Err(Status::unavailable(
+                    "build is no longer in flight; resubmit",
+                )));
+            }
+        } else {
             inner.subs.push(tx);
         }
         rx
