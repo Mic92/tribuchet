@@ -878,34 +878,41 @@ async fn run_job(
     )
     .await?;
 
-    let missing = match recv(&mut in_rx).await? {
-        // The worker already holds this build (it survived a hub
-        // restart); skip staging, its result arrives like any other.
-        worker_message::Msg::Resumed(_) => {
-            tracing::info!(id = job.id, "worker resumed an in-flight build");
-            return relay_build(job, vkey, out_tx, &mut in_rx).await;
-        }
-        worker_message::Msg::MissingPaths(m) => {
-            // Only ever pack paths we offered: anything else would let
-            // a compromised worker read arbitrary host files. Dedupe,
-            // so a repeated entry cannot amplify pack work either.
-            let offered: std::collections::HashSet<&String> = req.input_paths.iter().collect();
-            let mut missing = Vec::new();
-            let mut seen = std::collections::HashSet::new();
-            for p in m.store_paths {
-                if !offered.contains(&p) {
-                    bail!("worker requested unoffered path {p}");
-                }
-                if seen.insert(p.clone()) {
-                    missing.push(p);
-                }
+    let missing = loop {
+        match recv(&mut in_rx).await? {
+            // The worker already holds this build (it survived a hub
+            // restart); skip staging, its result arrives like any other.
+            worker_message::Msg::Resumed(_) => {
+                tracing::info!(id = job.id, "worker resumed an in-flight build");
+                return relay_build(job, vkey, out_tx, &mut in_rx).await;
             }
-            missing
+            // A resumed build's log tail can race ahead of its Resumed
+            // reply (separate task, same stream); pass the chunk on.
+            worker_message::Msg::Log(l) => {
+                job.replay.publish(attach_event::Event::Log(l.data)).await;
+            }
+            worker_message::Msg::MissingPaths(m) => {
+                // Only ever pack paths we offered: anything else would let
+                // a compromised worker read arbitrary host files. Dedupe,
+                // so a repeated entry cannot amplify pack work either.
+                let offered: std::collections::HashSet<&String> = req.input_paths.iter().collect();
+                let mut missing = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+                for p in m.store_paths {
+                    if !offered.contains(&p) {
+                        bail!("worker requested unoffered path {p}");
+                    }
+                    if seen.insert(p.clone()) {
+                        missing.push(p);
+                    }
+                }
+                break missing;
+            }
+            other => bail!(
+                "unexpected worker message while negotiating paths: {}",
+                msg_name(&other)
+            ),
         }
-        other => bail!(
-            "unexpected worker message while negotiating paths: {}",
-            msg_name(&other)
-        ),
     };
     tracing::info!(
         id = job.id,
