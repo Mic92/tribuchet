@@ -94,12 +94,6 @@ struct WorkerCtx {
     secret_paths: Vec<PathBuf>,
     /// Builds currently executing, reported in heartbeats.
     running: std::sync::atomic::AtomicU32,
-    /// Builds anywhere between assignment and cleanup; drain waits on
-    /// this, not `running`, so builds still staging inputs survive too.
-    busy: std::sync::atomic::AtomicU32,
-    /// Set on SIGTERM: finish what is active, request nothing new,
-    /// exit when idle. systemd then starts the replacement instance.
-    draining: std::sync::atomic::AtomicBool,
     /// dedupe_key -> build past staging; survives session loss so a
     /// replacement hub can resume instead of rebuilding.
     resumable: std::sync::Mutex<HashMap<String, ResumableBuild>>,
@@ -484,8 +478,6 @@ async fn run_async(
         build_memory_max: opts.build_memory_max,
         secret_paths: vec![opts.key.clone(), opts.state_dir.join("signing.key")],
         running: std::sync::atomic::AtomicU32::new(0),
-        busy: std::sync::atomic::AtomicU32::new(0),
-        draining: std::sync::atomic::AtomicBool::new(false),
         resumable: std::sync::Mutex::new(HashMap::new()),
         emulators,
         pasta: opts.pasta.clone(),
@@ -501,7 +493,6 @@ async fn run_async(
     // hang in "activating" waiting for a hub that may be down.
     crate::sd::notify_ready();
     crate::sd::spawn_watchdog();
-    spawn_drain(ctx.clone());
     spawn_resumable_reaper(ctx.clone());
     spawn_handover();
     adopt_builds(&ctx, &signing_key);
@@ -539,7 +530,6 @@ fn adopt_builds(ctx: &std::sync::Arc<WorkerCtx>, signing_key: &std::sync::Arc<Se
                 continue;
             };
             tracing::info!(id = f.build_id, "adopted finished build awaiting delivery");
-            ctx.busy.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             ctx.resumable.lock().unwrap().insert(
                 f.dedupe_key.clone(),
                 ResumableBuild {
@@ -571,7 +561,6 @@ fn adopt_builds(ctx: &std::sync::Arc<WorkerCtx>, signing_key: &std::sync::Arc<Se
         };
         set_uid_slot(ctx, st.uid_slot, true);
         tracing::info!(id = st.build_id, pid = st.pid, "adopted running build");
-        ctx.busy.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         ctx.resumable.lock().unwrap().insert(
             st.dedupe_key.clone(),
             ResumableBuild {
@@ -658,11 +647,8 @@ fn supervise_adopted(
 
 /// Forget finished builds nobody resumed. Without a client
 /// resubmitting (it gave up or died), the result has no taker; the
-/// entry would otherwise pin the build dir and block drain forever.
+/// entry would otherwise pin the build dir forever.
 fn spawn_resumable_reaper(ctx: std::sync::Arc<WorkerCtx>) {
-    // Must undercut the service's stop timeout with reaper-interval
-    // slack: an undelivered result keeps a draining worker alive, and
-    // outliving TimeoutStopSec means SIGKILL instead of a clean exit.
     const TTL: std::time::Duration = std::time::Duration::from_secs(300);
     tokio::spawn(async move {
         loop {
@@ -679,7 +665,6 @@ fn spawn_resumable_reaper(ctx: std::sync::Arc<WorkerCtx>) {
                 });
             }
             for (key, dir) in expired {
-                ctx.busy.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 let _ = std::fs::remove_dir_all(&dir);
                 tracing::warn!(
                     key,
@@ -690,49 +675,23 @@ fn spawn_resumable_reaper(ctx: std::sync::Arc<WorkerCtx>) {
     });
 }
 
-/// SIGUSR1 from the reaper: a new worker generation is about to be
-/// exec'd (reload/upgrade). All resumable state is already on disk,
-/// so exit immediately; builds keep running under the reaper and the
-/// replacement re-adopts them.
+/// SIGUSR1 (reload: a new generation is about to be exec'd) or
+/// SIGTERM (unit stop): exit immediately either way. All resumable
+/// state is already on disk; on reload the replacement worker
+/// re-adopts the running builds, on stop the unit teardown ends them
+/// and the hub requeues their jobs.
 fn spawn_handover() {
     tokio::spawn(async {
-        let Ok(mut sig) =
+        let Ok(mut usr1) =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
         else {
             return;
         };
-        sig.recv().await;
-        tracing::info!("handover requested; exiting, builds keep running");
-        std::process::exit(0);
-    });
-}
-
-/// SIGTERM means "hand over to a replacement instance", not "die":
-/// in-flight builds finish and report their results, only then does
-/// the process exit. Requires KillMode=mixed (build children must not
-/// get the SIGTERM) and a TimeoutStopSec covering the longest build.
-fn spawn_drain(ctx: std::sync::Arc<WorkerCtx>) {
-    tokio::spawn(async move {
-        crate::sd::stop_requested().await;
-        ctx.draining
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        tracing::info!("SIGTERM: finishing active builds, requesting no new jobs");
-        let mut tick = 0u32;
-        loop {
-            let busy = ctx.busy.load(std::sync::atomic::Ordering::Relaxed);
-            if busy == 0 {
-                break;
-            }
-            if tick.is_multiple_of(10) {
-                tracing::info!(busy, "draining");
-            }
-            tick += 1;
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tokio::select! {
+            _ = usr1.recv() => {}
+            _ = crate::sd::stop_requested() => {}
         }
-        // Results queue through the gRPC channel; give it a moment to
-        // flush before the process goes away.
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        tracing::info!("drained, exiting");
+        tracing::info!("handover requested; exiting");
         std::process::exit(0);
     });
 }
@@ -774,12 +733,9 @@ async fn session(
         })))
         .await?;
     // One outstanding RequestJob per build slot; every finished build
-    // sends the next one, keeping the sum constant. None while
-    // draining: a reconnect mid-drain must not pull in new work.
-    if !ctx.draining.load(std::sync::atomic::Ordering::Relaxed) {
-        for _ in 0..opts.max_jobs.max(1) {
-            out_tx.send(request_job()).await?;
-        }
+    // sends the next one, keeping the sum constant.
+    for _ in 0..opts.max_jobs.max(1) {
+        out_tx.send(request_job()).await?;
     }
 
     let heartbeat_tx = out_tx.clone();
@@ -919,8 +875,7 @@ async fn session_loop(
                             let key = build.assignment.dedupe_key.clone();
                             // From here the build outlives the session:
                             // it is resumable until its result reaches
-                            // some hub. busy stays up with the entry.
-                            ctx.busy.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            // some hub.
                             ctx.resumable.lock().unwrap().insert(
                                 key.clone(),
                                 ResumableBuild {
@@ -944,9 +899,7 @@ async fn session_loop(
                                 ctx.running
                                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                                 record_finished(&ctx, &key, fin);
-                                if !ctx.draining.load(std::sync::atomic::Ordering::Relaxed) {
-                                    let _ = out_tx.blocking_send(request_job());
-                                }
+                                let _ = out_tx.blocking_send(request_job());
                             });
                         }
                     }
@@ -1111,7 +1064,6 @@ impl ActiveBuild {
             std::fs::remove_dir_all(&dir)?;
         }
         std::fs::create_dir_all(dir.join("top"))?;
-        ctx.busy.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Self {
             assignment,
             dir,
@@ -1482,14 +1434,6 @@ impl ActiveBuild {
     }
 }
 
-impl Drop for ActiveBuild {
-    fn drop(&mut self) {
-        self.ctx
-            .busy
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
 /// A build past staging: running, or finished with its result not yet
 /// delivered to any hub. Keyed by the assignment's dedupe_key, which
 /// survives hub restarts (build ids do not).
@@ -1740,7 +1684,6 @@ fn try_deliver(ctx: &std::sync::Arc<WorkerCtx>, key: &str) {
     match result {
         Ok(()) => {
             map.remove(key);
-            ctx.busy.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             if let Err(e) = std::fs::remove_dir_all(&fin.dir) {
                 tracing::warn!("cleaning up {}: {e}", fin.dir.display());
             }

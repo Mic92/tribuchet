@@ -152,10 +152,12 @@ pub fn ensure(status_dir: PathBuf) -> Result<Spawner> {
     std::process::exit(code);
 }
 
-/// Exec a worker generation: same binary, same arguments, with the
-/// spawner socket passed by fd number.
+/// Exec a worker generation: the path we were invoked as (argv[0]),
+/// same arguments, with the spawner socket passed by fd number. Using
+/// argv[0] rather than /proc/self/exe means a reload picks up new
+/// code when that path is a stable indirection (profile symlink).
 fn spawn_worker(worker_sock: &UnixDatagram) -> Result<i32> {
-    let exe = std::env::current_exe().context("resolving own binary")?;
+    let exe = std::env::args_os().next().context("missing argv[0]")?;
     // dup() clears CLOEXEC, so the fd survives the exec.
     let fd = nix::unistd::dup(worker_sock).context("duping spawner socket")?;
     let child = std::process::Command::new(exe)

@@ -173,17 +173,16 @@ dedupe key routes it back to the worker holding the build, which
 resumes (or just re-delivers the finished result) instead of building
 again.
 
-Worker restarts come in two flavours. Reload (SIGHUP to the unit) is
-the zero-downtime path: builds are children of a small reaper process
-the worker forks off at startup, with resume state and logs persisted
-in their build dirs, so the reaper just execs a fresh worker that
-re-adopts them — running builds are supervised to completion, finished
-ones redelivered. The hub covers the session gap by requeueing instead
-of failing jobs whose worker session died; the attached client sees a
-pause, not an error. A full stop (SIGTERM) drains instead: the worker
-exits only once active builds finished and their results were
-delivered, because a stopped unit takes the reaper — and with it the
-build processes — down.
+Worker redeploys go through reload (SIGHUP to the unit): builds are
+children of a small reaper process the worker is exec'd by, with
+resume state and logs persisted in their build dirs, so the reaper
+just execs a fresh worker that re-adopts them — running builds are
+supervised to completion, finished ones redelivered. The hub covers
+the session gap by requeueing instead of failing jobs whose worker
+session died; the attached client sees a pause, not an error. A full
+stop (SIGTERM) does not drain: the unit teardown takes the reaper and
+the build processes with it, and the requeued jobs fail once no
+capable worker is left (or get rebuilt by another one).
 
 ## Known limitations (MVP)
 

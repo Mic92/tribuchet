@@ -163,11 +163,6 @@ in
             # is the build reaper it forked off at startup.
             NotifyAccess = "all";
             WatchdogSec = "30";
-            # SIGTERM must reach only the worker itself: build children
-            # keep running while the worker drains, and only a drain
-            # overrunning TimeoutStopSec gets the whole cgroup killed.
-            KillMode = "mixed";
-            TimeoutStopSec = "600";
             # Zero-downtime handover: the reaper (main pid) execs a
             # fresh worker generation; running builds are re-adopted.
             ExecReload = "${pkgs.coreutils}/bin/kill -HUP $MAINPID";
@@ -252,11 +247,11 @@ in
             f"[ $(journalctl -u tribuchet-worker | grep -c 'build assigned') -gt {assigned} ]",
             timeout=60,
         )
-        # Both restarts at once, mid-build: the hub exits immediately
-        # (attach reconnects and resubmits; the worker resumes by
-        # dedupe key) and the old worker drains until the build's
-        # result is delivered.
-        worker.succeed("systemctl restart --no-block tribuchet-worker")
+        # Hub restart and worker reload at once, mid-build: the hub
+        # exits immediately (attach reconnects and resubmits; the
+        # worker resumes by dedupe key) and the worker generation is
+        # replaced while the build keeps running.
+        worker.succeed("systemctl reload tribuchet-worker")
         hub.succeed("systemctl restart --no-block tribuchet-hub")
         hub.wait_until_succeeds("test -f /tmp/drain.ok", timeout=120)
         out = hub.succeed("cat /tmp/drain.out").strip()
