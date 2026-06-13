@@ -1048,7 +1048,8 @@ async fn session_loop(
                 tracing::info!(id = c.build_id, "hub cancelled the build");
                 // Still staging: tear it down right here. Already
                 // executing: flag its dedupe key for the supervising
-                // loop (the registry maps the current build_id to it).
+                // loop. The key is the stable identity; the build_id
+                // the hub knows may predate a concurrent resume.
                 if let Some(build) = active.remove(&c.build_id) {
                     build.abort().await;
                     fail_build(out_tx, &c.build_id, &anyhow::anyhow!("build cancelled")).await?;
@@ -1057,19 +1058,17 @@ async fn session_loop(
                     // flagged for an already-finished build would
                     // never be consumed and would kill the next build
                     // sharing that dedupe key.
-                    let key = {
+                    let running = {
                         let map = ctx.resumable.lock().unwrap();
-                        map.iter()
-                            .find(|(_, e)| e.build_id == c.build_id && e.finished.is_none())
-                            .map(|(k, _)| k.clone())
+                        map.get(&c.dedupe_key).is_some_and(|e| e.finished.is_none())
                     };
-                    if let Some(key) = key {
-                        ctx.cancelled.lock().unwrap().insert(key);
+                    if running {
+                        ctx.cancelled.lock().unwrap().insert(c.dedupe_key);
                     }
                 }
             }
             hub_message::Msg::ResultAck(a) => {
-                ack_delivery(ctx, &a.build_id);
+                ack_delivery(ctx, &a.dedupe_key, &a.build_id);
             }
         }
     }
@@ -1812,15 +1811,16 @@ fn deliver(
 
 /// Drop a build whose result the hub confirmed: only now is it safe
 /// to forget it, a result merely handed to a dying session would
-/// otherwise be lost and cost a rebuild.
-fn ack_delivery(ctx: &std::sync::Arc<WorkerCtx>, build_id: &str) {
+/// otherwise be lost and cost a rebuild. Matched by dedupe key (the
+/// stable identity); the ack's build_id may predate a concurrent
+/// resume that rotated the entry's id.
+fn ack_delivery(ctx: &std::sync::Arc<WorkerCtx>, key: &str, build_id: &str) {
     let removed = {
         let mut map = ctx.resumable.lock().unwrap();
-        let key = map
-            .iter()
-            .find(|(_, e)| e.build_id == build_id && e.finished.is_some())
-            .map(|(k, _)| k.clone());
-        key.and_then(|k| map.remove(&k))
+        match map.get(key) {
+            Some(e) if e.finished.is_some() => map.remove(key),
+            _ => None,
+        }
     };
     if let Some(e) = removed {
         if let Err(err) = std::fs::remove_dir_all(&e.dir) {

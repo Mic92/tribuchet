@@ -1143,11 +1143,12 @@ impl Write for HashWriter {
 /// Tell the worker its result (and all output NARs) arrived intact,
 /// so it can stop keeping the build for redelivery. Best effort: a
 /// lost ack only means the worker holds the build dir until its TTL.
-async fn ack_result(out_tx: &mpsc::Sender<Result<HubMessage, Status>>, build_id: &str) {
+async fn ack_result(out_tx: &mpsc::Sender<Result<HubMessage, Status>>, job: &Job) {
     let _ = send(
         out_tx,
         hub_message::Msg::ResultAck(ResultAck {
-            build_id: build_id.into(),
+            build_id: job.id.clone(),
+            dedupe_key: job.key.clone(),
         }),
     )
     .await;
@@ -1182,6 +1183,7 @@ async fn relay_build(
                         out_tx,
                         hub_message::Msg::Cancel(CancelBuild {
                             build_id: job.id.clone(),
+                            dedupe_key: job.key.clone(),
                         }),
                     )
                     .await?;
@@ -1214,7 +1216,7 @@ async fn relay_build(
                     job.replay
                         .publish(attach_event::Event::ExitCode(res.exit_code))
                         .await;
-                    ack_result(out_tx, &res.build_id).await;
+                    ack_result(out_tx, job).await;
                     return Ok(());
                 }
                 for out in res.outputs {
@@ -1278,7 +1280,7 @@ async fn relay_build(
                         .await;
                     if pending.is_empty() {
                         job.replay.publish(attach_event::Event::ExitCode(0)).await;
-                        ack_result(out_tx, &n.build_id).await;
+                        ack_result(out_tx, job).await;
                         return Ok(());
                     }
                 }

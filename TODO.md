@@ -1,10 +1,5 @@
 # TODO
 
-- ResultAck and CancelBuild match the registry by build_id, which a
-  concurrent resume rotates: a stale id means the ack is dropped (the
-  build dir lingers until the TTL) or the cancel is lost. Match by
-  dedupe key, or accept any build_id the entry has carried.
-
 
 - Support launchd socket activation for the hub on macOS: adopt
   listeners via `launch_activate_socket()` (the launchd analogue of

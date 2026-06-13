@@ -58,6 +58,9 @@ message HubMessage {
 
 message ResultAck {
   string build_id = 1;
+  // Stable identity of the build on the worker; build_id rotates when
+  // a build is resumed under a new assignment.
+  string dedupe_key = 2;
 }
 
 // Subset of Nix's ValidPathInfo needed to import a NAR on the worker.
@@ -150,6 +153,9 @@ message LogChunk {
 
 message CancelBuild {
   string build_id = 1;
+  // Stable identity of the build on the worker; build_id rotates when
+  // a build is resumed under a new assignment.
+  string dedupe_key = 2;
 }
 
 message BuildResult {
