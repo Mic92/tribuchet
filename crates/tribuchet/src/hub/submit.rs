@@ -1,0 +1,425 @@
+//! Build submission: request validation, dedupe keys, the AttachHub service.
+
+use std::path::Path;
+use std::sync::Arc;
+
+use sha2::{Digest, Sha256};
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{Request, Response, Status};
+
+use super::state::{HubState, Job, Replay, WORKER_GRACE};
+use crate::proto::{attach_hub_server, AttachEvent, BuildRequest};
+
+/// The hub serves exactly the canonical Nix store; clients must not
+/// anchor path validation at an arbitrary prefix.
+pub(crate) const STORE_DIR: &str = "/nix/store";
+
+/// gRPC message size cap. Metadata messages (BuildRequest, PathOffer)
+/// carry the whole input closure; tonic's 4 MiB default rejects large
+/// but legitimate closures.
+pub(crate) const MAX_MSG_SIZE: usize = 64 * 1024 * 1024;
+
+/// A store path directly under the store dir: absolute, exactly one
+/// component, hash-prefixed, Nix name charset (no shell/SBPL
+/// metacharacters, control bytes, or path tricks). The hub runs as
+/// root and reads these from disk, so anything else would be an
+/// arbitrary-file-read primitive.
+pub(crate) fn valid_store_path(store_dir: &str, path: &str) -> bool {
+    let Ok(dir) = harmonia_store_path::StoreDir::new(store_dir) else {
+        return false;
+    };
+    dir.parse::<harmonia_store_path::StorePath>(path).is_ok()
+}
+
+#[allow(clippy::result_large_err)] // tonic::Status is what the caller needs
+fn validate_request(req: &BuildRequest) -> Result<(), Status> {
+    let bad = |what: &str, p: &str| {
+        Status::invalid_argument(format!("{what} is not a valid store path: {p}"))
+    };
+    // A client-chosen store_dir would turn the root hub into an
+    // arbitrary-file-read (and the worker sandbox into worse).
+    if req.store_dir != STORE_DIR {
+        return Err(Status::invalid_argument("invalid store dir"));
+    }
+    let mut seen_inputs = std::collections::HashSet::new();
+    for p in &req.input_paths {
+        if !valid_store_path(&req.store_dir, p) {
+            return Err(bad("input path", p));
+        }
+        if !seen_inputs.insert(p) {
+            return Err(Status::invalid_argument(format!(
+                "duplicate input path {p}"
+            )));
+        }
+    }
+    let mut seen_outputs = std::collections::HashSet::new();
+    for p in req.outputs.values() {
+        if !valid_store_path(&req.store_dir, p) {
+            return Err(bad("output path", p));
+        }
+        if !seen_outputs.insert(p) {
+            return Err(Status::invalid_argument(format!(
+                "duplicate output path {p}"
+            )));
+        }
+        if seen_inputs.contains(p) {
+            return Err(Status::invalid_argument(format!(
+                "output path {p} is also an input"
+            )));
+        }
+    }
+    // Nix builders are absolute store paths; anything else would also be
+    // option-injectable into sandbox-exec on Darwin workers.
+    if !req.builder.starts_with('/') {
+        return Err(Status::invalid_argument("builder must be an absolute path"));
+    }
+    // Where the worker mounts/symlinks the shipped build dir: "/build"
+    // from Linux clients, the real per-build topTmpDir from Darwin.
+    let tmp_in_sandbox = Path::new(&req.tmp_dir_in_sandbox);
+    if !tmp_in_sandbox.is_absolute()
+        || tmp_in_sandbox.components().any(|c| {
+            !matches!(
+                c,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        })
+        || req.tmp_dir_in_sandbox.starts_with(STORE_DIR)
+    {
+        return Err(Status::invalid_argument("invalid tmpDirInSandbox"));
+    }
+    let tmp = Path::new(&req.top_tmp_dir);
+    if !tmp.is_absolute()
+        || tmp
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(Status::invalid_argument("invalid topTmpDir"));
+    }
+    Ok(())
+}
+
+/// The root hub tars `top_tmp_dir` off local disk; require it to be a
+/// real directory owned by the connecting peer so a client cannot have
+/// the hub ship `/root` or another user's build dir. Returns the opened
+/// directory: tarring later goes through this fd, so swapping the path
+/// for a symlink after validation cannot redirect what gets shipped.
+#[allow(clippy::result_large_err)]
+pub(super) fn validate_top_tmp_dir(
+    top_tmp_dir: &str,
+    peer_uid: u32,
+) -> Result<std::fs::File, Status> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let dir = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags((nix::fcntl::OFlag::O_DIRECTORY | nix::fcntl::OFlag::O_NOFOLLOW).bits())
+        .open(top_tmp_dir)
+        .map_err(|e| Status::invalid_argument(format!("topTmpDir {top_tmp_dir}: {e}")))?;
+    // O_DIRECTORY already guarantees a directory; only ownership is
+    // left to check, via fstat on the handle just opened.
+    let meta = dir
+        .metadata()
+        .map_err(|e| Status::invalid_argument(format!("topTmpDir {top_tmp_dir}: {e}")))?;
+    if meta.uid() != peer_uid {
+        return Err(Status::permission_denied(
+            "topTmpDir is not owned by the requesting user",
+        ));
+    }
+    Ok(dir)
+}
+
+/// Path that re-opens an already-held fd; lets `tar::Builder` walk the
+/// validated directory handle instead of resolving the path again.
+pub(super) fn fd_path(fd: std::os::fd::RawFd) -> std::path::PathBuf {
+    if cfg!(target_os = "linux") {
+        format!("/proc/self/fd/{fd}")
+    } else {
+        format!("/dev/fd/{fd}")
+    }
+    .into()
+}
+
+/// Dedupe key: hash of the full canonicalized request, so only truly
+/// identical submissions share a build. A key built from output paths
+/// alone would let a colliding (or crafted) request attach to another
+/// client's build.
+pub(super) fn dedupe_key(req: &BuildRequest) -> String {
+    let mut h = Sha256::new();
+    fn feed(h: &mut Sha256, s: &str) {
+        h.update((s.len() as u64).to_le_bytes());
+        h.update(s.as_bytes());
+    }
+    // Each variable-length section is preceded by its element count;
+    // without it, an args tail and an env entry (for example) would
+    // feed identical bytes and two different requests could collide.
+    fn count(h: &mut Sha256, n: usize) {
+        h.update((n as u64).to_le_bytes());
+    }
+    feed(&mut h, &req.system);
+    feed(&mut h, &req.builder);
+    count(&mut h, req.args.len());
+    for a in &req.args {
+        feed(&mut h, a);
+    }
+    let mut env: Vec<_> = req.env.iter().collect();
+    env.sort();
+    count(&mut h, env.len());
+    for (k, v) in env {
+        feed(&mut h, k);
+        feed(&mut h, v);
+    }
+    let mut outs: Vec<_> = req.outputs.iter().collect();
+    outs.sort();
+    count(&mut h, outs.len());
+    for (k, v) in outs {
+        feed(&mut h, k);
+        feed(&mut h, v);
+    }
+    let mut inputs: Vec<_> = req.input_paths.iter().collect();
+    inputs.sort();
+    count(&mut h, inputs.len());
+    for p in inputs {
+        feed(&mut h, p);
+    }
+    feed(&mut h, &req.store_dir);
+    feed(&mut h, &req.tmp_dir_in_sandbox);
+    h.update([req.fixed_output as u8]);
+    hex::encode(h.finalize())
+}
+
+fn new_id() -> String {
+    let mut buf = [0u8; 16];
+    rand::Rng::fill(&mut rand::thread_rng(), &mut buf);
+    hex::encode(buf)
+}
+
+pub(super) struct AttachSvc {
+    pub(super) state: Arc<HubState>,
+}
+
+#[tonic::async_trait]
+impl attach_hub_server::AttachHub for AttachSvc {
+    type BuildStream = ReceiverStream<Result<AttachEvent, Status>>;
+
+    async fn build(
+        &self,
+        request: Request<BuildRequest>,
+    ) -> Result<Response<Self::BuildStream>, Status> {
+        let peer_uid = request
+            .extensions()
+            .get::<tonic::transport::server::UdsConnectInfo>()
+            .and_then(|info| info.peer_cred)
+            .map(|cred| cred.uid())
+            .ok_or_else(|| Status::internal("missing unix peer credentials"))?;
+        let req = request.into_inner();
+        if req.outputs.is_empty() {
+            return Err(Status::invalid_argument("build request without outputs"));
+        }
+        validate_request(&req)?;
+        let tmp_dir = Arc::new(validate_top_tmp_dir(&req.top_tmp_dir, peer_uid)?);
+        let key = dedupe_key(&req);
+
+        let features = crate::build_json::required_system_features(&req.env);
+        // Reject submissions no worker can serve, but only after a
+        // grace period: right after a hub restart the workers have not
+        // re-registered yet, and that must not fail client builds.
+        let servable = || {
+            let caps = self.state.worker_caps.lock().unwrap();
+            caps.values().any(|c| c.serves(&req.system, &features))
+        };
+        if !servable() {
+            tracing::info!(system = req.system, "no capable worker yet; waiting");
+            let deadline = std::time::Instant::now() + WORKER_GRACE;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                if servable() {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let what = if features.is_empty() {
+                        format!("system {}", req.system)
+                    } else {
+                        format!("system {} with features {features:?}", req.system)
+                    };
+                    return Err(Status::failed_precondition(format!(
+                        "no connected worker builds for {what}"
+                    )));
+                }
+            }
+        }
+
+        let mut inflight = self.state.inflight.lock().await;
+        let replay = if let Some(replay) = inflight.by_key.get(&key) {
+            tracing::info!(key, "deduplicating build submission");
+            replay.clone()
+        } else {
+            // A different request claiming an in-flight scratch path
+            // would race the other client's unpack at the same dest.
+            for p in req.outputs.values() {
+                if inflight.by_path.contains_key(p) {
+                    return Err(Status::failed_precondition(format!(
+                        "output path {p} is part of a different in-flight build"
+                    )));
+                }
+            }
+            let replay = Arc::new(Replay::default());
+            inflight.by_key.insert(key.clone(), replay.clone());
+            for p in req.outputs.values() {
+                inflight.by_path.insert(p.clone(), key.clone());
+            }
+            let job = Job {
+                id: new_id(),
+                key,
+                req,
+                tmp_dir,
+                features,
+                replay: replay.clone(),
+                attempts: 0,
+                requeued_at: None,
+            };
+            tracing::info!(id = job.id, system = job.req.system, "queueing build");
+            self.state.queue.lock().await.push_back(job);
+            self.state.notify.notify_waiters();
+            replay
+        };
+        // Subscribe outside the global inflight lock: the snapshot clone
+        // of a large backlog must not stall every other submission.
+        drop(inflight);
+        // Close the check-then-queue race: the last capable worker may
+        // have disconnected (and swept the queue) between the capability
+        // check above and the push.
+        self.state.fail_unservable().await;
+        let rx = replay.subscribe().await;
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 32-char base32 hash part for synthetic store paths.
+    const H: &str = "00000000000000000000000000000000";
+
+    #[test]
+    fn store_path_validation() {
+        fn ok(p: &str) -> bool {
+            valid_store_path("/nix/store", p)
+        }
+        assert!(ok(&format!("/nix/store/{H}-foo")));
+        assert!(ok(&format!("/nix/store/{H}-foo_1.2+x?=y")));
+        // hash part is mandatory since harmonia's StorePath parser
+        assert!(!ok("/nix/store/abc-foo"));
+        assert!(!ok("/nix/store/"));
+        assert!(!ok("/nix/store/.."));
+        // leading-dot names are valid in modern Nix (and harmonia)
+        assert!(ok(&format!("/nix/store/{H}-.hidden")));
+        assert!(!ok(&format!("/nix/store/{H}-abc/../../etc")));
+        assert!(!ok(&format!("/nix/store/{H}-abc/bin/sh")));
+        assert!(!ok("/etc/shadow"));
+        assert!(!ok(&format!("/nix/storeX/{H}-abc")));
+        // no quotes/parens/control bytes: these strings reach the macOS
+        // sandbox profile and log lines verbatim
+        assert!(!ok(&format!("/nix/store/{H}-a\")(allow-default)(\"")));
+        assert!(!ok(&format!("/nix/store/{H}-a\nb")));
+        assert!(!ok(&format!("/nix/store/{H}-a,b")));
+    }
+
+    fn base_request() -> BuildRequest {
+        BuildRequest {
+            system: "x86_64-linux".into(),
+            builder: format!("/nix/store/{H}-bash/bin/bash"),
+            args: vec!["-c".into(), "true".into()],
+            env: Default::default(),
+            outputs: [("out".to_string(), format!("/nix/store/{H}-out"))].into(),
+            input_paths: vec![format!("/nix/store/{H}-dep")],
+            top_tmp_dir: "/tmp/nix-build-x".into(),
+            tmp_dir_in_sandbox: "/build".into(),
+            store_dir: "/nix/store".into(),
+            fixed_output: false,
+        }
+    }
+
+    #[test]
+    fn request_validation() {
+        assert!(validate_request(&base_request()).is_ok());
+
+        let mut req = base_request();
+        req.store_dir = "/etc".into();
+        req.input_paths = vec!["/etc/shadow".into()];
+        req.outputs = [("out".to_string(), "/etc/out".to_string())].into();
+        assert!(validate_request(&req).is_err());
+
+        let mut req = base_request();
+        req.builder = "-p".into();
+        assert!(validate_request(&req).is_err());
+
+        let mut req = base_request();
+        req.tmp_dir_in_sandbox = "relative".into();
+        assert!(validate_request(&req).is_err());
+
+        // Darwin clients send the real per-build tmp dir path.
+        let mut req = base_request();
+        req.tmp_dir_in_sandbox = "/private/tmp/nix-build-foo.drv-0".into();
+        assert!(validate_request(&req).is_ok());
+
+        let mut req = base_request();
+        req.tmp_dir_in_sandbox = "/build/../etc".into();
+        assert!(validate_request(&req).is_err());
+
+        let mut req = base_request();
+        req.tmp_dir_in_sandbox = format!("/nix/store/{H}-x");
+        assert!(validate_request(&req).is_err());
+
+        let mut req = base_request();
+        req.input_paths = vec![format!("/nix/store/{H}-dep"), format!("/nix/store/{H}-dep")];
+        assert!(validate_request(&req).is_err());
+
+        let mut req = base_request();
+        req.outputs
+            .insert("doc".into(), format!("/nix/store/{H}-out"));
+        assert!(validate_request(&req).is_err());
+
+        let mut req = base_request();
+        req.outputs = [("out".to_string(), format!("/nix/store/{H}-dep"))].into();
+        assert!(validate_request(&req).is_err());
+    }
+
+    #[test]
+    fn top_tmp_dir_validation_rejects_symlinks_and_foreign_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let me = nix::unistd::getuid().as_raw();
+        let dir = tmp.path().join("build");
+        std::fs::create_dir(&dir).unwrap();
+        assert!(validate_top_tmp_dir(dir.to_str().unwrap(), me).is_ok());
+        assert!(validate_top_tmp_dir(dir.to_str().unwrap(), me + 1).is_err());
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert!(validate_top_tmp_dir(link.to_str().unwrap(), me).is_err());
+    }
+
+    #[test]
+    fn dedupe_key_binds_full_request() {
+        let a = dedupe_key(&base_request());
+        assert_eq!(a, dedupe_key(&base_request()));
+        let mut req = base_request();
+        req.args = vec!["-c".into(), "false".into()];
+        assert_ne!(a, dedupe_key(&req));
+        let mut req = base_request();
+        req.env.insert("X".into(), "1".into());
+        assert_ne!(a, dedupe_key(&req));
+    }
+
+    /// Strings shifted between adjacent sections must not collide:
+    /// args ["-c", "K", "V"] with no env and args ["-c"] with
+    /// env {K: V} would feed identical bytes without section counts.
+    #[test]
+    fn dedupe_key_separates_sections() {
+        let mut a = base_request();
+        a.args = vec!["-c".into(), "K".into(), "V".into()];
+        a.env.clear();
+        let mut b = base_request();
+        b.args = vec!["-c".into()];
+        b.env = [("K".to_string(), "V".to_string())].into();
+        assert_ne!(dedupe_key(&a), dedupe_key(&b));
+    }
+}
