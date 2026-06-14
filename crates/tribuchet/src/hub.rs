@@ -1199,15 +1199,19 @@ async fn relay_build(
     let mut awaiting_outputs = false;
     let mut abandoned_since: Option<std::time::Instant> = None;
     let mut cancel_sent = false;
+    // An interval, not a per-iteration sleep: a build that logs
+    // continuously must not starve the abandonment check.
+    let mut abandon_check = tokio::time::interval(std::time::Duration::from_secs(2));
+    abandon_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
-        // Between worker messages, watch for the last attach client
-        // going away; after a grace period the worker is told to kill
-        // the build. Its "cancelled" result then flows back through
-        // the arms below like any other failure.
+        // Periodically watch for the last attach client going away;
+        // after a grace period the worker is told to kill the build.
+        // Its "cancelled" result then flows back through the arms
+        // below like any other failure.
         let m = tokio::select! {
             m = recv(in_rx) => m?,
-            _ = tokio::time::sleep(std::time::Duration::from_secs(2)), if !cancel_sent => {
+            _ = abandon_check.tick(), if !cancel_sent => {
                 if job.replay.has_subscribers().await {
                     abandoned_since = None;
                 } else if abandoned_since.get_or_insert_with(std::time::Instant::now).elapsed()

@@ -9,6 +9,15 @@ derivation {
   builder = builtins.storePath bash + "/bin/bash";
   args = [
     "-c"
-    "echo cancel-marker-running >&2; while [ $SECONDS -lt 30 ]; do :; done; echo cancel-done > $out"
+    # logs roughly once a second: continuous output must not keep the
+    # hub from noticing the departed client and cancelling the build
+    ''
+      echo cancel-marker-running >&2
+      last=-1
+      while [ $SECONDS -lt 30 ]; do
+        if [ $SECONDS -gt $last ]; then last=$SECONDS; echo "still running $SECONDS" >&2; fi
+      done
+      echo cancel-done > $out
+    ''
   ];
 }
