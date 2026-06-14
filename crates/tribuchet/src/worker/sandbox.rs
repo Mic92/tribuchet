@@ -168,11 +168,18 @@ pub fn spawn_request(
         .collect();
     let req = crate::worker::reaper::SpawnRequest {
         argv,
-        env: spec
-            .env
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
+        // The derivation env must not reach the pre-sandbox setup stage
+        // (worker binary, worker host credentials): LD_PRELOAD would run
+        // client code outside the sandbox. With the spec on stdin the
+        // env is applied at the builder exec instead.
+        env: if platform::SPEC_VIA_STDIN {
+            Vec::new()
+        } else {
+            spec.env
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        },
         cwd: cmd
             .get_current_dir()
             .map(|p| p.to_string_lossy().into_owned()),
@@ -202,9 +209,13 @@ pub fn spawn(spec: &SandboxSpec, log: std::fs::File) -> Result<Child> {
     // Own process group, so orphaned builder children can be killed
     // after the builder exits (there is no PID namespace to do it).
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
-    cmd.env_clear()
-        .envs(&spec.env)
-        .stdin(platform::stdin_mode())
+    cmd.env_clear();
+    // Mirror the reaper: with the spec on stdin the builder env is
+    // applied at the builder exec, not on the setup stage process.
+    if !platform::SPEC_VIA_STDIN {
+        cmd.envs(&spec.env);
+    }
+    cmd.stdin(platform::stdin_mode())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log));
     let mut child = cmd
@@ -504,7 +515,15 @@ mod platform {
             .chain(spec.args.iter().map(|a| std::ffi::CString::new(a.as_str())))
             .collect::<Result<_, _>>()
             .map_err(|_| io::Error::other("NUL in builder argument"))?;
-        nix::unistd::execv(&prog, &args).map_err(ioerr("exec builder"))
+        // The setup stage runs with a clean environment; the derivation
+        // env is applied only here, to the builder inside the sandbox.
+        let env: Vec<std::ffi::CString> = spec
+            .env
+            .iter()
+            .map(|(k, v)| std::ffi::CString::new(format!("{k}={v}")))
+            .collect::<Result<_, _>>()
+            .map_err(|_| io::Error::other("NUL in builder environment"))?;
+        nix::unistd::execve(&prog, &args, &env).map_err(ioerr("exec builder"))
     }
 
     fn existing_mount_flags(target: &Path) -> io::Result<MsFlags> {
@@ -1188,6 +1207,38 @@ mod tests {
         }
     }
 
+    /// The derivation env is client-controlled (LD_PRELOAD, …) and must
+    /// not be applied to the setup stage, which runs the worker binary
+    /// with the worker's host credentials before entering the sandbox.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn derivation_env_stays_off_the_setup_stage() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let spec = SandboxSpec {
+            builder: "/bin/sh".into(),
+            system: "x86_64-linux".into(),
+            args: vec![],
+            env: HashMap::from([("LD_PRELOAD".into(), "/nix/store/evil.so".into())]),
+            cwd: "/build".into(),
+            network: false,
+            root: dir.path().join("root"),
+            build_dir: dir.path().join("top/build"),
+            binds_ro: vec![],
+            binds_dev: vec![],
+            outputs: vec![],
+            cgroup: None,
+            uid_range: None,
+            fod_uid: None,
+            pasta: None,
+            emulator: None,
+            deny_read: vec![],
+        };
+        std::fs::create_dir_all(&spec.build_dir)?;
+        let (req, _r, _w) = spawn_request(&spec)?;
+        assert!(req.env.is_empty(), "setup stage env: {:?}", req.env);
+        Ok(())
+    }
+
     /// End-to-end smoke test of the Linux sandbox: namespaces, mounts,
     /// pivot_root, /proc, loopback, and exit-code plumbing through the
     /// PID-namespace shim. Requires unprivileged user namespaces.
@@ -1205,11 +1256,14 @@ mod tests {
                 // sleep keeps the builder alive so the timing assertion
                 // below is meaningful; environments without a sleep
                 // binary (Nix's busybox /bin/sh) just exit fast.
+                // $FOO asserts the derivation env reaches the builder
+                // even though the setup stage runs with a clean env.
                 "test -w /build && test -d /proc/self && test -d /dev/shm || exit 1; \
+                 test \"$FOO\" = bar || exit 2; \
                  sleep 1 2>/dev/null; exit 7"
                     .into(),
             ],
-            env: HashMap::new(),
+            env: HashMap::from([("FOO".into(), "bar".into())]),
             cwd: "/build".into(),
             network: false,
             root: dir.path().join("root"),
