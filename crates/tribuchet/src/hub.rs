@@ -954,6 +954,27 @@ async fn run_job(
                 }
                 break missing;
             }
+            // Staging failed worker-side (assignment validation, its
+            // nix-daemon unreachable, ...): the worker reports it as a
+            // Result before ever sending MissingPaths. Pass the error
+            // on to the client instead of calling it unexpected.
+            worker_message::Msg::Result(res) if res.exit_code != 0 => {
+                if !(1..=255).contains(&res.exit_code) {
+                    bail!("worker sent invalid exit code {}", res.exit_code);
+                }
+                if !res.error.is_empty() {
+                    job.replay
+                        .publish(attach_event::Event::Log(
+                            format!("tribuchet worker error: {}\n", res.error).into_bytes(),
+                        ))
+                        .await;
+                }
+                job.replay
+                    .publish(attach_event::Event::ExitCode(res.exit_code))
+                    .await;
+                ack_result(out_tx, job).await;
+                return Ok(());
+            }
             other => bail!(
                 "unexpected worker message while negotiating paths: {}",
                 msg_name(&other)
