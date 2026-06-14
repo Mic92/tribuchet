@@ -122,7 +122,9 @@ Reference implementations: `nix/src/libstore/unix/build/` and
   unreachable, and root workers back such builds with an unprivileged
   uid.
 * macOS: no mount namespace, but inputs already live at their real
-  /nix/store paths thanks to the daemon import; `/build` is a symlink to the build dir, and the builder
+  /nix/store paths thanks to the daemon import; the request's per-build
+  `tmpDirInSandbox` (a `/private/tmp/nix-build-*` path — Nix has no
+  `/build` on Darwin) becomes a symlink to the build dir, and the builder
   runs under `/usr/bin/sandbox-exec` with a deny-default write profile
   modeled on Nix's `sandbox-defaults.sb` (reads stay permissive except
   for the worker's key material; writes are scoped to the build dir,
@@ -190,9 +192,7 @@ capable worker is left (or get rebuilt by another one).
   build attempt: it only catches concurrent duplicate submissions of the
   same goal, not the same derivation submitted twice. Proper dedupe
   needs a derivation identity in build.json (upstream patch).
-* Workers run up to `max-jobs` concurrent builds over one session;
-  on macOS, builds sharing the daemon-pinned `/build` symlink are
-  serialized per worker (no mount namespace to give each its own).
+* Workers run up to `max-jobs` concurrent builds over one session.
 * Reload upgrades the worker but never the reaper itself; picking up
   a new reaper still needs a full restart (which kills running
   builds). The reaper is deliberately small so this rarely matters.

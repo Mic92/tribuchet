@@ -71,9 +71,6 @@ struct WorkerCtx {
     /// blocks keep concurrent uid-range builds apart.
     uid_base: u32,
     uid_slots: std::sync::Mutex<Vec<bool>>,
-    /// macOS: tmpDirInSandbox=/build is one global symlink (no mount
-    /// namespace); builds sharing it run one at a time.
-    shared_link_lock: std::sync::Mutex<()>,
     /// Dedupe keys of builds the hub cancelled; the supervising loops
     /// abort them. Keyed like the registry, since a resumed build's
     /// build_id changes while it runs.
@@ -578,7 +575,6 @@ async fn run_async(
         max_log_size: opts.max_log_size,
         uid_base: opts.auto_allocate_uids_base,
         uid_slots: std::sync::Mutex::new(vec![false; opts.max_jobs.max(1) as usize]),
-        shared_link_lock: std::sync::Mutex::new(()),
     });
 
     // Ready once local setup is done, not once the hub answers: the
@@ -1430,18 +1426,6 @@ impl ActiveBuild {
         timeout: std::time::Duration,
     ) -> Result<FinishedBuild> {
         let a = &self.assignment;
-        // Serialize macOS builds sharing the global /build symlink;
-        // Linux mounts it inside a private namespace, no lock needed.
-        let _link_guard = if cfg!(target_os = "macos") && a.tmp_dir_in_sandbox == "/build" {
-            Some(
-                self.ctx
-                    .shared_link_lock
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()),
-            )
-        } else {
-            None
-        };
         // The slot lease keeps concurrent uids disjoint; returned on
         // drop when the build finishes.
         let owner = BuildOwner::for_build(&self.ctx, a)?;

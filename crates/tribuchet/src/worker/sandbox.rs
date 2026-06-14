@@ -1056,19 +1056,19 @@ mod platform {
         // so there is nothing to materialize.
         spec.binds_ro.clear();
         // env refers to tmpDirInSandbox; link it to the real build dir.
+        // Darwin daemons always send a per-build tmp path here (Nix has
+        // no /build on macOS), so each build gets its own symlink.
         let link = Path::new(&spec.cwd);
         // Don't trust the hub: a root worker creating a symlink at an
-        // arbitrary path is a takeover primitive. Allow only tmp
-        // prefixes and the shared /build (serialized by the caller).
-        let allowed = spec.cwd == "/build"
-            || [
-                "/tmp/",
-                "/private/tmp/",
-                "/private/var/folders/",
-                "/var/folders/",
-            ]
-            .iter()
-            .any(|p| spec.cwd.starts_with(p));
+        // arbitrary path is a takeover primitive. Allow only tmp prefixes.
+        let allowed = [
+            "/tmp/",
+            "/private/tmp/",
+            "/private/var/folders/",
+            "/var/folders/",
+        ]
+        .iter()
+        .any(|p| spec.cwd.starts_with(p));
         if !allowed {
             anyhow::bail!("refusing tmpDirInSandbox outside tmp: {}", spec.cwd);
         }
@@ -1186,8 +1186,7 @@ mod platform {
             let _ = std::fs::remove_file(p);
         }
         // Only remove the symlink this build created (it points at our
-        // build dir): the shared /build may already belong to the next
-        // build, and a hub-chosen path that prepare() rejected must not
+        // build dir): a hub-chosen path that prepare() rejected must not
         // become a delete-anything primitive on a root worker.
         let link = Path::new(&a.tmp_dir_in_sandbox);
         if std::fs::read_link(link).is_ok_and(|t| t == dir.join("top").join("build")) {
