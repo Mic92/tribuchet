@@ -1909,36 +1909,89 @@ fn try_deliver(ctx: &std::sync::Arc<WorkerCtx>, key: &str) {
 /// Unpack the client-supplied tmp-dir tar, refusing anything but plain
 /// files, directories, and symlinks, and applying only the 0777 mode
 /// bits: a root worker must not materialize client-chosen setuid bits.
+///
+/// Every path is created relative to the destination directory's fd via
+/// openat with O_NOFOLLOW, so no entry name -- absolute, dot-dotted, or
+/// aimed at a symlink planted by an earlier entry -- can place or chmod
+/// anything outside the destination.
 fn unpack_tmp_dir_archive(reader: impl Read, dest: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use nix::fcntl::OFlag;
+    use std::os::fd::{AsFd, OwnedFd};
+    use std::path::Component;
+
+    fn open_dir_at(at: &impl AsFd, name: &std::ffi::OsStr) -> Result<OwnedFd> {
+        Ok(nix::fcntl::openat(
+            at.as_fd(),
+            name,
+            OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_RDONLY | OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::empty(),
+        )?)
+    }
+
+    fn mkdir_at(at: &impl AsFd, name: &std::ffi::OsStr, mode: nix::sys::stat::Mode) -> Result<()> {
+        match nix::sys::stat::mkdirat(at.as_fd(), name, mode) {
+            Ok(()) | Err(nix::errno::Errno::EEXIST) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    let dest = std::fs::File::open(dest).context("opening tmp dir destination")?;
     let mut tar = tar::Archive::new(reader);
     for entry in tar.entries()? {
         let mut entry = entry?;
-        // Build the on-disk path from the entry's normal components
-        // only, mirroring how unpack_in places it: a crafted absolute
-        // entry name must not turn the chmod below into a write to an
-        // arbitrary host path.
-        let rel: PathBuf = entry
-            .path()?
-            .components()
-            .filter_map(|c| match c {
-                std::path::Component::Normal(p) => Some(p.to_owned()),
-                _ => None,
-            })
-            .collect();
-        let path = dest.join(rel);
         let kind = entry.header().entry_type();
         match kind {
             tar::EntryType::Regular | tar::EntryType::Directory | tar::EntryType::Symlink => {}
             other => bail!("unsupported tar entry type {other:?} in tmp dir archive"),
         }
-        let mode = entry.header().mode()? & 0o777;
-        entry.set_preserve_permissions(false);
-        if !entry.unpack_in(dest)? {
-            bail!("tar entry escapes the tmp dir");
+        // Mirror unpack_in's name handling: drop root/cur-dir
+        // components (absolute names land under dest), refuse `..`.
+        let path = entry.path()?.into_owned();
+        let mut comps = Vec::new();
+        for c in path.components() {
+            match c {
+                Component::Normal(p) => comps.push(p.to_owned()),
+                Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+                Component::ParentDir => bail!("tar entry escapes the tmp dir: {path:?}"),
+            }
         }
-        if kind != tar::EntryType::Symlink {
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))?;
+        let Some(leaf) = comps.pop() else { continue };
+        // Descend to the parent, creating intermediate directories.
+        let mut parent: OwnedFd = dest.as_fd().try_clone_to_owned()?;
+        for c in &comps {
+            mkdir_at(&parent, c.as_os_str(), nix::sys::stat::Mode::S_IRWXU)?;
+            parent = open_dir_at(&parent, c)?;
+        }
+        let mode = nix::sys::stat::Mode::from_bits_truncate(entry.header().mode()? & 0o777);
+        match kind {
+            tar::EntryType::Directory => {
+                mkdir_at(&parent, leaf.as_os_str(), mode)?;
+                let dir = open_dir_at(&parent, &leaf)?;
+                nix::sys::stat::fchmod(dir.as_fd(), mode)?;
+            }
+            tar::EntryType::Symlink => {
+                let target = entry
+                    .link_name()?
+                    .ok_or_else(|| anyhow::anyhow!("symlink entry without target"))?
+                    .into_owned();
+                nix::unistd::symlinkat(target.as_os_str(), parent.as_fd(), leaf.as_os_str())?;
+            }
+            _ => {
+                let file: std::fs::File = nix::fcntl::openat(
+                    parent.as_fd(),
+                    leaf.as_os_str(),
+                    OFlag::O_WRONLY
+                        | OFlag::O_CREAT
+                        | OFlag::O_TRUNC
+                        | OFlag::O_NOFOLLOW
+                        | OFlag::O_CLOEXEC,
+                    mode,
+                )?
+                .into();
+                std::io::copy(&mut entry, &mut &file)?;
+                // the umask at create time may have masked bits off
+                nix::sys::stat::fchmod(file.as_fd(), mode)?;
+            }
         }
     }
     Ok(())
@@ -2111,6 +2164,32 @@ mod tests {
         let data = builder.into_inner()?;
         let dest = tempfile::tempdir()?;
         assert!(unpack_tmp_dir_archive(data.as_slice(), dest.path()).is_err());
+        Ok(())
+    }
+
+    /// A symlink planted by an earlier entry must not redirect later
+    /// entries outside the destination: descent uses O_NOFOLLOW.
+    #[test]
+    fn tmp_dir_archive_does_not_follow_planted_symlinks() -> Result<()> {
+        let outside = tempfile::tempdir()?;
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_path("exit")?;
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_link_name(outside.path())?;
+        header.set_size(0);
+        header.set_cksum();
+        builder.append(&header, &b""[..])?;
+        let mut header = tar::Header::new_gnu();
+        header.set_path("exit/pwn")?;
+        header.set_size(1);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append(&header, &b"x"[..])?;
+        let data = builder.into_inner()?;
+        let dest = tempfile::tempdir()?;
+        assert!(unpack_tmp_dir_archive(data.as_slice(), dest.path()).is_err());
+        assert!(!outside.path().join("pwn").exists());
         Ok(())
     }
 
