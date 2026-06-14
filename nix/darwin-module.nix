@@ -126,7 +126,12 @@ in
         # adopts them by these names via launch_activate_socket, so
         # they keep accepting across hub restarts.
         Sockets = {
-          attach.SockPathName = toString hub.socketPath;
+          attach = {
+            SockPathName = toString hub.socketPath;
+            # 0660; launchd cannot set a group, so until the hub starts
+            # and chowns the path to nixbld only root can connect.
+            SockPathMode = 432;
+          };
           workers = {
             SockNodeName = hub.listenAddress;
             SockServiceName = toString hub.port;

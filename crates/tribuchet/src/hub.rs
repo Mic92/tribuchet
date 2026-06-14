@@ -1406,6 +1406,24 @@ fn bind_attach_socket(socket: &Path) -> Result<tokio::net::UnixListener> {
     Ok(uds)
 }
 
+/// Restrict an attach socket path bound by launchd to the nixbld group
+/// with mode 0660, like bind_attach_socket() does for self-bound and
+/// systemd does for socket-activated ones; launchd's `Sockets` plist
+/// dictionary has a mode key but no owner/group key.
+#[cfg(target_os = "macos")]
+fn restrict_attach_socket(socket: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let group = match nix::unistd::Group::from_name("nixbld")? {
+        Some(group) => group,
+        None => bail!(
+            "group nixbld not found; refusing to serve a hub socket without a group to restrict it to"
+        ),
+    };
+    std::os::unix::fs::chown(socket, None, Some(group.gid.as_raw()))?;
+    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o660))?;
+    Ok(())
+}
+
 pub fn run(socket: &Path, listen: &str, config_dir: &Path) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run_async(socket, listen, config_dir))
@@ -1487,8 +1505,11 @@ async fn run_async(socket: &Path, listen: &str, config_dir: &Path) -> Result<()>
 
     let uds = match activated.unix {
         // Activated socket: systemd owns the path, mode and group
-        // (SocketGroup=/SocketMode= in the .socket unit).
+        // (SocketGroup=/SocketMode= in the .socket unit). launchd has
+        // no group key, so on macOS the hub restricts the path itself.
         Some(l) => {
+            #[cfg(target_os = "macos")]
+            restrict_attach_socket(socket)?;
             tokio::net::UnixListener::from_std(l).context("adopting activated unix socket")?
         }
         None => bind_attach_socket(socket)?,
