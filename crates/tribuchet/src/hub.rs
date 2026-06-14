@@ -29,7 +29,7 @@ mod state;
 mod submit;
 
 use relay::{run_job, send};
-use state::{HubState, WorkerCaps, WORKER_GRACE};
+use state::{HubState, WorkerCaps};
 use submit::AttachSvc;
 
 /// No worker message for this long tears the session down and fails
@@ -276,15 +276,12 @@ async fn worker_loop(
         let out_tx = out_tx.clone();
         let vkey = vkey.clone();
         tokio::spawn(async move {
-            let err = match run_job(&state, &job, &vkey, &out_tx, in_rx).await {
-                Ok(()) => {
-                    router.unregister(&job.id);
-                    state.finish(&job).await;
-                    return;
-                }
-                Err(e) => e,
-            };
+            let res = run_job(&state, &job, &vkey, &out_tx, in_rx).await;
             router.unregister(&job.id);
+            let Err(err) = res else {
+                state.finish(&job).await;
+                return;
+            };
             // A dead worker session is not a build verdict: requeue so
             // the worker (or its replacement) can resume the build by
             // dedupe key, or another worker can start over.
@@ -293,25 +290,7 @@ async fn worker_loop(
                     id = job.id,
                     "worker session lost; requeueing build: {err:#}"
                 );
-                let mut job = job;
-                job.attempts += 1;
-                job.requeued_at = Some(std::time::Instant::now());
-                // Output NARs interrupted mid-stream are already in the
-                // replay; tell attach clients to drop those partial
-                // transfers before the next attempt re-streams them.
-                for path in job.req.outputs.values() {
-                    job.replay
-                        .publish(attach_event::Event::OutputRestart(path.clone()))
-                        .await;
-                }
-                state.queue.lock().await.push_back(job);
-                state.notify.notify_waiters();
-                // Re-evaluate once the grace expired, or the job would
-                // strand forever if no worker ever returns.
-                tokio::spawn(async move {
-                    tokio::time::sleep(WORKER_GRACE + std::time::Duration::from_secs(1)).await;
-                    state.fail_unservable().await;
-                });
+                state.requeue(job).await;
             } else {
                 tracing::warn!(id = job.id, "build failed: {err:#}");
                 // The worker session is still up: it may hold a

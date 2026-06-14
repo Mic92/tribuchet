@@ -232,6 +232,27 @@ impl HubState {
         queue.remove(pos)
     }
 
+    /// Put a job back in the queue after its worker session died,
+    /// telling attach clients to drop any half-streamed output NARs
+    /// (the next attempt re-streams them from the start). A delayed
+    /// fail_unservable() covers the case where no worker ever returns.
+    pub(super) async fn requeue(self: &Arc<Self>, mut job: Job) {
+        job.attempts += 1;
+        job.requeued_at = Some(std::time::Instant::now());
+        for path in job.req.outputs.values() {
+            job.replay
+                .publish(attach_event::Event::OutputRestart(path.clone()))
+                .await;
+        }
+        self.queue.lock().await.push_back(job);
+        self.notify.notify_waiters();
+        let state = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(WORKER_GRACE + std::time::Duration::from_secs(1)).await;
+            state.fail_unservable().await;
+        });
+    }
+
     pub(super) async fn finish(&self, job: &Job) {
         let mut inflight = self.inflight.lock().await;
         inflight.by_key.remove(&job.key);
