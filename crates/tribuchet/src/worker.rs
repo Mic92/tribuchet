@@ -588,7 +588,7 @@ async fn run_async(
     crate::sd::spawn_watchdog();
     spawn_resumable_reaper(ctx.clone());
     spawn_handover();
-    adopt_builds(&ctx, &signing_key);
+    adopt_builds(&ctx, &signing_key).await;
 
     // Reconnect with backoff: a hub restart must not drain the fleet.
     let mut backoff = std::time::Duration::from_secs(1);
@@ -610,7 +610,7 @@ async fn run_async(
 /// Pick up builds a previous worker generation left behind: still
 /// running (same reaper, so their pids and exit statuses are valid)
 /// or finished but undelivered. Anything stale is swept.
-fn adopt_builds(ctx: &std::sync::Arc<WorkerCtx>, signing_key: &std::sync::Arc<SecretKey>) {
+async fn adopt_builds(ctx: &std::sync::Arc<WorkerCtx>, signing_key: &std::sync::Arc<SecretKey>) {
     let reaper_id = std::env::var(reaper::ID_ENV).unwrap_or_default();
     let Ok(entries) = std::fs::read_dir(ctx.state_dir.join("builds")) else {
         return;
@@ -656,6 +656,10 @@ fn adopt_builds(ctx: &std::sync::Arc<WorkerCtx>, signing_key: &std::sync::Arc<Se
         };
         set_uid_slot(ctx, st.uid_slot, true);
         tracing::info!(id = st.build_id, pid = st.pid, "adopted running build");
+        // The temp roots taken at negotiation died with the previous
+        // generation's daemon connection; without new ones a GC could
+        // delete inputs under the still-running build.
+        let gc_roots = re_root_inputs(&st.spec).await;
         ctx.resumable.lock().unwrap().insert(
             st.dedupe_key.clone(),
             ResumableBuild {
@@ -675,11 +679,37 @@ fn adopt_builds(ctx: &std::sync::Arc<WorkerCtx>, signing_key: &std::sync::Arc<Se
             let ctx = task_ctx;
             let key = st.dedupe_key.clone();
             let fin = supervise_adopted(&ctx, st, dir, &signing_key);
+            // Roots live until the outputs are packed.
+            drop(gc_roots);
             ctx.running
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             record_finished(&ctx, &key, fin);
         });
     }
+}
+
+/// Take fresh temp roots for an adopted build's inputs on a new daemon
+/// connection (returned; the roots die with it). Best effort: adoption
+/// must not fail because the daemon is briefly unavailable.
+async fn re_root_inputs(spec: &sandbox::SandboxSpec) -> Option<DaemonConn> {
+    let store_dir = StoreDir::default();
+    let mut daemon = match DaemonClient::builder().connect_daemon().await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!("connecting to nix-daemon for adopted-build GC roots: {e:#}");
+            return None;
+        }
+    };
+    for (src, _) in &spec.binds_ro {
+        // non-store binds (e.g. the static /bin/sh) need no root
+        let Some(sp) = src.to_str().and_then(|p| store_dir.parse(p).ok()) else {
+            continue;
+        };
+        if let Err(e) = daemon.add_temp_root(&sp).await {
+            tracing::warn!(path = %src.display(), "re-adding GC root: {e:#}");
+        }
+    }
+    Some(daemon)
 }
 
 /// Wait out a re-adopted build and pack its outputs, mirroring the
