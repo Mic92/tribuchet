@@ -162,31 +162,8 @@ fn supervise_adopted(
             gone_since = None;
         }
         if aborted.is_none() {
-            // The same guards execute() applies, recovered from the log
-            // file: its size for max-log-size, its mtime for
-            // max-silent-time (every chunk the builder writes bumps it).
-            let log = std::fs::metadata(&log_path).ok();
-            let silent = log
-                .as_ref()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.elapsed().ok())
-                .unwrap_or_default();
-            let log_size = log.map(|m| m.len()).unwrap_or(0);
-            if ctx.cancelled.lock().unwrap().remove(&st.dedupe_key) {
-                aborted = Some("build cancelled".into());
-            } else if unix_now() >= st.deadline_unix {
-                aborted = Some("build timed out".into());
-            } else if ctx.max_log_size > 0 && log_size > ctx.max_log_size {
-                aborted = Some(format!(
-                    "build log exceeded the limit of {} bytes",
-                    ctx.max_log_size
-                ));
-            } else if !ctx.max_silent_time.is_zero() && silent > ctx.max_silent_time {
-                aborted = Some(format!(
-                    "build produced no output for {}s",
-                    ctx.max_silent_time.as_secs()
-                ));
-            }
+            let timed_out = (unix_now() >= st.deadline_unix).then(|| "build timed out".to_string());
+            aborted = ctx.abort_reason(&st.dedupe_key, &log_path, timed_out);
             if aborted.is_some() {
                 let _ = nix::sys::signal::killpg(pgrp, nix::sys::signal::Signal::SIGKILL);
             }

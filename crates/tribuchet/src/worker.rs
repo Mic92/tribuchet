@@ -84,6 +84,46 @@ struct WorkerCtx {
 }
 
 impl WorkerCtx {
+    /// Reason to abort a running build, evaluated each supervision
+    /// tick. Reads the log file (size for max-log-size, mtime for
+    /// max-silent-time): counters fed by a session-bound tailer freeze
+    /// when the hub session drops and would kill a healthy build.
+    /// `timed_out` carries the caller's deadline check (wall clock vs
+    /// the persisted unix deadline of an adopted build).
+    fn abort_reason(
+        &self,
+        dedupe_key: &str,
+        log_path: &Path,
+        timed_out: Option<String>,
+    ) -> Option<String> {
+        let log = std::fs::metadata(log_path).ok();
+        let silent = log
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .unwrap_or_default();
+        let log_size = log.map(|m| m.len()).unwrap_or(0);
+        if self.cancelled.lock().unwrap().remove(dedupe_key) {
+            return Some("build cancelled".into());
+        }
+        if let Some(reason) = timed_out {
+            return Some(reason);
+        }
+        if self.max_log_size > 0 && log_size > self.max_log_size {
+            return Some(format!(
+                "build log exceeded the limit of {} bytes",
+                self.max_log_size
+            ));
+        }
+        if !self.max_silent_time.is_zero() && silent > self.max_silent_time {
+            return Some(format!(
+                "build produced no output for {}s",
+                self.max_silent_time.as_secs()
+            ));
+        }
+        None
+    }
+
     fn resumable_keys(&self) -> Vec<String> {
         self.resumable.lock().unwrap().keys().cloned().collect()
     }

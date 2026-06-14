@@ -455,36 +455,15 @@ impl ActiveBuild {
             })
         };
         let pgrp = nix::unistd::Pid::from_raw(pid);
-        let max_log = self.ctx.max_log_size;
         use std::sync::atomic::Ordering;
         let mut abort: Option<String> = None;
         let status = loop {
             if let Some(code) = reaper::take_status(&self.ctx.status_dir, &req.token) {
                 break code;
             }
-            // The guards read the log file itself (size for max-log-size,
-            // mtime for max-silent-time), like supervise_adopted: counters
-            // fed by the session-bound tailer freeze when the hub session
-            // drops and would kill a healthy, actively-logging build.
-            let log_meta = std::fs::metadata(&log_path).ok();
-            let silent = log_meta
-                .as_ref()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.elapsed().ok())
-                .unwrap_or_default();
-            let log_size = log_meta.map(|m| m.len()).unwrap_or(0);
-            if self.ctx.cancelled.lock().unwrap().remove(&a.dedupe_key) {
-                abort = Some("build cancelled".into());
-            } else if std::time::Instant::now() >= deadline {
-                abort = Some(format!("build timed out after {}s", timeout.as_secs()));
-            } else if max_log > 0 && log_size > max_log {
-                abort = Some(format!("build log exceeded the limit of {max_log} bytes"));
-            } else if !self.ctx.max_silent_time.is_zero() && silent > self.ctx.max_silent_time {
-                abort = Some(format!(
-                    "build produced no output for {}s",
-                    self.ctx.max_silent_time.as_secs()
-                ));
-            }
+            let timed_out = (std::time::Instant::now() >= deadline)
+                .then(|| format!("build timed out after {}s", timeout.as_secs()));
+            abort = self.ctx.abort_reason(&a.dedupe_key, &log_path, timed_out);
             if abort.is_some() {
                 let _ = nix::sys::signal::killpg(pgrp, nix::sys::signal::Signal::SIGKILL);
                 // The reaper collects the kill within its sweep interval.
