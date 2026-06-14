@@ -81,16 +81,13 @@ enum Outcome {
     Retry(anyhow::Error),
 }
 
-async fn attempt_build(
-    req: &BuildRequest,
-    socket: &Path,
-    expected_outputs: &[String],
-) -> Result<Outcome> {
-    // The URI is ignored; the connector always dials the unix socket.
-    let socket_owned = socket.to_owned();
-    let channel = match Endpoint::try_from("http://hub.invalid")?
+/// gRPC channel over the hub's local unix socket; tonic only knows
+/// HTTP URIs, so the connector ignores the URI and dials the path.
+async fn connect(socket: &Path) -> Result<tonic::transport::Channel> {
+    let socket = socket.to_owned();
+    Endpoint::try_from("http://hub.invalid")?
         .connect_with_connector(service_fn(move |_: Uri| {
-            let socket = socket_owned.clone();
+            let socket = socket.clone();
             async move {
                 Ok::<_, std::io::Error>(TokioIo::new(
                     tokio::net::UnixStream::connect(socket).await?,
@@ -98,13 +95,17 @@ async fn attempt_build(
             }
         }))
         .await
-    {
+        .context("connecting to hub socket")
+}
+
+async fn attempt_build(
+    req: &BuildRequest,
+    socket: &Path,
+    expected_outputs: &[String],
+) -> Result<Outcome> {
+    let channel = match connect(socket).await {
         Ok(c) => c,
-        Err(e) => {
-            return Ok(Outcome::Retry(
-                anyhow::Error::new(e).context("connecting to hub socket"),
-            ))
-        }
+        Err(e) => return Ok(Outcome::Retry(e)),
     };
     let mut client = AttachHubClient::new(channel)
         .max_decoding_message_size(crate::proto::MAX_MSG_SIZE)
