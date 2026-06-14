@@ -278,6 +278,10 @@ pub(super) struct PackedOutput {
     pub(super) nar_file: PathBuf,
     pub(super) nar_sha256: Vec<u8>,
     pub(super) signature: String,
+    /// Store paths the NAR references (intersection with the
+    /// candidate set: inputs, sibling outputs, proxy-added paths).
+    #[serde(default)]
+    pub(super) references: Vec<String>,
 }
 
 /// On-disk state for re-adopting a running build after a worker

@@ -535,6 +535,7 @@ pub(super) fn pack_outputs(
     deadline: std::time::Instant,
     signing_key: &SecretKey,
 ) -> Result<Vec<PackedOutput>> {
+    let candidates = scan_candidates(&spec.store_inputs, &spec.outputs);
     let mut packed = Vec::new();
     for scratch in &spec.outputs {
         let host_path = sandbox::output_host_path(spec, scratch);
@@ -544,32 +545,88 @@ pub(super) fn pack_outputs(
             bail!("builder did not produce output {scratch}");
         }
         let nar_file = dir.join(format!("{}.nar.zst", store_base(scratch)));
-        let mut hasher = Sha256::new();
-        {
-            let f = std::fs::File::create(&nar_file)?;
-            let mut enc = zstd::stream::write::Encoder::new(f, 3)?;
-            let mut tee = TeeWriter(&mut enc, &mut hasher);
-            // The build deadline also bounds packing: a builder can
-            // exit instantly leaving a multi-TB sparse output.
-            let mut limited = LimitedWriter {
-                inner: &mut tee,
-                remaining: MAX_NAR_BYTES,
-                deadline,
-            };
-            nar::pack(&host_path, &mut limited)
-                .with_context(|| format!("packing output {scratch}"))?;
-            enc.finish()?.flush()?;
-        }
-        let hash = hasher.finalize();
-        let sig = signing_key.sign(format!("{}:{}", scratch, hex::encode(hash)).as_bytes());
+        let self_path = harmonia_store_path::StorePath::from_base_path(store_base(scratch)).ok();
+        let res = pack_one_nar(
+            &host_path,
+            &nar_file,
+            &candidates,
+            self_path.as_ref(),
+            deadline,
+        )
+        .with_context(|| format!("packing output {scratch}"))?;
+        let sig =
+            signing_key.sign(format!("{scratch}:{}", hex::encode(&res.nar_sha256)).as_bytes());
         packed.push(PackedOutput {
             scratch: scratch.clone(),
             nar_file,
-            nar_sha256: hash.to_vec(),
+            nar_sha256: res.nar_sha256,
             signature: sig.to_string(),
+            references: res.references,
         });
     }
     Ok(packed)
+}
+
+struct NarPackResult {
+    nar_sha256: Vec<u8>,
+    references: Vec<String>,
+}
+
+/// Pack `host_path` as a zstd-compressed NAR into `nar_path`, hashing
+/// and reference-scanning the plaintext NAR in the same pass.
+fn pack_one_nar(
+    host_path: &Path,
+    nar_path: &Path,
+    candidates: &std::collections::BTreeSet<harmonia_store_path::StorePath>,
+    self_path: Option<&harmonia_store_path::StorePath>,
+    deadline: std::time::Instant,
+) -> Result<NarPackResult> {
+    let mut hasher = Sha256::new();
+    let mut sink = harmonia_store_ref_scan::RefScanSink::new(candidates, self_path);
+    {
+        let f = std::fs::File::create(nar_path)?;
+        let mut enc = zstd::stream::write::Encoder::new(f, 3)?;
+        let mut tee = TeeScanner {
+            zstd: &mut enc,
+            hasher: &mut hasher,
+            scan: &mut sink,
+        };
+        // Deadline bounds packing too: a builder can exit instantly
+        // leaving a multi-TB sparse output.
+        let mut limited = LimitedWriter {
+            inner: &mut tee,
+            remaining: MAX_NAR_BYTES,
+            deadline,
+        };
+        nar::pack(host_path, &mut limited)?;
+        enc.finish()?.flush()?;
+    }
+    let store_dir = harmonia_store_path::StoreDir::default();
+    let references = sink
+        .found_paths()
+        .into_iter()
+        .filter(|p| self_path != Some(p))
+        .map(|p| {
+            p.to_absolute_path(&store_dir)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    Ok(NarPackResult {
+        nar_sha256: hasher.finalize().to_vec(),
+        references,
+    })
+}
+
+fn scan_candidates(
+    inputs: &[String],
+    outputs: &[String],
+) -> std::collections::BTreeSet<harmonia_store_path::StorePath> {
+    inputs
+        .iter()
+        .chain(outputs.iter())
+        .filter_map(|p| harmonia_store_path::StorePath::from_base_path(store_base(p)).ok())
+        .collect()
 }
 
 /// Unpack the client-supplied tmp-dir tar, refusing anything but plain
@@ -691,16 +748,23 @@ impl<W: Write> Write for LimitedWriter<W> {
     }
 }
 
-struct TeeWriter<'a, A: Write, B: Write>(&'a mut A, &'a mut B);
+/// One-pass tee of plaintext NAR bytes into zstd, sha256, and the
+/// reference scanner.
+struct TeeScanner<'a, W: Write> {
+    zstd: &'a mut W,
+    hasher: &'a mut Sha256,
+    scan: &'a mut harmonia_store_ref_scan::RefScanSink,
+}
 
-impl<A: Write, B: Write> Write for TeeWriter<'_, A, B> {
+impl<W: Write> Write for TeeScanner<'_, W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.write_all(buf)?;
-        self.1.write_all(buf)?;
+        self.zstd.write_all(buf)?;
+        self.hasher.update(buf);
+        self.scan.feed(buf);
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
-        self.0.flush()
+        self.zstd.flush()
     }
 }
 
@@ -825,6 +889,31 @@ mod tests {
         let dest = tempfile::tempdir()?;
         assert!(unpack_tmp_dir_archive(data.as_slice(), dest.path()).is_err());
         assert!(!outside.path().join("pwn").exists());
+        Ok(())
+    }
+
+    /// pack_one_nar finds references in the same pass as the NAR
+    /// hash; self-paths are dropped.
+    #[test]
+    fn pack_one_nar_finds_references_and_excludes_self() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let host = dir.path().join("out");
+        std::fs::create_dir(&host)?;
+        let input = "/nix/store/00000000000000000000000000000001-input";
+        let self_path = "/nix/store/00000000000000000000000000000002-self";
+        let unrelated = "/nix/store/00000000000000000000000000000003-unrelated";
+        std::fs::write(host.join("data"), format!("refs: {input} {self_path}\n"))?;
+        let candidates = scan_candidates(&[input.into(), unrelated.into()], &[self_path.into()]);
+        let self_sp = harmonia_store_path::StorePath::from_base_path(store_base(self_path)).ok();
+        let res = pack_one_nar(
+            &host,
+            &dir.path().join("out.nar.zst"),
+            &candidates,
+            self_sp.as_ref(),
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        )?;
+        assert_eq!(res.references, vec![input.to_string()]);
+        assert_eq!(res.nar_sha256.len(), 32);
         Ok(())
     }
 

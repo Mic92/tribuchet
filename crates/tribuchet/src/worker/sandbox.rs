@@ -50,6 +50,10 @@ pub struct SandboxSpec {
     /// Scratch output store paths (used by the macOS profile).
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub outputs: Vec<String>,
+    /// Input store paths visible to the builder; reference-scan
+    /// candidates alongside outputs.
+    #[serde(default)]
+    pub store_inputs: Vec<String>,
     /// Per-build cgroup; the builder enters it from pre_exec so pids/
     /// memory limits cover the whole build, including the setup phase.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
@@ -125,6 +129,7 @@ pub fn prepare(
             .collect(),
         binds_dev: Vec::new(),
         outputs: a.outputs.values().cloned().collect(),
+        store_inputs: inputs.to_vec(),
         cgroup: None,
         uid_range: opts.uid_range,
         fod_uid: opts.fod_uid.filter(|_| a.fixed_output),
@@ -302,6 +307,7 @@ mod tests {
             root: dir.path().join("root"),
             build_dir: dir.path().join("top/build"),
             binds_ro: vec![],
+            store_inputs: vec![],
             binds_dev: vec![],
             outputs: vec![],
             cgroup: None,
@@ -346,6 +352,7 @@ mod tests {
             network: false,
             root: dir.path().join("root"),
             build_dir: dir.path().join("top/build"),
+            store_inputs: vec![],
             binds_ro: ["/bin", "/usr", "/lib", "/lib64", "/nix/store"]
                 .iter()
                 .filter(|p| Path::new(p).exists())
