@@ -47,8 +47,8 @@ pub struct SpawnRequest {
     pub token: String,
 }
 
-/// Generous bound for one request datagram (argv + env; the sandbox
-/// spec travels by fd, not in-band).
+/// Generous bound for one serialized spawn request (argv + env; the
+/// sandbox spec travels by fd, not in-band) and for a reply datagram.
 const MAX_MSG: usize = 1 << 20;
 
 #[derive(Serialize, Deserialize)]
@@ -75,12 +75,11 @@ impl Spawner {
     ) -> Result<i32> {
         req.token = hex::encode(rand::random::<[u8; 16]>());
         let sock = self.sock.lock().unwrap();
-        let payload = serde_json::to_vec(req)?;
         let mut fds = vec![log.as_raw_fd()];
         if let Some(fd) = &stdin {
             fds.push(fd.as_raw_fd());
         }
-        send_with_fds(&sock, &payload, &fds).context("sending spawn request to reaper")?;
+        send_request(&sock, req, &fds).context("sending spawn request to reaper")?;
         let mut buf = vec![0u8; MAX_MSG];
         let reply = loop {
             let (n, _) = recv_with_fds(&sock, &mut buf).context("reading reaper reply")?;
@@ -221,7 +220,6 @@ fn reaper_main(sock: UnixDatagram, worker_sock: UnixDatagram, status_dir: &Path)
     let mut spawned_at = std::time::Instant::now();
     let mut fast_failures = 0u32;
     const MAX_FAST_FAILURES: u32 = 5;
-    let mut buf = vec![0u8; MAX_MSG];
     sock.set_read_timeout(Some(std::time::Duration::from_millis(200)))
         .ok();
     loop {
@@ -289,12 +287,10 @@ fn reaper_main(sock: UnixDatagram, worker_sock: UnixDatagram, status_dir: &Path)
             }
             continue;
         }
-        match recv_with_fds(&sock, &mut buf) {
-            Ok((n, fds)) => {
-                let token = serde_json::from_slice::<SpawnRequest>(&buf[..n])
-                    .map(|r| r.token)
-                    .unwrap_or_default();
-                let reply = match handle_spawn(&buf[..n], fds) {
+        match recv_request(&sock) {
+            Ok((req, fds)) => {
+                let token = req.token.clone();
+                let reply = match handle_spawn(req, fds) {
                     Ok(pid) => {
                         builds.push((pid, token.clone()));
                         SpawnReply {
@@ -330,8 +326,7 @@ fn kill_builds(builds: &mut Vec<(i32, String)>) {
     }
 }
 
-fn handle_spawn(buf: &[u8], mut fds: Vec<OwnedFd>) -> Result<i32> {
-    let req: SpawnRequest = serde_json::from_slice(buf).context("decoding spawn request")?;
+fn handle_spawn(req: SpawnRequest, mut fds: Vec<OwnedFd>) -> Result<i32> {
     anyhow::ensure!(
         fds.len() == 1 + req.has_stdin as usize,
         "expected {} fds, got {}",
@@ -358,6 +353,36 @@ fn handle_spawn(buf: &[u8], mut fds: Vec<OwnedFd>) -> Result<i32> {
     });
     let child = cmd.spawn().context("spawning build")?;
     Ok(child.id() as i32)
+}
+
+/// The serialized request travels through a passed fd, not in the
+/// datagram itself: a datagram is capped by the socket send buffer
+/// (~208 KiB by default on Linux), which a large derivation
+/// environment easily exceeds.
+fn send_request(sock: &UnixDatagram, req: &SpawnRequest, fds: &[RawFd]) -> Result<()> {
+    use std::io::{Seek, Write};
+    let mut file = tempfile::tempfile().context("creating spawn request file")?;
+    file.write_all(&serde_json::to_vec(req)?)?;
+    file.rewind()?;
+    let mut all = vec![file.as_raw_fd()];
+    all.extend_from_slice(fds);
+    send_with_fds(sock, &[], &all)
+}
+
+/// Counterpart of `send_request`: the first passed fd carries the
+/// request, the rest are returned to the caller.
+fn recv_request(sock: &UnixDatagram) -> Result<(SpawnRequest, Vec<OwnedFd>)> {
+    use std::io::Read;
+    let mut buf = [0u8; 1]; // the datagram itself carries no payload
+    let (_, mut fds) = recv_with_fds(sock, &mut buf)?;
+    anyhow::ensure!(!fds.is_empty(), "spawn request without request fd");
+    let mut json = Vec::new();
+    std::fs::File::from(fds.remove(0))
+        .take(MAX_MSG as u64)
+        .read_to_end(&mut json)
+        .context("reading spawn request")?;
+    let req = serde_json::from_slice(&json).context("decoding spawn request")?;
+    Ok((req, fds))
 }
 
 fn send_with_fds(sock: &UnixDatagram, payload: &[u8], fds: &[RawFd]) -> Result<()> {
@@ -393,4 +418,30 @@ fn recv_with_fds(sock: &UnixDatagram, buf: &mut [u8]) -> Result<(usize, Vec<Owne
         }
     }
     Ok((msg.bytes, fds))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A derivation environment of a few hundred KiB must reach the
+    /// reaper: in-datagram requests were capped by the default socket
+    /// send buffer, well below MAX_MSG.
+    #[test]
+    fn large_spawn_request_reaches_the_reaper() -> Result<()> {
+        let (worker, reaper) = UnixDatagram::pair()?;
+        let req = SpawnRequest {
+            argv: vec!["/bin/sh".into()],
+            env: vec![("BIG".into(), "x".repeat(600 * 1024))],
+            cwd: None,
+            has_stdin: false,
+            token: "t".into(),
+        };
+        let log = std::fs::File::open("/dev/null")?;
+        send_request(&worker, &req, &[log.as_raw_fd()])?;
+        let (received, fds) = recv_request(&reaper)?;
+        assert_eq!(received.env, req.env);
+        assert_eq!(fds.len(), 1);
+        Ok(())
+    }
 }

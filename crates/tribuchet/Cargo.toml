@@ -38,9 +38,9 @@ harmonia-store-path-info.workspace = true
 harmonia-utils-signature.workspace = true
 harmonia-store-remote.workspace = true
 sd-notify = "0.5.0"
+tempfile.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
 
 [build-dependencies]
 tonic-build.workspace = true
