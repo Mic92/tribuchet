@@ -15,7 +15,8 @@ use super::state::{HubState, Job};
 use crate::chunkio::ChunkWriter;
 use crate::proto::{
     attach_event, hub_message, nar_transfer, worker_message, BuildAssignment, CancelBuild,
-    HubMessage, NarTransfer, OutputNar, PathInfoMsg, PathOffer, ResultAck, TmpDirArchive,
+    HubMessage, NarTransfer, OutputNar, OutputSignature, PathInfoMsg, PathOffer, ResultAck,
+    TmpDirArchive,
 };
 
 /// How long a dispatched build may run with no attach client listening
@@ -416,6 +417,42 @@ impl Write for HashWriter {
     }
 }
 
+/// Verifier for each output the worker reports, checked to be exactly
+/// the requested set: a missing output is a build failure, and an extra
+/// one would let a worker plant arbitrary store paths on the client.
+fn verify_set(
+    reported: Vec<OutputSignature>,
+    requested: &HashMap<String, String>,
+) -> Result<HashMap<String, OutputVerify>> {
+    let mut pending = HashMap::new();
+    for out in reported {
+        let signature: Signature = out
+            .signature
+            .parse()
+            .context("malformed output signature")?;
+        pending.insert(
+            out.store_path,
+            OutputVerify {
+                decoder: zstd::stream::write::Decoder::new(HashWriter::default())?,
+                signature,
+            },
+        );
+    }
+    for scratch in requested.values() {
+        if !pending.contains_key(scratch) {
+            bail!("worker result is missing output {scratch}");
+        }
+    }
+    if pending.len() != requested.len() {
+        let extra: Vec<&String> = pending
+            .keys()
+            .filter(|p| !requested.values().any(|o| o == *p))
+            .collect();
+        bail!("worker result contains unrequested outputs: {extra:?}");
+    }
+    Ok(pending)
+}
+
 /// Tell the worker its result (and all output NARs) arrived intact,
 /// so it can stop keeping the build for redelivery. Best effort: a
 /// lost ack only means the worker holds the build dir until its TTL.
@@ -499,33 +536,7 @@ async fn relay_build(
                     ack_result(out_tx, job).await;
                     return Ok(());
                 }
-                for out in res.outputs {
-                    let sig: Signature = out
-                        .signature
-                        .parse()
-                        .context("malformed output signature")?;
-                    pending.insert(
-                        out.store_path,
-                        OutputVerify {
-                            decoder: zstd::stream::write::Decoder::new(HashWriter::default())?,
-                            signature: sig,
-                        },
-                    );
-                }
-                for scratch in job.req.outputs.values() {
-                    if !pending.contains_key(scratch) {
-                        bail!("worker result is missing output {scratch}");
-                    }
-                }
-                // ... and nothing besides the requested outputs, or the
-                // worker could plant arbitrary store paths on the client.
-                if pending.len() != job.req.outputs.len() {
-                    let extra: Vec<&String> = pending
-                        .keys()
-                        .filter(|p| !job.req.outputs.values().any(|o| o == *p))
-                        .collect();
-                    bail!("worker result contains unrequested outputs: {extra:?}");
-                }
+                pending = verify_set(res.outputs, &job.req.outputs)?;
                 awaiting_outputs = true;
             }
             worker_message::Msg::Nar(n) if awaiting_outputs => {
