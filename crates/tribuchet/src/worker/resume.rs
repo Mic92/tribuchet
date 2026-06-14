@@ -16,8 +16,8 @@ use super::{cgroup, msg, reaper, sandbox, unix_now, DaemonConn, WorkerCtx};
 use crate::chunkio::CHUNK_SIZE;
 use crate::fsutil::remove_path_all;
 use crate::proto::{
-    nar_transfer, worker_message, BuildAssignment, BuildResult, NarTransfer, OutputSignature,
-    WorkerMessage,
+    nar_transfer, worker_message, BuildAssignment, BuildResult, ExtraPath, NarTransfer,
+    OutputSignature, PathInfoMsg, WorkerMessage,
 };
 
 /// Pick up builds a previous worker generation left behind: still
@@ -48,6 +48,7 @@ pub(super) async fn adopt_builds(
                         exit_code: f.exit_code,
                         error: f.error,
                         outputs: f.outputs,
+                        extras: f.extras,
                         dir: dir.clone(),
                         finished_at: std::time::Instant::now(),
                     }),
@@ -211,6 +212,7 @@ fn supervise_adopted(
         exit_code,
         error,
         outputs,
+        extras: Vec::new(),
         dir,
         finished_at: std::time::Instant::now(),
     }
@@ -273,9 +275,31 @@ pub(super) struct FinishedBuild {
     pub(super) exit_code: i32,
     pub(super) error: String,
     pub(super) outputs: Vec<PackedOutput>,
+    /// Recursive-nix closure-delta paths the builder registered with
+    /// the worker daemon; empty for non-recursive builds.
+    pub(super) extras: Vec<PackedExtra>,
     /// Build dir holding the packed NARs; removed after delivery.
     pub(super) dir: PathBuf,
     pub(super) finished_at: std::time::Instant,
+}
+
+/// One closure-delta path: PathInfo from the worker daemon plus a
+/// PackedOutput-shaped signed envelope over `path:hex(nar_sha256)`.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(super) struct PackedExtra {
+    /// Absolute store path of the registered extra.
+    pub(super) path: String,
+    pub(super) nar_file: PathBuf,
+    pub(super) nar_sha256: Vec<u8>,
+    pub(super) nar_size: u64,
+    pub(super) signature: String,
+    pub(super) references: Vec<String>,
+    /// Existing daemon signatures (`name:base64`).
+    pub(super) sigs: Vec<String>,
+    /// Absolute store path or empty.
+    pub(super) deriver: String,
+    /// Content-address string or empty.
+    pub(super) ca: String,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -318,6 +342,8 @@ struct FinishedState {
     pub(super) exit_code: i32,
     pub(super) error: String,
     pub(super) outputs: Vec<PackedOutput>,
+    #[serde(default)]
+    pub(super) extras: Vec<PackedExtra>,
 }
 
 /// Record a build's result in the registry (persisted for redelivery
@@ -360,6 +386,7 @@ fn persist_finished(key: &str, build_id: &str, fin: &FinishedBuild) {
         exit_code: fin.exit_code,
         error: fin.error.clone(),
         outputs: fin.outputs.clone(),
+        extras: fin.extras.clone(),
     };
     if let Ok(json) = serde_json::to_vec(&state) {
         let _ = std::fs::write(fin.dir.join("finished.json"), json);
@@ -387,6 +414,7 @@ pub(super) fn execute_to_finished(
             exit_code: 1,
             error: format!("{e:#}"),
             outputs: vec![],
+            extras: vec![],
             dir: build.dir.clone(),
             finished_at: std::time::Instant::now(),
         }
@@ -403,7 +431,23 @@ pub(super) fn deliver(
     out_tx.blocking_send(msg(worker_message::Msg::Result(BuildResult {
         build_id: build_id.into(),
         exit_code: fin.exit_code,
-        extras: Vec::new(),
+        extras: fin
+            .extras
+            .iter()
+            .map(|e| ExtraPath {
+                info: Some(PathInfoMsg {
+                    build_id: build_id.into(),
+                    store_path: e.path.clone(),
+                    nar_sha256: e.nar_sha256.clone(),
+                    nar_size: e.nar_size,
+                    references: e.references.clone(),
+                    signatures: e.sigs.clone(),
+                    deriver: e.deriver.clone(),
+                    ca: e.ca.clone(),
+                }),
+                signature: e.signature.clone(),
+            })
+            .collect(),
         outputs: fin
             .outputs
             .iter()
@@ -433,6 +477,28 @@ pub(super) fn deliver(
         out_tx.blocking_send(msg(worker_message::Msg::Nar(NarTransfer {
             build_id: build_id.into(),
             store_path: o.scratch.clone(),
+            payload: None,
+            eof: true,
+        })))?;
+    }
+    for e in &fin.extras {
+        let mut f = std::fs::File::open(&e.nar_file)?;
+        let mut buf = vec![0u8; CHUNK_SIZE];
+        loop {
+            let n = f.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            out_tx.blocking_send(msg(worker_message::Msg::Nar(NarTransfer {
+                build_id: build_id.into(),
+                store_path: e.path.clone(),
+                payload: Some(nar_transfer::Payload::ZstdNarChunk(buf[..n].to_vec())),
+                eof: false,
+            })))?;
+        }
+        out_tx.blocking_send(msg(worker_message::Msg::Nar(NarTransfer {
+            build_id: build_id.into(),
+            store_path: e.path.clone(),
             payload: None,
             eof: true,
         })))?;

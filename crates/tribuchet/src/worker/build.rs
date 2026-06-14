@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 
 use super::caps::requires_uid_range;
 use super::logtail::tail_log;
-use super::resume::{FinishedBuild, PackedOutput, ResumeState};
+use super::resume::{FinishedBuild, PackedExtra, PackedOutput, ResumeState};
 use super::{cgroup, reaper, sandbox, unix_now, DaemonConn, WorkerCtx};
 use crate::chunkio::ChannelReader;
 use crate::nar;
@@ -483,29 +483,19 @@ impl ActiveBuild {
                 exit_code,
                 error,
                 outputs: Vec::new(),
+                extras: Vec::new(),
                 dir: self.dir.clone(),
                 finished_at: std::time::Instant::now(),
             });
         }
 
-        let extra_candidates = if spec.recursive_nix {
-            // The builder may have added paths via the daemon socket
-            // bind-mount; without widening the candidate set the
-            // ref-scan would miss them.
-            tokio::runtime::Handle::current()
-                .block_on(query_all_valid_paths())
-                .unwrap_or_else(|e| {
-                    tracing::warn!(id = a.build_id, "queryAllValidPaths failed: {e:#}");
-                    std::collections::BTreeSet::new()
-                })
-        } else {
-            std::collections::BTreeSet::new()
-        };
-        let packed = pack_outputs(&self.dir, &spec, &extra_candidates, deadline, signing_key)?;
+        let (packed, extras) =
+            pack_outputs_and_extras(&self.dir, &spec, deadline, signing_key, &a.build_id)?;
         Ok(FinishedBuild {
             exit_code: 0,
             error: String::new(),
             outputs: packed,
+            extras,
             dir: self.dir.clone(),
             finished_at: std::time::Instant::now(),
         })
@@ -540,6 +530,46 @@ impl ActiveBuild {
             tracing::warn!("cleaning up {}: {e}", self.dir.display());
         }
     }
+}
+
+/// Pack the outputs, then (under recursive-nix) the closure-delta
+/// extras.
+fn pack_outputs_and_extras(
+    dir: &Path,
+    spec: &sandbox::SandboxSpec,
+    deadline: std::time::Instant,
+    signing_key: &SecretKey,
+    build_id: &str,
+) -> Result<(Vec<PackedOutput>, Vec<PackedExtra>)> {
+    let extra_candidates = if spec.recursive_nix {
+        tokio::runtime::Handle::current()
+            .block_on(query_all_valid_paths())
+            .unwrap_or_else(|e| {
+                tracing::warn!(id = build_id, "queryAllValidPaths failed: {e:#}");
+                std::collections::BTreeSet::new()
+            })
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    let packed = pack_outputs(dir, spec, &extra_candidates, deadline, signing_key)?;
+    let extras = if spec.recursive_nix {
+        tokio::runtime::Handle::current()
+            .block_on(pack_extras(
+                dir,
+                &packed,
+                &spec.store_inputs,
+                &spec.outputs,
+                deadline,
+                signing_key,
+            ))
+            .unwrap_or_else(|e| {
+                tracing::warn!(id = build_id, "packing extras failed: {e:#}");
+                Vec::new()
+            })
+    } else {
+        Vec::new()
+    };
+    Ok((packed, extras))
 }
 
 /// Snapshot of every valid store path on the worker, used to widen
@@ -597,6 +627,106 @@ pub(super) fn pack_outputs(
         });
     }
     Ok(packed)
+}
+
+/// Pack the closure-delta extras: paths an output references that
+/// are neither inputs nor sibling outputs.
+async fn pack_extras(
+    dir: &Path,
+    outputs: &[PackedOutput],
+    store_inputs: &[String],
+    spec_outputs: &[String],
+    deadline: std::time::Instant,
+    signing_key: &SecretKey,
+) -> Result<Vec<PackedExtra>> {
+    let known: std::collections::BTreeSet<&str> = store_inputs
+        .iter()
+        .map(String::as_str)
+        .chain(spec_outputs.iter().map(String::as_str))
+        .collect();
+    let mut extras_set = std::collections::BTreeSet::new();
+    for o in outputs {
+        for r in &o.references {
+            if !known.contains(r.as_str()) {
+                extras_set.insert(r.clone());
+            }
+        }
+    }
+    if extras_set.is_empty() {
+        return Ok(Vec::new());
+    }
+    let store_dir = StoreDir::default();
+    let mut daemon = DaemonClient::builder()
+        .connect_daemon()
+        .await
+        .context("connecting to the local nix-daemon")?;
+    let mut out = Vec::new();
+    for path in extras_set {
+        let sp = StorePath::from_base_path(store_base(&path))
+            .with_context(|| format!("parsing extra path {path}"))?;
+        // Hold a temp root so the daemon does not GC the path while
+        // we read it.
+        daemon
+            .add_temp_root(&sp)
+            .await
+            .with_context(|| format!("temp-rooting {path}"))?;
+        let info = daemon
+            .query_path_info(&sp)
+            .await
+            .with_context(|| format!("queryPathInfo {path}"))?
+            .ok_or_else(|| anyhow::anyhow!("extra {path} vanished from store"))?;
+        // Re-scan the extra's NAR against its declared references so
+        // the hub-side import keeps the transitive closure intact.
+        let mut candidates: std::collections::BTreeSet<StorePath> =
+            info.references.iter().cloned().collect();
+        let self_sp = sp.clone();
+        candidates.insert(self_sp.clone());
+        let nar_file = dir.join(format!("extra-{}.nar.zst", store_base(&path)));
+        let res = pack_one_nar(
+            Path::new(&path),
+            &nar_file,
+            &candidates,
+            Some(&self_sp),
+            deadline,
+        )
+        .with_context(|| format!("packing extra {path}"))?;
+        // Daemon NAR layout is deterministic, so its recorded
+        // nar_size matches the bytes we just hashed.
+        let nar_size = info.nar_size;
+        let sig = signing_key.sign(format!("{path}:{}", hex::encode(&res.nar_sha256)).as_bytes());
+        out.push(PackedExtra {
+            path,
+            nar_file,
+            nar_sha256: res.nar_sha256,
+            nar_size,
+            signature: sig.to_string(),
+            references: info
+                .references
+                .iter()
+                .map(|p| {
+                    p.to_absolute_path(&store_dir)
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect(),
+            sigs: info.signatures.iter().map(ToString::to_string).collect(),
+            deriver: info
+                .deriver
+                .as_ref()
+                .map(|p| {
+                    p.to_absolute_path(&store_dir)
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .unwrap_or_default(),
+            ca: info
+                .ca
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+        });
+    }
+    Ok(out)
 }
 
 struct NarPackResult {
