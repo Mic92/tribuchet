@@ -488,7 +488,20 @@ impl ActiveBuild {
             });
         }
 
-        let packed = pack_outputs(&self.dir, &spec, deadline, signing_key)?;
+        let extra_candidates = if spec.recursive_nix {
+            // The builder may have added paths via the daemon socket
+            // bind-mount; without widening the candidate set the
+            // ref-scan would miss them.
+            tokio::runtime::Handle::current()
+                .block_on(query_all_valid_paths())
+                .unwrap_or_else(|e| {
+                    tracing::warn!(id = a.build_id, "queryAllValidPaths failed: {e:#}");
+                    std::collections::BTreeSet::new()
+                })
+        } else {
+            std::collections::BTreeSet::new()
+        };
+        let packed = pack_outputs(&self.dir, &spec, &extra_candidates, deadline, signing_key)?;
         Ok(FinishedBuild {
             exit_code: 0,
             error: String::new(),
@@ -529,15 +542,32 @@ impl ActiveBuild {
     }
 }
 
+/// Snapshot of every valid store path on the worker, used to widen
+/// the ref-scan candidate set when recursive-nix is on.
+async fn query_all_valid_paths(
+) -> Result<std::collections::BTreeSet<harmonia_store_path::StorePath>> {
+    let mut daemon = DaemonClient::builder()
+        .connect_daemon()
+        .await
+        .context("connecting to the local nix-daemon")?;
+    let set = daemon
+        .query_all_valid_paths()
+        .await
+        .context("queryAllValidPaths")?;
+    Ok(set.into_iter().collect())
+}
+
 /// Pack, hash and sign every output before announcing the result,
 /// because signatures travel in BuildResult ahead of the NAR data.
 pub(super) fn pack_outputs(
     dir: &Path,
     spec: &sandbox::SandboxSpec,
+    extra_candidates: &std::collections::BTreeSet<harmonia_store_path::StorePath>,
     deadline: std::time::Instant,
     signing_key: &SecretKey,
 ) -> Result<Vec<PackedOutput>> {
-    let candidates = scan_candidates(&spec.store_inputs, &spec.outputs);
+    let mut candidates = scan_candidates(&spec.store_inputs, &spec.outputs);
+    candidates.extend(extra_candidates.iter().cloned());
     let mut packed = Vec::new();
     for scratch in &spec.outputs {
         let host_path = sandbox::output_host_path(spec, scratch);

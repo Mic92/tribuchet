@@ -196,7 +196,13 @@ fn supervise_adopted(
         // one only stops packing a pathological (e.g. sparse-file)
         // output from running away.
         let deadline = std::time::Instant::now() + std::time::Duration::from_mins(10);
-        match pack_outputs(&dir, &st.spec, deadline, signing_key) {
+        // Resume path: skip the recursive-nix candidate widening.
+        // The daemon was queried on the original execute(); a
+        // worker-handover replay re-scans against inputs+outputs only,
+        // accepting that closure-delta extras from a resumed build
+        // miss any cross-references between added paths.
+        let extra_candidates = std::collections::BTreeSet::new();
+        match pack_outputs(&dir, &st.spec, &extra_candidates, deadline, signing_key) {
             Ok(outputs) => (0, String::new(), outputs),
             Err(e) => (1, format!("{e:#}"), vec![]),
         }
