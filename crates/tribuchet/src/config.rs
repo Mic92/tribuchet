@@ -92,6 +92,11 @@ pub struct WorkerConfig {
     /// baked in at build time, if any; "none" disables it.
     #[serde(default)]
     pub pasta: Option<PathBuf>,
+    /// Advertise the `recursive-nix` system feature so the hub routes
+    /// derivations using it here. Requires the patched Nix on the
+    /// client side (see `nix/patches/`).
+    #[serde(default)]
+    pub recursive_nix: bool,
 }
 
 fn default_state_dir() -> PathBuf {

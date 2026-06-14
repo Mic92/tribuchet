@@ -16,8 +16,8 @@ pub(super) fn requires_uid_range(env: &HashMap<String, String>) -> bool {
 /// System features this worker can honor, advertised to the hub for
 /// scheduling. Mirrors Nix's defaults. Emulated systems get only the
 /// baseline: kvm is an x86 device to an emulated guest, and uid-range
-/// under emulation is untested.
-fn local_features(native: bool, uid_base: u32) -> Vec<String> {
+/// and recursive-nix under emulation are untested.
+fn local_features(native: bool, opts: &WorkerConfig) -> Vec<String> {
     let mut features = vec![
         "nixos-test".to_owned(),
         "benchmark".to_owned(),
@@ -27,9 +27,12 @@ fn local_features(native: bool, uid_base: u32) -> Vec<String> {
         if std::path::Path::new("/dev/kvm").exists() {
             features.push("kvm".to_owned());
         }
-        if can_map_uid_range(uid_base) {
+        if can_map_uid_range(opts.auto_allocate_uids_base) {
             features.push("uid-range".to_owned());
         }
+    }
+    if native && opts.recursive_nix {
+        features.push("recursive-nix".to_owned());
     }
     features
 }
@@ -37,8 +40,8 @@ fn local_features(native: bool, uid_base: u32) -> Vec<String> {
 /// Per-system capability list for Register; native systems get the
 /// probed feature set, emulated ones only the baseline.
 pub(super) fn system_caps(opts: &WorkerConfig, ctx: &WorkerCtx) -> Vec<crate::proto::SystemCaps> {
-    let native = local_features(true, opts.auto_allocate_uids_base);
-    let emulated = local_features(false, opts.auto_allocate_uids_base);
+    let native = local_features(true, opts);
+    let emulated = local_features(false, opts);
     opts.systems
         .iter()
         .map(|s| crate::proto::SystemCaps {
@@ -130,5 +133,19 @@ mod tests {
         let mut env = HashMap::new();
         env.insert("__json".into(), r#"{"outputHash":"x"}"#.into());
         assert!(!requires_uid_range(&env));
+    }
+
+    #[test]
+    fn recursive_nix_advertised_only_when_enabled_and_native() {
+        let toml =
+            |body: &str| toml::from_str::<WorkerConfig>(&format!("hub = \"x\"\n{body}")).unwrap();
+        let off = toml("");
+        assert!(!local_features(true, &off).contains(&"recursive-nix".to_owned()));
+        assert!(!local_features(false, &off).contains(&"recursive-nix".to_owned()));
+
+        let on = toml("recursive-nix = true");
+        assert!(local_features(true, &on).contains(&"recursive-nix".to_owned()));
+        // emulated systems must not inherit the host's recursive-nix
+        assert!(!local_features(false, &on).contains(&"recursive-nix".to_owned()));
     }
 }
