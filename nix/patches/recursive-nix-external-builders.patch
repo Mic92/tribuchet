@@ -1,0 +1,89 @@
+From: Tribuchet contributors
+Subject: [PATCH] external builders: read result.json for recursive-nix additions
+
+external-derivation-builder.cc rejects recursive-nix, and the
+base-class registerOutputs() scans outputs against inputPaths ∪
+scratchOutputs ∪ addedPaths. addedPaths is populated only by Nix's
+in-process recursive-nix daemon, so for an external builder it is
+always empty: paths an out-of-process recursive implementation
+realises during the build are silently dropped from the output's
+registered closure, leaving a wrong PathInfo and a dangling reference
+after a GC.
+
+Drop the reject and add a processSandboxResult() virtual called
+between the build child's exit and registerOutputs(). The external
+builder's override reads an optional result.json next to build.json
+and inserts each entry of its addedPaths array into addedPaths.
+
+diff --git a/src/libstore/unix/build/derivation-builder.cc b/src/libstore/unix/build/derivation-builder.cc
+index fc877dd..8a37e45 100644
+--- a/src/libstore/unix/build/derivation-builder.cc
++++ b/src/libstore/unix/build/derivation-builder.cc
+@@ -441,6 +441,13 @@ private:
+ 
+ protected:
+ 
++    /**
++     * Subclass hook between the build child's exit and
++     * registerOutputs(), for inserting paths into addedPaths so the
++     * reference scan in registerOutputs() sees them.
++     */
++    virtual void processSandboxResult() {}
++
+     /**
+      * Delete the temporary directory, if we have one.
+      *
+@@ -600,6 +607,10 @@ SingleDrvOutputs DerivationBuilderImpl::unprepareBuild()
+         };
+     }
+ 
++    /* Subclass hook: insert recursive-nix additions into addedPaths
++       before the reference scan in registerOutputs(). */
++    processSandboxResult();
++
+     /* Compute the FS closure of the outputs and register them as
+        being valid. */
+     auto builtOutputs = registerOutputs();
+diff --git a/src/libstore/unix/build/external-derivation-builder.cc b/src/libstore/unix/build/external-derivation-builder.cc
+index 96301af..b90e03c 100644
+--- a/src/libstore/unix/build/external-derivation-builder.cc
++++ b/src/libstore/unix/build/external-derivation-builder.cc
+@@ -30,9 +30,6 @@ struct ExternalDerivationBuilder : DerivationBuilderImpl
+ 
+     void startChild() override
+     {
+-        if (drvOptions.getRequiredSystemFeatures(drv).count("recursive-nix"))
+-            throw Error("'recursive-nix' is not supported yet by external derivation builders");
+-
+         auto json = nlohmann::json::object();
+ 
+         json.emplace("version", 1);
+@@ -104,6 +101,28 @@ struct ExternalDerivationBuilder : DerivationBuilderImpl
+             }
+         });
+     }
++
++    /**
++     * Insert entries of `addedPaths` in an optional `result.json`
++     * next to `build.json` into addedPaths, so an external
++     * recursive-nix implementation (where Nix itself never sees the
++     * AddToStore calls) can still have its additions flow into the
++     * reference scan in registerOutputs().
++     */
++    void processSandboxResult() override
++    {
++        auto resultJsonPath = std::filesystem::path{topTmpDir} / "result.json";
++        if (!pathExists(resultJsonPath))
++            return;
++
++        auto result = nlohmann::json::parse(readFile(resultJsonPath));
++        auto added = result.find("addedPaths");
++        if (added == result.end() || !added->is_array())
++            return;
++
++        for (auto & p : *added)
++            addedPaths.insert(store.parseStorePath(p.get<std::string>()));
++    }
+ };
+ 
+ DerivationBuilderUnique makeExternalDerivationBuilder(

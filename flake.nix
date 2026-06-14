@@ -24,6 +24,16 @@
     in
     {
       packages = forAllSystems (pkgs: {
+        # Nix patched to let external builders implement recursive-nix:
+        # the rejection in external-derivation-builder.cc is dropped,
+        # and a result.json sidecar populates addedPaths so the output
+        # reference scan sees inner-built paths. Off-tree because the
+        # change is not upstream; opt in via
+        # services.tribuchet-hub.externalBuilders.recursiveNix.
+        nix-recursive = pkgs.nixVersions.latest.appendPatches [
+          ./nix/patches/recursive-nix-external-builders.patch
+        ];
+
         default = pkgs.rustPlatform.buildRustPackage (
           {
             pname = "tribuchet";

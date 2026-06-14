@@ -96,6 +96,16 @@ in
         default = true;
         description = "Patch Nix so uid-range derivations reach the external builder.";
       };
+      recursiveNix = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Patch Nix so external builders see recursive-nix derivations
+          and can populate the registered output closure via a
+          `result.json` sidecar. Off by default; only useful when a
+          tribuchet worker advertises the `recursive-nix` feature.
+        '';
+      };
     };
   };
 
@@ -127,10 +137,15 @@ in
   config = lib.mkMerge [
     (lib.mkIf (hub.enable && hub.externalBuilders.enable) {
       nix.package =
-        if hub.externalBuilders.patchNix then
-          hub.externalBuilders.nixPackage.appendPatches [ ./patches/external-builders-uid-range.patch ]
+        let
+          patches =
+            lib.optional hub.externalBuilders.patchNix ./patches/external-builders-uid-range.patch
+            ++ lib.optional hub.externalBuilders.recursiveNix ./patches/recursive-nix-external-builders.patch;
+        in
+        if patches == [ ] then
+          hub.externalBuilders.nixPackage
         else
-          hub.externalBuilders.nixPackage;
+          hub.externalBuilders.nixPackage.appendPatches patches;
       nix.settings = {
         experimental-features = [ "external-builders" ];
         external-builders = builtins.toJSON [
