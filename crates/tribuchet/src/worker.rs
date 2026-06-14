@@ -169,7 +169,6 @@ fn tail_log(
     build_id: &str,
     out_tx: &mpsc::Sender<WorkerMessage>,
     done: impl Fn() -> bool,
-    mut on_chunk: impl FnMut(usize),
 ) {
     use std::io::Seek;
     let Ok(mut file) = std::fs::File::open(dir.join("build.log")) else {
@@ -190,7 +189,6 @@ fn tail_log(
             }
             Err(_) => break,
             Ok(n) => {
-                on_chunk(n);
                 if out_tx
                     .blocking_send(msg(worker_message::Msg::Log(LogChunk {
                         build_id: build_id.into(),
@@ -226,7 +224,7 @@ fn spawn_log_tail(
                 map.get(&key).is_none_or(|e| e.finished.is_some())
             }
         };
-        tail_log(&dir, &build_id, &out_tx, done, |_| {});
+        tail_log(&dir, &build_id, &out_tx, done);
     });
     LogTail { done, handle }
 }
@@ -1441,34 +1439,18 @@ impl ActiveBuild {
         };
         std::fs::write(self.dir.join("resume.json"), serde_json::to_vec(&resume)?)?;
 
-        let log_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        // ms since `started`, updated on every log chunk
-        let last_log_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let started = std::time::Instant::now();
         let log_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let tailer = {
             let tx = out_tx.clone();
             let build_id = a.build_id.clone();
-            let log_bytes = log_bytes.clone();
-            let last_log_ms = last_log_ms.clone();
             let log_done = log_done.clone();
             let dir = self.dir.clone();
             std::thread::spawn(move || {
                 use std::sync::atomic::Ordering;
-                tail_log(
-                    &dir,
-                    &build_id,
-                    &tx,
-                    || log_done.load(Ordering::Relaxed),
-                    |n| {
-                        log_bytes.fetch_add(n as u64, Ordering::Relaxed);
-                        last_log_ms.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
-                    },
-                );
+                tail_log(&dir, &build_id, &tx, || log_done.load(Ordering::Relaxed));
             })
         };
         let pgrp = nix::unistd::Pid::from_raw(pid);
-        let max_silent_ms = self.ctx.max_silent_time.as_millis() as u64;
         let max_log = self.ctx.max_log_size;
         use std::sync::atomic::Ordering;
         let mut abort: Option<String> = None;
@@ -1476,17 +1458,24 @@ impl ActiveBuild {
             if let Some(code) = reaper::take_status(&self.ctx.status_dir, &req.token) {
                 break code;
             }
-            // saturating: a log thread may store a newer timestamp
-            // between the elapsed() read and the load
-            let silent_ms = (started.elapsed().as_millis() as u64)
-                .saturating_sub(last_log_ms.load(Ordering::Relaxed));
+            // The guards read the log file itself (size for max-log-size,
+            // mtime for max-silent-time), like supervise_adopted: counters
+            // fed by the session-bound tailer freeze when the hub session
+            // drops and would kill a healthy, actively-logging build.
+            let log_meta = std::fs::metadata(&log_path).ok();
+            let silent = log_meta
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.elapsed().ok())
+                .unwrap_or_default();
+            let log_size = log_meta.map(|m| m.len()).unwrap_or(0);
             if self.ctx.cancelled.lock().unwrap().remove(&a.dedupe_key) {
                 abort = Some("build cancelled".into());
             } else if std::time::Instant::now() >= deadline {
                 abort = Some(format!("build timed out after {}s", timeout.as_secs()));
-            } else if max_log > 0 && log_bytes.load(Ordering::Relaxed) > max_log {
+            } else if max_log > 0 && log_size > max_log {
                 abort = Some(format!("build log exceeded the limit of {max_log} bytes"));
-            } else if max_silent_ms > 0 && silent_ms > max_silent_ms {
+            } else if !self.ctx.max_silent_time.is_zero() && silent > self.ctx.max_silent_time {
                 abort = Some(format!(
                     "build produced no output for {}s",
                     self.ctx.max_silent_time.as_secs()
