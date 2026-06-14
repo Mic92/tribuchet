@@ -1114,10 +1114,21 @@ mod platform {
              (allow file-ioctl)\n",
         );
         for secret in &spec.deny_read {
-            profile.push_str(&format!(
-                "(deny file-read* (literal \"{}\"))\n",
-                sb_escape(&secret.to_string_lossy())?
-            ));
+            // Seatbelt matches path filters against the canonical vnode
+            // path; the configured paths usually live under /var, which
+            // is a symlink to /private/var, so a deny on the literal
+            // alone would never match. Emit both forms.
+            let canonical = secret.canonicalize().unwrap_or_else(|_| secret.clone());
+            let mut paths = vec![secret];
+            if canonical != *secret {
+                paths.push(&canonical);
+            }
+            for path in paths {
+                profile.push_str(&format!(
+                    "(deny file-read* (literal \"{}\"))\n",
+                    sb_escape(&path.to_string_lossy())?
+                ));
+            }
         }
         profile.push_str("(allow file-write*\n");
         for path in [spec.cwd.as_str(), &spec.build_dir.to_string_lossy()] {
