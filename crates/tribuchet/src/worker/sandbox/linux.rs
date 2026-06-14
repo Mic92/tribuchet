@@ -307,6 +307,10 @@ fn ioerr(step: &str) -> impl Fn(nix::errno::Errno) -> io::Error + '_ {
     move |e| io::Error::other(format!("{step}: {e}"))
 }
 
+fn werr(step: &'static str) -> impl Fn(io::Error) -> io::Error {
+    move |e| io::Error::other(format!("{step}: {e}"))
+}
+
 /// Unshare and have a forked helper, still in the parent user
 /// namespace, write this process's uid/gid maps: multi-uid ranges
 /// need CAP_SETUID *there*, which the unshared process no longer
@@ -507,24 +511,6 @@ struct SetupParams<'a> {
 }
 
 fn setup(p: &SetupParams) -> io::Result<()> {
-    let SetupParams {
-        root,
-        system,
-        binfmt_line,
-        pasta,
-        fod_uid,
-        build_dir,
-        binds,
-        binds_dev,
-        cwd,
-        network,
-        has_cgroup,
-        sandbox_uid,
-        host_uid,
-        sandbox_gid,
-        host_gid,
-        uid_count,
-    } = *p;
     let mut flags = CloneFlags::CLONE_NEWUSER
         | CloneFlags::CLONE_NEWNS
         | CloneFlags::CLONE_NEWPID
@@ -535,7 +521,7 @@ fn setup(p: &SetupParams) -> io::Result<()> {
     // Drop host root before creating any namespace, so the userns
     // is owned by the unprivileged uid and rootless pasta can
     // attach to it.
-    if let Some(uid) = fod_uid {
+    if let Some(uid) = p.fod_uid {
         nix::unistd::setgroups(&[]).map_err(ioerr("fod setgroups"))?;
         nix::unistd::setgid(nix::unistd::Gid::from_raw(uid)).map_err(ioerr("fod setgid"))?;
         nix::unistd::setuid(nix::unistd::Uid::from_raw(uid)).map_err(ioerr("fod setuid"))?;
@@ -544,46 +530,42 @@ fn setup(p: &SetupParams) -> io::Result<()> {
         // (and pasta's /proc access) work.
         nix::sys::prctl::set_dumpable(true).map_err(ioerr("set_dumpable"))?;
     }
-    let private_net = !network || pasta.is_some();
+    let private_net = !p.network || p.pasta.is_some();
     if private_net {
         flags |= CloneFlags::CLONE_NEWNET;
     }
-    let pasta_helper = match pasta {
-        Some(bin) if network => Some(fork_pasta_helper(bin)?),
+    let pasta_helper = match p.pasta {
+        Some(bin) if p.network => Some(fork_pasta_helper(bin)?),
         _ => None,
     };
-    if has_cgroup {
+    if p.has_cgroup {
         // Cgroup namespace rooted at the just-entered build cgroup:
         // the cgroup2 mount below then exposes only the build's own
         // delegated subtree (usable by nspawn inside the sandbox).
         flags |= CloneFlags::CLONE_NEWCGROUP;
     }
-    let werr = |step: &str| {
-        let step = step.to_string();
-        move |e: io::Error| io::Error::other(format!("{step}: {e}"))
-    };
-    if uid_count == 1 {
+    if p.uid_count == 1 {
         // Unprivileged self-mapping of the caller's own uid.
         unshare(flags).map_err(ioerr("unshare"))?;
         std::fs::write("/proc/self/setgroups", "deny").map_err(werr("setgroups"))?;
         std::fs::write(
             "/proc/self/uid_map",
-            format!("{sandbox_uid} {host_uid} {uid_count}"),
+            format!("{} {} {}", p.sandbox_uid, p.host_uid, p.uid_count),
         )
         .map_err(werr("uid_map"))?;
         std::fs::write(
             "/proc/self/gid_map",
-            format!("{sandbox_gid} {host_gid} {uid_count}"),
+            format!("{} {} {}", p.sandbox_gid, p.host_gid, p.uid_count),
         )
         .map_err(werr("gid_map"))?;
     } else {
         map_uid_range_via_helper(
             flags,
-            sandbox_uid,
-            host_uid,
-            sandbox_gid,
-            host_gid,
-            uid_count,
+            p.sandbox_uid,
+            p.host_uid,
+            p.sandbox_gid,
+            p.host_gid,
+            p.uid_count,
         )?;
     }
     sethostname("localhost").map_err(ioerr("sethostname"))?;
@@ -604,6 +586,46 @@ fn setup(p: &SetupParams) -> io::Result<()> {
         unreachable!("parent never returns");
     }
 
+    mount_filesystems(p)?;
+
+    // pivot_root + detach the old root: unlike a bare chroot, the
+    // host filesystem is no longer reachable in this namespace.
+    std::env::set_current_dir(p.root).map_err(werr("chdir to root"))?;
+    pivot_root(".", ".").map_err(ioerr("pivot_root"))?;
+    umount2(".", MntFlags::MNT_DETACH).map_err(ioerr("detaching old root"))?;
+    std::env::set_current_dir("/").map_err(werr("chdir /"))?;
+    std::env::set_current_dir(p.cwd)
+        .map_err(|e| io::Error::other(format!("chdir {}: {e}", p.cwd)))?;
+
+    if let Some(line) = p.binfmt_line {
+        register_binfmt(line)?;
+    }
+    apply_process_limits(p.system)?;
+
+    // uid-range: become the in-namespace root the mapping promised;
+    // the worker's own uid is outside the mapped block. Single-uid
+    // builds already run as the mapped uid.
+    if p.uid_count > 1 {
+        nix::unistd::setgroups(&[]).map_err(ioerr("setgroups"))?;
+        nix::unistd::setgid(nix::unistd::Gid::from_raw(p.sandbox_gid)).map_err(ioerr("setgid"))?;
+        nix::unistd::setuid(nix::unistd::Uid::from_raw(p.sandbox_uid)).map_err(ioerr("setuid"))?;
+    } else if p.binfmt_line.is_some() {
+        // binfmt registration needed in-namespace root; remap to
+        // Nix's uid 1000 via a nested userns. Exec lookup falls back
+        // to the ancestor namespace's binfmt instance.
+        unshare(CloneFlags::CLONE_NEWUSER).map_err(ioerr("nested unshare"))?;
+        std::fs::write("/proc/self/setgroups", "deny").map_err(werr("nested setgroups"))?;
+        std::fs::write("/proc/self/uid_map", "1000 0 1").map_err(werr("nested uid_map"))?;
+        std::fs::write("/proc/self/gid_map", "100 0 1").map_err(werr("nested gid_map"))?;
+    }
+    Ok(())
+}
+
+/// Bind the sandbox root over itself, populate it with input/device
+/// binds and the pseudo-filesystems the builder expects. Runs in the
+/// PID-1 child after fork, before pivot_root.
+fn mount_filesystems(p: &SetupParams) -> io::Result<()> {
+    let root = p.root;
     let none: Option<&str> = None;
     mount(none, "/", none, MsFlags::MS_REC | MsFlags::MS_PRIVATE, none)
         .map_err(ioerr("making / private"))?;
@@ -643,13 +665,13 @@ fn setup(p: &SetupParams) -> io::Result<()> {
     // prefix of a client-influenced destination would let a request
     // bind host devices read-write.
     let nosuid_nodev = MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
-    for (src, dst) in binds {
+    for (src, dst) in p.binds {
         bind_one(src, dst, true, nosuid_nodev)?;
     }
-    for (src, dst) in binds_dev {
+    for (src, dst) in p.binds_dev {
         bind_one(src, dst, false, MsFlags::MS_NOSUID)?;
     }
-    bind_one(build_dir, Path::new(cwd), false, nosuid_nodev)?;
+    bind_one(p.build_dir, Path::new(p.cwd), false, nosuid_nodev)?;
 
     mount(
         Some("tmpfs"),
@@ -683,7 +705,7 @@ fn setup(p: &SetupParams) -> io::Result<()> {
     // Like Nix: uid-range builds get a real sysfs (the userns owns
     // its netns, so the kernel allows it); container managers fail
     // without one ("VFS: Mount too revealing").
-    if uid_count > 1 {
+    if p.uid_count > 1 {
         mount(
             Some("sysfs"),
             &root.join("sys"),
@@ -694,7 +716,7 @@ fn setup(p: &SetupParams) -> io::Result<()> {
         .map_err(ioerr("mounting /sys"))?;
     }
 
-    if has_cgroup {
+    if p.has_cgroup {
         // the cgroup namespace makes the build's own cgroup the root
         mount(
             Some("cgroup2"),
@@ -705,43 +727,36 @@ fn setup(p: &SetupParams) -> io::Result<()> {
         )
         .map_err(ioerr("mounting /sys/fs/cgroup"))?;
     }
+    Ok(())
+}
 
-    // pivot_root + detach the old root: unlike a bare chroot, the
-    // host filesystem is no longer reachable in this namespace.
-    std::env::set_current_dir(root).map_err(|e| io::Error::other(format!("chdir to root: {e}")))?;
-    pivot_root(".", ".").map_err(ioerr("pivot_root"))?;
-    umount2(".", MntFlags::MNT_DETACH).map_err(ioerr("detaching old root"))?;
-    std::env::set_current_dir("/").map_err(|e| io::Error::other(format!("chdir /: {e}")))?;
-    std::env::set_current_dir(cwd).map_err(|e| io::Error::other(format!("chdir {cwd}: {e}")))?;
+/// Fresh per-userns binfmt_misc instance (kernel 6.7+) so emulated
+/// builds bind their interpreter without touching the host registry.
+fn register_binfmt(line: &str) -> io::Result<()> {
+    mount(
+        Some("binfmt_misc"),
+        "/proc/sys/fs/binfmt_misc",
+        Some("binfmt_misc"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+        None::<&str>,
+    )
+    .map_err(ioerr(
+        "mounting binfmt_misc (emulated builds need kernel 6.7+)",
+    ))?;
+    std::fs::write("/proc/sys/fs/binfmt_misc/register", line)
+        .map_err(werr("registering binfmt entry"))
+}
 
-    if let Some(line) = binfmt_line {
-        // Fresh per-userns binfmt_misc instance (kernel 6.7+).
-        mount(
-            Some("binfmt_misc"),
-            "/proc/sys/fs/binfmt_misc",
-            Some("binfmt_misc"),
-            MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
-            none,
-        )
-        .map_err(ioerr(
-            "mounting binfmt_misc (emulated builds need kernel 6.7+)",
-        ))?;
-        std::fs::write("/proc/sys/fs/binfmt_misc/register", line)
-            .map_err(|e| io::Error::other(format!("registering binfmt entry: {e}")))?;
-    }
-
-    // Last-resort fork-bomb brake; the PID namespace makes the bomb
-    // killable, the rlimit caps how big it can get. Clamp to the
-    // inherited hard limit: raising it needs init-ns CAP_SYS_RESOURCE,
-    // which the child userns does not have.
+/// Match Nix's process environment: no core dumps in outputs, a
+/// predictable umask (output modes feed the NAR hash), 32-bit
+/// personality for 32-bit systems, no ASLR for determinism, no
+/// privilege gain via setuid binaries, and a fork-bomb-braking
+/// RLIMIT_NPROC clamped to the inherited hard limit (raising it needs
+/// init-ns CAP_SYS_RESOURCE, which the child userns does not have).
+fn apply_process_limits(system: &str) -> io::Result<()> {
     let (_, hard) = getrlimit(Resource::RLIMIT_NPROC).map_err(ioerr("getrlimit NPROC"))?;
     let limit = hard.min(4096);
     setrlimit(Resource::RLIMIT_NPROC, limit, limit).map_err(ioerr("setting RLIMIT_NPROC"))?;
-
-    // Like Nix: no core dumps in outputs, a predictable umask
-    // (output modes feed the NAR hash), 32-bit personality for
-    // 32-bit systems, no ASLR for determinism, and no privilege
-    // gain via setuid binaries.
     setrlimit(Resource::RLIMIT_CORE, 0, nix::sys::resource::RLIM_INFINITY)
         .map_err(ioerr("setting RLIMIT_CORE"))?;
     nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o022));
@@ -761,25 +776,7 @@ fn setup(p: &SetupParams) -> io::Result<()> {
     if let Ok(persona) = personality::get() {
         let _ = personality::set(persona | Persona::ADDR_NO_RANDOMIZE);
     }
-    nix::sys::prctl::set_no_new_privs().map_err(ioerr("PR_SET_NO_NEW_PRIVS"))?;
-
-    // uid-range: become the in-namespace root the mapping promised;
-    // the worker's own uid is outside the mapped block. Single-uid
-    // builds already run as the mapped uid.
-    if uid_count > 1 {
-        nix::unistd::setgroups(&[]).map_err(ioerr("setgroups"))?;
-        nix::unistd::setgid(nix::unistd::Gid::from_raw(sandbox_gid)).map_err(ioerr("setgid"))?;
-        nix::unistd::setuid(nix::unistd::Uid::from_raw(sandbox_uid)).map_err(ioerr("setuid"))?;
-    } else if binfmt_line.is_some() {
-        // binfmt registration needed in-namespace root; remap to
-        // Nix's uid 1000 via a nested userns. Exec lookup falls back
-        // to the ancestor namespace's binfmt instance.
-        unshare(CloneFlags::CLONE_NEWUSER).map_err(ioerr("nested unshare"))?;
-        std::fs::write("/proc/self/setgroups", "deny").map_err(werr("nested setgroups"))?;
-        std::fs::write("/proc/self/uid_map", "1000 0 1").map_err(werr("nested uid_map"))?;
-        std::fs::write("/proc/self/gid_map", "100 0 1").map_err(werr("nested gid_map"))?;
-    }
-    Ok(())
+    nix::sys::prctl::set_no_new_privs().map_err(ioerr("PR_SET_NO_NEW_PRIVS"))
 }
 
 pub fn setup_error_file(root: &Path) -> PathBuf {
