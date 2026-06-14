@@ -164,6 +164,18 @@ impl WorkerCtx {
 /// Load or create the worker's NAR signing key, stored in Nix's
 /// "name:base64" secret key format (nix-store --generate-binary-cache-key)
 /// so operators can inspect it with standard tooling.
+/// 1-minute load average for the heartbeat; informational only, the
+/// hub does not schedule on it.
+fn loadavg1() -> f64 {
+    let mut avg = [0.0f64; 1];
+    // SAFETY: getloadavg writes at most nelem doubles to the buffer.
+    if unsafe { libc::getloadavg(avg.as_mut_ptr(), 1) } == 1 {
+        avg[0]
+    } else {
+        0.0
+    }
+}
+
 fn hostname() -> String {
     nix::unistd::gethostname()
         .ok()
@@ -414,7 +426,7 @@ async fn session(
                     running_jobs: heartbeat_ctx
                         .running
                         .load(std::sync::atomic::Ordering::Relaxed),
-                    load1: 0.0,
+                    load1: loadavg1(),
                 })))
                 .await
                 .is_err()
