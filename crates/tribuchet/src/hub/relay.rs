@@ -15,8 +15,8 @@ use super::state::{HubState, Job};
 use crate::chunkio::ChunkWriter;
 use crate::proto::{
     attach_event, hub_message, nar_transfer, worker_message, BuildAssignment, CancelBuild,
-    HubMessage, NarTransfer, OutputNar, OutputSignature, PathInfoMsg, PathOffer, ResultAck,
-    TmpDirArchive,
+    ExtraPath, HubMessage, NarTransfer, OutputNar, OutputSignature, PathInfoMsg, PathOffer,
+    ResultAck, TmpDirArchive,
 };
 
 /// How long a dispatched build may run with no attach client listening
@@ -72,7 +72,7 @@ pub(super) async fn run_job(
             // restart); skip staging, its result arrives like any other.
             worker_message::Msg::Resumed(_) => {
                 tracing::info!(id = job.id, "worker resumed an in-flight build");
-                return relay_build(job, vkey, out_tx, &mut in_rx).await;
+                return relay_build(state, job, vkey, out_tx, &mut in_rx).await;
             }
             // A resumed build's log tail can race ahead of its Resumed
             // reply (separate task, same stream); pass the chunk on.
@@ -140,7 +140,7 @@ pub(super) async fn run_job(
     }
     stream_tmp_dir(&job.id, job.tmp_dir.clone(), out_tx).await?;
 
-    relay_build(job, vkey, out_tx, &mut in_rx).await
+    relay_build(state, job, vkey, out_tx, &mut in_rx).await
 }
 
 /// Log/error-safe name of a worker message variant. The messages embed
@@ -453,6 +453,137 @@ fn verify_set(
     Ok(pending)
 }
 
+/// In-flight AddToStoreNar of one recursive-nix extra. Chunks stream
+/// through `tx` into a daemon-pool connection held by `task`.
+struct ExtraImport {
+    tx: mpsc::Sender<bytes::Bytes>,
+    task: tokio::task::JoinHandle<Result<()>>,
+}
+
+/// Verify each extra's worker signature over `path:nar_sha256_hex`
+/// (the same envelope as outputs) and spawn the daemon import. The
+/// daemon then verifies on its end that the NAR matches the signed
+/// hash.
+fn start_extras(
+    state: &HubState,
+    vkey: &PublicKey,
+    reported: Vec<ExtraPath>,
+) -> Result<HashMap<String, ExtraImport>> {
+    let mut out = HashMap::with_capacity(reported.len());
+    for extra in reported {
+        let info = extra
+            .info
+            .ok_or_else(|| anyhow::anyhow!("extra without PathInfo"))?;
+        let path = info.store_path.clone();
+        let sig: Signature = extra
+            .signature
+            .parse()
+            .context("malformed extra signature")?;
+        let envelope = format!("{}:{}", path, hex::encode(&info.nar_sha256));
+        if !vkey.verify(envelope.as_bytes(), &sig) {
+            bail!("signature verification failed for extra {path}");
+        }
+        let parsed = crate::store::parse_path_info(&info).context("parsing extra PathInfo")?;
+        let (tx, rx) = mpsc::channel::<bytes::Bytes>(8);
+        let pool = state.daemon_pool.clone();
+        let task = tokio::spawn(async move { import_extra(&pool, parsed, rx).await });
+        out.insert(path, ExtraImport { tx, task });
+    }
+    Ok(out)
+}
+
+async fn import_extra(
+    pool: &harmonia_store_remote::ConnectionPool,
+    info: harmonia_store_path_info::ValidPathInfo,
+    rx: mpsc::Receiver<bytes::Bytes>,
+) -> Result<()> {
+    use futures_util::StreamExt as _;
+    use harmonia_store_remote::DaemonStore as _;
+    use tokio::io::AsyncReadExt as _;
+    let mut guard = pool
+        .acquire()
+        .await
+        .context("connecting to the local nix-daemon")?;
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(Ok::<_, std::io::Error>);
+    let reader = tokio_util::io::StreamReader::new(stream);
+    let dec =
+        async_compression::tokio::bufread::ZstdDecoder::new(tokio::io::BufReader::new(reader));
+    let limited = tokio::io::BufReader::new(dec.take(info.info.nar_size));
+    guard
+        .client()
+        .add_to_store_nar(&info, limited, false, true)
+        .await
+        .map_err(|e| anyhow::anyhow!("registering extra {} via daemon: {e}", info.path))
+}
+
+async fn relay_output_chunk(
+    vkey: &PublicKey,
+    pending: &mut HashMap<String, OutputVerify>,
+    replay: &super::state::Replay,
+    n: &NarTransfer,
+) -> Result<()> {
+    let verify = pending.get_mut(&n.store_path).unwrap();
+    if let Some(nar_transfer::Payload::ZstdNarChunk(chunk)) = &n.payload {
+        tokio::task::block_in_place(|| verify.decoder.write_all(chunk))?;
+        replay
+            .publish(attach_event::Event::Output(OutputNar {
+                store_path: n.store_path.clone(),
+                zstd_nar_chunk: chunk.clone(),
+                eof: false,
+            }))
+            .await;
+    }
+    if n.eof {
+        let mut verify = pending.remove(&n.store_path).unwrap();
+        verify.decoder.flush()?;
+        let hash = verify.decoder.into_inner().hasher.finalize();
+        let msg = format!("{}:{}", n.store_path, hex::encode(hash));
+        if !vkey.verify(msg.as_bytes(), &verify.signature) {
+            bail!("signature verification failed for {}", n.store_path);
+        }
+        replay
+            .publish(attach_event::Event::Output(OutputNar {
+                store_path: n.store_path.clone(),
+                zstd_nar_chunk: Vec::new(),
+                eof: true,
+            }))
+            .await;
+    }
+    Ok(())
+}
+
+async fn relay_extra_chunk(
+    extras: &mut HashMap<String, ExtraImport>,
+    replay: &super::state::Replay,
+    n: NarTransfer,
+) -> Result<()> {
+    let extra = extras.get_mut(&n.store_path).unwrap();
+    if let Some(nar_transfer::Payload::ZstdNarChunk(chunk)) = n.payload {
+        if extra.tx.send(chunk.into()).await.is_err() {
+            let extra = extras.remove(&n.store_path).unwrap();
+            return Err(extra.task.await?.unwrap_err());
+        }
+    }
+    if n.eof {
+        let extra = extras.remove(&n.store_path).unwrap();
+        drop(extra.tx);
+        extra.task.await??;
+        replay
+            .publish(attach_event::Event::AddedPath(n.store_path))
+            .await;
+    }
+    Ok(())
+}
+
+async fn finish_relay(
+    out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
+    replay: &super::state::Replay,
+    job: &Job,
+) {
+    replay.publish(attach_event::Event::ExitCode(0)).await;
+    ack_result(out_tx, job).await;
+}
+
 /// Tell the worker its result (and all output NARs) arrived intact,
 /// so it can stop keeping the build for redelivery. Best effort: a
 /// lost ack only means the worker holds the build dir until its TTL.
@@ -468,12 +599,14 @@ async fn ack_result(out_tx: &mpsc::Sender<Result<HubMessage, Status>>, job: &Job
 }
 
 async fn relay_build(
+    state: &HubState,
     job: &Job,
     vkey: &PublicKey,
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
     in_rx: &mut mpsc::Receiver<worker_message::Msg>,
 ) -> Result<()> {
     let mut pending: HashMap<String, OutputVerify> = HashMap::new();
+    let mut extras: HashMap<String, ExtraImport> = HashMap::new();
     let mut awaiting_outputs = false;
     let mut abandoned_since: Option<std::time::Instant> = None;
     let mut cancel_sent = false;
@@ -537,43 +670,24 @@ async fn relay_build(
                     return Ok(());
                 }
                 pending = verify_set(res.outputs, &job.req.outputs)?;
+                extras = start_extras(state, vkey, res.extras)?;
                 awaiting_outputs = true;
+                if pending.is_empty() && extras.is_empty() {
+                    finish_relay(out_tx, &job.replay, job).await;
+                    return Ok(());
+                }
             }
             worker_message::Msg::Nar(n) if awaiting_outputs => {
-                let Some(verify) = pending.get_mut(&n.store_path) else {
-                    bail!("worker sent unexpected output {}", n.store_path);
-                };
-                if let Some(nar_transfer::Payload::ZstdNarChunk(chunk)) = &n.payload {
-                    // CPU work off the shared executor threads
-                    tokio::task::block_in_place(|| verify.decoder.write_all(chunk))?;
-                    job.replay
-                        .publish(attach_event::Event::Output(OutputNar {
-                            store_path: n.store_path.clone(),
-                            zstd_nar_chunk: chunk.clone(),
-                            eof: false,
-                        }))
-                        .await;
+                if pending.contains_key(&n.store_path) {
+                    relay_output_chunk(vkey, &mut pending, &job.replay, &n).await?;
+                } else if extras.contains_key(&n.store_path) {
+                    relay_extra_chunk(&mut extras, &job.replay, n).await?;
+                } else {
+                    bail!("worker sent unexpected store path {}", n.store_path);
                 }
-                if n.eof {
-                    let mut verify = pending.remove(&n.store_path).unwrap();
-                    verify.decoder.flush()?;
-                    let hash = verify.decoder.into_inner().hasher.finalize();
-                    let msg = format!("{}:{}", n.store_path, hex::encode(hash));
-                    if !vkey.verify(msg.as_bytes(), &verify.signature) {
-                        bail!("signature verification failed for {}", n.store_path);
-                    }
-                    job.replay
-                        .publish(attach_event::Event::Output(OutputNar {
-                            store_path: n.store_path.clone(),
-                            zstd_nar_chunk: Vec::new(),
-                            eof: true,
-                        }))
-                        .await;
-                    if pending.is_empty() {
-                        job.replay.publish(attach_event::Event::ExitCode(0)).await;
-                        ack_result(out_tx, job).await;
-                        return Ok(());
-                    }
+                if pending.is_empty() && extras.is_empty() {
+                    finish_relay(out_tx, &job.replay, job).await;
+                    return Ok(());
                 }
             }
             other => bail!("unexpected worker message: {}", msg_name(&other)),
@@ -664,6 +778,41 @@ mod tests {
             found.get(Path::new("sub/file")),
             Some(&tar::EntryType::Regular),
             "{found:?}"
+        );
+    }
+
+    /// Wrong-key signatures must fail before any daemon contact, so a
+    /// compromised worker cannot plant store paths on the client.
+    #[tokio::test]
+    async fn extras_with_wrong_signature_are_rejected() {
+        use harmonia_utils_signature::SecretKey;
+        let hub_sk = SecretKey::generate("hub-trusted-key-1".into()).unwrap();
+        let attacker_sk = SecretKey::generate("attacker-1".into()).unwrap();
+        let vkey = hub_sk.to_public_key();
+
+        let path = format!("/nix/store/{}-extra", "0".repeat(32));
+        let nar_sha256 = vec![0u8; 32];
+        let envelope = format!("{path}:{}", hex::encode(&nar_sha256));
+        let bad = ExtraPath {
+            info: Some(PathInfoMsg {
+                build_id: String::new(),
+                store_path: path.clone(),
+                nar_sha256: nar_sha256.clone(),
+                nar_size: 1024,
+                references: vec![],
+                signatures: vec![],
+                deriver: String::new(),
+                ca: String::new(),
+            }),
+            signature: attacker_sk.sign(envelope.as_bytes()).to_string(),
+        };
+        let state = HubState::default();
+        let err = start_extras(&state, &vkey, vec![bad])
+            .err()
+            .expect("expected signature rejection");
+        assert!(
+            err.to_string().contains("signature verification failed"),
+            "{err}"
         );
     }
 }

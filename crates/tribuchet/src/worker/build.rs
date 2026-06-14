@@ -1,13 +1,13 @@
 //! One build on this worker: input staging, sandbox execution, output packing.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 use anyhow::{bail, Context, Result};
 use harmonia_store_path::{StoreDir, StorePath};
-use harmonia_store_path_info::{NarHash, UnkeyedValidPathInfo, ValidPathInfo};
+use harmonia_store_path_info::ValidPathInfo;
 use harmonia_store_remote::{DaemonClient, DaemonStore};
 use harmonia_utils_signature::SecretKey;
 use sha2::{Digest, Sha256};
@@ -20,7 +20,7 @@ use super::{cgroup, reaper, sandbox, unix_now, DaemonConn, WorkerCtx};
 use crate::chunkio::ChannelReader;
 use crate::nar;
 use crate::proto::{nar_transfer, BuildAssignment, NarTransfer, PathInfoMsg, WorkerMessage};
-use crate::store::{valid_store_path, STORE_DIR};
+use crate::store::{parse_path_info, valid_store_path, STORE_DIR};
 
 impl WorkerCtx {
     fn alloc_uid_slot(self: &std::sync::Arc<Self>) -> Option<UidSlot> {
@@ -176,35 +176,6 @@ pub(super) struct ActiveBuild {
 
 fn store_base(store_path: &str) -> &str {
     store_path.rsplit('/').next().unwrap_or(store_path)
-}
-
-/// Wire metadata -> daemon ValidPathInfo.
-fn parse_path_info(msg: &PathInfoMsg) -> Result<ValidPathInfo> {
-    let store_dir = StoreDir::default();
-    Ok(ValidPathInfo {
-        path: store_dir.parse(&msg.store_path)?,
-        info: UnkeyedValidPathInfo {
-            deriver: (!msg.deriver.is_empty())
-                .then(|| store_dir.parse(&msg.deriver))
-                .transpose()?,
-            nar_hash: NarHash::from_slice(&msg.nar_sha256)?,
-            references: msg
-                .references
-                .iter()
-                .map(|r| store_dir.parse(r))
-                .collect::<Result<BTreeSet<StorePath>, _>>()?,
-            registration_time: None,
-            nar_size: msg.nar_size,
-            ultimate: false,
-            signatures: msg
-                .signatures
-                .iter()
-                .map(|s| s.parse())
-                .collect::<Result<BTreeSet<_>, _>>()?,
-            ca: (!msg.ca.is_empty()).then(|| msg.ca.parse()).transpose()?,
-            store_dir,
-        },
-    })
 }
 
 /// Drive one AddToStoreNar: hub chunks -> zstd decode -> daemon. The

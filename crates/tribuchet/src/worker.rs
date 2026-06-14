@@ -642,6 +642,7 @@ async fn fail_build(
             build_id: build_id.into(),
             exit_code: 1,
             outputs: vec![],
+            extras: vec![],
             error: format!("{err:#}"),
         })))
         .await

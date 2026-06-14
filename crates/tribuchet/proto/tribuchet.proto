@@ -166,6 +166,19 @@ message BuildResult {
   // messages on the worker stream.
   repeated OutputSignature outputs = 3;
   string error = 4;
+  // Inner outputs and AddToStore'd paths the build's outputs
+  // reference (recursive-nix). The hub verifies the worker signature
+  // and registers each in the local store via AddToStoreNar; attach
+  // receives an AddedPath event per registered extra.
+  repeated ExtraPath extras = 5;
+}
+
+// PathInfo plus a worker signature over "<store_path>:<nar_sha256>";
+// same trust shape as OutputSignature, but for a real registered path
+// rather than a scratch output.
+message ExtraPath {
+  PathInfoMsg info = 1;
+  string signature = 2;
 }
 
 message OutputSignature {
@@ -206,6 +219,10 @@ message AttachEvent {
     // build was handed to another worker attempt and the output will
     // be streamed again from the start.
     string output_restart = 5;
+    // Store path the hub registered locally on attach's behalf
+    // (recursive-nix extra). Goes into result.json for Nix's output
+    // reference scan.
+    string added_path = 6;
   }
 }
 

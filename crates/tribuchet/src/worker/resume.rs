@@ -393,6 +393,7 @@ pub(super) fn deliver(
     out_tx.blocking_send(msg(worker_message::Msg::Result(BuildResult {
         build_id: build_id.into(),
         exit_code: fin.exit_code,
+        extras: Vec::new(),
         outputs: fin
             .outputs
             .iter()

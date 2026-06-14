@@ -18,6 +18,40 @@ pub fn valid_store_path(store_dir: &str, path: &str) -> bool {
     dir.parse::<harmonia_store_path::StorePath>(path).is_ok()
 }
 
+/// Wire metadata -> daemon ValidPathInfo.
+pub fn parse_path_info(
+    msg: &crate::proto::PathInfoMsg,
+) -> anyhow::Result<harmonia_store_path_info::ValidPathInfo> {
+    use harmonia_store_path::StoreDir;
+    use harmonia_store_path_info::{NarHash, UnkeyedValidPathInfo, ValidPathInfo};
+    use std::collections::BTreeSet;
+    let store_dir = StoreDir::default();
+    Ok(ValidPathInfo {
+        path: store_dir.parse(&msg.store_path)?,
+        info: UnkeyedValidPathInfo {
+            deriver: (!msg.deriver.is_empty())
+                .then(|| store_dir.parse(&msg.deriver))
+                .transpose()?,
+            nar_hash: NarHash::from_slice(&msg.nar_sha256)?,
+            references: msg
+                .references
+                .iter()
+                .map(|r| store_dir.parse(r))
+                .collect::<Result<BTreeSet<_>, _>>()?,
+            registration_time: None,
+            nar_size: msg.nar_size,
+            ultimate: false,
+            signatures: msg
+                .signatures
+                .iter()
+                .map(|s| s.parse())
+                .collect::<Result<BTreeSet<_>, _>>()?,
+            ca: (!msg.ca.is_empty()).then(|| msg.ca.parse()).transpose()?,
+            store_dir,
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
