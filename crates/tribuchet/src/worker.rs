@@ -858,9 +858,14 @@ async fn session(
             resumable_keys: ctx.resumable_keys(),
         })))
         .await?;
-    // One outstanding RequestJob per build slot; every finished build
-    // sends the next one, keeping the sum constant.
-    for _ in 0..opts.max_jobs.max(1) {
+    // One outstanding RequestJob per *free* build slot; every finished
+    // build sends the next one, keeping the sum constant. Builds
+    // adopted from a previous generation (or running across a hub
+    // reconnect) already occupy slots and are re-dispatched
+    // credit-free, so they must not be funded again or the worker
+    // would run more than max-jobs builds and exhaust its uid slots.
+    let occupied = ctx.running.load(std::sync::atomic::Ordering::Relaxed) as u64;
+    for _ in 0..u64::from(opts.max_jobs.max(1)).saturating_sub(occupied) {
         out_tx.send(request_job()).await?;
     }
 
