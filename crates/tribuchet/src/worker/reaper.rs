@@ -8,19 +8,18 @@
 //! collected by real parentage on both Linux and macOS (no subreaper
 //! needed).
 //!
-//! The interface between the halves is deliberately dumb: a datagram
-//! socketpair carrying a JSON spawn request plus fds (SCM_RIGHTS), and
-//! a status directory of per-spawn `<token>` files containing the
-//! exit code (tokens, not pids: a recycled pid must not be able to
-//! shadow or clobber another build's status). The
-//! reaper never parses build specs; those travel through an fd it
-//! passes along untouched.
+//! The interface between the halves is a datagram socketpair carrying
+//! a JSON spawn request plus fds (SCM_RIGHTS), and a status directory
+//! of per-spawn `<token>` files containing the exit code (tokens, not
+//! pids: a recycled pid must not be able to shadow or clobber another
+//! build's status). The reaper never parses build specs; those travel
+//! through an fd it passes along untouched.
 //!
 //! The reaper outlives worker generations: SIGHUP makes it hand the
-//! worker a fast-exit signal and exec a fresh one (zero-downtime
-//! reload), and a crashed worker is respawned. Builds keep running
-//! either way; the replacement worker re-adopts them from the state
-//! they persisted on disk, matching the reaper generation id.
+//! worker a fast-exit signal and exec a fresh one, and a crashed
+//! worker is respawned. Builds keep running either way; the
+//! replacement worker re-adopts them from the state they persisted on
+//! disk, matching the reaper generation id.
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixDatagram;
@@ -175,38 +174,47 @@ fn spawn_worker(worker_sock: &UnixDatagram) -> Result<i32> {
 /// statuses, and respawn the worker generation when it exits or is
 /// reloaded. Returns the last worker's exit code once a stop was
 /// requested and every remaining build has been killed and reaped.
-fn reaper_main(sock: &UnixDatagram, worker_sock: &UnixDatagram, status_dir: &Path) -> i32 {
-    // systemd signals the main pid, which is the reaper. SIGTERM is
-    // forwarded to the worker, which owns the drain policy; SIGHUP
-    // (ExecReload) asks the worker to exit fast and gets a fresh one
-    // exec'd while its builds keep running.
-    static TERM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    static HUP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TERM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static HUP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Crash-loop guard: respawning a worker that keeps dying instantly
+/// would present a broken unit as healthy forever (the reaper is the
+/// main pid systemd/launchd watch). Give up after a few fast failures
+/// so Restart=on-failure / KeepAlive can escalate.
+const MAX_FAST_FAILURES: u32 = 5;
+
+/// systemd signals the main pid, which is the reaper. SIGTERM is
+/// forwarded to the worker, which owns the drain policy; SIGHUP
+/// (ExecReload) asks the worker to exit fast and gets a fresh one
+/// exec'd while its builds keep running.
+fn install_signals() {
+    use nix::sys::signal::{
+        sigaction, SaFlags, SigAction, SigHandler, SigSet, SIGHUP, SIGINT, SIGTERM,
+    };
     extern "C" fn on_term(_: i32) {
         TERM.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     extern "C" fn on_hup(_: i32) {
         HUP.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    // Crash-loop guard: respawning a worker that keeps dying instantly
-    // would present a broken unit as healthy forever (the reaper is
-    // the main pid systemd/launchd watch). Give up after a few fast
-    // failures so Restart=on-failure / KeepAlive can escalate.
-    const MAX_FAST_FAILURES: u32 = 5;
     for (sig, handler) in [
-        (nix::sys::signal::SIGTERM, on_term as extern "C" fn(i32)),
-        (nix::sys::signal::SIGINT, on_term),
-        (nix::sys::signal::SIGHUP, on_hup),
+        (SIGTERM, on_term as extern "C" fn(i32)),
+        (SIGINT, on_term),
+        (SIGHUP, on_hup),
     ] {
-        let action = nix::sys::signal::SigAction::new(
-            nix::sys::signal::SigHandler::Handler(handler),
-            nix::sys::signal::SaFlags::SA_RESTART,
-            nix::sys::signal::SigSet::empty(),
+        let action = SigAction::new(
+            SigHandler::Handler(handler),
+            SaFlags::SA_RESTART,
+            SigSet::empty(),
         );
         unsafe {
-            let _ = nix::sys::signal::sigaction(sig, &action);
+            let _ = sigaction(sig, &action);
         }
     }
+}
+
+fn reaper_main(sock: &UnixDatagram, worker_sock: &UnixDatagram, status_dir: &Path) -> i32 {
+    install_signals();
     let mut worker_pid = match spawn_worker(worker_sock) {
         Ok(pid) => pid,
         Err(e) => {
