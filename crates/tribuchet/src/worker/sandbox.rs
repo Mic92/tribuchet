@@ -1166,7 +1166,7 @@ mod platform {
         Ok(())
     }
 
-    pub fn cleanup(a: &BuildAssignment, _dir: &Path) {
+    pub fn cleanup(a: &BuildAssignment, dir: &Path) {
         // Outputs were written straight into /nix/store; drop them after
         // upload, and remove the /build symlink.
         for scratch in a.outputs.values() {
@@ -1174,7 +1174,14 @@ mod platform {
             let _ = std::fs::remove_dir_all(p);
             let _ = std::fs::remove_file(p);
         }
-        let _ = std::fs::remove_file(Path::new(&a.tmp_dir_in_sandbox));
+        // Only remove the symlink this build created (it points at our
+        // build dir): the shared /build may already belong to the next
+        // build, and a hub-chosen path that prepare() rejected must not
+        // become a delete-anything primitive on a root worker.
+        let link = Path::new(&a.tmp_dir_in_sandbox);
+        if std::fs::read_link(link).is_ok_and(|t| t == dir.join("top").join("build")) {
+            let _ = std::fs::remove_file(link);
+        }
     }
 }
 
