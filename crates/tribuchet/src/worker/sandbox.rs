@@ -83,7 +83,15 @@ pub struct SandboxSpec {
     /// mount namespace already hides them.
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub deny_read: Vec<PathBuf>,
+    /// Sandbox has the host daemon socket bind-mounted in; the
+    /// closure-delta producer also consults this flag.
+    #[serde(default)]
+    pub recursive_nix: bool,
 }
+
+/// Default daemon socket path inside the sandbox; `nix` looks here
+/// unless `NIX_REMOTE` overrides.
+pub const NIX_DAEMON_SOCKET: &str = "/nix/var/nix/daemon-socket/socket";
 
 /// Host path where the builder's output for `scratch` lands.
 pub fn output_host_path(spec: &SandboxSpec, scratch: &str) -> PathBuf {
@@ -103,6 +111,12 @@ pub struct PrepareOpts<'a> {
     pub emulator: Option<&'a Path>,
     pub pasta: Option<&'a Path>,
     pub fod_uid: Option<u32>,
+    /// Bind-mount the host nix-daemon socket into the sandbox so the
+    /// builder can register inner-build outputs.
+    pub recursive_nix: bool,
+    /// Host path of the daemon socket to expose; only consulted when
+    /// `recursive_nix` is set.
+    pub nix_daemon_socket: Option<&'a Path>,
 }
 
 pub fn prepare(
@@ -136,6 +150,7 @@ pub fn prepare(
         pasta: opts.pasta.filter(|_| a.fixed_output).map(Path::to_path_buf),
         emulator: opts.emulator.map(Path::to_path_buf),
         deny_read: opts.secrets.to_vec(),
+        recursive_nix: opts.recursive_nix,
     };
     if cfg!(target_os = "linux") {
         if let Some(em) = opts.emulator {
@@ -147,6 +162,13 @@ pub fn prepare(
             // need a shell at /bin/sh.
             spec.binds_ro
                 .push((sh.to_owned(), PathBuf::from("/bin/sh")));
+        }
+        if opts.recursive_nix {
+            let host = opts
+                .nix_daemon_socket
+                .unwrap_or_else(|| Path::new(NIX_DAEMON_SOCKET));
+            spec.binds_ro
+                .push((host.to_path_buf(), PathBuf::from(NIX_DAEMON_SOCKET)));
         }
     }
     spec.binds_ro.sort(); // deterministic mount order
@@ -265,6 +287,63 @@ mod platform;
 mod tests {
     use super::*;
 
+    fn min_assignment() -> crate::proto::BuildAssignment {
+        crate::proto::BuildAssignment {
+            build_id: "0123456789abcdef0123456789abcdef".into(),
+            dedupe_key: "k".into(),
+            system: "x86_64-linux".into(),
+            builder: "/nix/store/00000000000000000000000000000000-b/bin/b".into(),
+            args: vec![],
+            env: HashMap::default(),
+            outputs: HashMap::default(),
+            tmp_dir_in_sandbox: "/build".into(),
+            store_dir: "/nix/store".into(),
+            fixed_output: false,
+        }
+    }
+
+    /// recursive-nix flag toggles a daemon-socket bind; without it,
+    /// no /nix/var path appears in binds_ro.
+    #[test]
+    fn recursive_nix_adds_the_daemon_socket_bind() -> Result<()> {
+        let host = tempfile::tempdir()?;
+        let host_sock = host.path().join("sock");
+        std::fs::File::create(&host_sock)?;
+
+        let off_dir = tempfile::tempdir()?;
+        let off = prepare(
+            &min_assignment(),
+            off_dir.path(),
+            &[],
+            &PrepareOpts {
+                recursive_nix: false,
+                nix_daemon_socket: Some(&host_sock),
+                ..Default::default()
+            },
+        )?;
+        assert!(off
+            .binds_ro
+            .iter()
+            .all(|(_, dst)| dst != Path::new(NIX_DAEMON_SOCKET)));
+
+        let on_dir = tempfile::tempdir()?;
+        let on = prepare(
+            &min_assignment(),
+            on_dir.path(),
+            &[],
+            &PrepareOpts {
+                recursive_nix: true,
+                nix_daemon_socket: Some(&host_sock),
+                ..Default::default()
+            },
+        )?;
+        assert!(on
+            .binds_ro
+            .iter()
+            .any(|(src, dst)| src == &host_sock && dst == Path::new(NIX_DAEMON_SOCKET)));
+        Ok(())
+    }
+
     /// Not a test: re-exec target for `sandbox_runs_builder`. There
     /// `/proc/self/exe` is the libtest binary, which treats the stage
     /// argument as a name filter selecting exactly this function.
@@ -308,6 +387,7 @@ mod tests {
             build_dir: dir.path().join("top/build"),
             binds_ro: vec![],
             store_inputs: vec![],
+            recursive_nix: false,
             binds_dev: vec![],
             outputs: vec![],
             cgroup: None,
@@ -353,6 +433,7 @@ mod tests {
             root: dir.path().join("root"),
             build_dir: dir.path().join("top/build"),
             store_inputs: vec![],
+            recursive_nix: false,
             binds_ro: ["/bin", "/usr", "/lib", "/lib64", "/nix/store"]
                 .iter()
                 .filter(|p| Path::new(p).exists())

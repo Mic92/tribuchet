@@ -366,6 +366,8 @@ impl ActiveBuild {
                 emulator: self.ctx.emulators.get(&a.system).map(PathBuf::as_path),
                 pasta: self.ctx.pasta.as_deref(),
                 fod_uid: owner.fod_uid(),
+                recursive_nix: self.ctx.recursive_nix,
+                nix_daemon_socket: None,
             },
         )?;
         spec.cgroup = self

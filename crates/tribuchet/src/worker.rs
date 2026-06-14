@@ -72,6 +72,9 @@ struct WorkerCtx {
     pasta: Option<PathBuf>,
     max_silent_time: std::time::Duration,
     max_log_size: u64,
+    /// Builder gets the host nix-daemon socket bind-mounted in; the
+    /// worker advertises the `recursive-nix` feature.
+    pub(super) recursive_nix: bool,
     /// Slot i maps the uid block [uid_base + i*65536, 65536); disjoint
     /// blocks keep concurrent uid-range builds apart.
     uid_base: u32,
@@ -316,6 +319,7 @@ async fn run_async(
         pasta: opts.pasta.clone(),
         max_silent_time: std::time::Duration::from_secs(opts.max_silent_time_secs),
         max_log_size: opts.max_log_size,
+        recursive_nix: opts.recursive_nix,
         uid_base: opts.auto_allocate_uids_base,
         uid_slots: std::sync::Mutex::new(vec![false; opts.max_jobs.max(1) as usize]),
     });
