@@ -145,6 +145,10 @@ struct Job {
     id: String,
     key: String,
     req: BuildRequest,
+    /// The topTmpDir as validated at submission time, held open so the
+    /// later tar step cannot be redirected by swapping the path for a
+    /// symlink while the job is queued.
+    tmp_dir: Arc<std::fs::File>,
     /// requiredSystemFeatures; only workers advertising them get the job.
     features: Vec<String>,
     replay: Arc<Replay>,
@@ -393,21 +397,39 @@ fn validate_request(req: &BuildRequest) -> Result<(), Status> {
 
 /// The root hub tars `top_tmp_dir` off local disk; require it to be a
 /// real directory owned by the connecting peer so a client cannot have
-/// the hub ship `/root` or another user's build dir.
+/// the hub ship `/root` or another user's build dir. Returns the opened
+/// directory: tarring later goes through this fd, so swapping the path
+/// for a symlink after validation cannot redirect what gets shipped.
 #[allow(clippy::result_large_err)]
-fn validate_top_tmp_dir(top_tmp_dir: &str, peer_uid: u32) -> Result<(), Status> {
-    use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::symlink_metadata(top_tmp_dir)
+fn validate_top_tmp_dir(top_tmp_dir: &str, peer_uid: u32) -> Result<std::fs::File, Status> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let dir = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags((nix::fcntl::OFlag::O_DIRECTORY | nix::fcntl::OFlag::O_NOFOLLOW).bits())
+        .open(top_tmp_dir)
         .map_err(|e| Status::invalid_argument(format!("topTmpDir {top_tmp_dir}: {e}")))?;
-    if !meta.is_dir() {
-        return Err(Status::invalid_argument("topTmpDir is not a directory"));
-    }
+    // O_DIRECTORY already guarantees a directory; only ownership is
+    // left to check, via fstat on the handle just opened.
+    let meta = dir
+        .metadata()
+        .map_err(|e| Status::invalid_argument(format!("topTmpDir {top_tmp_dir}: {e}")))?;
     if meta.uid() != peer_uid {
         return Err(Status::permission_denied(
             "topTmpDir is not owned by the requesting user",
         ));
     }
-    Ok(())
+    Ok(dir)
+}
+
+/// Path that re-opens an already-held fd; lets `tar::Builder` walk the
+/// validated directory handle instead of resolving the path again.
+fn fd_path(fd: std::os::fd::RawFd) -> std::path::PathBuf {
+    if cfg!(target_os = "linux") {
+        format!("/proc/self/fd/{fd}")
+    } else {
+        format!("/dev/fd/{fd}")
+    }
+    .into()
 }
 
 /// Dedupe key: hash of the full canonicalized request, so only truly
@@ -477,7 +499,7 @@ impl attach_hub_server::AttachHub for AttachSvc {
             return Err(Status::invalid_argument("build request without outputs"));
         }
         validate_request(&req)?;
-        validate_top_tmp_dir(&req.top_tmp_dir, peer_uid)?;
+        let tmp_dir = Arc::new(validate_top_tmp_dir(&req.top_tmp_dir, peer_uid)?);
         let key = dedupe_key(&req);
 
         let features = crate::build_json::required_system_features(&req.env);
@@ -532,6 +554,7 @@ impl attach_hub_server::AttachHub for AttachSvc {
                 id: new_id(),
                 key,
                 req,
+                tmp_dir,
                 features,
                 replay: replay.clone(),
                 attempts: 0,
@@ -929,7 +952,7 @@ async fn run_job(
         send(out_tx, hub_message::Msg::PathInfo(info)).await?;
         stream_store_path(&job.id, path, out_tx).await?;
     }
-    stream_tmp_dir(&job.id, Path::new(&req.top_tmp_dir), out_tx).await?;
+    stream_tmp_dir(&job.id, job.tmp_dir.clone(), out_tx).await?;
 
     relay_build(job, vkey, out_tx, &mut in_rx).await
 }
@@ -1060,16 +1083,18 @@ async fn stream_store_path(
 /// worker. Always sent last: its EOF tells the worker to start the build.
 async fn stream_tmp_dir(
     build_id: &str,
-    top_tmp_dir: &Path,
+    top_tmp_dir: Arc<std::fs::File>,
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
 ) -> Result<()> {
+    use std::os::fd::AsRawFd;
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
-    let dir = top_tmp_dir.to_owned();
     let task = tokio::task::spawn_blocking(move || -> Result<()> {
         let enc = zstd::stream::write::Encoder::new(ChunkWriter::new(tx), 3)?;
         let mut tar = tar::Builder::new(enc);
         tar.follow_symlinks(false);
-        tar.append_dir_all(".", &dir)?;
+        // Walk the directory through the fd validated at submission
+        // time, not by re-resolving the client-controlled path.
+        tar.append_dir_all(".", fd_path(top_tmp_dir.as_raw_fd()))?;
         tar.into_inner()?.finish()?.flush()?;
         Ok(())
     });
@@ -1458,6 +1483,7 @@ mod tests {
                 system: "x86_64-linux".into(),
                 ..Default::default()
             },
+            tmp_dir: Arc::new(std::fs::File::open(std::env::temp_dir()).unwrap()),
             features: vec![],
             replay: replay.clone(),
             attempts: 0,
@@ -1578,6 +1604,57 @@ mod tests {
         let mut req = base_request();
         req.outputs = [("out".to_string(), format!("/nix/store/{H}-dep"))].into();
         assert!(validate_request(&req).is_err());
+    }
+
+    #[test]
+    fn top_tmp_dir_validation_rejects_symlinks_and_foreign_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let me = nix::unistd::getuid().as_raw();
+        let dir = tmp.path().join("build");
+        std::fs::create_dir(&dir).unwrap();
+        assert!(validate_top_tmp_dir(dir.to_str().unwrap(), me).is_ok());
+        assert!(validate_top_tmp_dir(dir.to_str().unwrap(), me + 1).is_err());
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert!(validate_top_tmp_dir(link.to_str().unwrap(), me).is_err());
+    }
+
+    /// Swapping the submitted path for a symlink after validation must
+    /// not redirect what the hub tars: the archive is built from the
+    /// directory handle opened at validation time.
+    #[tokio::test]
+    async fn tmp_dir_archive_comes_from_the_validated_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("build");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("attrs"), "validated").unwrap();
+        let me = nix::unistd::getuid().as_raw();
+        let handle = validate_top_tmp_dir(dir.to_str().unwrap(), me).unwrap();
+
+        // attacker swaps the path for a symlink to a foreign directory
+        let foreign = tmp.path().join("foreign");
+        std::fs::create_dir(&foreign).unwrap();
+        std::fs::write(foreign.join("secret"), "foreign").unwrap();
+        std::fs::rename(&dir, tmp.path().join("moved-aside")).unwrap();
+        std::os::unix::fs::symlink(&foreign, &dir).unwrap();
+
+        let (tx, mut rx) = mpsc::channel(64);
+        stream_tmp_dir("b1", Arc::new(handle), &tx).await.unwrap();
+        drop(tx);
+        let mut compressed = Vec::new();
+        while let Some(Ok(msg)) = rx.recv().await {
+            if let Some(hub_message::Msg::TmpDir(c)) = msg.msg {
+                compressed.extend(c.zstd_tar_chunk);
+            }
+        }
+        let tar_bytes = zstd::decode_all(&compressed[..]).unwrap();
+        let mut names = Vec::new();
+        let mut ar = tar::Archive::new(&tar_bytes[..]);
+        for entry in ar.entries().unwrap() {
+            names.push(entry.unwrap().path().unwrap().into_owned());
+        }
+        assert!(names.iter().any(|p| p.ends_with("attrs")), "{names:?}");
+        assert!(!names.iter().any(|p| p.ends_with("secret")), "{names:?}");
     }
 
     #[test]
