@@ -382,20 +382,8 @@ impl ActiveBuild {
         Ok(false)
     }
 
-    /// Runs on a blocking thread: sandboxed build, live log streaming,
-    /// output packing and signing. Sends only logs; the result and
-    /// output NARs go through deliver(), which can run again on a
-    /// later session if this one dies first.
-    pub(super) fn execute(
-        &self,
-        out_tx: &mpsc::Sender<WorkerMessage>,
-        signing_key: &SecretKey,
-        timeout: std::time::Duration,
-    ) -> Result<FinishedBuild> {
+    fn build_spec(&self, owner: &BuildOwner) -> Result<sandbox::SandboxSpec> {
         let a = &self.assignment;
-        // The slot lease keeps concurrent uids disjoint; returned on
-        // drop when the build finishes.
-        let owner = BuildOwner::for_build(&self.ctx, a)?;
         let mut spec = sandbox::prepare(
             a,
             &self.dir,
@@ -419,6 +407,24 @@ impl ActiveBuild {
             // `cgroups` setting); needed by nspawn inside the sandbox
             cgroup::chown_to_builder(cg, base);
         }
+        Ok(spec)
+    }
+
+    /// Runs on a blocking thread: sandboxed build, live log streaming,
+    /// output packing and signing. Sends only logs; the result and
+    /// output NARs go through deliver(), which can run again on a
+    /// later session if this one dies first.
+    pub(super) fn execute(
+        &self,
+        out_tx: &mpsc::Sender<WorkerMessage>,
+        signing_key: &SecretKey,
+        timeout: std::time::Duration,
+    ) -> Result<FinishedBuild> {
+        let a = &self.assignment;
+        // The slot lease keeps concurrent uids disjoint; returned on
+        // drop when the build finishes.
+        let owner = BuildOwner::for_build(&self.ctx, a)?;
+        let spec = self.build_spec(&owner)?;
         let deadline = std::time::Instant::now() + timeout;
         // Logs go through a file in the build dir, not pipes: capture
         // is decoupled from this process's lifetime, so a later worker
