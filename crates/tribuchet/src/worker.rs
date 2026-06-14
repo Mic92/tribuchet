@@ -1057,12 +1057,12 @@ async fn session_loop(
                     // Only flag builds that are still running: a key
                     // flagged for an already-finished build would
                     // never be consumed and would kill the next build
-                    // sharing that dedupe key.
-                    let running = {
-                        let map = ctx.resumable.lock().unwrap();
-                        map.get(&c.dedupe_key).is_some_and(|e| e.finished.is_none())
-                    };
-                    if running {
+                    // sharing that dedupe key. The flag is set while
+                    // holding the registry lock so a build finishing
+                    // concurrently (record_finished) cannot slip
+                    // between the check and the insert.
+                    let map = ctx.resumable.lock().unwrap();
+                    if map.get(&c.dedupe_key).is_some_and(|e| e.finished.is_none()) {
                         ctx.cancelled.lock().unwrap().insert(c.dedupe_key);
                     }
                 }
@@ -1696,10 +1696,6 @@ fn unix_now() -> u64 {
 /// across worker generations) and start delivering it. Shared by the
 /// normal execute path and re-adopted builds.
 fn record_finished(ctx: &std::sync::Arc<WorkerCtx>, key: &str, fin: FinishedBuild) {
-    // A cancel flag the abort loop did not get to consume (the build
-    // beat it to the finish line) must not linger and kill the next
-    // build with this dedupe key.
-    ctx.cancelled.lock().unwrap().remove(key);
     {
         let mut map = ctx.resumable.lock().unwrap();
         if let Some(e) = map.get_mut(key) {
@@ -1708,6 +1704,12 @@ fn record_finished(ctx: &std::sync::Arc<WorkerCtx>, key: &str, fin: FinishedBuil
             e.finished = Some(fin);
         }
     }
+    // A cancel flag the abort loop did not get to consume (the build
+    // beat it to the finish line) must not linger and kill the next
+    // build with this dedupe key. Cleared after `finished` is set: the
+    // Cancel handler only adds the flag while the entry is unfinished
+    // (under the registry lock), so no new flag can appear afterwards.
+    ctx.cancelled.lock().unwrap().remove(key);
     try_deliver(ctx, key);
 }
 
