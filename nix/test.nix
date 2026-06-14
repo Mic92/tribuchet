@@ -251,9 +251,14 @@ in
         assigned = int(worker.succeed(
             "journalctl -u tribuchet-worker | grep -c 'build assigned' || true"
         ).strip())
+        # nix-build's stderr (the relayed build log) goes to a file,
+        # not the journal: ~1MB of payload would otherwise reach the
+        # VM's serial console and bloat the test driver's output.
         hub.succeed(
-            "systemd-run --unit=slowlogbuild bash -lc "
-            "'nix-build /etc/tt/slowlog.nix --no-out-link'"
+            "systemd-run --unit=slowlogbuild "
+            "-p StandardOutput=file:/tmp/slowlog.out "
+            "-p StandardError=file:/tmp/slowlog.out "
+            "bash -lc 'nix-build /etc/tt/slowlog.nix --no-out-link'"
         )
         worker.wait_until_succeeds(
             f"[ $(journalctl -u tribuchet-worker | grep -c 'build assigned') -gt {assigned} ]",
@@ -263,7 +268,7 @@ in
         # so only the re-adopted build can exceed it.
         worker.succeed("systemctl reload tribuchet-worker")
         hub.wait_until_succeeds(
-            "journalctl -u slowlogbuild | grep -q 'exceeded the limit'", timeout=120
+            "grep -q 'exceeded the limit' /tmp/slowlog.out", timeout=120
         )
 
     with subtest("worker reload mid-build re-adopts the running build"):
