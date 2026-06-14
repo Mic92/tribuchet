@@ -31,12 +31,10 @@ fn magic(system: &str) -> Option<(&'static str, &'static str)> {
             r"\x7fELF\x02\x02\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\xb7",
             r"\xff\xff\xff\xff\xff\xff\xff\x00\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff",
         ),
-        "i386-linux" => (
+        // All 32-bit x86 binaries carry e_machine = EM_386 (0x03);
+        // EM_486 was never emitted by toolchains.
+        "i386-linux" | "i486-linux" | "i586-linux" | "i686-linux" => (
             r"\x7fELF\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x03\x00",
-            r"\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff",
-        ),
-        "i486-linux" | "i586-linux" | "i686-linux" => (
-            r"\x7fELF\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x06\x00",
             r"\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff",
         ),
         "x86_64-linux" => (
@@ -115,5 +113,14 @@ mod tests {
         assert!(line.ends_with(":/run/binfmt-emulator:F"));
         assert_eq!(line.split(':').count(), 7 + 1); // leading empty field
         assert!(register_line("vax-vms").is_none());
+    }
+
+    /// i686 binaries carry e_machine EM_386 (0x03), not the legacy
+    /// EM_486 value; the magic must match what toolchains emit.
+    #[test]
+    fn i686_matches_em_386() {
+        let line = register_line("i686-linux").unwrap();
+        assert!(line.contains(r"\x02\x00\x03\x00"), "{line}");
+        assert_eq!(line, register_line("i386-linux").unwrap());
     }
 }
