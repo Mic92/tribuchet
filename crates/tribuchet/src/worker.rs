@@ -101,7 +101,7 @@ impl WorkerCtx {
             .and_then(|m| m.modified().ok())
             .and_then(|t| t.elapsed().ok())
             .unwrap_or_default();
-        let log_size = log.map(|m| m.len()).unwrap_or(0);
+        let log_size = log.map_or(0, |m| m.len());
         if self.cancelled.lock().unwrap().remove(dedupe_key) {
             return Some("build cancelled".into());
         }
@@ -139,7 +139,7 @@ impl WorkerCtx {
         let mut map = self.resumable.lock().unwrap();
         match map.get_mut(&a.dedupe_key) {
             Some(e) => {
-                e.build_id = a.build_id.clone();
+                e.build_id.clone_from(&a.build_id);
                 e.out_tx = Some(out_tx.clone());
                 if let Some(t) = e.log_tail.take() {
                     // An earlier resume's tailer feeds a dead session.
@@ -230,8 +230,7 @@ fn sweep_state_dir(state_dir: &Path) {
 pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 fn msg(m: worker_message::Msg) -> WorkerMessage {
@@ -246,7 +245,7 @@ pub fn run(opts: WorkerConfig) -> Result<()> {
     // ensure() either becomes the reaper (never returns) or, in the
     // worker generation it exec'd, hands back the spawner. It runs
     // before tokio because the reaper must stay single-threaded.
-    let spawner = reaper::ensure(opts.state_dir.join("exited"))?;
+    let spawner = reaper::ensure(&opts.state_dir.join("exited"))?;
     let cgroup_base = std::env::var(reaper::CGROUP_ENV).ok().map(PathBuf::from);
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run_async(opts, spawner, cgroup_base))
@@ -338,12 +337,12 @@ async fn run_async(
             Ok(()) => unreachable!("session only returns on error"),
             Err(e) => tracing::warn!("hub session ended: {e:#}"),
         }
-        if started.elapsed() > std::time::Duration::from_secs(60) {
+        if started.elapsed() > std::time::Duration::from_mins(1) {
             backoff = std::time::Duration::from_secs(1);
         }
         tracing::info!("reconnecting to hub in {}s", backoff.as_secs());
         tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(std::time::Duration::from_secs(60));
+        backoff = (backoff * 2).min(std::time::Duration::from_mins(1));
     }
 }
 
@@ -361,7 +360,7 @@ fn spawn_handover() {
         };
         tokio::select! {
             _ = usr1.recv() => {}
-            _ = crate::sd::stop_requested() => {}
+            () = crate::sd::stop_requested() => {}
         }
         tracing::info!("handover requested; exiting");
         std::process::exit(0);
@@ -410,7 +409,7 @@ async fn session(
     // reconnect) already occupy slots and are re-dispatched
     // credit-free, so they must not be funded again or the worker
     // would run more than max-jobs builds and exhaust its uid slots.
-    let occupied = ctx.running.load(std::sync::atomic::Ordering::Relaxed) as u64;
+    let occupied = u64::from(ctx.running.load(std::sync::atomic::Ordering::Relaxed));
     for _ in 0..u64::from(opts.max_jobs.max(1)).saturating_sub(occupied) {
         out_tx.send(request_job()).await?;
     }
@@ -588,7 +587,7 @@ async fn session_loop(
             hub_message::Msg::PathInfo(pi) => {
                 let id = pi.build_id.clone();
                 if let Some(build) = active.get_mut(&id) {
-                    if let Err(e) = build.feed_path_info(pi) {
+                    if let Err(e) = build.feed_path_info(&pi) {
                         let build = active.remove(&id).unwrap();
                         build.abort().await;
                         fail_build(out_tx, &id, &e).await?;

@@ -25,7 +25,7 @@ pub fn run(build_json: &Path, socket: &Path) -> Result<()> {
     let code = rt.block_on(run_async(build, socket.to_owned()))?;
     // Unix exposes only the low 8 bits of the exit status; never let a
     // nonzero code collapse to an observed 0.
-    std::process::exit(if code != 0 && code & 0xff == 0 {
+    std::process::exit(if code != 0 && code.trailing_zeros() >= 8 {
         1
     } else {
         code
@@ -125,7 +125,8 @@ async fn attempt_build(
         Err(e) => return Err(e).context("submitting build"),
     };
 
-    let mut unpackers: std::collections::HashMap<String, Unpacker> = Default::default();
+    let mut unpackers: std::collections::HashMap<String, Unpacker> =
+        std::collections::HashMap::default();
 
     loop {
         let ev = match stream.message().await {

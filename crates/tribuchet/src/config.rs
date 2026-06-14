@@ -113,7 +113,7 @@ fn default_max_jobs() -> u32 {
     1
 }
 fn default_uid_base() -> u32 {
-    872415232
+    872_415_232
 }
 
 #[cfg(test)]

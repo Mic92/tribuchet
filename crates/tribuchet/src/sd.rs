@@ -41,8 +41,9 @@ impl ActivatedSockets {
     /// Take ownership of one activated listener fd, classified by
     /// address family.
     fn adopt(&mut self, fd: RawFd) -> Result<()> {
+        use nix::sys::socket::AddressFamily;
         match socket_family(fd)? {
-            libc::AF_INET | libc::AF_INET6 => {
+            Some(AddressFamily::Inet | AddressFamily::Inet6) => {
                 if self.tcp.is_some() {
                     bail!("more than one activated TCP socket");
                 }
@@ -51,7 +52,7 @@ impl ActivatedSockets {
                 l.set_nonblocking(true)?;
                 self.tcp = Some(l);
             }
-            libc::AF_UNIX => {
+            Some(AddressFamily::Unix) => {
                 if self.unix.is_some() {
                     bail!("more than one activated unix socket");
                 }
@@ -60,7 +61,7 @@ impl ActivatedSockets {
                 l.set_nonblocking(true)?;
                 self.unix = Some(l);
             }
-            family => bail!("activated socket fd {fd} has unsupported family {family}"),
+            family => bail!("activated socket fd {fd} has unsupported family {family:?}"),
         }
         Ok(())
     }
@@ -112,15 +113,11 @@ fn launchd_sockets(out: &mut ActivatedSockets) -> Result<()> {
     Ok(())
 }
 
-fn socket_family(fd: RawFd) -> Result<libc::c_int> {
-    let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-    let rc = unsafe { libc::getsockname(fd, &mut addr as *mut _ as *mut libc::sockaddr, &mut len) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("getsockname on activated fd {fd}"));
-    }
-    Ok(addr.ss_family as libc::c_int)
+fn socket_family(fd: RawFd) -> Result<Option<nix::sys::socket::AddressFamily>> {
+    use nix::sys::socket::SockaddrLike;
+    let addr: nix::sys::socket::SockaddrStorage = nix::sys::socket::getsockname(fd)
+        .with_context(|| format!("getsockname on activated fd {fd}"))?;
+    Ok(addr.family())
 }
 
 /// Tell systemd (Type=notify) that startup finished. Restarts become

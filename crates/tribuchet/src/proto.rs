@@ -1,4 +1,5 @@
 //! Generated gRPC types for the tribuchet protocol.
+#![expect(clippy::pedantic, reason = "tonic-generated code")]
 
 tonic::include_proto!("tribuchet.v1");
 

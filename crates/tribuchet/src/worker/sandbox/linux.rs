@@ -1,10 +1,20 @@
 //! Linux sandbox implementation: namespaces, bind mounts, pivot_root.
 
-use super::*;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+#[cfg(test)]
+use std::process::{Child, Stdio};
+
+use anyhow::{Context, Result};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use nix::sched::{unshare, CloneFlags};
+use nix::sys::personality::{self, Persona};
+use nix::sys::resource::{getrlimit, setrlimit, Resource};
 use nix::unistd::{getgid, getuid, pivot_root, sethostname};
-use std::io;
+
+use super::{binfmt, SandboxSpec, PASTA_DNS};
+use crate::proto::BuildAssignment;
 
 pub fn prepare(spec: &mut SandboxSpec) -> Result<()> {
     let root = &spec.root;
@@ -186,9 +196,9 @@ pub fn send_spec(child: &mut Child, spec: &SandboxSpec) -> Result<()> {
 }
 
 pub fn setup_stage() -> ! {
+    use std::io::{Read, Write};
     let err = (|| -> io::Result<std::convert::Infallible> {
         let mut json = String::new();
-        use std::io::Read;
         std::io::stdin().read_to_string(&mut json)?;
         let spec: SandboxSpec = serde_json::from_str(&json).map_err(io::Error::other)?;
         // The builder gets /dev/null as stdin, like under Nix.
@@ -198,7 +208,6 @@ pub fn setup_stage() -> ! {
         // pivot_root detaches the host filesystem, a path would not.
         let err_file = std::fs::File::create(setup_error_file(&spec.root))?;
         enter_and_exec(&spec).inspect_err(|e| {
-            use std::io::Write;
             let _ = (&err_file).write_all(e.to_string().as_bytes());
         })
     })()
@@ -206,11 +215,11 @@ pub fn setup_stage() -> ! {
     // stderr is the build log pipe; the client sees the message.
     // Write to the fd, not via eprintln!: under the unit test the
     // stage runs inside libtest, which captures macro output.
-    use std::io::Write;
     let _ = writeln!(std::io::stderr(), "sandbox setup: {err}");
     std::process::exit(121);
 }
 
+#[expect(clippy::similar_names, reason = "uid/gid pairs are conventional")]
 fn enter_and_exec(spec: &SandboxSpec) -> io::Result<std::convert::Infallible> {
     // Enter the build cgroup first, with the worker's full
     // credentials and before any namespace changes.
@@ -302,6 +311,7 @@ fn ioerr(step: &str) -> impl Fn(nix::errno::Errno) -> io::Error + '_ {
 /// namespace, write this process's uid/gid maps: multi-uid ranges
 /// need CAP_SETUID *there*, which the unshared process no longer
 /// has (hence uid-range requires a root worker).
+#[expect(clippy::similar_names, reason = "uid/gid pairs are conventional")]
 fn map_uid_range_via_helper(
     flags: CloneFlags,
     sandbox_uid: u32,
@@ -318,7 +328,7 @@ fn map_uid_range_via_helper(
         nix::unistd::ForkResult::Child => {
             // Mapper: wait until the target has unshared, then map.
             let mut buf = [0u8; 1];
-            let ok = read(&req_r, &mut buf).map(|n| n == 1).unwrap_or(false)
+            let ok = read(&req_r, &mut buf).is_ok_and(|n| n == 1)
                 && std::fs::write(
                     format!("/proc/{target}/uid_map"),
                     format!("{sandbox_uid} {host_uid} {uid_count}"),
@@ -369,9 +379,7 @@ fn fork_pasta_helper(bin: &Path) -> io::Result<PastaHelper> {
             // and leak this helper forever.
             drop(req_w);
             let mut buf = [0u8; 1];
-            let ok = nix::unistd::read(&req_r, &mut buf)
-                .map(|n| n == 1)
-                .unwrap_or(false);
+            let ok = nix::unistd::read(&req_r, &mut buf).is_ok_and(|n| n == 1);
             if !ok {
                 // build process died before signaling; nothing to do
                 unsafe { libc::_exit(1) }
@@ -434,10 +442,13 @@ fn loopback_up() -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
         let mut ifr: libc::ifreq = std::mem::zeroed();
-        for (i, b) in b"lo".iter().enumerate() {
-            ifr.ifr_name[i] = *b as libc::c_char;
+        // ifr_name is [c_char; _]; c_char's signedness is target-dependent,
+        // so write the bytes via a u8 pointer instead of an `as` cast.
+        std::ptr::copy_nonoverlapping(b"lo".as_ptr(), ifr.ifr_name.as_mut_ptr().cast::<u8>(), 2);
+        #[expect(clippy::cast_possible_truncation, reason = "IFF_UP|IFF_RUNNING = 0x41")]
+        {
+            ifr.ifr_ifru.ifru_flags = (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
         }
-        ifr.ifr_ifru.ifru_flags = (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
         let res = libc::ioctl(fd, libc::SIOCSIFFLAGS, &ifr);
         let err = io::Error::last_os_error();
         libc::close(fd);
@@ -467,8 +478,7 @@ fn fork_into_pid_ns() -> io::Result<bool> {
                 match waitpid(child, None) {
                     Ok(WaitStatus::Exited(_, code)) => break code,
                     Ok(WaitStatus::Signaled(_, sig, _)) => break 128 + sig as i32,
-                    Ok(_) => continue,
-                    Err(nix::errno::Errno::EINTR) => continue,
+                    Ok(_) | Err(nix::errno::Errno::EINTR) => {}
                     Err(_) => break 1,
                 }
             };
@@ -724,7 +734,6 @@ fn setup(p: &SetupParams) -> io::Result<()> {
     // killable, the rlimit caps how big it can get. Clamp to the
     // inherited hard limit: raising it needs init-ns CAP_SYS_RESOURCE,
     // which the child userns does not have.
-    use nix::sys::resource::{getrlimit, setrlimit, Resource};
     let (_, hard) = getrlimit(Resource::RLIMIT_NPROC).map_err(ioerr("getrlimit NPROC"))?;
     let limit = hard.min(4096);
     setrlimit(Resource::RLIMIT_NPROC, limit, limit).map_err(ioerr("setting RLIMIT_NPROC"))?;
@@ -749,7 +758,6 @@ fn setup(p: &SetupParams) -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
     }
-    use nix::sys::personality::{self, Persona};
     if let Ok(persona) = personality::get() {
         let _ = personality::set(persona | Persona::ADDR_NO_RANDOMIZE);
     }

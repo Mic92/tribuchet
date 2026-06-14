@@ -11,7 +11,10 @@ use super::state::{HubState, Job, Replay, WORKER_GRACE};
 use crate::proto::{attach_hub_server, AttachEvent, BuildRequest};
 use crate::store::{valid_store_path, STORE_DIR};
 
-#[allow(clippy::result_large_err)] // tonic::Status is what the caller needs
+#[expect(
+    clippy::result_large_err,
+    reason = "tonic::Status is what the caller needs"
+)]
 fn validate_request(req: &BuildRequest) -> Result<(), Status> {
     let bad = |what: &str, p: &str| {
         Status::invalid_argument(format!("{what} is not a valid store path: {p}"))
@@ -83,7 +86,10 @@ fn validate_request(req: &BuildRequest) -> Result<(), Status> {
 /// the hub ship `/root` or another user's build dir. Returns the opened
 /// directory: tarring later goes through this fd, so swapping the path
 /// for a symlink after validation cannot redirect what gets shipped.
-#[allow(clippy::result_large_err)]
+#[expect(
+    clippy::result_large_err,
+    reason = "tonic::Status is what the caller needs"
+)]
 pub(super) fn validate_top_tmp_dir(
     top_tmp_dir: &str,
     peer_uid: u32,
@@ -112,7 +118,6 @@ pub(super) fn validate_top_tmp_dir(
 /// alone would let a colliding (or crafted) request attach to another
 /// client's build.
 pub(super) fn dedupe_key(req: &BuildRequest) -> String {
-    let mut h = Sha256::new();
     fn feed(h: &mut Sha256, s: &str) {
         h.update((s.len() as u64).to_le_bytes());
         h.update(s.as_bytes());
@@ -123,6 +128,7 @@ pub(super) fn dedupe_key(req: &BuildRequest) -> String {
     fn count(h: &mut Sha256, n: usize) {
         h.update((n as u64).to_le_bytes());
     }
+    let mut h = Sha256::new();
     feed(&mut h, &req.system);
     feed(&mut h, &req.builder);
     count(&mut h, req.args.len());
@@ -151,7 +157,7 @@ pub(super) fn dedupe_key(req: &BuildRequest) -> String {
     }
     feed(&mut h, &req.store_dir);
     feed(&mut h, &req.tmp_dir_in_sandbox);
-    h.update([req.fixed_output as u8]);
+    h.update([u8::from(req.fixed_output)]);
     hex::encode(h.finalize())
 }
 
@@ -265,6 +271,7 @@ impl attach_hub_server::AttachHub for AttachSvc {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     /// 32-char base32 hash part for synthetic store paths.
     const H: &str = "00000000000000000000000000000000";
@@ -274,7 +281,7 @@ mod tests {
             system: "x86_64-linux".into(),
             builder: format!("/nix/store/{H}-bash/bin/bash"),
             args: vec!["-c".into(), "true".into()],
-            env: Default::default(),
+            env: HashMap::default(),
             outputs: [("out".to_string(), format!("/nix/store/{H}-out"))].into(),
             input_paths: vec![format!("/nix/store/{H}-dep")],
             top_tmp_dir: "/tmp/nix-build-x".into(),
@@ -355,8 +362,8 @@ mod tests {
     }
 
     /// Strings shifted between adjacent sections must not collide:
-    /// args ["-c", "K", "V"] with no env and args ["-c"] with
-    /// env {K: V} would feed identical bytes without section counts.
+    /// args `["-c", "K", "V"]` with no env and args `["-c"]` with
+    /// env `{K: V}` would feed identical bytes without section counts.
     #[test]
     fn dedupe_key_separates_sections() {
         let mut a = base_request();

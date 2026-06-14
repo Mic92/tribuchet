@@ -97,7 +97,7 @@ impl Replay {
             let concluded = inner.events.iter().any(|e| {
                 matches!(
                     e.event,
-                    Some(attach_event::Event::ExitCode(_)) | Some(attach_event::Event::Error(_))
+                    Some(attach_event::Event::ExitCode(_) | attach_event::Event::Error(_))
                 )
             });
             if !concluded {
@@ -186,15 +186,15 @@ impl WorkerCaps {
 impl Default for HubState {
     fn default() -> Self {
         Self {
-            queue: Default::default(),
-            inflight: Default::default(),
-            notify: Default::default(),
+            queue: Mutex::default(),
+            inflight: Mutex::default(),
+            notify: Notify::default(),
             daemon_pool: harmonia_store_remote::ConnectionPool::new(
                 "/nix/var/nix/daemon-socket/socket",
-                Default::default(),
+                harmonia_store_remote::PoolConfig::default(),
             ),
-            worker_caps: Default::default(),
-            next_worker_id: Default::default(),
+            worker_caps: std::sync::Mutex::default(),
+            next_worker_id: std::sync::atomic::AtomicU64::default(),
         }
     }
 }

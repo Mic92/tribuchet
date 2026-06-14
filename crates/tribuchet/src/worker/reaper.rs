@@ -24,7 +24,7 @@
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixDatagram;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -71,12 +71,12 @@ impl Spawner {
         &self,
         req: &mut SpawnRequest,
         log: &std::fs::File,
-        stdin: Option<OwnedFd>,
+        stdin: Option<&OwnedFd>,
     ) -> Result<i32> {
         req.token = hex::encode(rand::random::<[u8; 16]>());
         let sock = self.sock.lock().unwrap();
         let mut fds = vec![log.as_raw_fd()];
-        if let Some(fd) = &stdin {
+        if let Some(fd) = stdin {
             fds.push(fd.as_raw_fd());
         }
         send_request(&sock, req, &fds).context("sending spawn request to reaper")?;
@@ -118,7 +118,7 @@ pub const ID_ENV: &str = "TRIBUCHET_REAPER_ID";
 /// already is a worker child exec'd by one. The reaper half never
 /// returns: it serves spawn requests and respawns worker generations
 /// until told to stop, then exits with the last worker's code.
-pub fn ensure(status_dir: PathBuf) -> Result<Spawner> {
+pub fn ensure(status_dir: &Path) -> Result<Spawner> {
     if let Ok(s) = std::env::var(FD_ENV) {
         let fd: RawFd = s.parse().context("parsing TRIBUCHET_REAPER_FD")?;
         let sock = unsafe { UnixDatagram::from_raw_fd(fd) };
@@ -131,9 +131,9 @@ pub fn ensure(status_dir: PathBuf) -> Result<Spawner> {
             sock: std::sync::Mutex::new(sock),
         });
     }
-    std::fs::create_dir_all(&status_dir)?;
+    std::fs::create_dir_all(status_dir)?;
     // Fresh reaper: previous statuses refer to pids it never spawned.
-    if let Ok(entries) = std::fs::read_dir(&status_dir) {
+    if let Ok(entries) = std::fs::read_dir(status_dir) {
         for entry in entries.flatten() {
             let _ = std::fs::remove_file(entry.path());
         }
@@ -150,7 +150,7 @@ pub fn ensure(status_dir: PathBuf) -> Result<Spawner> {
         format!("{}-{}", std::process::id(), super::unix_now()),
     );
     let (reaper_sock, worker_sock) = UnixDatagram::pair().context("creating reaper socketpair")?;
-    let code = reaper_main(reaper_sock, worker_sock, &status_dir);
+    let code = reaper_main(&reaper_sock, &worker_sock, status_dir);
     std::process::exit(code);
 }
 
@@ -168,14 +168,14 @@ fn spawn_worker(worker_sock: &UnixDatagram) -> Result<i32> {
         .spawn()
         .context("spawning worker")?;
     drop(fd);
-    Ok(child.id() as i32)
+    Ok(child.id().cast_signed())
 }
 
 /// The reaper loop: serve spawn requests, reap children, persist
 /// statuses, and respawn the worker generation when it exits or is
 /// reloaded. Returns the last worker's exit code once a stop was
 /// requested and every remaining build has been killed and reaped.
-fn reaper_main(sock: UnixDatagram, worker_sock: UnixDatagram, status_dir: &Path) -> i32 {
+fn reaper_main(sock: &UnixDatagram, worker_sock: &UnixDatagram, status_dir: &Path) -> i32 {
     // systemd signals the main pid, which is the reaper. SIGTERM is
     // forwarded to the worker, which owns the drain policy; SIGHUP
     // (ExecReload) asks the worker to exit fast and gets a fresh one
@@ -188,6 +188,11 @@ fn reaper_main(sock: UnixDatagram, worker_sock: UnixDatagram, status_dir: &Path)
     extern "C" fn on_hup(_: i32) {
         HUP.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    // Crash-loop guard: respawning a worker that keeps dying instantly
+    // would present a broken unit as healthy forever (the reaper is
+    // the main pid systemd/launchd watch). Give up after a few fast
+    // failures so Restart=on-failure / KeepAlive can escalate.
+    const MAX_FAST_FAILURES: u32 = 5;
     for (sig, handler) in [
         (nix::sys::signal::SIGTERM, on_term as extern "C" fn(i32)),
         (nix::sys::signal::SIGINT, on_term),
@@ -202,7 +207,7 @@ fn reaper_main(sock: UnixDatagram, worker_sock: UnixDatagram, status_dir: &Path)
             let _ = nix::sys::signal::sigaction(sig, &action);
         }
     }
-    let mut worker_pid = match spawn_worker(&worker_sock) {
+    let mut worker_pid = match spawn_worker(worker_sock) {
         Ok(pid) => pid,
         Err(e) => {
             eprintln!("tribuchet reaper: {e:#}");
@@ -213,13 +218,8 @@ fn reaper_main(sock: UnixDatagram, worker_sock: UnixDatagram, status_dir: &Path)
     let mut builds: Vec<(i32, String)> = Vec::new();
     let mut worker_code: Option<i32> = None;
     let mut stopping = false;
-    // Crash-loop guard: respawning a worker that keeps dying instantly
-    // would present a broken unit as healthy forever (the reaper is
-    // the main pid systemd/launchd watch). Give up after a few fast
-    // failures so Restart=on-failure / KeepAlive can escalate.
     let mut spawned_at = std::time::Instant::now();
     let mut fast_failures = 0u32;
-    const MAX_FAST_FAILURES: u32 = 5;
     sock.set_read_timeout(Some(std::time::Duration::from_millis(200)))
         .ok();
     loop {
@@ -244,9 +244,8 @@ fn reaper_main(sock: UnixDatagram, worker_sock: UnixDatagram, status_dir: &Path)
             let code = match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
                 Ok(WaitStatus::Exited(pid, code)) => Some((pid.as_raw(), code)),
                 Ok(WaitStatus::Signaled(pid, sig, _)) => Some((pid.as_raw(), 128 + sig as i32)),
-                Ok(WaitStatus::StillAlive) => None,
+                Ok(WaitStatus::StillAlive) | Err(_) => None,
                 Ok(_) => continue,
-                Err(_) => None,
             };
             let Some((pid, code)) = code else { break };
             if pid == worker_pid {
@@ -261,7 +260,7 @@ fn reaper_main(sock: UnixDatagram, worker_sock: UnixDatagram, status_dir: &Path)
                 kill_builds(&mut builds);
                 return code;
             }
-            if code != 0 && spawned_at.elapsed() < std::time::Duration::from_secs(60) {
+            if code != 0 && spawned_at.elapsed() < std::time::Duration::from_mins(1) {
                 fast_failures += 1;
                 if fast_failures >= MAX_FAST_FAILURES {
                     eprintln!("tribuchet reaper: worker keeps crashing on startup; giving up");
@@ -274,7 +273,7 @@ fn reaper_main(sock: UnixDatagram, worker_sock: UnixDatagram, status_dir: &Path)
             // Reload handover or worker crash: builds keep running,
             // the next generation re-adopts them.
             std::thread::sleep(std::time::Duration::from_secs(1));
-            match spawn_worker(&worker_sock) {
+            match spawn_worker(worker_sock) {
                 Ok(pid) => {
                     worker_pid = pid;
                     spawned_at = std::time::Instant::now();
@@ -287,27 +286,25 @@ fn reaper_main(sock: UnixDatagram, worker_sock: UnixDatagram, status_dir: &Path)
             }
             continue;
         }
-        match recv_request(&sock) {
-            Ok((req, fds)) => {
-                let token = req.token.clone();
-                let reply = match handle_spawn(req, fds) {
-                    Ok(pid) => {
-                        builds.push((pid, token.clone()));
-                        SpawnReply {
-                            token,
-                            pid: Some(pid),
-                            error: String::new(),
-                        }
-                    }
-                    Err(e) => SpawnReply {
+        // recv error: timeout or worker not sending; loop re-reaps
+        if let Ok((req, fds)) = recv_request(sock) {
+            let token = req.token.clone();
+            let reply = match handle_spawn(&req, fds) {
+                Ok(pid) => {
+                    builds.push((pid, token.clone()));
+                    SpawnReply {
                         token,
-                        pid: None,
-                        error: format!("{e:#}"),
-                    },
-                };
-                let _ = sock.send(&serde_json::to_vec(&reply).unwrap_or_default());
-            }
-            Err(_) => continue, // timeout or worker not sending; loop re-reaps
+                        pid: Some(pid),
+                        error: String::new(),
+                    }
+                }
+                Err(e) => SpawnReply {
+                    token,
+                    pid: None,
+                    error: format!("{e:#}"),
+                },
+            };
+            let _ = sock.send(&serde_json::to_vec(&reply).unwrap_or_default());
         }
     }
 }
@@ -326,11 +323,11 @@ fn kill_builds(builds: &mut Vec<(i32, String)>) {
     }
 }
 
-fn handle_spawn(req: SpawnRequest, mut fds: Vec<OwnedFd>) -> Result<i32> {
+fn handle_spawn(req: &SpawnRequest, mut fds: Vec<OwnedFd>) -> Result<i32> {
     anyhow::ensure!(
-        fds.len() == 1 + req.has_stdin as usize,
+        fds.len() == 1 + usize::from(req.has_stdin),
         "expected {} fds, got {}",
-        1 + req.has_stdin as usize,
+        1 + usize::from(req.has_stdin),
         fds.len()
     );
     let log = fds.remove(0);
@@ -352,7 +349,7 @@ fn handle_spawn(req: SpawnRequest, mut fds: Vec<OwnedFd>) -> Result<i32> {
         None => std::process::Stdio::null(),
     });
     let child = cmd.spawn().context("spawning build")?;
-    Ok(child.id() as i32)
+    Ok(child.id().cast_signed())
 }
 
 /// The serialized request travels through a passed fd, not in the

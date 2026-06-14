@@ -15,7 +15,6 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 #[cfg(test)]
 use std::process::{Child, Stdio};
 

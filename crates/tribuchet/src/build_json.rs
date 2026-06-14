@@ -99,7 +99,7 @@ mod tests {
         assert!(required_system_features(&HashMap::new()).is_empty());
     }
 
-    fn doc(env: serde_json::Value) -> BuildJson {
+    fn doc(env: &serde_json::Value) -> BuildJson {
         serde_json::from_value(serde_json::json!({
             "version": 1,
             "builder": "/bin/sh",
@@ -117,12 +117,12 @@ mod tests {
 
     #[test]
     fn fixed_output_detection() {
-        assert!(!doc(serde_json::json!({})).is_fixed_output());
-        assert!(doc(serde_json::json!({"outputHash": "sha256-..."})).is_fixed_output());
+        assert!(!doc(&serde_json::json!({})).is_fixed_output());
+        assert!(doc(&serde_json::json!({"outputHash": "sha256-..."})).is_fixed_output());
         // structured attrs: outputHash lives in the __json blob
         let env = serde_json::json!({"__json": "{\"outputHash\":\"sha256-...\"}"});
-        assert!(doc(env).is_fixed_output());
+        assert!(doc(&env).is_fixed_output());
         let env = serde_json::json!({"__json": "{\"name\":\"x\"}"});
-        assert!(!doc(env).is_fixed_output());
+        assert!(!doc(&env).is_fixed_output());
     }
 }

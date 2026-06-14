@@ -3,6 +3,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 
 use anyhow::{bail, Context, Result};
 use harmonia_store_path::{StoreDir, StorePath};
@@ -28,7 +29,7 @@ impl WorkerCtx {
         slots[idx] = true;
         Some(UidSlot {
             ctx: self.clone(),
-            base: self.uid_base + (idx as u32) * 65536,
+            base: self.uid_base + u32::try_from(idx).expect("slot index fits u32") * 65536,
             idx,
         })
     }
@@ -284,7 +285,7 @@ impl ActiveBuild {
         Ok(missing)
     }
 
-    pub(super) fn feed_path_info(&mut self, pi: PathInfoMsg) -> Result<()> {
+    pub(super) fn feed_path_info(&mut self, pi: &PathInfoMsg) -> Result<()> {
         let Some(slot) = self.pending.get_mut(&pi.store_path) else {
             bail!("hub sent path info for unrequested path {}", pi.store_path);
         };
@@ -295,7 +296,7 @@ impl ActiveBuild {
             );
         }
         *slot =
-            Some(parse_path_info(&pi).with_context(|| format!("path info for {}", pi.store_path))?);
+            Some(parse_path_info(pi).with_context(|| format!("path info for {}", pi.store_path))?);
         Ok(())
     }
 
@@ -425,7 +426,10 @@ impl ActiveBuild {
         let log_path = self.dir.join("build.log");
         let log_file = std::fs::File::create(&log_path)?;
         let (mut req, child_stdin, spec_w) = sandbox::spawn_request(&spec)?;
-        let pid = self.ctx.spawner.spawn(&mut req, &log_file, child_stdin)?;
+        let pid = self
+            .ctx
+            .spawner
+            .spawn(&mut req, &log_file, child_stdin.as_ref())?;
         if let Some(w) = spec_w {
             sandbox::send_spec_to(&spec, w)?;
         }
@@ -451,12 +455,10 @@ impl ActiveBuild {
             let log_done = log_done.clone();
             let dir = self.dir.clone();
             std::thread::spawn(move || {
-                use std::sync::atomic::Ordering;
                 tail_log(&dir, &build_id, &tx, || log_done.load(Ordering::Relaxed));
             })
         };
         let pgrp = nix::unistd::Pid::from_raw(pid);
-        use std::sync::atomic::Ordering;
         let mut abort: Option<String> = None;
         let status = loop {
             if let Some(code) = reaper::take_status(&self.ctx.status_dir, &req.token) {
@@ -639,7 +641,9 @@ fn unpack_tmp_dir_archive(reader: impl Read, dest: &Path) -> Result<()> {
             match c {
                 Component::Normal(p) => comps.push(p.to_owned()),
                 Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
-                Component::ParentDir => bail!("tar entry escapes the tmp dir: {path:?}"),
+                Component::ParentDir => {
+                    bail!("tar entry escapes the tmp dir: {}", path.display())
+                }
             }
         }
         let Some(leaf) = comps.pop() else { continue };
@@ -734,7 +738,7 @@ mod tests {
             system: "x86_64-linux".into(),
             builder: "/nix/store/00000000000000000000000000000000-bash/bin/bash".into(),
             args: vec![],
-            env: Default::default(),
+            env: HashMap::default(),
             outputs: [(
                 "out".to_string(),
                 "/nix/store/00000000000000000000000000000000-out".to_string(),

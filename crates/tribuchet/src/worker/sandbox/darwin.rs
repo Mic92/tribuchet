@@ -1,6 +1,14 @@
 //! macOS sandbox implementation: sandbox-exec with a deny-default write profile.
 
-use super::*;
+use std::path::Path;
+use std::process::Command;
+#[cfg(test)]
+use std::process::{Child, Stdio};
+
+use anyhow::{Context, Result};
+
+use super::SandboxSpec;
+use crate::proto::BuildAssignment;
 
 pub fn prepare(spec: &mut SandboxSpec) -> Result<()> {
     // No bind mounts on Darwin: inputs already live at their real

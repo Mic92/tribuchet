@@ -35,7 +35,7 @@ use submit::AttachSvc;
 /// No worker message for this long tears the session down and fails
 /// its builds: heartbeats flow every 30s, so silence means a dead
 /// worker that would otherwise pin its builds (and dedupe keys) forever.
-const WORKER_SILENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+const WORKER_SILENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(3);
 /// A worker-session loss requeues a job at most this many times.
 const MAX_JOB_ATTEMPTS: u32 = 3;
 
@@ -140,10 +140,11 @@ async fn route_loop(
         };
         // clone outside the lock: a send must not block other routing
         let tx = router.builds.lock().unwrap().get(&id).cloned();
-        match tx {
+        if let Some(tx) = tx {
             // send error = job already ended; drop the message
-            Some(tx) => drop(tx.send(m).await),
-            None => tracing::warn!(id, "dropping worker message for unknown build"),
+            drop(tx.send(m).await);
+        } else {
+            tracing::warn!(id, "dropping worker message for unknown build");
         }
     }
     router.close_all();
@@ -158,11 +159,11 @@ impl crate::proto::worker_hub_server::WorkerHub for WorkerSvc {
         request: Request<Streaming<WorkerMessage>>,
     ) -> Result<Response<Self::SessionStream>, Status> {
         let mut inbound = request.into_inner();
-        let register = match inbound.message().await? {
-            Some(WorkerMessage {
-                msg: Some(worker_message::Msg::Register(r)),
-            }) => r,
-            _ => return Err(Status::invalid_argument("first message must be Register")),
+        let Some(WorkerMessage {
+            msg: Some(worker_message::Msg::Register(register)),
+        }) = inbound.message().await?
+        else {
+            return Err(Status::invalid_argument("first message must be Register"));
         };
         let vkey: PublicKey = register
             .signing_public_key
@@ -256,8 +257,8 @@ async fn worker_loop(
             // notify_waiters() wakes only current waiters; the timeout
             // closes the race between checking the queue and awaiting.
             tokio::select! {
-                _ = state.notify.notified() => {}
-                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                () = state.notify.notified() => {}
+                () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
                 r = req_rx.recv() => match r {
                     Some(()) => credits += 1,
                     None => break 'outer, // route_loop ended: worker gone
@@ -357,11 +358,8 @@ fn bind_attach_socket(socket: &Path) -> Result<tokio::net::UnixListener> {
         bail!("another hub is already serving {}", socket.display());
     }
     let _ = std::fs::remove_file(socket);
-    let group = match nix::unistd::Group::from_name("nixbld") {
-        Ok(Some(group)) => group,
-        _ => bail!(
-            "group nixbld not found; refusing to serve a hub socket without a group to restrict it to"
-        ),
+    let Ok(Some(group)) = nix::unistd::Group::from_name("nixbld") else {
+        bail!("group nixbld not found; refusing to serve a hub socket without a group to restrict it to");
     };
     let old_umask = nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o117));
     let uds = tokio::net::UnixListener::bind(socket);

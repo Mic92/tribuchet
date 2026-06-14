@@ -94,7 +94,7 @@ pub(super) async fn adopt_builds(
         tokio::task::spawn_blocking(move || {
             let ctx = task_ctx;
             let key = st.dedupe_key.clone();
-            let fin = supervise_adopted(&ctx, st, dir, &signing_key);
+            let fin = supervise_adopted(&ctx, &st, dir, &signing_key);
             // Roots live until the outputs are packed.
             drop(gc_roots);
             ctx.running
@@ -133,7 +133,7 @@ async fn re_root_inputs(spec: &sandbox::SandboxSpec) -> Option<DaemonConn> {
 /// adopt_assignment starts once a session re-dispatches the build.
 fn supervise_adopted(
     ctx: &std::sync::Arc<WorkerCtx>,
-    st: ResumeState,
+    st: &ResumeState,
     dir: PathBuf,
     signing_key: &SecretKey,
 ) -> FinishedBuild {
@@ -195,7 +195,7 @@ fn supervise_adopted(
         // Fresh deadline: the build's own one bounded execution; this
         // one only stops packing a pathological (e.g. sparse-file)
         // output from running away.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_mins(10);
         match pack_outputs(&dir, &st.spec, deadline, signing_key) {
             Ok(outputs) => (0, String::new(), outputs),
             Err(e) => (1, format!("{e:#}"), vec![]),
@@ -214,10 +214,10 @@ fn supervise_adopted(
 /// resubmitting (it gave up or died), the result has no taker; the
 /// entry would otherwise pin the build dir forever.
 pub(super) fn spawn_resumable_reaper(ctx: std::sync::Arc<WorkerCtx>) {
-    const TTL: std::time::Duration = std::time::Duration::from_secs(300);
+    const TTL: std::time::Duration = std::time::Duration::from_mins(5);
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            tokio::time::sleep(std::time::Duration::from_mins(1)).await;
             let mut expired = Vec::new();
             {
                 let mut map = ctx.resumable.lock().unwrap();

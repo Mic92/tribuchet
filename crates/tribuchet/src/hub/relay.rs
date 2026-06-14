@@ -209,7 +209,7 @@ async fn query_path_infos(
                 .iter()
                 .map(|r| store_dir.display(r).to_string())
                 .collect(),
-            signatures: info.signatures.iter().map(|s| s.to_string()).collect(),
+            signatures: info.signatures.iter().map(ToString::to_string).collect(),
             deriver: info
                 .deriver
                 .map(|d| store_dir.display(&d).to_string())
@@ -356,7 +356,7 @@ fn append_dir_fd<W: std::io::Write>(
         let meta = fd.metadata()?;
         let mut h = tar::Header::new_gnu();
         h.set_mode(meta.mode() & 0o7777);
-        h.set_mtime(meta.mtime().max(0) as u64);
+        h.set_mtime(u64::try_from(meta.mtime()).unwrap_or(0));
         if meta.is_dir() {
             h.set_entry_type(tar::EntryType::Directory);
             h.set_size(0);
