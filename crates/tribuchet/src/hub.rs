@@ -438,34 +438,44 @@ fn fd_path(fd: std::os::fd::RawFd) -> std::path::PathBuf {
 /// client's build.
 fn dedupe_key(req: &BuildRequest) -> String {
     let mut h = Sha256::new();
-    let mut feed = |s: &str| {
+    fn feed(h: &mut Sha256, s: &str) {
         h.update((s.len() as u64).to_le_bytes());
         h.update(s.as_bytes());
-    };
-    feed(&req.system);
-    feed(&req.builder);
+    }
+    // Each variable-length section is preceded by its element count;
+    // without it, an args tail and an env entry (for example) would
+    // feed identical bytes and two different requests could collide.
+    fn count(h: &mut Sha256, n: usize) {
+        h.update((n as u64).to_le_bytes());
+    }
+    feed(&mut h, &req.system);
+    feed(&mut h, &req.builder);
+    count(&mut h, req.args.len());
     for a in &req.args {
-        feed(a);
+        feed(&mut h, a);
     }
     let mut env: Vec<_> = req.env.iter().collect();
     env.sort();
+    count(&mut h, env.len());
     for (k, v) in env {
-        feed(k);
-        feed(v);
+        feed(&mut h, k);
+        feed(&mut h, v);
     }
     let mut outs: Vec<_> = req.outputs.iter().collect();
     outs.sort();
+    count(&mut h, outs.len());
     for (k, v) in outs {
-        feed(k);
-        feed(v);
+        feed(&mut h, k);
+        feed(&mut h, v);
     }
     let mut inputs: Vec<_> = req.input_paths.iter().collect();
     inputs.sort();
+    count(&mut h, inputs.len());
     for p in inputs {
-        feed(p);
+        feed(&mut h, p);
     }
-    feed(&req.store_dir);
-    feed(&req.tmp_dir_in_sandbox);
+    feed(&mut h, &req.store_dir);
+    feed(&mut h, &req.tmp_dir_in_sandbox);
     h.update([req.fixed_output as u8]);
     hex::encode(h.finalize())
 }
@@ -1667,5 +1677,19 @@ mod tests {
         let mut req = base_request();
         req.env.insert("X".into(), "1".into());
         assert_ne!(a, dedupe_key(&req));
+    }
+
+    /// Strings shifted between adjacent sections must not collide:
+    /// args ["-c", "K", "V"] with no env and args ["-c"] with
+    /// env {K: V} would feed identical bytes without section counts.
+    #[test]
+    fn dedupe_key_separates_sections() {
+        let mut a = base_request();
+        a.args = vec!["-c".into(), "K".into(), "V".into()];
+        a.env.clear();
+        let mut b = base_request();
+        b.args = vec!["-c".into()];
+        b.env = [("K".to_string(), "V".to_string())].into();
+        assert_ne!(dedupe_key(&a), dedupe_key(&b));
     }
 }
