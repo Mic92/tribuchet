@@ -188,6 +188,15 @@ async fn attempt_build(
                     tracing::info!(path = out.store_path, "output unpacked");
                 }
             }
+            Some(attach_event::Event::OutputRestart(path)) => {
+                // The previous worker attempt died mid-NAR; the next
+                // attempt streams this output again from the start.
+                if let Some((tx, task)) = unpackers.remove(&path) {
+                    drop(tx);
+                    let _ = task.await;
+                    remove_tree(&unpack_temp_path(&path));
+                }
+            }
             Some(attach_event::Event::ExitCode(code)) => {
                 if !unpackers.is_empty() {
                     bail!("hub closed build with unfinished output transfers");

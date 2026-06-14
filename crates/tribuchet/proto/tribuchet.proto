@@ -202,6 +202,10 @@ message AttachEvent {
     OutputNar output = 2;
     int32 exit_code = 3;
     string error = 4;
+    // Discard any partially received NAR for this scratch path; the
+    // build was handed to another worker attempt and the output will
+    // be streamed again from the start.
+    string output_restart = 5;
   }
 }
 

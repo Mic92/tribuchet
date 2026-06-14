@@ -62,6 +62,7 @@ fn event_size(ev: &attach_event::Event) -> usize {
     match ev {
         attach_event::Event::Log(d) => d.len(),
         attach_event::Event::Output(o) => o.zstd_nar_chunk.len(),
+        attach_event::Event::OutputRestart(p) => p.len(),
         attach_event::Event::Error(e) => e.len(),
         attach_event::Event::ExitCode(_) => 0,
     }
@@ -843,6 +844,14 @@ async fn worker_loop(
                 let mut job = job;
                 job.attempts += 1;
                 job.requeued_at = Some(std::time::Instant::now());
+                // Output NARs interrupted mid-stream are already in the
+                // replay; tell attach clients to drop those partial
+                // transfers before the next attempt re-streams them.
+                for path in job.req.outputs.values() {
+                    job.replay
+                        .publish(attach_event::Event::OutputRestart(path.clone()))
+                        .await;
+                }
                 state.queue.lock().await.push_back(job);
                 state.notify.notify_waiters();
                 // Re-evaluate once the grace expired, or the job would
