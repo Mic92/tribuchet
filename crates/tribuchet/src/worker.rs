@@ -694,9 +694,27 @@ fn supervise_adopted(
     let pgrp = nix::unistd::Pid::from_raw(st.pid);
     let mut aborted: Option<String> = None;
     let log_path = dir.join("build.log");
+    // Set when the build process is gone but no status file appears: a
+    // previous generation may have consumed the status (take_status
+    // deletes it on read) and died before recording the result. Waiting
+    // forever would leak the slot and the supervising thread.
+    let mut gone_since: Option<std::time::Instant> = None;
     let code = loop {
         if let Some(code) = reaper::take_status(&ctx.status_dir, &st.status_token) {
             break code;
+        }
+        if nix::sys::signal::kill(pgrp, None).is_err() {
+            let since = gone_since.get_or_insert_with(std::time::Instant::now);
+            // a couple of reaper sweeps of grace for a status file
+            // that is still on its way
+            if since.elapsed() > std::time::Duration::from_secs(5) {
+                aborted.get_or_insert_with(|| {
+                    "build exit status was lost during a worker handover".into()
+                });
+                break 1;
+            }
+        } else {
+            gone_since = None;
         }
         if aborted.is_none() {
             // The same guards execute() applies, recovered from the log
