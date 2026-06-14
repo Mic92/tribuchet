@@ -47,6 +47,12 @@
             };
             nativeBuildInputs = [ pkgs.protobuf ];
             PROTOC = "${pkgs.protobuf}/bin/protoc";
+            # sandbox_runs_builder needs CAP_SYS_ADMIN that the outer
+            # Nix builder sandbox does not grant; `nix develop -c
+            # cargo test` runs it.
+            checkFlags = [
+              "--skip=worker::sandbox::tests::sandbox_runs_builder"
+            ];
           }
           // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
             # default network backend for fixed-output builds
