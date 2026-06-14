@@ -20,7 +20,6 @@ mod resume;
 pub mod sandbox;
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -162,25 +161,6 @@ impl WorkerCtx {
     }
 }
 
-/// Write a secret file atomically with mode 0600: created via a temp
-/// file so it is never world-readable (fs::write + chmod would race)
-/// and a torn write cannot leave a short key behind.
-pub(crate) fn write_secret(path: &Path, data: &[u8]) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let tmp = path.with_extension("tmp");
-    let _ = std::fs::remove_file(&tmp);
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)
-        .with_context(|| format!("creating {}", tmp.display()))?;
-    f.write_all(data)?;
-    f.sync_all()?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
-}
-
 /// Load or create the worker's NAR signing key, stored in Nix's
 /// "name:base64" secret key format (nix-store --generate-binary-cache-key)
 /// so operators can inspect it with standard tooling.
@@ -207,7 +187,7 @@ fn load_signing_key(state_dir: &Path) -> Result<SecretKey> {
     } else {
         let key = SecretKey::generate(format!("{}-1", hostname()))
             .map_err(|e| anyhow::anyhow!("generating signing key: {e}"))?;
-        write_secret(&path, format!("{key}\n").as_bytes())?;
+        crate::fsutil::write_secret(&path, format!("{key}\n").as_bytes())?;
         Ok(key)
     }
 }
@@ -223,7 +203,7 @@ fn sweep_state_dir(state_dir: &Path) {
                 continue;
             }
             tracing::info!("removing stale build dir {}", dir.display());
-            remove_path_all(&dir);
+            crate::fsutil::remove_path_all(&dir);
         }
     }
     // Input caching moved into the real /nix/store (daemon import);
@@ -231,20 +211,7 @@ fn sweep_state_dir(state_dir: &Path) {
     let legacy = state_dir.join("store");
     if legacy.symlink_metadata().is_ok() {
         tracing::info!("removing legacy input cache {}", legacy.display());
-        remove_path_all(&legacy);
-    }
-}
-
-/// Remove whatever is at `path` without following a symlink at `path`.
-fn remove_path_all(path: &Path) {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.is_dir() => {
-            let _ = std::fs::remove_dir_all(path);
-        }
-        Ok(_) => {
-            let _ = std::fs::remove_file(path);
-        }
-        Err(_) => {}
+        crate::fsutil::remove_path_all(&legacy);
     }
 }
 

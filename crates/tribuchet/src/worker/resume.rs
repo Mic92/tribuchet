@@ -12,8 +12,9 @@ use tokio::sync::mpsc;
 
 use super::build::{pack_outputs, ActiveBuild};
 use super::logtail::LogTail;
-use super::{cgroup, msg, reaper, remove_path_all, sandbox, unix_now, DaemonConn, WorkerCtx};
+use super::{cgroup, msg, reaper, sandbox, unix_now, DaemonConn, WorkerCtx};
 use crate::chunkio::CHUNK_SIZE;
+use crate::fsutil::remove_path_all;
 use crate::proto::{
     nar_transfer, worker_message, BuildAssignment, BuildResult, NarTransfer, OutputSignature,
     WorkerMessage,

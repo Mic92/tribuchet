@@ -3,6 +3,7 @@ mod build_json;
 mod ca;
 mod chunkio;
 mod config;
+mod fsutil;
 mod hub;
 mod nar;
 mod proto;
