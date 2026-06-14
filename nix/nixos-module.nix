@@ -29,6 +29,9 @@ let
   workerToml = format.generate "worker.toml" worker.settings;
   workerExec = "/run/tribuchet-worker/exec";
   flipWorkerExec = "${pkgs.coreutils}/bin/ln -sfn ${lib.getExe' worker.package "tribuchet"} ${workerExec}";
+  attachWrapper = pkgs.writeShellScript "tribuchet-attach" ''
+    exec ${lib.getExe' hub.package "tribuchet"} attach "$1" --socket ${hub.socketPath}
+  '';
 in
 {
   options.services.tribuchet-hub = {
@@ -74,6 +77,26 @@ in
       default = { };
       description = "Extra settings merged into hub.toml.";
     };
+    externalBuilders = {
+      enable = lib.mkEnableOption "routing this machine's nix-daemon builds through the hub (experimental external-builders feature)";
+      systems = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ pkgs.stdenv.hostPlatform.system ];
+        defaultText = lib.literalExpression "[ pkgs.stdenv.hostPlatform.system ]";
+        description = "Systems handed to tribuchet instead of being built locally.";
+      };
+      nixPackage = lib.mkOption {
+        type = lib.types.package;
+        default = pkgs.nixVersions.latest;
+        defaultText = lib.literalExpression "pkgs.nixVersions.latest";
+        description = "Nix package to use; must support the external-builders experimental feature.";
+      };
+      patchNix = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = "Patch Nix so uid-range derivations reach the external builder.";
+      };
+    };
   };
 
   options.services.tribuchet-worker = {
@@ -102,6 +125,24 @@ in
   };
 
   config = lib.mkMerge [
+    (lib.mkIf (hub.enable && hub.externalBuilders.enable) {
+      nix.package =
+        if hub.externalBuilders.patchNix then
+          hub.externalBuilders.nixPackage.appendPatches [ ./patches/external-builders-uid-range.patch ]
+        else
+          hub.externalBuilders.nixPackage;
+      nix.settings = {
+        experimental-features = [ "external-builders" ];
+        external-builders = builtins.toJSON [
+          {
+            systems = hub.externalBuilders.systems;
+            program = attachWrapper;
+            args = [ ];
+          }
+        ];
+      };
+    })
+
     (lib.mkIf hub.enable {
       networking.firewall.allowedTCPPorts = lib.optional hub.openFirewall hub.port;
       systemd.sockets.tribuchet-hub = {

@@ -145,6 +145,11 @@ Import `tribuchet.nixosModules.default` (flake input
 {
   # hub machine
   services.tribuchet-hub.enable = true;
+  # optional: route this machine's nix-daemon builds through the hub
+  services.tribuchet-hub.externalBuilders = {
+    enable = true;
+    systems = [ "x86_64-linux" "aarch64-linux" ];
+  };
 
   # worker machines
   services.tribuchet-worker = {

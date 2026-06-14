@@ -4,11 +4,6 @@
 { tribuchet, nixosModule }:
 { pkgs, lib, ... }:
 let
-  attachWrapper = pkgs.writeShellScript "tribuchet-attach" ''
-    export RUST_LOG=info
-    exec ${tribuchet}/bin/tribuchet attach "$1" --socket /run/tribuchet/hub.sock
-  '';
-
   # evaluated here so the container closure can be pre-seeded into both
   # VM stores; the hub re-evaluates the same expression at test time
   nspawn = import ./nspawn-container.nix { nixpkgs = pkgs.path; };
@@ -43,30 +38,14 @@ in
           nspawn.toplevel
         ];
 
-        # patched so uid-range derivations reach the external builder
-        # (upstream rejects them before invoking it)
-        nix.package = pkgs.nixVersions.latest.appendPatches [
-          ./patches/external-builders-uid-range.patch
-        ];
         nix.settings = {
           experimental-features = [
-            "external-builders"
             "ca-derivations"
             "impure-derivations"
           ];
           # let the daemon accept uid-range builds; tribuchet's worker
           # provides the actual uid range
           system-features = [ "uid-range" ];
-          external-builders = builtins.toJSON [
-            {
-              systems = [
-                "x86_64-linux"
-                "aarch64-linux"
-              ];
-              program = "${attachWrapper}";
-              args = [ ];
-            }
-          ];
           substituters = lib.mkForce [ ];
         };
 
@@ -132,6 +111,13 @@ in
         imports = [ nixosModule ];
         services.tribuchet-hub = {
           enable = true;
+          externalBuilders = {
+            enable = true;
+            systems = [
+              "x86_64-linux"
+              "aarch64-linux"
+            ];
+          };
           package = tribuchet;
         };
         # started by the test script once certificates exist
