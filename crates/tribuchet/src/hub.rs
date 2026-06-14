@@ -853,6 +853,19 @@ async fn worker_loop(
                 });
             } else {
                 tracing::warn!(id = job.id, "build failed: {err:#}");
+                // The worker session is still up: it may hold a
+                // half-staged or running build (and its job credit) for
+                // this id. Cancelling lets it tear that down and send
+                // the next RequestJob; without it every hub-side
+                // failure permanently costs the worker one slot.
+                let _ = send(
+                    &out_tx,
+                    hub_message::Msg::Cancel(CancelBuild {
+                        build_id: job.id.clone(),
+                        dedupe_key: job.key.clone(),
+                    }),
+                )
+                .await;
                 job.replay
                     .publish(attach_event::Event::Error(format!("{err:#}")))
                     .await;
