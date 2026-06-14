@@ -514,12 +514,7 @@ async fn session_loop(
                             })))
                             .await?;
                     }
-                    Err(e) => {
-                        let build = active.remove(&offer.build_id).unwrap();
-                        let id = build.assignment.build_id.clone();
-                        build.abort().await;
-                        fail_build(out_tx, &id, &e).await?;
-                    }
+                    Err(e) => abort_active(active, &offer.build_id, out_tx, &e).await?,
                 }
             }
             hub_message::Msg::Nar(n) => {
@@ -527,9 +522,7 @@ async fn session_loop(
                 if let Some(build) = active.get_mut(&id) {
                     // A bad transfer fails this build, not the session.
                     if let Err(e) = build.feed_nar(n).await {
-                        let build = active.remove(&id).unwrap();
-                        build.abort().await;
-                        fail_build(out_tx, &id, &e).await?;
+                        abort_active(active, &id, out_tx, &e).await?;
                     }
                 }
             }
@@ -537,49 +530,11 @@ async fn session_loop(
                 let id = t.build_id.clone();
                 if let Some(build) = active.get_mut(&id) {
                     match build.feed_tmp_dir(t).await {
-                        Err(e) => {
-                            let build = active.remove(&id).unwrap();
-                            build.abort().await;
-                            fail_build(out_tx, &id, &e).await?;
-                        }
+                        Err(e) => abort_active(active, &id, out_tx, &e).await?,
                         Ok(false) => {}
                         Ok(true) => {
                             let build = active.remove(&id).unwrap();
-                            let out_tx = out_tx.clone();
-                            let signing_key = signing_key.clone();
-                            let ctx = ctx.clone();
-                            let key = build.assignment.dedupe_key.clone();
-                            // From here the build outlives the session:
-                            // it is resumable until its result reaches
-                            // some hub.
-                            ctx.resumable.lock().unwrap().insert(
-                                key.clone(),
-                                ResumableBuild {
-                                    build_id: id.clone(),
-                                    out_tx: Some(out_tx.clone()),
-                                    finished: None,
-                                    delivering: false,
-                                    dir: build.dir.clone(),
-                                    // execute() streams the log live itself
-                                    log_tail: None,
-                                },
-                            );
-                            ctx.running
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            tokio::task::spawn_blocking(move || {
-                                let fin = execute_to_finished(
-                                    &build,
-                                    &out_tx,
-                                    &signing_key,
-                                    build_timeout,
-                                );
-                                build.teardown();
-                                drop(build);
-                                ctx.running
-                                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                                record_finished(&ctx, &key, fin);
-                                let _ = out_tx.blocking_send(request_job());
-                            });
+                            launch_build(ctx, build, out_tx, signing_key, build_timeout);
                         }
                     }
                 }
@@ -588,9 +543,7 @@ async fn session_loop(
                 let id = pi.build_id.clone();
                 if let Some(build) = active.get_mut(&id) {
                     if let Err(e) = build.feed_path_info(&pi) {
-                        let build = active.remove(&id).unwrap();
-                        build.abort().await;
-                        fail_build(out_tx, &id, &e).await?;
+                        abort_active(active, &id, out_tx, &e).await?;
                     }
                 }
             }
@@ -623,6 +576,58 @@ async fn session_loop(
         }
     }
     bail!("hub closed the session");
+}
+
+/// Register a fully-staged build as resumable and run it on a blocking
+/// thread; the result is delivered via the resumable registry, so the
+/// build outlives this session.
+fn launch_build(
+    ctx: &std::sync::Arc<WorkerCtx>,
+    build: ActiveBuild,
+    out_tx: &mpsc::Sender<WorkerMessage>,
+    signing_key: &std::sync::Arc<SecretKey>,
+    build_timeout: std::time::Duration,
+) {
+    let ctx = ctx.clone();
+    let out_tx = out_tx.clone();
+    let signing_key = signing_key.clone();
+    let key = build.assignment.dedupe_key.clone();
+    ctx.resumable.lock().unwrap().insert(
+        key.clone(),
+        ResumableBuild {
+            build_id: build.assignment.build_id.clone(),
+            out_tx: Some(out_tx.clone()),
+            finished: None,
+            delivering: false,
+            dir: build.dir.clone(),
+            // execute() streams the log live itself
+            log_tail: None,
+        },
+    );
+    ctx.running
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tokio::task::spawn_blocking(move || {
+        let fin = execute_to_finished(&build, &out_tx, &signing_key, build_timeout);
+        build.teardown();
+        drop(build);
+        ctx.running
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        record_finished(&ctx, &key, fin);
+        let _ = out_tx.blocking_send(request_job());
+    });
+}
+
+/// Tear down a still-staging build and report the error to the hub.
+async fn abort_active(
+    active: &mut HashMap<String, ActiveBuild>,
+    id: &str,
+    out_tx: &mpsc::Sender<WorkerMessage>,
+    e: &anyhow::Error,
+) -> Result<()> {
+    if let Some(build) = active.remove(id) {
+        build.abort().await;
+    }
+    fail_build(out_tx, id, e).await
 }
 
 /// Report a per-build failure to the hub without tearing the session down.
