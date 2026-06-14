@@ -332,7 +332,13 @@ fn append_dir_fd<W: std::io::Write>(
         let entry = entry?;
         let name = entry.file_name();
         let in_tar = prefix.join(&name);
-        if entry.file_type()?.is_symlink() {
+        let ftype = entry.file_type()?;
+        // Tar carries only files, dirs and symlinks; openat would
+        // ENXIO on the .nix-socket recursive-nix leaves in topTmpDir.
+        if !ftype.is_dir() && !ftype.is_file() && !ftype.is_symlink() {
+            continue;
+        }
+        if ftype.is_symlink() {
             let target = nix::fcntl::readlinkat(dir.as_fd(), name.as_os_str())?;
             let mut h = tar::Header::new_gnu();
             h.set_entry_type(tar::EntryType::Symlink);

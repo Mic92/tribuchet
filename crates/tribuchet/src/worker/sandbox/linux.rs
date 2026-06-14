@@ -285,7 +285,16 @@ fn enter_and_exec(spec: &SandboxSpec) -> io::Result<std::convert::Infallible> {
 
 fn existing_mount_flags(target: &Path) -> io::Result<MsFlags> {
     use nix::sys::statvfs::{statvfs, FsFlags};
-    let st = statvfs(target).map_err(ioerr("statvfs"))?;
+    // statvfs on a unix socket returns ENXIO; the parent directory
+    // describes the same mount, so fall back to it.
+    let st = match statvfs(target) {
+        Ok(st) => st,
+        Err(nix::errno::Errno::ENXIO) => {
+            let parent = target.parent().unwrap_or(target);
+            statvfs(parent).map_err(ioerr("statvfs"))?
+        }
+        Err(e) => return Err(ioerr("statvfs")(e)),
+    };
     let f = st.flags();
     let mut flags = MsFlags::empty();
     for (fs, ms) in [

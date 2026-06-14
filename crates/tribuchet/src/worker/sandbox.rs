@@ -169,6 +169,13 @@ pub fn prepare(
                 .unwrap_or_else(|| Path::new(NIX_DAEMON_SOCKET));
             spec.binds_ro
                 .push((host.to_path_buf(), PathBuf::from(NIX_DAEMON_SOCKET)));
+            // The hub-side patched Nix points NIX_REMOTE at its own
+            // topTmpDir/.nix-socket (where its in-process recursive
+            // daemon would listen); redirect to the worker's daemon.
+            spec.env.insert(
+                "NIX_REMOTE".to_owned(),
+                format!("unix://{NIX_DAEMON_SOCKET}"),
+            );
         }
     }
     spec.binds_ro.sort(); // deterministic mount order

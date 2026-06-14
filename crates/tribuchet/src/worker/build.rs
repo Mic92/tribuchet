@@ -489,8 +489,9 @@ impl ActiveBuild {
             });
         }
 
-        let (packed, extras) =
-            pack_outputs_and_extras(&self.dir, &spec, deadline, signing_key, &a.build_id)?;
+        let (packed, extras) = tokio::runtime::Handle::current().block_on(
+            pack_outputs_and_extras(&self.dir, &spec, deadline, signing_key, &a.build_id),
+        )?;
         Ok(FinishedBuild {
             exit_code: 0,
             error: String::new(),
@@ -534,7 +535,7 @@ impl ActiveBuild {
 
 /// Pack the outputs, then (under recursive-nix) the closure-delta
 /// extras.
-fn pack_outputs_and_extras(
+async fn pack_outputs_and_extras(
     dir: &Path,
     spec: &sandbox::SandboxSpec,
     deadline: std::time::Instant,
@@ -542,30 +543,28 @@ fn pack_outputs_and_extras(
     build_id: &str,
 ) -> Result<(Vec<PackedOutput>, Vec<PackedExtra>)> {
     let extra_candidates = if spec.recursive_nix {
-        tokio::runtime::Handle::current()
-            .block_on(query_all_valid_paths())
-            .unwrap_or_else(|e| {
-                tracing::warn!(id = build_id, "queryAllValidPaths failed: {e:#}");
-                std::collections::BTreeSet::new()
-            })
+        query_all_valid_paths().await.unwrap_or_else(|e| {
+            tracing::warn!(id = build_id, "queryAllValidPaths failed: {e:#}");
+            std::collections::BTreeSet::new()
+        })
     } else {
         std::collections::BTreeSet::new()
     };
-    let packed = pack_outputs(dir, spec, &extra_candidates, deadline, signing_key)?;
+    let packed = pack_outputs(dir, spec, &extra_candidates, deadline, signing_key).await?;
     let extras = if spec.recursive_nix {
-        tokio::runtime::Handle::current()
-            .block_on(pack_extras(
-                dir,
-                &packed,
-                &spec.store_inputs,
-                &spec.outputs,
-                deadline,
-                signing_key,
-            ))
-            .unwrap_or_else(|e| {
-                tracing::warn!(id = build_id, "packing extras failed: {e:#}");
-                Vec::new()
-            })
+        pack_extras(
+            dir,
+            &packed,
+            &spec.store_inputs,
+            &spec.outputs,
+            deadline,
+            signing_key,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(id = build_id, "packing extras failed: {e:#}");
+            Vec::new()
+        })
     } else {
         Vec::new()
     };
@@ -589,7 +588,7 @@ async fn query_all_valid_paths(
 
 /// Pack, hash and sign every output before announcing the result,
 /// because signatures travel in BuildResult ahead of the NAR data.
-pub(super) fn pack_outputs(
+pub(super) async fn pack_outputs(
     dir: &Path,
     spec: &sandbox::SandboxSpec,
     extra_candidates: &std::collections::BTreeSet<harmonia_store_path::StorePath>,
@@ -615,6 +614,7 @@ pub(super) fn pack_outputs(
             self_path.as_ref(),
             deadline,
         )
+        .await
         .with_context(|| format!("packing output {scratch}"))?;
         let sig =
             signing_key.sign(format!("{scratch}:{}", hex::encode(&res.nar_sha256)).as_bytes());
@@ -689,6 +689,7 @@ async fn pack_extras(
             Some(&self_sp),
             deadline,
         )
+        .await
         .with_context(|| format!("packing extra {path}"))?;
         // Daemon NAR layout is deterministic, so its recorded
         // nar_size matches the bytes we just hashed.
@@ -736,7 +737,7 @@ struct NarPackResult {
 
 /// Pack `host_path` as a zstd-compressed NAR into `nar_path`, hashing
 /// and reference-scanning the plaintext NAR in the same pass.
-fn pack_one_nar(
+async fn pack_one_nar(
     host_path: &Path,
     nar_path: &Path,
     candidates: &std::collections::BTreeSet<harmonia_store_path::StorePath>,
@@ -760,7 +761,7 @@ fn pack_one_nar(
             remaining: MAX_NAR_BYTES,
             deadline,
         };
-        nar::pack(host_path, &mut limited)?;
+        nar::pack(host_path, &mut limited).await?;
         enc.finish()?.flush()?;
     }
     let store_dir = harmonia_store_path::StoreDir::default();
@@ -1056,8 +1057,8 @@ mod tests {
 
     /// pack_one_nar finds references in the same pass as the NAR
     /// hash; self-paths are dropped.
-    #[test]
-    fn pack_one_nar_finds_references_and_excludes_self() -> Result<()> {
+    #[tokio::test]
+    async fn pack_one_nar_finds_references_and_excludes_self() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let host = dir.path().join("out");
         std::fs::create_dir(&host)?;
@@ -1073,7 +1074,8 @@ mod tests {
             &candidates,
             self_sp.as_ref(),
             std::time::Instant::now() + std::time::Duration::from_secs(30),
-        )?;
+        )
+        .await?;
         assert_eq!(res.references, vec![input.to_string()]);
         assert_eq!(res.nar_sha256.len(), 32);
         Ok(())

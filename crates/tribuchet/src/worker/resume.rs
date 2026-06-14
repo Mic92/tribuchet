@@ -203,7 +203,13 @@ fn supervise_adopted(
         // accepting that closure-delta extras from a resumed build
         // miss any cross-references between added paths.
         let extra_candidates = std::collections::BTreeSet::new();
-        match pack_outputs(&dir, &st.spec, &extra_candidates, deadline, signing_key) {
+        match tokio::runtime::Handle::current().block_on(pack_outputs(
+            &dir,
+            &st.spec,
+            &extra_candidates,
+            deadline,
+            signing_key,
+        )) {
             Ok(outputs) => (0, String::new(), outputs),
             Err(e) => (1, format!("{e:#}"), vec![]),
         }

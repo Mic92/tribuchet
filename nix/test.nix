@@ -42,6 +42,7 @@ in
           experimental-features = [
             "ca-derivations"
             "impure-derivations"
+            "recursive-nix"
           ];
           # let the daemon accept uid-range builds; tribuchet's worker
           # provides the actual uid range
@@ -107,12 +108,19 @@ in
             busybox = "${pkgs.pkgsCross.aarch64-multiplatform.pkgsStatic.busybox}";
           }
         '';
+        environment.etc."tt/recursive.nix".text = ''
+          import ${./tests/recursive.nix} {
+            bash = "${pkgs.bash}";
+            nix = "${pkgs.nixVersions.latest}";
+          }
+        '';
 
         imports = [ nixosModule ];
         services.tribuchet-hub = {
           enable = true;
           externalBuilders = {
             enable = true;
+            recursiveNix = true;
             systems = [
               "x86_64-linux"
               "aarch64-linux"
@@ -152,6 +160,7 @@ in
             hub = "https://hub:7437";
             max-jobs = 2;
             max-log-size = 1048576;
+            recursive-nix = true;
             emulate.aarch64-linux = "${pkgs.pkgsStatic.qemu-user}/bin/qemu-aarch64";
           };
         };
@@ -395,6 +404,16 @@ in
         out = hub.succeed("nix-build /etc/tt/cross.nix --no-out-link").strip()
         hub.succeed(f"grep -q aarch64 {out}")
         hub.succeed(f"grep -qx 1000 {out}")
+
+    with subtest("recursive-nix: builder registers a path through the daemon socket"):
+        out = hub.succeed("nix-build /etc/tt/recursive.nix --no-out-link").strip()
+        inner = hub.succeed(f"cat {out}").strip()
+        # The closure-delta must have travelled: the inner path is
+        # registered in the hub's store, not just referenced.
+        hub.succeed(f"nix-store --check-validity {inner}")
+        hub.succeed(f"grep -q recursive-payload {inner}")
+        # And the worker really added it locally too.
+        worker.succeed(f"nix-store --check-validity {inner}")
 
     with subtest("systemd-nspawn boots a NixOS container in a remote build"):
         out = hub.succeed("nix-build /etc/tt/nspawn.nix --no-out-link", timeout=1800).strip()

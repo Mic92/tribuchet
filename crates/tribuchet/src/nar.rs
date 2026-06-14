@@ -12,28 +12,13 @@ use futures_util::StreamExt as _;
 use tokio::sync::mpsc;
 
 /// Serialize the filesystem object at `path` as a NAR into `w`.
-///
-/// Synchronous wrapper for blocking call sites (worker output packing
-/// runs on a blocking thread, interleaved with deadline checks); the
-/// async byte stream is driven by a local `block_on`.
-pub fn pack(path: &Path, w: &mut impl Write) -> Result<()> {
-    let fut = async {
-        let mut stream = harmonia_file_nar::archive::NarByteStream::new(path.to_path_buf());
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.with_context(|| format!("packing {}", path.display()))?;
-            w.write_all(&chunk)?;
-        }
-        Ok(())
-    };
-    // Callers are on spawn_blocking threads (or plain threads in
-    // tests), never inside an async context, so block_on cannot
-    // deadlock the runtime.
-    match tokio::runtime::Handle::try_current() {
-        Ok(h) => h.block_on(fut),
-        Err(_) => tokio::runtime::Runtime::new()
-            .expect("building a runtime for NAR I/O")
-            .block_on(fut),
+pub async fn pack(path: &Path, w: &mut impl Write) -> Result<()> {
+    let mut stream = harmonia_file_nar::archive::NarByteStream::new(path.to_path_buf());
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.with_context(|| format!("packing {}", path.display()))?;
+        w.write_all(&chunk)?;
     }
+    Ok(())
 }
 
 /// Restore a zstd-compressed NAR arriving as byte chunks on `rx` at
@@ -63,7 +48,7 @@ mod tests {
 
     async fn round_trip_via_zstd(src: &Path, dest: &Path) -> Result<()> {
         let mut nar = Vec::new();
-        pack_blocking(src, &mut nar)?;
+        pack(src, &mut nar).await?;
         let zstd = zstd::stream::encode_all(nar.as_slice(), 3)?;
         // capacity for every chunk: sender runs before the consumer
         let (tx, rx) = mpsc::channel(zstd.len() / 7 + 2);
@@ -72,16 +57,6 @@ mod tests {
         }
         drop(tx);
         unpack_zstd_chunks(rx, dest).await
-    }
-
-    /// pack() must not run inside an async context; tests drive it on
-    /// a plain thread like the worker's blocking call site does.
-    fn pack_blocking(path: &Path, w: &mut Vec<u8>) -> Result<()> {
-        let path = path.to_path_buf();
-        let mut buf = Vec::new();
-        std::thread::scope(|s| s.spawn(|| pack(&path, &mut buf)).join().unwrap())?;
-        w.extend_from_slice(&buf);
-        Ok(())
     }
 
     /// Round-trip a tree with the cases NAR distinguishes: regular
@@ -119,21 +94,21 @@ mod tests {
 
         // packing the restored tree yields identical bytes (determinism)
         let mut a = Vec::new();
-        pack_blocking(src.path(), &mut a)?;
+        pack(src.path(), &mut a).await?;
         let mut b = Vec::new();
-        pack_blocking(&dest, &mut b)?;
+        pack(&dest, &mut b).await?;
         assert_eq!(a, b);
         Ok(())
     }
 
     /// The NAR matches nix-store --dump byte for byte when nix exists.
-    #[test]
-    fn matches_nix_store_dump() -> Result<()> {
+    #[tokio::test]
+    async fn matches_nix_store_dump() -> Result<()> {
         let src = tempfile::tempdir()?;
         std::fs::write(src.path().join("a"), b"x")?;
         std::os::unix::fs::symlink("a", src.path().join("b"))?;
         let mut ours = Vec::new();
-        pack(src.path(), &mut ours)?;
+        pack(src.path(), &mut ours).await?;
         let theirs = match std::process::Command::new("nix-store")
             .arg("--dump")
             .arg(src.path())
