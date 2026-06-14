@@ -413,8 +413,8 @@ async fn session(
         .await
         .context("connecting to hub")?;
     let mut client = WorkerHubClient::new(channel)
-        .max_decoding_message_size(crate::hub::MAX_MSG_SIZE)
-        .max_encoding_message_size(crate::hub::MAX_MSG_SIZE);
+        .max_decoding_message_size(crate::proto::MAX_MSG_SIZE)
+        .max_encoding_message_size(crate::proto::MAX_MSG_SIZE);
 
     let (out_tx, out_rx) = mpsc::channel::<WorkerMessage>(64);
     out_tx

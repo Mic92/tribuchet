@@ -19,6 +19,7 @@ use super::{cgroup, reaper, sandbox, unix_now, DaemonConn, WorkerCtx};
 use crate::chunkio::ChannelReader;
 use crate::nar;
 use crate::proto::{nar_transfer, BuildAssignment, NarTransfer, PathInfoMsg, WorkerMessage};
+use crate::store::{valid_store_path, STORE_DIR};
 
 impl WorkerCtx {
     fn alloc_uid_slot(self: &std::sync::Arc<Self>) -> Option<UidSlot> {
@@ -131,7 +132,7 @@ pub(super) fn validate_assignment(a: &BuildAssignment) -> Result<()> {
         bail!("invalid tmpDirInSandbox {:?}", a.tmp_dir_in_sandbox);
     }
     for p in a.outputs.values() {
-        if !crate::hub::valid_store_path(crate::hub::STORE_DIR, p) {
+        if !valid_store_path(STORE_DIR, p) {
             bail!("invalid output path {p:?}");
         }
         // Scratch outputs handed out by Nix never exist yet. An output
@@ -773,7 +774,7 @@ mod tests {
             .flatten()
             .flatten()
             .map(|e| e.path().to_string_lossy().into_owned())
-            .find(|p| crate::hub::valid_store_path(crate::hub::STORE_DIR, p))
+            .find(|p| valid_store_path(STORE_DIR, p))
         {
             let mut a = base_assignment();
             a.outputs.insert("doc".into(), existing);

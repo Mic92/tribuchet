@@ -21,8 +21,8 @@ use std::process::{Child, Stdio};
 
 use anyhow::{Context, Result};
 
+use super::binfmt;
 use crate::proto::BuildAssignment;
-use crate::worker::binfmt;
 
 /// Address pasta's in-namespace DNS forwarder listens on; written to
 /// the sandbox resolv.conf for fixed-output builds.

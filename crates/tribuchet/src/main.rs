@@ -7,6 +7,7 @@ mod hub;
 mod nar;
 mod proto;
 mod sd;
+mod store;
 mod worker;
 
 use std::path::PathBuf;

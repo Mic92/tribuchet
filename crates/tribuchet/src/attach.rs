@@ -107,8 +107,8 @@ async fn attempt_build(
         }
     };
     let mut client = AttachHubClient::new(channel)
-        .max_decoding_message_size(crate::hub::MAX_MSG_SIZE)
-        .max_encoding_message_size(crate::hub::MAX_MSG_SIZE);
+        .max_decoding_message_size(crate::proto::MAX_MSG_SIZE)
+        .max_encoding_message_size(crate::proto::MAX_MSG_SIZE);
 
     // Ready marker for Nix; emitted only after a hub connection
     // exists so persistent connect failures surface as setup errors,

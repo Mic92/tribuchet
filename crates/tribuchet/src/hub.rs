@@ -21,7 +21,7 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::proto::{
     attach_event, attach_hub_server, hub_message, worker_message, CancelBuild, HubMessage,
-    Register, WorkerMessage,
+    Register, WorkerMessage, MAX_MSG_SIZE,
 };
 
 mod relay;
@@ -31,7 +31,6 @@ mod submit;
 use relay::{run_job, send};
 use state::{HubState, WorkerCaps, WORKER_GRACE};
 use submit::AttachSvc;
-pub(crate) use submit::{valid_store_path, MAX_MSG_SIZE, STORE_DIR};
 
 /// No worker message for this long tears the session down and fails
 /// its builds: heartbeats flow every 30s, so silence means a dead

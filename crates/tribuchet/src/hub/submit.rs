@@ -9,27 +9,7 @@ use tonic::{Request, Response, Status};
 
 use super::state::{HubState, Job, Replay, WORKER_GRACE};
 use crate::proto::{attach_hub_server, AttachEvent, BuildRequest};
-
-/// The hub serves exactly the canonical Nix store; clients must not
-/// anchor path validation at an arbitrary prefix.
-pub(crate) const STORE_DIR: &str = "/nix/store";
-
-/// gRPC message size cap. Metadata messages (BuildRequest, PathOffer)
-/// carry the whole input closure; tonic's 4 MiB default rejects large
-/// but legitimate closures.
-pub(crate) const MAX_MSG_SIZE: usize = 64 * 1024 * 1024;
-
-/// A store path directly under the store dir: absolute, exactly one
-/// component, hash-prefixed, Nix name charset (no shell/SBPL
-/// metacharacters, control bytes, or path tricks). The hub runs as
-/// root and reads these from disk, so anything else would be an
-/// arbitrary-file-read primitive.
-pub(crate) fn valid_store_path(store_dir: &str, path: &str) -> bool {
-    let Ok(dir) = harmonia_store_path::StoreDir::new(store_dir) else {
-        return false;
-    };
-    dir.parse::<harmonia_store_path::StorePath>(path).is_ok()
-}
+use crate::store::{valid_store_path, STORE_DIR};
 
 #[allow(clippy::result_large_err)] // tonic::Status is what the caller needs
 fn validate_request(req: &BuildRequest) -> Result<(), Status> {
@@ -299,30 +279,6 @@ mod tests {
 
     /// 32-char base32 hash part for synthetic store paths.
     const H: &str = "00000000000000000000000000000000";
-
-    #[test]
-    fn store_path_validation() {
-        fn ok(p: &str) -> bool {
-            valid_store_path("/nix/store", p)
-        }
-        assert!(ok(&format!("/nix/store/{H}-foo")));
-        assert!(ok(&format!("/nix/store/{H}-foo_1.2+x?=y")));
-        // hash part is mandatory since harmonia's StorePath parser
-        assert!(!ok("/nix/store/abc-foo"));
-        assert!(!ok("/nix/store/"));
-        assert!(!ok("/nix/store/.."));
-        // leading-dot names are valid in modern Nix (and harmonia)
-        assert!(ok(&format!("/nix/store/{H}-.hidden")));
-        assert!(!ok(&format!("/nix/store/{H}-abc/../../etc")));
-        assert!(!ok(&format!("/nix/store/{H}-abc/bin/sh")));
-        assert!(!ok("/etc/shadow"));
-        assert!(!ok(&format!("/nix/storeX/{H}-abc")));
-        // no quotes/parens/control bytes: these strings reach the macOS
-        // sandbox profile and log lines verbatim
-        assert!(!ok(&format!("/nix/store/{H}-a\")(allow-default)(\"")));
-        assert!(!ok(&format!("/nix/store/{H}-a\nb")));
-        assert!(!ok(&format!("/nix/store/{H}-a,b")));
-    }
 
     fn base_request() -> BuildRequest {
         BuildRequest {
