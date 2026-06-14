@@ -193,6 +193,12 @@ capable worker is left (or get rebuilt by another one).
   same goal, not the same derivation submitted twice. Proper dedupe
   needs a derivation identity in build.json (upstream patch).
 * Workers run up to `max-jobs` concurrent builds over one session.
+* The hub's tmp-dir tar and the worker's unpack walk their trees
+  through directory fds with O_NOFOLLOW, but NAR pack/unpack go through
+  harmonia-file-nar, which resolves paths; output packing therefore
+  trusts that nothing rewrites the finished build's output tree while
+  it is being packed (builds run under disjoint uids, so only root or
+  the same build could).
 * Reload upgrades the worker but never the reaper itself; picking up
   a new reaper still needs a full restart (which kills running
   builds). The reaper is deliberately small so this rarely matters.
