@@ -107,17 +107,6 @@ pub(super) fn validate_top_tmp_dir(
     Ok(dir)
 }
 
-/// Path that re-opens an already-held fd; lets `tar::Builder` walk the
-/// validated directory handle instead of resolving the path again.
-pub(super) fn fd_path(fd: std::os::fd::RawFd) -> std::path::PathBuf {
-    if cfg!(target_os = "linux") {
-        format!("/proc/self/fd/{fd}")
-    } else {
-        format!("/dev/fd/{fd}")
-    }
-    .into()
-}
-
 /// Dedupe key: hash of the full canonicalized request, so only truly
 /// identical submissions share a build. A key built from output paths
 /// alone would let a colliding (or crafted) request attach to another

@@ -12,7 +12,6 @@ use tokio::sync::mpsc;
 use tonic::Status;
 
 use super::state::{HubState, Job};
-use super::submit::fd_path;
 use crate::chunkio::ChunkWriter;
 use crate::proto::{
     attach_event, hub_message, nar_transfer, worker_message, BuildAssignment, CancelBuild,
@@ -320,7 +319,15 @@ fn append_dir_fd<W: std::io::Write>(
 ) -> Result<()> {
     use std::os::fd::{AsFd, AsRawFd};
     use std::os::unix::fs::MetadataExt;
-    for entry in std::fs::read_dir(fd_path(dir.as_raw_fd()))? {
+    // read_dir takes a path, not a fd; route it through /proc/self/fd
+    // so it lists the validated handle instead of re-resolving the
+    // client-controlled path.
+    let fd_path = if cfg!(target_os = "linux") {
+        format!("/proc/self/fd/{}", dir.as_raw_fd())
+    } else {
+        format!("/dev/fd/{}", dir.as_raw_fd())
+    };
+    for entry in std::fs::read_dir(fd_path)? {
         let entry = entry?;
         let name = entry.file_name();
         let in_tar = prefix.join(&name);
