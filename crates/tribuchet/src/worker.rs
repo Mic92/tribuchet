@@ -1173,6 +1173,13 @@ fn validate_assignment(a: &BuildAssignment) -> Result<()> {
         if !crate::hub::valid_store_path(crate::hub::STORE_DIR, p) {
             bail!("invalid output path {p:?}");
         }
+        // Scratch outputs handed out by Nix never exist yet. An output
+        // naming an existing store path would give the build write
+        // access to it (macOS builds write outputs in place) and have
+        // the post-build cleanup delete it.
+        if std::fs::symlink_metadata(p).is_ok() {
+            bail!("output path {p} already exists on this worker");
+        }
     }
     Ok(())
 }
@@ -2034,6 +2041,21 @@ mod tests {
         let mut a = base_assignment();
         a.outputs.insert("doc".into(), "/etc/shadow".into());
         assert!(validate_assignment(&a).is_err());
+
+        // an existing, registered store path must not be claimable as
+        // an output (in-place tampering, deletion by cleanup)
+        if let Some(existing) = std::fs::read_dir("/nix/store")
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path().to_string_lossy().into_owned())
+            .find(|p| crate::hub::valid_store_path(crate::hub::STORE_DIR, p))
+        {
+            let mut a = base_assignment();
+            a.outputs.insert("doc".into(), existing);
+            assert!(validate_assignment(&a).is_err());
+        }
 
         let mut a = base_assignment();
         a.builder = "-p".into();
