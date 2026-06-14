@@ -1879,7 +1879,19 @@ fn unpack_tmp_dir_archive(reader: impl Read, dest: &Path) -> Result<()> {
     let mut tar = tar::Archive::new(reader);
     for entry in tar.entries()? {
         let mut entry = entry?;
-        let path = dest.join(entry.path()?);
+        // Build the on-disk path from the entry's normal components
+        // only, mirroring how unpack_in places it: a crafted absolute
+        // entry name must not turn the chmod below into a write to an
+        // arbitrary host path.
+        let rel: PathBuf = entry
+            .path()?
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(p) => Some(p.to_owned()),
+                _ => None,
+            })
+            .collect();
+        let path = dest.join(rel);
         let kind = entry.header().entry_type();
         match kind {
             tar::EntryType::Regular | tar::EntryType::Directory | tar::EntryType::Symlink => {}
@@ -2049,6 +2061,41 @@ mod tests {
         let data = builder.into_inner()?;
         let dest = tempfile::tempdir()?;
         assert!(unpack_tmp_dir_archive(data.as_slice(), dest.path()).is_err());
+        Ok(())
+    }
+
+    /// An absolute entry name unpacks under dest (unpack_in skips the
+    /// root component); the chmod must follow it there instead of
+    /// touching the literal host path.
+    #[test]
+    fn tmp_dir_archive_chmod_stays_inside_dest() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let outside = tempfile::tempdir()?;
+        let victim = outside.path().join("victim");
+        std::fs::write(&victim, "x")?;
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644))?;
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        // set_path refuses absolute names, so write the name bytes the
+        // way a hostile archive would carry them
+        let name = victim.to_str().unwrap().as_bytes();
+        header.as_old_mut().name[..name.len()].copy_from_slice(name);
+        header.set_size(1);
+        header.set_mode(0o600);
+        header.set_cksum();
+        builder.append(&header, &b"y"[..])?;
+        let data = builder.into_inner()?;
+        let dest = tempfile::tempdir()?;
+        unpack_tmp_dir_archive(data.as_slice(), dest.path())?;
+        let mode = std::fs::metadata(&victim)?.permissions().mode();
+        assert_eq!(mode & 0o777, 0o644, "outside file was chmodded: {mode:o}");
+        let unpacked = dest
+            .path()
+            .join(victim.strip_prefix("/").unwrap_or(&victim));
+        assert_eq!(
+            std::fs::metadata(&unpacked)?.permissions().mode() & 0o777,
+            0o600
+        );
         Ok(())
     }
 }
