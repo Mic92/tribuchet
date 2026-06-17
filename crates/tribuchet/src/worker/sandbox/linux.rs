@@ -17,8 +17,12 @@ use nix::sys::resource::{self, getrlimit, setrlimit, Resource};
 use nix::sys::{prctl, stat, wait};
 use nix::unistd::{self, getgid, getuid, pivot_root, sethostname};
 
-use super::{binfmt, SandboxSpec, PASTA_DNS};
+use super::{binfmt, SandboxSpec};
 use crate::proto::BuildAssignment;
+
+/// Address pasta's in-namespace DNS forwarder listens on; written to
+/// the sandbox resolv.conf for fixed-output builds.
+const PASTA_DNS: &str = "169.254.1.53";
 
 pub fn prepare(spec: &mut SandboxSpec) -> Result<()> {
     let root = &spec.root;
@@ -409,7 +413,7 @@ fn fork_pasta_helper(bin: &Path) -> io::Result<PastaHelper> {
                 "--config-net",
                 "--quiet",
                 "--dns-forward",
-                super::PASTA_DNS,
+                PASTA_DNS,
                 "-t",
                 "none",
                 "-u",

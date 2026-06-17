@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 /// v2's no-internal-process rule forbids enabling controllers while the
 /// parent holds processes) and enable pids/memory for siblings.
 /// Returns the delegated base, or None when cgroups are unavailable.
+// Only the Linux reaper calls this; builds are unscoped on macOS.
+#[cfg(target_os = "linux")]
 pub fn init() -> Option<PathBuf> {
     let unavailable = |why: &str| {
         tracing::warn!("cgroup limits disabled: {why}; builds run without pids/memory caps");

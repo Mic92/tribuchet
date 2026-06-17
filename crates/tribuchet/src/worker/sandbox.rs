@@ -24,10 +24,6 @@ use anyhow::{Context, Result};
 use super::binfmt;
 use crate::proto::BuildAssignment;
 
-/// Address pasta's in-namespace DNS forwarder listens on; written to
-/// the sandbox resolv.conf for fixed-output builds.
-pub const PASTA_DNS: &str = "169.254.1.53";
-
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct SandboxSpec {
     pub builder: String,
