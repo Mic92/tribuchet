@@ -318,27 +318,39 @@ fn append_dir_fd<W: std::io::Write>(
     dir: &std::fs::File,
     prefix: &Path,
 ) -> Result<()> {
-    use std::os::fd::{AsFd, AsRawFd};
+    use std::os::fd::AsFd;
+    use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::MetadataExt;
-    // read_dir takes a path, not a fd; route it through /proc/self/fd
-    // so it lists the validated handle instead of re-resolving the
-    // client-controlled path.
-    let fd_path = if cfg!(target_os = "linux") {
-        format!("/proc/self/fd/{}", dir.as_raw_fd())
-    } else {
-        format!("/dev/fd/{}", dir.as_raw_fd())
-    };
-    for entry in std::fs::read_dir(fd_path)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let in_tar = prefix.join(&name);
-        let ftype = entry.file_type()?;
-        // Tar carries only files, dirs and symlinks; openat would
-        // ENXIO on the .nix-socket recursive-nix leaves in topTmpDir.
-        if !ftype.is_dir() && !ftype.is_file() && !ftype.is_symlink() {
+    // List through fdopendir on a dup of the validated handle instead
+    // of re-resolving the client-controlled path (and instead of
+    // /proc/self/fd, which is Linux-only and unreliable on macOS).
+    let mut listing = nix::dir::Dir::from_fd(std::os::fd::OwnedFd::from(dir.try_clone()?))?;
+    // Collect names and types up front: nix::dir::Entry borrows the
+    // iterator, and we recurse below.
+    let mut entries = Vec::new();
+    for res in listing.iter() {
+        let entry = res?;
+        let bytes = entry.file_name().to_bytes();
+        if bytes == b"." || bytes == b".." {
             continue;
         }
-        if ftype.is_symlink() {
+        entries.push((
+            std::ffi::OsString::from_vec(bytes.to_vec()),
+            entry.file_type(),
+        ));
+    }
+    for (name, ftype) in entries {
+        let in_tar = prefix.join(&name);
+        // Tar carries only files, dirs and symlinks; openat would
+        // ENXIO on the .nix-socket recursive-nix leaves in topTmpDir.
+        // An unknown type is resolved by the O_NOFOLLOW open below.
+        if !matches!(
+            ftype,
+            None | Some(nix::dir::Type::Directory | nix::dir::Type::File | nix::dir::Type::Symlink)
+        ) {
+            continue;
+        }
+        if ftype == Some(nix::dir::Type::Symlink) {
             let target = nix::fcntl::readlinkat(dir.as_fd(), name.as_os_str())?;
             let mut h = tar::Header::new_gnu();
             h.set_entry_type(tar::EntryType::Symlink);
