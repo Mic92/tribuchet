@@ -290,10 +290,11 @@ mod platform;
 #[path = "sandbox/darwin.rs"]
 mod platform;
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
     fn min_assignment() -> crate::proto::BuildAssignment {
         crate::proto::BuildAssignment {
             build_id: "0123456789abcdef0123456789abcdef".into(),
@@ -311,6 +312,7 @@ mod tests {
 
     /// recursive-nix flag toggles a daemon-socket bind; without it,
     /// no /nix/var path appears in binds_ro.
+    #[cfg(target_os = "linux")]
     #[test]
     fn recursive_nix_adds_the_daemon_socket_bind() -> Result<()> {
         let host = tempfile::tempdir()?;
@@ -413,6 +415,7 @@ mod tests {
     /// End-to-end smoke test of the Linux sandbox: namespaces, mounts,
     /// pivot_root, /proc, loopback, and exit-code plumbing through the
     /// PID-namespace shim. Requires unprivileged user namespaces.
+    #[cfg(target_os = "linux")]
     #[test]
     fn sandbox_runs_builder() -> Result<()> {
         if nix::sched::unshare(nix::sched::CloneFlags::empty()).is_err() {
@@ -470,6 +473,65 @@ mod tests {
         let status = child.wait()?;
         let stderr = std::fs::read_to_string(&log_path)?;
         assert_eq!(status.code(), Some(7), "{status:?} log: {stderr}");
+        Ok(())
+    }
+
+    /// End-to-end smoke test of the Darwin sandbox: prepare's tmp-dir
+    /// symlink, writes confined to the build dir, deny_read on worker
+    /// secrets, and exit-code plumbing through sandbox-exec.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_runs_builder() -> Result<()> {
+        // tempdir lives under $TMPDIR (/var/folders/...), one of the
+        // tmp prefixes prepare() accepts for the cwd symlink.
+        let dir = tempfile::tempdir()?;
+        let secret = dir.path().join("secret");
+        std::fs::write(&secret, "key-material")?;
+        let outside = dir.path().join("outside");
+        let cwd = dir.path().join("build-link");
+        let mut spec = SandboxSpec {
+            builder: "/bin/sh".into(),
+            system: "aarch64-darwin".into(),
+            args: vec![
+                "-c".into(),
+                // Each escape attempt exits with its own code so a
+                // failure names the broken rule; 7 means all held.
+                // $FOO asserts the derivation env reaches the builder.
+                format!(
+                    "test \"$FOO\" = bar || exit 1; \
+                     echo ok > out || exit 2; \
+                     cat {secret} 2>/dev/null && exit 3; \
+                     echo escaped > {outside} 2>/dev/null && exit 4; \
+                     exit 7",
+                    secret = secret.display(),
+                    outside = outside.display()
+                ),
+            ],
+            env: HashMap::from([("FOO".into(), "bar".into())]),
+            cwd: cwd.to_string_lossy().into_owned(),
+            network: false,
+            root: dir.path().join("root"),
+            build_dir: dir.path().join("top/build"),
+            binds_ro: vec![],
+            binds_dev: vec![],
+            outputs: vec![],
+            store_inputs: vec![],
+            cgroup: None,
+            uid_range: None,
+            fod_uid: None,
+            pasta: None,
+            emulator: None,
+            deny_read: vec![secret],
+            recursive_nix: false,
+        };
+        std::fs::create_dir_all(&spec.build_dir)?;
+        platform::prepare(&mut spec)?;
+        let log_path = dir.path().join("build.log");
+        let mut child = spawn(&spec, std::fs::File::create(&log_path)?)?;
+        let status = child.wait()?;
+        let log = std::fs::read_to_string(&log_path)?;
+        assert_eq!(status.code(), Some(7), "{status:?} log: {log}");
+        assert_eq!(std::fs::read_to_string(spec.build_dir.join("out"))?, "ok\n");
         Ok(())
     }
 }

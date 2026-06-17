@@ -91,8 +91,21 @@ pub fn command(spec: &SandboxSpec) -> Result<Command> {
         }
     }
     profile.push_str("(allow file-write*\n");
-    for path in [spec.cwd.as_str(), &spec.build_dir.to_string_lossy()] {
+    // Like deny_read above: writes resolve to the canonical vnode
+    // path, so a subpath on the literal alone (e.g. a build dir under
+    // the /var -> /private/var symlink) would never match. Emit both.
+    let build_dir = spec.build_dir.to_string_lossy();
+    for path in std::iter::once(spec.cwd.as_str())
+        .chain(std::iter::once(build_dir.as_ref()))
+        .chain(spec.outputs.iter().map(String::as_str))
+    {
         profile.push_str(&format!("  (subpath \"{}\")\n", sb_escape(path)?));
+        if let Ok(canonical) = Path::new(path).canonicalize() {
+            let canonical = canonical.to_string_lossy();
+            if canonical != path {
+                profile.push_str(&format!("  (subpath \"{}\")\n", sb_escape(&canonical)?));
+            }
+        }
     }
     for dev in [
         "/dev/null",
@@ -102,9 +115,6 @@ pub fn command(spec: &SandboxSpec) -> Result<Command> {
         "/dev/tty",
     ] {
         profile.push_str(&format!("  (literal \"{dev}\")\n"));
-    }
-    for out in &spec.outputs {
-        profile.push_str(&format!("  (subpath \"{}\")\n", sb_escape(out)?));
     }
     profile.push_str(")\n");
     if spec.network {
