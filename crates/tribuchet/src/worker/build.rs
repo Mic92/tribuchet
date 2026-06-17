@@ -850,7 +850,10 @@ fn unpack_tmp_dir_archive(reader: impl Read, dest: &Path) -> Result<()> {
             mkdir_at(&parent, c.as_os_str(), nix::sys::stat::Mode::S_IRWXU)?;
             parent = open_dir_at(&parent, c)?;
         }
-        let mode = nix::sys::stat::Mode::from_bits_truncate(entry.header().mode()? & 0o777);
+        let mode = nix::sys::stat::Mode::from_bits_truncate(
+            // mode_t is u16 on macOS but u32 on Linux
+            (entry.header().mode()? & 0o777) as nix::libc::mode_t,
+        );
         match kind {
             tar::EntryType::Directory => {
                 mkdir_at(&parent, leaf.as_os_str(), mode)?;
