@@ -1,12 +1,15 @@
 //! Per-job protocol with a worker: input staging, output relay and verification.
 
-use std::collections::HashMap;
-use std::io::Write;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use harmonia_utils_signature::{PublicKey, Signature};
+use nix::{dir, fcntl};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tonic::Status;
@@ -21,7 +24,7 @@ use crate::proto::{
 
 /// How long a dispatched build may run with no attach client listening
 /// before the hub cancels it on the worker.
-const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+const CANCEL_GRACE: Duration = Duration::from_secs(10);
 
 pub(super) async fn send(
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
@@ -83,9 +86,9 @@ pub(super) async fn run_job(
                 // Only ever pack paths we offered: anything else would let
                 // a compromised worker read arbitrary host files. Dedupe,
                 // so a repeated entry cannot amplify pack work either.
-                let offered: std::collections::HashSet<&String> = req.input_paths.iter().collect();
+                let offered: HashSet<&String> = req.input_paths.iter().collect();
                 let mut missing = Vec::new();
-                let mut seen = std::collections::HashSet::new();
+                let mut seen = HashSet::new();
                 for p in m.store_paths {
                     if !offered.contains(&p) {
                         bail!("worker requested unoffered path {p}");
@@ -271,7 +274,7 @@ async fn stream_store_path(
 /// worker. Always sent last: its EOF tells the worker to start the build.
 async fn stream_tmp_dir(
     build_id: &str,
-    top_tmp_dir: Arc<std::fs::File>,
+    top_tmp_dir: Arc<fs::File>,
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
@@ -313,9 +316,9 @@ async fn stream_tmp_dir(
 /// are taken from the opened fd: an entry swapped for a symlink between
 /// listing and opening is archived as whatever it now is, never
 /// followed into a foreign root-readable file.
-fn append_dir_fd<W: std::io::Write>(
+fn append_dir_fd<W: io::Write>(
     tar: &mut tar::Builder<W>,
-    dir: &std::fs::File,
+    dir: &fs::File,
     prefix: &Path,
 ) -> Result<()> {
     use std::os::fd::AsFd;
@@ -324,8 +327,8 @@ fn append_dir_fd<W: std::io::Write>(
     // List through fdopendir on a dup of the validated handle instead
     // of re-resolving the client-controlled path (and instead of
     // /proc/self/fd, which is Linux-only and unreliable on macOS).
-    let mut listing = nix::dir::Dir::from_fd(std::os::fd::OwnedFd::from(dir.try_clone()?))?;
-    // Collect names and types up front: nix::dir::Entry borrows the
+    let mut listing = dir::Dir::from_fd(std::os::fd::OwnedFd::from(dir.try_clone()?))?;
+    // Collect names and types up front: dir::Entry borrows the
     // iterator, and we recurse below.
     let mut entries = Vec::new();
     for res in listing.iter() {
@@ -346,12 +349,12 @@ fn append_dir_fd<W: std::io::Write>(
         // An unknown type is resolved by the O_NOFOLLOW open below.
         if !matches!(
             ftype,
-            None | Some(nix::dir::Type::Directory | nix::dir::Type::File | nix::dir::Type::Symlink)
+            None | Some(dir::Type::Directory | dir::Type::File | dir::Type::Symlink)
         ) {
             continue;
         }
-        if ftype == Some(nix::dir::Type::Symlink) {
-            let target = nix::fcntl::readlinkat(dir.as_fd(), name.as_os_str())?;
+        if ftype == Some(dir::Type::Symlink) {
+            let target = fcntl::readlinkat(dir.as_fd(), name.as_os_str())?;
             let mut h = tar::Header::new_gnu();
             h.set_entry_type(tar::EntryType::Symlink);
             h.set_size(0);
@@ -362,13 +365,13 @@ fn append_dir_fd<W: std::io::Write>(
         // O_NOFOLLOW: an entry swapped for a symlink since the listing
         // fails the open instead of being followed. O_NONBLOCK: a fifo
         // swapped in cannot stall the hub; the fstat below skips it.
-        let fd: std::fs::File = nix::fcntl::openat(
+        let fd: fs::File = fcntl::openat(
             dir.as_fd(),
             name.as_os_str(),
-            nix::fcntl::OFlag::O_RDONLY
-                | nix::fcntl::OFlag::O_NOFOLLOW
-                | nix::fcntl::OFlag::O_CLOEXEC
-                | nix::fcntl::OFlag::O_NONBLOCK,
+            fcntl::OFlag::O_RDONLY
+                | fcntl::OFlag::O_NOFOLLOW
+                | fcntl::OFlag::O_CLOEXEC
+                | fcntl::OFlag::O_NONBLOCK,
             nix::sys::stat::Mode::empty(),
         )?
         .into();
@@ -379,7 +382,7 @@ fn append_dir_fd<W: std::io::Write>(
         if meta.is_dir() {
             h.set_entry_type(tar::EntryType::Directory);
             h.set_size(0);
-            tar.append_data(&mut h, &in_tar, std::io::empty())?;
+            tar.append_data(&mut h, &in_tar, io::empty())?;
             append_dir_fd(tar, &fd, &in_tar)?;
         } else if meta.is_file() {
             h.set_entry_type(tar::EntryType::Regular);
@@ -420,9 +423,9 @@ impl Default for HashWriter {
 const MAX_OUTPUT_NAR_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 impl Write for HashWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if buf.len() as u64 > self.remaining {
-            return Err(std::io::Error::other(format!(
+            return Err(io::Error::other(format!(
                 "output NAR exceeds the {MAX_OUTPUT_NAR_BYTES} byte limit"
             )));
         }
@@ -430,7 +433,7 @@ impl Write for HashWriter {
         self.hasher.update(buf);
         Ok(buf.len())
     }
-    fn flush(&mut self) -> std::io::Result<()> {
+    fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
@@ -522,7 +525,7 @@ async fn import_extra(
         .acquire()
         .await
         .context("connecting to the local nix-daemon")?;
-    let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(Ok::<_, std::io::Error>);
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(Ok::<_, io::Error>);
     let reader = tokio_util::io::StreamReader::new(stream);
     let dec =
         async_compression::tokio::bufread::ZstdDecoder::new(tokio::io::BufReader::new(reader));
@@ -626,11 +629,11 @@ async fn relay_build(
     let mut pending: HashMap<String, OutputVerify> = HashMap::new();
     let mut extras: HashMap<String, ExtraImport> = HashMap::new();
     let mut awaiting_outputs = false;
-    let mut abandoned_since: Option<std::time::Instant> = None;
+    let mut abandoned_since: Option<Instant> = None;
     let mut cancel_sent = false;
     // An interval, not a per-iteration sleep: a build that logs
     // continuously must not starve the abandonment check.
-    let mut abandon_check = tokio::time::interval(std::time::Duration::from_secs(2));
+    let mut abandon_check = tokio::time::interval(Duration::from_secs(2));
     abandon_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
@@ -643,7 +646,7 @@ async fn relay_build(
             _ = abandon_check.tick(), if !cancel_sent => {
                 if job.replay.has_subscribers().await {
                     abandoned_since = None;
-                } else if abandoned_since.get_or_insert_with(std::time::Instant::now).elapsed()
+                } else if abandoned_since.get_or_insert_with(Instant::now).elapsed()
                     > CANCEL_GRACE
                 {
                     tracing::info!(id = job.id, "no attach client left; cancelling build");
@@ -720,7 +723,7 @@ mod tests {
 
     /// Run stream_tmp_dir over an already-validated handle and return
     /// the decompressed tar bytes.
-    async fn tmp_dir_tar(handle: std::fs::File) -> Vec<u8> {
+    async fn tmp_dir_tar(handle: fs::File) -> Vec<u8> {
         let (tx, mut rx) = mpsc::channel(64);
         stream_tmp_dir("b1", Arc::new(handle), &tx).await.unwrap();
         drop(tx);
@@ -740,16 +743,16 @@ mod tests {
     async fn tmp_dir_archive_comes_from_the_validated_directory() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("build");
-        std::fs::create_dir(&dir).unwrap();
-        std::fs::write(dir.join("attrs"), "validated").unwrap();
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("attrs"), "validated").unwrap();
         let me = nix::unistd::getuid().as_raw();
         let handle = validate_top_tmp_dir(dir.to_str().unwrap(), me).unwrap();
 
         // attacker swaps the path for a symlink to a foreign directory
         let foreign = tmp.path().join("foreign");
-        std::fs::create_dir(&foreign).unwrap();
-        std::fs::write(foreign.join("secret"), "foreign").unwrap();
-        std::fs::rename(&dir, tmp.path().join("moved-aside")).unwrap();
+        fs::create_dir(&foreign).unwrap();
+        fs::write(foreign.join("secret"), "foreign").unwrap();
+        fs::rename(&dir, tmp.path().join("moved-aside")).unwrap();
         std::os::unix::fs::symlink(&foreign, &dir).unwrap();
 
         let tar_bytes = tmp_dir_tar(handle).await;
@@ -768,17 +771,17 @@ mod tests {
     async fn tmp_dir_archive_does_not_follow_symlink_entries() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("build");
-        std::fs::create_dir_all(dir.join("sub")).unwrap();
-        std::fs::write(dir.join("sub/file"), "payload").unwrap();
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("sub/file"), "payload").unwrap();
         let secret = tmp.path().join("secret");
-        std::fs::write(&secret, "foreign-content").unwrap();
+        fs::write(&secret, "foreign-content").unwrap();
         std::os::unix::fs::symlink(&secret, dir.join("link")).unwrap();
         let me = nix::unistd::getuid().as_raw();
         let handle = validate_top_tmp_dir(dir.to_str().unwrap(), me).unwrap();
 
         let tar_bytes = tmp_dir_tar(handle).await;
         assert!(!tar_bytes.windows(15).any(|w| w == b"foreign-content"));
-        let mut found = std::collections::HashMap::new();
+        let mut found = HashMap::new();
         let mut ar = tar::Archive::new(&tar_bytes[..]);
         for entry in ar.entries().unwrap() {
             let entry = entry.unwrap();

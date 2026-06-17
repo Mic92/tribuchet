@@ -63,28 +63,28 @@ pub(super) fn system_caps(opts: &WorkerConfig, ctx: &WorkerCtx) -> Vec<crate::pr
 /// process; the child runs only async-signal-safe syscalls.
 #[cfg(target_os = "linux")]
 fn can_map_uid_range(base: u32) -> bool {
-    use nix::unistd::ForkResult;
-    let Ok((sync_r, sync_w)) = nix::unistd::pipe() else {
+    use nix::unistd::{self, ForkResult};
+    let Ok((sync_r, sync_w)) = unistd::pipe() else {
         return false;
     };
-    let Ok((hold_r, hold_w)) = nix::unistd::pipe() else {
+    let Ok((hold_r, hold_w)) = unistd::pipe() else {
         return false;
     };
-    match unsafe { nix::unistd::fork() } {
+    match unsafe { unistd::fork() } {
         Ok(ForkResult::Child) => {
             if nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWUSER).is_err() {
                 unsafe { libc::_exit(1) }
             }
-            let _ = nix::unistd::write(&sync_w, b"u");
+            let _ = unistd::write(&sync_w, b"u");
             drop(sync_w);
             // block until the parent has tried the map write
             drop(hold_w);
-            let _ = nix::unistd::read(&hold_r, &mut [0u8; 1]);
+            let _ = unistd::read(&hold_r, &mut [0u8; 1]);
             unsafe { libc::_exit(0) }
         }
         Ok(ForkResult::Parent { child }) => {
             drop(sync_w);
-            let unshared = nix::unistd::read(&sync_r, &mut [0u8; 1]) == Ok(1);
+            let unshared = unistd::read(&sync_r, &mut [0u8; 1]) == Ok(1);
             let mapped = unshared
                 && std::fs::write(format!("/proc/{child}/uid_map"), format!("0 {base} 65536"))
                     .is_ok();

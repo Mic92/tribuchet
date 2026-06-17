@@ -1,5 +1,6 @@
 //! macOS sandbox implementation: sandbox-exec with a deny-default write profile.
 
+use std::fs;
 use std::path::Path;
 use std::process::Command;
 #[cfg(test)]
@@ -32,15 +33,15 @@ pub fn prepare(spec: &mut SandboxSpec) -> Result<()> {
     if !allowed {
         anyhow::bail!("refusing tmpDirInSandbox outside tmp: {}", spec.cwd);
     }
-    match std::fs::symlink_metadata(link) {
+    match fs::symlink_metadata(link) {
         Ok(meta) if meta.file_type().is_symlink() => {
-            std::fs::remove_file(link)?; // stale link from a crashed build
+            fs::remove_file(link)?; // stale link from a crashed build
         }
         Ok(_) => anyhow::bail!("tmpDirInSandbox {} already exists", spec.cwd),
         Err(_) => {}
     }
     if let Some(parent) = link.parent() {
-        std::fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent)?;
     }
     std::os::unix::fs::symlink(&spec.build_dir, link)
         .with_context(|| format!("creating {} symlink", link.display()))?;
@@ -152,14 +153,14 @@ pub fn cleanup(a: &BuildAssignment, dir: &Path) {
     // upload, and remove the /build symlink.
     for scratch in a.outputs.values() {
         let p = Path::new(scratch);
-        let _ = std::fs::remove_dir_all(p);
-        let _ = std::fs::remove_file(p);
+        let _ = fs::remove_dir_all(p);
+        let _ = fs::remove_file(p);
     }
     // Only remove the symlink this build created (it points at our
     // build dir): a hub-chosen path that prepare() rejected must not
     // become a delete-anything primitive on a root worker.
     let link = Path::new(&a.tmp_dir_in_sandbox);
-    if std::fs::read_link(link).is_ok_and(|t| t == dir.join("top").join("build")) {
-        let _ = std::fs::remove_file(link);
+    if fs::read_link(link).is_ok_and(|t| t == dir.join("top").join("build")) {
+        let _ = fs::remove_file(link);
     }
 }

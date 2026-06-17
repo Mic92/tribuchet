@@ -3,9 +3,11 @@
 //! notification. Every function degrades to a no-op outside the
 //! respective service manager, so plain CLI runs are unaffected.
 
+use std::net::TcpListener;
 use std::os::fd::{FromRawFd as _, RawFd};
 
 use anyhow::{bail, Context, Result};
+use nix::sys::socket;
 
 /// Listeners handed over by systemd socket activation, classified by
 /// address family. Holding the listening sockets in systemd keeps them
@@ -13,7 +15,7 @@ use anyhow::{bail, Context, Result};
 /// ECONNREFUSED.
 #[derive(Default)]
 pub struct ActivatedSockets {
-    pub tcp: Option<std::net::TcpListener>,
+    pub tcp: Option<TcpListener>,
     pub unix: Option<std::os::unix::net::UnixListener>,
 }
 
@@ -41,14 +43,14 @@ impl ActivatedSockets {
     /// Take ownership of one activated listener fd, classified by
     /// address family.
     fn adopt(&mut self, fd: RawFd) -> Result<()> {
-        use nix::sys::socket::AddressFamily;
+        use socket::AddressFamily;
         match socket_family(fd)? {
             Some(AddressFamily::Inet | AddressFamily::Inet6) => {
                 if self.tcp.is_some() {
                     bail!("more than one activated TCP socket");
                 }
                 // Safety: the service manager passed this fd for us to own.
-                let l = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+                let l = unsafe { TcpListener::from_raw_fd(fd) };
                 l.set_nonblocking(true)?;
                 self.tcp = Some(l);
             }
@@ -113,10 +115,10 @@ fn launchd_sockets(out: &mut ActivatedSockets) -> Result<()> {
     Ok(())
 }
 
-fn socket_family(fd: RawFd) -> Result<Option<nix::sys::socket::AddressFamily>> {
-    use nix::sys::socket::SockaddrLike;
-    let addr: nix::sys::socket::SockaddrStorage = nix::sys::socket::getsockname(fd)
-        .with_context(|| format!("getsockname on activated fd {fd}"))?;
+fn socket_family(fd: RawFd) -> Result<Option<socket::AddressFamily>> {
+    use socket::SockaddrLike;
+    let addr: socket::SockaddrStorage =
+        socket::getsockname(fd).with_context(|| format!("getsockname on activated fd {fd}"))?;
     Ok(addr.family())
 }
 

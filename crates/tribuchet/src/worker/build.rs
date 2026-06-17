@@ -1,15 +1,21 @@
 //! One build on this worker: input staging, sandbox execution, output packing.
 
-use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::collections::{BTreeSet, HashMap};
+use std::ffi::OsStr;
+use std::fs;
+use std::io::{self, Read, Write};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{self, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use harmonia_store_path::{StoreDir, StorePath};
 use harmonia_store_path_info::ValidPathInfo;
 use harmonia_store_remote::{DaemonClient, DaemonStore};
 use harmonia_utils_signature::SecretKey;
+use nix::fcntl;
+use nix::sys::{signal, stat};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
@@ -23,7 +29,7 @@ use crate::proto::{nar_transfer, BuildAssignment, NarTransfer, PathInfoMsg, Work
 use crate::store::{parse_path_info, valid_store_path, STORE_DIR};
 
 impl WorkerCtx {
-    fn alloc_uid_slot(self: &std::sync::Arc<Self>) -> Option<UidSlot> {
+    fn alloc_uid_slot(self: &Arc<Self>) -> Option<UidSlot> {
         let mut slots = self.uid_slots.lock().unwrap();
         let idx = slots.iter().position(|used| !used)?;
         slots[idx] = true;
@@ -37,7 +43,7 @@ impl WorkerCtx {
 
 /// A leased 65536-uid range; returned to the pool on drop.
 struct UidSlot {
-    ctx: std::sync::Arc<WorkerCtx>,
+    ctx: Arc<WorkerCtx>,
     base: u32,
     idx: usize,
 }
@@ -64,7 +70,7 @@ enum BuildOwner {
 }
 
 impl BuildOwner {
-    fn for_build(ctx: &std::sync::Arc<WorkerCtx>, a: &BuildAssignment) -> Result<Self> {
+    fn for_build(ctx: &Arc<WorkerCtx>, a: &BuildAssignment) -> Result<Self> {
         let is_root = nix::unistd::geteuid().is_root();
         if requires_uid_range(&a.env) {
             if !is_root {
@@ -123,12 +129,9 @@ pub(super) fn validate_assignment(a: &BuildAssignment) -> Result<()> {
     }
     let tmp = Path::new(&a.tmp_dir_in_sandbox);
     if !tmp.is_absolute()
-        || tmp.components().any(|c| {
-            !matches!(
-                c,
-                std::path::Component::RootDir | std::path::Component::Normal(_)
-            )
-        })
+        || tmp
+            .components()
+            .any(|c| !matches!(c, Component::RootDir | Component::Normal(_)))
     {
         bail!("invalid tmpDirInSandbox {:?}", a.tmp_dir_in_sandbox);
     }
@@ -140,7 +143,7 @@ pub(super) fn validate_assignment(a: &BuildAssignment) -> Result<()> {
         // naming an existing store path would give the build write
         // access to it (macOS builds write outputs in place) and have
         // the post-build cleanup delete it.
-        if std::fs::symlink_metadata(p).is_ok() {
+        if fs::symlink_metadata(p).is_ok() {
             bail!("output path {p} already exists on this worker");
         }
     }
@@ -161,7 +164,7 @@ struct Importer {
 pub(super) struct ActiveBuild {
     pub(super) assignment: BuildAssignment,
     pub(super) dir: PathBuf, // state_dir/builds/<id>
-    pub(super) ctx: std::sync::Arc<WorkerCtx>,
+    pub(super) ctx: Arc<WorkerCtx>,
     /// Input store paths available in /nix/store (bind-mount sources).
     inputs: Vec<String>,
     /// Paths reported missing, waiting for PathInfo + NAR. The value
@@ -188,7 +191,7 @@ async fn import_nar(
 ) -> Result<()> {
     use futures_util::StreamExt as _;
     use tokio::io::AsyncReadExt as _;
-    let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(Ok::<_, std::io::Error>);
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(Ok::<_, io::Error>);
     let reader = tokio_util::io::StreamReader::new(stream);
     let dec =
         async_compression::tokio::bufread::ZstdDecoder::new(tokio::io::BufReader::new(reader));
@@ -202,12 +205,12 @@ async fn import_nar(
 }
 
 impl ActiveBuild {
-    pub(super) fn new(assignment: BuildAssignment, ctx: std::sync::Arc<WorkerCtx>) -> Result<Self> {
+    pub(super) fn new(assignment: BuildAssignment, ctx: Arc<WorkerCtx>) -> Result<Self> {
         let dir = ctx.state_dir.join("builds").join(&assignment.build_id);
         if dir.exists() {
-            std::fs::remove_dir_all(&dir)?;
+            fs::remove_dir_all(&dir)?;
         }
-        std::fs::create_dir_all(dir.join("top"))?;
+        fs::create_dir_all(dir.join("top"))?;
         Ok(Self {
             assignment,
             dir,
@@ -391,19 +394,19 @@ impl ActiveBuild {
         &self,
         out_tx: &mpsc::Sender<WorkerMessage>,
         signing_key: &SecretKey,
-        timeout: std::time::Duration,
+        timeout: Duration,
     ) -> Result<FinishedBuild> {
         let a = &self.assignment;
         // The slot lease keeps concurrent uids disjoint; returned on
         // drop when the build finishes.
         let owner = BuildOwner::for_build(&self.ctx, a)?;
         let spec = self.build_spec(&owner)?;
-        let deadline = std::time::Instant::now() + timeout;
+        let deadline = Instant::now() + timeout;
         // Logs go through a file in the build dir, not pipes: capture
         // is decoupled from this process's lifetime, so a later worker
         // generation can resume tailing where we stopped.
         let log_path = self.dir.join("build.log");
-        let log_file = std::fs::File::create(&log_path)?;
+        let log_file = fs::File::create(&log_path)?;
         let (mut req, child_stdin, spec_w) = sandbox::spawn_request(&spec)?;
         let pid = self
             .ctx
@@ -425,9 +428,9 @@ impl ActiveBuild {
             deadline_unix: unix_now() + timeout.as_secs(),
             uid_slot: owner.slot_idx(),
         };
-        std::fs::write(self.dir.join("resume.json"), serde_json::to_vec(&resume)?)?;
+        fs::write(self.dir.join("resume.json"), serde_json::to_vec(&resume)?)?;
 
-        let log_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let log_done = Arc::new(atomic::AtomicBool::new(false));
         let tailer = {
             let tx = out_tx.clone();
             let build_id = a.build_id.clone();
@@ -443,25 +446,25 @@ impl ActiveBuild {
             if let Some(code) = reaper::take_status(&self.ctx.status_dir, &req.token) {
                 break code;
             }
-            let timed_out = (std::time::Instant::now() >= deadline)
+            let timed_out = (Instant::now() >= deadline)
                 .then(|| format!("build timed out after {}s", timeout.as_secs()));
             abort = self.ctx.abort_reason(&a.dedupe_key, &log_path, timed_out);
             if abort.is_some() {
-                let _ = nix::sys::signal::killpg(pgrp, nix::sys::signal::Signal::SIGKILL);
+                let _ = signal::killpg(pgrp, signal::Signal::SIGKILL);
                 // The reaper collects the kill within its sweep interval.
                 break loop {
                     if let Some(code) = reaper::take_status(&self.ctx.status_dir, &req.token) {
                         break code;
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    std::thread::sleep(Duration::from_millis(100));
                 };
             }
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            std::thread::sleep(Duration::from_millis(200));
         };
         // The builder is PID 1 of its PID namespace, so its death took
         // every descendant with it; the killpg also covers the brief
         // pre-exec window and macOS, where there is no PID namespace.
-        let _ = nix::sys::signal::killpg(pgrp, nix::sys::signal::Signal::SIGKILL);
+        let _ = signal::killpg(pgrp, signal::Signal::SIGKILL);
         log_done.store(true, Ordering::Relaxed);
         let _ = tailer.join();
         if let Some(reason) = abort {
@@ -485,7 +488,7 @@ impl ActiveBuild {
                 outputs: Vec::new(),
                 extras: Vec::new(),
                 dir: self.dir.clone(),
-                finished_at: std::time::Instant::now(),
+                finished_at: Instant::now(),
             });
         }
 
@@ -498,7 +501,7 @@ impl ActiveBuild {
             outputs: packed,
             extras,
             dir: self.dir.clone(),
-            finished_at: std::time::Instant::now(),
+            finished_at: Instant::now(),
         })
     }
 
@@ -527,7 +530,7 @@ impl ActiveBuild {
             task.abort();
             let _ = task.await;
         }
-        if let Err(e) = std::fs::remove_dir_all(&self.dir) {
+        if let Err(e) = fs::remove_dir_all(&self.dir) {
             tracing::warn!("cleaning up {}: {e}", self.dir.display());
         }
     }
@@ -538,17 +541,17 @@ impl ActiveBuild {
 async fn pack_outputs_and_extras(
     dir: &Path,
     spec: &sandbox::SandboxSpec,
-    deadline: std::time::Instant,
+    deadline: Instant,
     signing_key: &SecretKey,
     build_id: &str,
 ) -> Result<(Vec<PackedOutput>, Vec<PackedExtra>)> {
     let extra_candidates = if spec.recursive_nix {
         query_all_valid_paths().await.unwrap_or_else(|e| {
             tracing::warn!(id = build_id, "queryAllValidPaths failed: {e:#}");
-            std::collections::BTreeSet::new()
+            BTreeSet::new()
         })
     } else {
-        std::collections::BTreeSet::new()
+        BTreeSet::new()
     };
     let packed = pack_outputs(dir, spec, &extra_candidates, deadline, signing_key).await?;
     let extras = if spec.recursive_nix {
@@ -573,8 +576,7 @@ async fn pack_outputs_and_extras(
 
 /// Snapshot of every valid store path on the worker, used to widen
 /// the ref-scan candidate set when recursive-nix is on.
-async fn query_all_valid_paths(
-) -> Result<std::collections::BTreeSet<harmonia_store_path::StorePath>> {
+async fn query_all_valid_paths() -> Result<BTreeSet<harmonia_store_path::StorePath>> {
     let mut daemon = DaemonClient::builder()
         .connect_daemon()
         .await
@@ -591,8 +593,8 @@ async fn query_all_valid_paths(
 pub(super) async fn pack_outputs(
     dir: &Path,
     spec: &sandbox::SandboxSpec,
-    extra_candidates: &std::collections::BTreeSet<harmonia_store_path::StorePath>,
-    deadline: std::time::Instant,
+    extra_candidates: &BTreeSet<harmonia_store_path::StorePath>,
+    deadline: Instant,
     signing_key: &SecretKey,
 ) -> Result<Vec<PackedOutput>> {
     let mut candidates = scan_candidates(&spec.store_inputs, &spec.outputs);
@@ -636,15 +638,15 @@ async fn pack_extras(
     outputs: &[PackedOutput],
     store_inputs: &[String],
     spec_outputs: &[String],
-    deadline: std::time::Instant,
+    deadline: Instant,
     signing_key: &SecretKey,
 ) -> Result<Vec<PackedExtra>> {
-    let known: std::collections::BTreeSet<&str> = store_inputs
+    let known: BTreeSet<&str> = store_inputs
         .iter()
         .map(String::as_str)
         .chain(spec_outputs.iter().map(String::as_str))
         .collect();
-    let mut extras_set = std::collections::BTreeSet::new();
+    let mut extras_set = BTreeSet::new();
     for o in outputs {
         for r in &o.references {
             if !known.contains(r.as_str()) {
@@ -677,8 +679,7 @@ async fn pack_extras(
             .ok_or_else(|| anyhow::anyhow!("extra {path} vanished from store"))?;
         // Re-scan the extra's NAR against its declared references so
         // the hub-side import keeps the transitive closure intact.
-        let mut candidates: std::collections::BTreeSet<StorePath> =
-            info.references.iter().cloned().collect();
+        let mut candidates: BTreeSet<StorePath> = info.references.iter().cloned().collect();
         let self_sp = sp.clone();
         candidates.insert(self_sp.clone());
         let nar_file = dir.join(format!("extra-{}.nar.zst", store_base(&path)));
@@ -740,14 +741,14 @@ struct NarPackResult {
 async fn pack_one_nar(
     host_path: &Path,
     nar_path: &Path,
-    candidates: &std::collections::BTreeSet<harmonia_store_path::StorePath>,
+    candidates: &BTreeSet<harmonia_store_path::StorePath>,
     self_path: Option<&harmonia_store_path::StorePath>,
-    deadline: std::time::Instant,
+    deadline: Instant,
 ) -> Result<NarPackResult> {
     let mut hasher = Sha256::new();
     let mut sink = harmonia_store_ref_scan::RefScanSink::new(candidates, self_path);
     {
-        let f = std::fs::File::create(nar_path)?;
+        let f = fs::File::create(nar_path)?;
         let mut enc = zstd::stream::write::Encoder::new(f, 3)?;
         let mut tee = TeeScanner {
             zstd: &mut enc,
@@ -784,7 +785,7 @@ async fn pack_one_nar(
 fn scan_candidates(
     inputs: &[String],
     outputs: &[String],
-) -> std::collections::BTreeSet<harmonia_store_path::StorePath> {
+) -> BTreeSet<harmonia_store_path::StorePath> {
     inputs
         .iter()
         .chain(outputs.iter())
@@ -801,27 +802,27 @@ fn scan_candidates(
 /// aimed at a symlink planted by an earlier entry -- can place or chmod
 /// anything outside the destination.
 fn unpack_tmp_dir_archive(reader: impl Read, dest: &Path) -> Result<()> {
-    use nix::fcntl::OFlag;
+    use fcntl::OFlag;
     use std::os::fd::{AsFd, OwnedFd};
-    use std::path::Component;
+    use Component;
 
-    fn open_dir_at(at: &impl AsFd, name: &std::ffi::OsStr) -> Result<OwnedFd> {
-        Ok(nix::fcntl::openat(
+    fn open_dir_at(at: &impl AsFd, name: &OsStr) -> Result<OwnedFd> {
+        Ok(fcntl::openat(
             at.as_fd(),
             name,
             OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_RDONLY | OFlag::O_CLOEXEC,
-            nix::sys::stat::Mode::empty(),
+            stat::Mode::empty(),
         )?)
     }
 
-    fn mkdir_at(at: &impl AsFd, name: &std::ffi::OsStr, mode: nix::sys::stat::Mode) -> Result<()> {
-        match nix::sys::stat::mkdirat(at.as_fd(), name, mode) {
+    fn mkdir_at(at: &impl AsFd, name: &OsStr, mode: stat::Mode) -> Result<()> {
+        match stat::mkdirat(at.as_fd(), name, mode) {
             Ok(()) | Err(nix::errno::Errno::EEXIST) => Ok(()),
             Err(e) => Err(e.into()),
         }
     }
 
-    let dest = std::fs::File::open(dest).context("opening tmp dir destination")?;
+    let dest = fs::File::open(dest).context("opening tmp dir destination")?;
     let mut tar = tar::Archive::new(reader);
     for entry in tar.entries()? {
         let mut entry = entry?;
@@ -847,10 +848,10 @@ fn unpack_tmp_dir_archive(reader: impl Read, dest: &Path) -> Result<()> {
         // Descend to the parent, creating intermediate directories.
         let mut parent: OwnedFd = dest.as_fd().try_clone_to_owned()?;
         for c in &comps {
-            mkdir_at(&parent, c.as_os_str(), nix::sys::stat::Mode::S_IRWXU)?;
+            mkdir_at(&parent, c.as_os_str(), stat::Mode::S_IRWXU)?;
             parent = open_dir_at(&parent, c)?;
         }
-        let mode = nix::sys::stat::Mode::from_bits_truncate(
+        let mode = stat::Mode::from_bits_truncate(
             // mode_t is u16 on macOS but u32 on Linux
             (entry.header().mode()? & 0o777) as nix::libc::mode_t,
         );
@@ -858,7 +859,7 @@ fn unpack_tmp_dir_archive(reader: impl Read, dest: &Path) -> Result<()> {
             tar::EntryType::Directory => {
                 mkdir_at(&parent, leaf.as_os_str(), mode)?;
                 let dir = open_dir_at(&parent, &leaf)?;
-                nix::sys::stat::fchmod(dir.as_fd(), mode)?;
+                stat::fchmod(dir.as_fd(), mode)?;
             }
             tar::EntryType::Symlink => {
                 let target = entry
@@ -868,7 +869,7 @@ fn unpack_tmp_dir_archive(reader: impl Read, dest: &Path) -> Result<()> {
                 nix::unistd::symlinkat(target.as_os_str(), parent.as_fd(), leaf.as_os_str())?;
             }
             _ => {
-                let file: std::fs::File = nix::fcntl::openat(
+                let file: fs::File = fcntl::openat(
                     parent.as_fd(),
                     leaf.as_os_str(),
                     OFlag::O_WRONLY
@@ -879,9 +880,9 @@ fn unpack_tmp_dir_archive(reader: impl Read, dest: &Path) -> Result<()> {
                     mode,
                 )?
                 .into();
-                std::io::copy(&mut entry, &mut &file)?;
+                io::copy(&mut entry, &mut &file)?;
                 // the umask at create time may have masked bits off
-                nix::sys::stat::fchmod(file.as_fd(), mode)?;
+                stat::fchmod(file.as_fd(), mode)?;
             }
         }
     }
@@ -892,16 +893,16 @@ fn unpack_tmp_dir_archive(reader: impl Read, dest: &Path) -> Result<()> {
 struct LimitedWriter<W> {
     inner: W,
     remaining: u64,
-    deadline: std::time::Instant,
+    deadline: Instant,
 }
 
 impl<W: Write> Write for LimitedWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if std::time::Instant::now() >= self.deadline {
-            return Err(std::io::Error::other("build timed out"));
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if Instant::now() >= self.deadline {
+            return Err(io::Error::other("build timed out"));
         }
         if buf.len() as u64 > self.remaining {
-            return Err(std::io::Error::other(format!(
+            return Err(io::Error::other(format!(
                 "NAR exceeds the {MAX_NAR_BYTES} byte limit"
             )));
         }
@@ -909,7 +910,7 @@ impl<W: Write> Write for LimitedWriter<W> {
         self.remaining -= n as u64;
         Ok(n)
     }
-    fn flush(&mut self) -> std::io::Result<()> {
+    fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()
     }
 }
@@ -923,13 +924,13 @@ struct TeeScanner<'a, W: Write> {
 }
 
 impl<W: Write> Write for TeeScanner<'_, W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.zstd.write_all(buf)?;
         self.hasher.update(buf);
         self.scan.feed(buf);
         Ok(buf.len())
     }
-    fn flush(&mut self) -> std::io::Result<()> {
+    fn flush(&mut self) -> io::Result<()> {
         self.zstd.flush()
     }
 }
@@ -979,7 +980,7 @@ mod tests {
 
         // an existing, registered store path must not be claimable as
         // an output (in-place tampering, deletion by cleanup)
-        if let Some(existing) = std::fs::read_dir("/nix/store")
+        if let Some(existing) = fs::read_dir("/nix/store")
             .ok()
             .into_iter()
             .flatten()
@@ -1012,9 +1013,7 @@ mod tests {
         let data = builder.into_inner()?;
         let dest = tempfile::tempdir()?;
         unpack_tmp_dir_archive(data.as_slice(), dest.path())?;
-        let mode = std::fs::metadata(dest.path().join("evil"))?
-            .permissions()
-            .mode();
+        let mode = fs::metadata(dest.path().join("evil"))?.permissions().mode();
         assert_eq!(mode & 0o7777, 0o755, "mode {mode:o}");
 
         // hard links could alias files outside the build dir
@@ -1064,11 +1063,11 @@ mod tests {
     async fn pack_one_nar_finds_references_and_excludes_self() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let host = dir.path().join("out");
-        std::fs::create_dir(&host)?;
+        fs::create_dir(&host)?;
         let input = "/nix/store/00000000000000000000000000000001-input";
         let self_path = "/nix/store/00000000000000000000000000000002-self";
         let unrelated = "/nix/store/00000000000000000000000000000003-unrelated";
-        std::fs::write(host.join("data"), format!("refs: {input} {self_path}\n"))?;
+        fs::write(host.join("data"), format!("refs: {input} {self_path}\n"))?;
         let candidates = scan_candidates(&[input.into(), unrelated.into()], &[self_path.into()]);
         let self_sp = harmonia_store_path::StorePath::from_base_path(store_base(self_path)).ok();
         let res = pack_one_nar(
@@ -1076,7 +1075,7 @@ mod tests {
             &dir.path().join("out.nar.zst"),
             &candidates,
             self_sp.as_ref(),
-            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            Instant::now() + Duration::from_secs(30),
         )
         .await?;
         assert_eq!(res.references, vec![input.to_string()]);
@@ -1092,8 +1091,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let outside = tempfile::tempdir()?;
         let victim = outside.path().join("victim");
-        std::fs::write(&victim, "x")?;
-        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644))?;
+        fs::write(&victim, "x")?;
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o644))?;
         let mut builder = tar::Builder::new(Vec::new());
         let mut header = tar::Header::new_gnu();
         // set_path refuses absolute names, so write the name bytes the
@@ -1107,15 +1106,12 @@ mod tests {
         let data = builder.into_inner()?;
         let dest = tempfile::tempdir()?;
         unpack_tmp_dir_archive(data.as_slice(), dest.path())?;
-        let mode = std::fs::metadata(&victim)?.permissions().mode();
+        let mode = fs::metadata(&victim)?.permissions().mode();
         assert_eq!(mode & 0o777, 0o644, "outside file was chmodded: {mode:o}");
         let unpacked = dest
             .path()
             .join(victim.strip_prefix("/").unwrap_or(&victim));
-        assert_eq!(
-            std::fs::metadata(&unpacked)?.permissions().mode() & 0o777,
-            0o600
-        );
+        assert_eq!(fs::metadata(&unpacked)?.permissions().mode() & 0o777, 0o600);
         Ok(())
     }
 }

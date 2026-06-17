@@ -14,6 +14,7 @@
 //! comparatively weak Darwin sandbox).
 
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::process::{Child, Stdio};
@@ -126,7 +127,7 @@ pub fn prepare(
     opts: &PrepareOpts,
 ) -> Result<SandboxSpec> {
     let build_dir = dir.join("top").join("build");
-    std::fs::create_dir_all(&build_dir)?;
+    fs::create_dir_all(&build_dir)?;
     let mut spec = SandboxSpec {
         builder: a.builder.clone(),
         system: a.system.clone(),
@@ -231,13 +232,13 @@ pub fn spawn_request(
 /// after the reaper confirmed the spawn. No-op platform-wise on macOS
 /// (no pipe exists there).
 pub fn send_spec_to(spec: &SandboxSpec, w: std::os::fd::OwnedFd) -> Result<()> {
-    serde_json::to_writer(std::fs::File::from(w), spec).context("sending sandbox spec")
+    serde_json::to_writer(fs::File::from(w), spec).context("sending sandbox spec")
 }
 
 /// Spawn the builder directly (unit tests only; real builds go
 /// through the reaper) with stdout/stderr on `log`.
 #[cfg(test)]
-pub fn spawn(spec: &SandboxSpec, log: std::fs::File) -> Result<Child> {
+pub fn spawn(spec: &SandboxSpec, log: fs::File) -> Result<Child> {
     let mut cmd = platform::command(spec)?;
     // Own process group, so orphaned builder children can be killed
     // after the builder exits (there is no PID namespace to do it).
@@ -317,7 +318,7 @@ mod tests {
     fn recursive_nix_adds_the_daemon_socket_bind() -> Result<()> {
         let host = tempfile::tempdir()?;
         let host_sock = host.path().join("sock");
-        std::fs::File::create(&host_sock)?;
+        fs::File::create(&host_sock)?;
 
         let off_dir = tempfile::tempdir()?;
         let off = prepare(
@@ -406,7 +407,7 @@ mod tests {
             emulator: None,
             deny_read: vec![],
         };
-        std::fs::create_dir_all(&spec.build_dir)?;
+        fs::create_dir_all(&spec.build_dir)?;
         let (req, _r, _w) = spawn_request(&spec)?;
         assert!(req.env.is_empty(), "setup stage env: {:?}", req.env);
         Ok(())
@@ -458,11 +459,11 @@ mod tests {
             emulator: None,
             deny_read: vec![],
         };
-        std::fs::create_dir_all(&spec.build_dir)?;
+        fs::create_dir_all(&spec.build_dir)?;
         platform::prepare(&mut spec)?;
         let log_path = dir.path().join("build.log");
         let started = std::time::Instant::now();
-        let mut child = spawn(&spec, std::fs::File::create(&log_path)?)?;
+        let mut child = spawn(&spec, fs::File::create(&log_path)?)?;
         // spawn must return as soon as the builder execs; if the PID-ns
         // shim kept std's status pipe open, spawn would block for the
         // whole build and deadlock against the unread pipe.
@@ -471,7 +472,7 @@ mod tests {
             "spawn blocked until builder exit"
         );
         let status = child.wait()?;
-        let stderr = std::fs::read_to_string(&log_path)?;
+        let stderr = fs::read_to_string(&log_path)?;
         assert_eq!(status.code(), Some(7), "{status:?} log: {stderr}");
         Ok(())
     }
@@ -486,7 +487,7 @@ mod tests {
         // tmp prefixes prepare() accepts for the cwd symlink.
         let dir = tempfile::tempdir()?;
         let secret = dir.path().join("secret");
-        std::fs::write(&secret, "key-material")?;
+        fs::write(&secret, "key-material")?;
         let outside = dir.path().join("outside");
         let cwd = dir.path().join("build-link");
         let mut spec = SandboxSpec {
@@ -524,14 +525,14 @@ mod tests {
             deny_read: vec![secret],
             recursive_nix: false,
         };
-        std::fs::create_dir_all(&spec.build_dir)?;
+        fs::create_dir_all(&spec.build_dir)?;
         platform::prepare(&mut spec)?;
         let log_path = dir.path().join("build.log");
-        let mut child = spawn(&spec, std::fs::File::create(&log_path)?)?;
+        let mut child = spawn(&spec, fs::File::create(&log_path)?)?;
         let status = child.wait()?;
-        let log = std::fs::read_to_string(&log_path)?;
+        let log = fs::read_to_string(&log_path)?;
         assert_eq!(status.code(), Some(7), "{status:?} log: {log}");
-        assert_eq!(std::fs::read_to_string(spec.build_dir.join("out"))?, "ok\n");
+        assert_eq!(fs::read_to_string(spec.build_dir.join("out"))?, "ok\n");
         Ok(())
     }
 }

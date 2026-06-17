@@ -1,5 +1,7 @@
 //! Linux sandbox implementation: namespaces, bind mounts, pivot_root.
 
+use std::ffi::CString;
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -7,11 +9,13 @@ use std::process::Command;
 use std::process::{Child, Stdio};
 
 use anyhow::{Context, Result};
+use nix::errno::Errno;
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use nix::sched::{unshare, CloneFlags};
 use nix::sys::personality::{self, Persona};
-use nix::sys::resource::{getrlimit, setrlimit, Resource};
-use nix::unistd::{getgid, getuid, pivot_root, sethostname};
+use nix::sys::resource::{self, getrlimit, setrlimit, Resource};
+use nix::sys::{prctl, stat, wait};
+use nix::unistd::{self, getgid, getuid, pivot_root, sethostname};
 
 use super::{binfmt, SandboxSpec, PASTA_DNS};
 use crate::proto::BuildAssignment;
@@ -29,33 +33,33 @@ pub fn prepare(spec: &mut SandboxSpec) -> Result<()> {
         "etc",
         "tmp",
     ] {
-        std::fs::create_dir_all(root.join(sub))?;
+        fs::create_dir_all(root.join(sub))?;
     }
-    std::fs::write(
+    fs::write(
         root.join("etc/passwd"),
         "root:x:0:0:Nix build user:/build:/noshell\n\
          nixbld:x:1000:100:Nix build user:/build:/noshell\n\
          nobody:x:65534:65534:Nobody:/:/noshell\n",
     )?;
-    std::fs::write(
+    fs::write(
         root.join("etc/group"),
         "root:x:0:\nnixbld:x:100:\nnogroup:x:65534:\n",
     )?;
-    std::fs::write(
+    fs::write(
         root.join("etc/hosts"),
         "127.0.0.1 localhost\n::1 localhost\n",
     )?;
 
     for dev in ["null", "zero", "full", "random", "urandom", "tty"] {
         let host = PathBuf::from("/dev").join(dev);
-        std::fs::File::create(root.join("dev").join(dev))?;
+        fs::File::create(root.join("dev").join(dev))?;
         spec.binds_dev.push((host.clone(), host)); // dev nodes: bind, rw via node perms
     }
     // Nix's `kvm` system feature: pass the device through when the
     // host has it (VM builds, NixOS tests).
     let kvm = PathBuf::from("/dev/kvm");
     if kvm.exists() {
-        std::fs::File::create(root.join("dev/kvm"))?;
+        fs::File::create(root.join("dev/kvm"))?;
         spec.binds_dev.push((kvm.clone(), kvm));
     }
     for (link, target) in [
@@ -71,25 +75,25 @@ pub fn prepare(spec: &mut SandboxSpec) -> Result<()> {
         // Like Nix's fixed-output setup: name resolution via files
         // and DNS only, host resolver/services/hosts copied in, host
         // CA bundle at the standard path for TLS fetches.
-        std::fs::write(
+        fs::write(
             root.join("etc/nsswitch.conf"),
             "hosts: files dns\nservices: files\n",
         )?;
         for f in ["services", "hosts"] {
-            if let Ok(data) = std::fs::read(Path::new("/etc").join(f)) {
-                std::fs::write(root.join("etc").join(f), data)?;
+            if let Ok(data) = fs::read(Path::new("/etc").join(f)) {
+                fs::write(root.join("etc").join(f), data)?;
             }
         }
         if spec.pasta.is_some() {
             // pasta forwards DNS on this address; the host
             // resolv.conf may point at an unreachable loopback
             // stub (systemd-resolved).
-            std::fs::write(
+            fs::write(
                 root.join("etc/resolv.conf"),
                 format!("nameserver {PASTA_DNS}\n"),
             )?;
-        } else if let Ok(data) = std::fs::read("/etc/resolv.conf") {
-            std::fs::write(root.join("etc/resolv.conf"), data)?;
+        } else if let Ok(data) = fs::read("/etc/resolv.conf") {
+            fs::write(root.join("etc/resolv.conf"), data)?;
         }
         let ca = Path::new("/etc/ssl/certs/ca-certificates.crt");
         if let Ok(real) = ca.canonicalize() {
@@ -102,7 +106,7 @@ pub fn prepare(spec: &mut SandboxSpec) -> Result<()> {
         // uids out.
         if let Some(build_root) = root.parent() {
             chown_recursive(build_root, uid)?;
-            std::fs::set_permissions(
+            fs::set_permissions(
                 build_root,
                 std::os::unix::fs::PermissionsExt::from_mode(0o700),
             )?;
@@ -133,7 +137,7 @@ fn chown_recursive(path: &Path, uid: u32) -> Result<()> {
     use std::os::unix::fs::lchown;
     lchown(path, Some(uid), Some(uid)).with_context(|| format!("chowning {}", path.display()))?;
     if path.is_dir() && !path.is_symlink() {
-        for entry in std::fs::read_dir(path)? {
+        for entry in fs::read_dir(path)? {
             chown_recursive(&entry?.path(), uid)?;
         }
     }
@@ -143,7 +147,7 @@ fn chown_recursive(path: &Path, uid: u32) -> Result<()> {
 pub fn command(spec: &SandboxSpec) -> Result<Command> {
     // The shipped tmp dir is mounted at the request's sandbox build
     // dir; pre-create the mount point inside the private root.
-    std::fs::create_dir_all(
+    fs::create_dir_all(
         spec.root.join(
             Path::new(&spec.cwd)
                 .strip_prefix("/")
@@ -157,12 +161,12 @@ pub fn command(spec: &SandboxSpec) -> Result<Command> {
             continue;
         }
         if src.is_dir() {
-            std::fs::create_dir_all(&target)?;
+            fs::create_dir_all(&target)?;
         } else {
             if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
+                fs::create_dir_all(parent)?;
             }
-            std::fs::File::create(&target)?;
+            fs::File::create(&target)?;
         }
     }
 
@@ -202,11 +206,11 @@ pub fn setup_stage() -> ! {
         std::io::stdin().read_to_string(&mut json)?;
         let spec: SandboxSpec = serde_json::from_str(&json).map_err(io::Error::other)?;
         // The builder gets /dev/null as stdin, like under Nix.
-        let null = std::fs::File::open("/dev/null")?;
-        nix::unistd::dup2_stdin(&null).map_err(ioerr("dup2 stdin"))?;
+        let null = fs::File::open("/dev/null")?;
+        unistd::dup2_stdin(&null).map_err(ioerr("dup2 stdin"))?;
         // Pre-open the error file: the fd keeps working after
         // pivot_root detaches the host filesystem, a path would not.
-        let err_file = std::fs::File::create(setup_error_file(&spec.root))?;
+        let err_file = fs::File::create(setup_error_file(&spec.root))?;
         enter_and_exec(&spec).inspect_err(|e| {
             let _ = (&err_file).write_all(e.to_string().as_bytes());
         })
@@ -224,7 +228,7 @@ fn enter_and_exec(spec: &SandboxSpec) -> io::Result<std::convert::Infallible> {
     // Enter the build cgroup first, with the worker's full
     // credentials and before any namespace changes.
     if let Some(cg) = &spec.cgroup {
-        std::fs::write(cg.join("cgroup.procs"), "0")
+        fs::write(cg.join("cgroup.procs"), "0")
             .map_err(|e| io::Error::other(format!("entering build cgroup: {e}")))?;
     }
     let binfmt_line = match &spec.emulator {
@@ -266,21 +270,21 @@ fn enter_and_exec(spec: &SandboxSpec) -> io::Result<std::convert::Infallible> {
         host_gid,
         uid_count,
     })?;
-    let prog = std::ffi::CString::new(spec.builder.as_str())
-        .map_err(|_| io::Error::other("NUL in builder path"))?;
-    let args: Vec<std::ffi::CString> = std::iter::once(Ok(prog.clone()))
-        .chain(spec.args.iter().map(|a| std::ffi::CString::new(a.as_str())))
+    let prog =
+        CString::new(spec.builder.as_str()).map_err(|_| io::Error::other("NUL in builder path"))?;
+    let args: Vec<CString> = std::iter::once(Ok(prog.clone()))
+        .chain(spec.args.iter().map(|a| CString::new(a.as_str())))
         .collect::<Result<_, _>>()
         .map_err(|_| io::Error::other("NUL in builder argument"))?;
     // The setup stage runs with a clean environment; the derivation
     // env is applied only here, to the builder inside the sandbox.
-    let env: Vec<std::ffi::CString> = spec
+    let env: Vec<CString> = spec
         .env
         .iter()
-        .map(|(k, v)| std::ffi::CString::new(format!("{k}={v}")))
+        .map(|(k, v)| CString::new(format!("{k}={v}")))
         .collect::<Result<_, _>>()
         .map_err(|_| io::Error::other("NUL in builder environment"))?;
-    nix::unistd::execve(&prog, &args, &env).map_err(ioerr("exec builder"))
+    unistd::execve(&prog, &args, &env).map_err(ioerr("exec builder"))
 }
 
 fn existing_mount_flags(target: &Path) -> io::Result<MsFlags> {
@@ -289,7 +293,7 @@ fn existing_mount_flags(target: &Path) -> io::Result<MsFlags> {
     // describes the same mount, so fall back to it.
     let st = match statvfs(target) {
         Ok(st) => st,
-        Err(nix::errno::Errno::ENXIO) => {
+        Err(Errno::ENXIO) => {
             let parent = target.parent().unwrap_or(target);
             statvfs(parent).map_err(ioerr("statvfs"))?
         }
@@ -312,7 +316,7 @@ fn existing_mount_flags(target: &Path) -> io::Result<MsFlags> {
     Ok(flags)
 }
 
-fn ioerr(step: &str) -> impl Fn(nix::errno::Errno) -> io::Error + '_ {
+fn ioerr(step: &str) -> impl Fn(Errno) -> io::Error + '_ {
     move |e| io::Error::other(format!("{step}: {e}"))
 }
 
@@ -334,20 +338,20 @@ fn map_uid_range_via_helper(
     uid_count: u32,
 ) -> io::Result<()> {
     use nix::unistd::{read, write};
-    let target = nix::unistd::getpid();
-    let (req_r, req_w) = nix::unistd::pipe().map_err(ioerr("pipe"))?;
-    let (ack_r, ack_w) = nix::unistd::pipe().map_err(ioerr("pipe"))?;
-    match unsafe { nix::unistd::fork() }.map_err(ioerr("fork mapper"))? {
-        nix::unistd::ForkResult::Child => {
+    let target = unistd::getpid();
+    let (req_r, req_w) = unistd::pipe().map_err(ioerr("pipe"))?;
+    let (ack_r, ack_w) = unistd::pipe().map_err(ioerr("pipe"))?;
+    match unsafe { unistd::fork() }.map_err(ioerr("fork mapper"))? {
+        unistd::ForkResult::Child => {
             // Mapper: wait until the target has unshared, then map.
             let mut buf = [0u8; 1];
             let ok = read(&req_r, &mut buf).is_ok_and(|n| n == 1)
-                && std::fs::write(
+                && fs::write(
                     format!("/proc/{target}/uid_map"),
                     format!("{sandbox_uid} {host_uid} {uid_count}"),
                 )
                 .is_ok()
-                && std::fs::write(
+                && fs::write(
                     format!("/proc/{target}/gid_map"),
                     format!("{sandbox_gid} {host_gid} {uid_count}"),
                 )
@@ -355,14 +359,14 @@ fn map_uid_range_via_helper(
             let _ = write(&ack_w, if ok { b"K" } else { b"E" });
             unsafe { libc::_exit(0) }
         }
-        nix::unistd::ForkResult::Parent { child } => {
+        unistd::ForkResult::Parent { child } => {
             drop(req_r);
             drop(ack_w);
             unshare(flags).map_err(ioerr("unshare"))?;
             write(&req_w, b"x").map_err(ioerr("signaling uid mapper"))?;
             let mut buf = [0u8; 1];
             let n = read(&ack_r, &mut buf).map_err(ioerr("reading uid mapper ack"))?;
-            let _ = nix::sys::wait::waitpid(child, None);
+            let _ = wait::waitpid(child, None);
             if n != 1 || buf[0] != b'K' {
                 return Err(io::Error::other(
                     "uid-range mapping failed (is the worker root?)",
@@ -374,7 +378,7 @@ fn map_uid_range_via_helper(
 }
 
 struct PastaHelper {
-    child: nix::unistd::Pid,
+    child: unistd::Pid,
     req_w: std::os::fd::OwnedFd,
 }
 
@@ -383,16 +387,16 @@ struct PastaHelper {
 /// (after unshare). pasta's parent exits once the namespace is
 /// configured, so waiting for the helper is the readiness barrier.
 fn fork_pasta_helper(bin: &Path) -> io::Result<PastaHelper> {
-    let target = nix::unistd::getpid();
-    let (req_r, req_w) = nix::unistd::pipe().map_err(ioerr("pipe"))?;
-    match unsafe { nix::unistd::fork() }.map_err(ioerr("fork pasta helper"))? {
-        nix::unistd::ForkResult::Child => {
+    let target = unistd::getpid();
+    let (req_r, req_w) = unistd::pipe().map_err(ioerr("pipe"))?;
+    match unsafe { unistd::fork() }.map_err(ioerr("fork pasta helper"))? {
+        unistd::ForkResult::Child => {
             // Close our copy of the write end, or a build process
             // dying before attach() would never EOF the read below
             // and leak this helper forever.
             drop(req_w);
             let mut buf = [0u8; 1];
-            let ok = nix::unistd::read(&req_r, &mut buf).is_ok_and(|n| n == 1);
+            let ok = unistd::read(&req_r, &mut buf).is_ok_and(|n| n == 1);
             if !ok {
                 // build process died before signaling; nothing to do
                 unsafe { libc::_exit(1) }
@@ -400,7 +404,7 @@ fn fork_pasta_helper(bin: &Path) -> io::Result<PastaHelper> {
             // pasta's default port forwarding and host-loopback
             // mapping splice host services into the namespace, the
             // exact leak the private netns is meant to close.
-            let args: Vec<std::ffi::CString> = [
+            let args: Vec<CString> = [
                 bin.to_string_lossy().as_ref(),
                 "--config-net",
                 "--quiet",
@@ -419,13 +423,13 @@ fn fork_pasta_helper(bin: &Path) -> io::Result<PastaHelper> {
                 &target.to_string(),
             ]
             .iter()
-            .map(|s| std::ffi::CString::new(*s).unwrap())
+            .map(|s| CString::new(*s).unwrap())
             .collect();
             drop(req_r); // do not leak the pipe into pasta
-            let _ = nix::unistd::execv(&args[0], &args);
+            let _ = unistd::execv(&args[0], &args);
             unsafe { libc::_exit(127) }
         }
-        nix::unistd::ForkResult::Parent { child } => {
+        unistd::ForkResult::Parent { child } => {
             drop(req_r);
             Ok(PastaHelper { child, req_w })
         }
@@ -434,8 +438,8 @@ fn fork_pasta_helper(bin: &Path) -> io::Result<PastaHelper> {
 
 impl PastaHelper {
     fn attach(self) -> io::Result<()> {
-        use nix::sys::wait::{waitpid, WaitStatus};
-        nix::unistd::write(&self.req_w, b"x").map_err(ioerr("signaling pasta helper"))?;
+        use wait::{waitpid, WaitStatus};
+        unistd::write(&self.req_w, b"x").map_err(ioerr("signaling pasta helper"))?;
         match waitpid(self.child, None) {
             Ok(WaitStatus::Exited(_, 0)) => Ok(()),
             other => Err(io::Error::other(format!(
@@ -477,10 +481,10 @@ fn loopback_up() -> io::Result<()> {
 /// status. When PID 1 dies the kernel kills every namespace member,
 /// so daemonized/setsid'd builder children cannot outlive the build.
 fn fork_into_pid_ns() -> io::Result<bool> {
-    match unsafe { nix::unistd::fork() }.map_err(ioerr("fork"))? {
-        nix::unistd::ForkResult::Child => Ok(true),
-        nix::unistd::ForkResult::Parent { child } => {
-            use nix::sys::wait::{waitpid, WaitStatus};
+    match unsafe { unistd::fork() }.map_err(ioerr("fork"))? {
+        unistd::ForkResult::Child => Ok(true),
+        unistd::ForkResult::Parent { child } => {
+            use wait::{waitpid, WaitStatus};
             // Drop every inherited fd: the long-lived shim must not
             // hold the log pipes (or the setup error file) open for
             // the build's whole lifetime.
@@ -491,7 +495,7 @@ fn fork_into_pid_ns() -> io::Result<bool> {
                 match waitpid(child, None) {
                     Ok(WaitStatus::Exited(_, code)) => break code,
                     Ok(WaitStatus::Signaled(_, sig, _)) => break 128 + sig as i32,
-                    Ok(_) | Err(nix::errno::Errno::EINTR) => {}
+                    Ok(_) | Err(Errno::EINTR) => {}
                     Err(_) => break 1,
                 }
             };
@@ -531,13 +535,13 @@ fn setup(p: &SetupParams) -> io::Result<()> {
     // is owned by the unprivileged uid and rootless pasta can
     // attach to it.
     if let Some(uid) = p.fod_uid {
-        nix::unistd::setgroups(&[]).map_err(ioerr("fod setgroups"))?;
-        nix::unistd::setgid(nix::unistd::Gid::from_raw(uid)).map_err(ioerr("fod setgid"))?;
-        nix::unistd::setuid(nix::unistd::Uid::from_raw(uid)).map_err(ioerr("fod setuid"))?;
+        unistd::setgroups(&[]).map_err(ioerr("fod setgroups"))?;
+        unistd::setgid(unistd::Gid::from_raw(uid)).map_err(ioerr("fod setgid"))?;
+        unistd::setuid(unistd::Uid::from_raw(uid)).map_err(ioerr("fod setuid"))?;
         // setuid cleared the dumpable flag, which makes /proc/self
         // root-owned; restore it so the uid/gid map writes below
         // (and pasta's /proc access) work.
-        nix::sys::prctl::set_dumpable(true).map_err(ioerr("set_dumpable"))?;
+        prctl::set_dumpable(true).map_err(ioerr("set_dumpable"))?;
     }
     let private_net = !p.network || p.pasta.is_some();
     if private_net {
@@ -556,13 +560,13 @@ fn setup(p: &SetupParams) -> io::Result<()> {
     if p.uid_count == 1 {
         // Unprivileged self-mapping of the caller's own uid.
         unshare(flags).map_err(ioerr("unshare"))?;
-        std::fs::write("/proc/self/setgroups", "deny").map_err(werr("setgroups"))?;
-        std::fs::write(
+        fs::write("/proc/self/setgroups", "deny").map_err(werr("setgroups"))?;
+        fs::write(
             "/proc/self/uid_map",
             format!("{} {} {}", p.sandbox_uid, p.host_uid, p.uid_count),
         )
         .map_err(werr("uid_map"))?;
-        std::fs::write(
+        fs::write(
             "/proc/self/gid_map",
             format!("{} {} {}", p.sandbox_gid, p.host_gid, p.uid_count),
         )
@@ -615,17 +619,17 @@ fn setup(p: &SetupParams) -> io::Result<()> {
     // the worker's own uid is outside the mapped block. Single-uid
     // builds already run as the mapped uid.
     if p.uid_count > 1 {
-        nix::unistd::setgroups(&[]).map_err(ioerr("setgroups"))?;
-        nix::unistd::setgid(nix::unistd::Gid::from_raw(p.sandbox_gid)).map_err(ioerr("setgid"))?;
-        nix::unistd::setuid(nix::unistd::Uid::from_raw(p.sandbox_uid)).map_err(ioerr("setuid"))?;
+        unistd::setgroups(&[]).map_err(ioerr("setgroups"))?;
+        unistd::setgid(unistd::Gid::from_raw(p.sandbox_gid)).map_err(ioerr("setgid"))?;
+        unistd::setuid(unistd::Uid::from_raw(p.sandbox_uid)).map_err(ioerr("setuid"))?;
     } else if p.binfmt_line.is_some() {
         // binfmt registration needed in-namespace root; remap to
         // Nix's uid 1000 via a nested userns. Exec lookup falls back
         // to the ancestor namespace's binfmt instance.
         unshare(CloneFlags::CLONE_NEWUSER).map_err(ioerr("nested unshare"))?;
-        std::fs::write("/proc/self/setgroups", "deny").map_err(werr("nested setgroups"))?;
-        std::fs::write("/proc/self/uid_map", "1000 0 1").map_err(werr("nested uid_map"))?;
-        std::fs::write("/proc/self/gid_map", "100 0 1").map_err(werr("nested gid_map"))?;
+        fs::write("/proc/self/setgroups", "deny").map_err(werr("nested setgroups"))?;
+        fs::write("/proc/self/uid_map", "1000 0 1").map_err(werr("nested uid_map"))?;
+        fs::write("/proc/self/gid_map", "100 0 1").map_err(werr("nested gid_map"))?;
     }
     Ok(())
 }
@@ -752,8 +756,7 @@ fn register_binfmt(line: &str) -> io::Result<()> {
     .map_err(ioerr(
         "mounting binfmt_misc (emulated builds need kernel 6.7+)",
     ))?;
-    std::fs::write("/proc/sys/fs/binfmt_misc/register", line)
-        .map_err(werr("registering binfmt entry"))
+    fs::write("/proc/sys/fs/binfmt_misc/register", line).map_err(werr("registering binfmt entry"))
 }
 
 /// Match Nix's process environment: no core dumps in outputs, a
@@ -766,9 +769,9 @@ fn apply_process_limits(system: &str) -> io::Result<()> {
     let (_, hard) = getrlimit(Resource::RLIMIT_NPROC).map_err(ioerr("getrlimit NPROC"))?;
     let limit = hard.min(4096);
     setrlimit(Resource::RLIMIT_NPROC, limit, limit).map_err(ioerr("setting RLIMIT_NPROC"))?;
-    setrlimit(Resource::RLIMIT_CORE, 0, nix::sys::resource::RLIM_INFINITY)
+    setrlimit(Resource::RLIMIT_CORE, 0, resource::RLIM_INFINITY)
         .map_err(ioerr("setting RLIMIT_CORE"))?;
-    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o022));
+    stat::umask(stat::Mode::from_bits_truncate(0o022));
     if matches!(
         system,
         "i686-linux" | "armv7l-linux" | "armv6l-linux" | "armv5tel-linux"
@@ -785,7 +788,7 @@ fn apply_process_limits(system: &str) -> io::Result<()> {
     if let Ok(persona) = personality::get() {
         let _ = personality::set(persona | Persona::ADDR_NO_RANDOMIZE);
     }
-    nix::sys::prctl::set_no_new_privs().map_err(ioerr("PR_SET_NO_NEW_PRIVS"))
+    prctl::set_no_new_privs().map_err(ioerr("PR_SET_NO_NEW_PRIVS"))
 }
 
 pub fn setup_error_file(root: &Path) -> PathBuf {
@@ -793,7 +796,7 @@ pub fn setup_error_file(root: &Path) -> PathBuf {
 }
 
 pub fn setup_error_detail_impl(spec: &SandboxSpec) -> Option<String> {
-    std::fs::read_to_string(setup_error_file(&spec.root))
+    fs::read_to_string(setup_error_file(&spec.root))
         .ok()
         .filter(|s| !s.is_empty())
 }

@@ -1,13 +1,18 @@
 //! Resumable builds: adoption across worker generations, result persistence and delivery.
 
 use std::collections::HashMap;
+use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
+use std::sync::atomic;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use harmonia_store_path::StoreDir;
 use harmonia_store_remote::{DaemonClient, DaemonStore};
 use harmonia_utils_signature::SecretKey;
+use nix::sys::signal;
 use tokio::sync::mpsc;
 
 use super::build::{pack_outputs, ActiveBuild};
@@ -23,17 +28,14 @@ use crate::proto::{
 /// Pick up builds a previous worker generation left behind: still
 /// running (same reaper, so their pids and exit statuses are valid)
 /// or finished but undelivered. Anything stale is swept.
-pub(super) async fn adopt_builds(
-    ctx: &std::sync::Arc<WorkerCtx>,
-    signing_key: &std::sync::Arc<SecretKey>,
-) {
+pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>, signing_key: &Arc<SecretKey>) {
     let reaper_id = std::env::var(reaper::ID_ENV).unwrap_or_default();
-    let Ok(entries) = std::fs::read_dir(ctx.state_dir.join("builds")) else {
+    let Ok(entries) = fs::read_dir(ctx.state_dir.join("builds")) else {
         return;
     };
     for entry in entries.flatten() {
         let dir = entry.path();
-        if let Ok(s) = std::fs::read_to_string(dir.join("finished.json")) {
+        if let Ok(s) = fs::read_to_string(dir.join("finished.json")) {
             let Ok(f) = serde_json::from_str::<FinishedState>(&s) else {
                 remove_path_all(&dir);
                 continue;
@@ -50,7 +52,7 @@ pub(super) async fn adopt_builds(
                         outputs: f.outputs,
                         extras: f.extras,
                         dir: dir.clone(),
-                        finished_at: std::time::Instant::now(),
+                        finished_at: Instant::now(),
                     }),
                     delivering: false,
                     dir,
@@ -59,7 +61,7 @@ pub(super) async fn adopt_builds(
             );
             continue;
         }
-        let Ok(s) = std::fs::read_to_string(dir.join("resume.json")) else {
+        let Ok(s) = fs::read_to_string(dir.join("resume.json")) else {
             continue; // already swept by sweep_state_dir
         };
         let st = match serde_json::from_str::<ResumeState>(&s) {
@@ -88,8 +90,7 @@ pub(super) async fn adopt_builds(
                 log_tail: None,
             },
         );
-        ctx.running
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ctx.running.fetch_add(1, atomic::Ordering::Relaxed);
         let task_ctx = ctx.clone();
         let signing_key = signing_key.clone();
         tokio::task::spawn_blocking(move || {
@@ -98,8 +99,7 @@ pub(super) async fn adopt_builds(
             let fin = supervise_adopted(&ctx, &st, dir, &signing_key);
             // Roots live until the outputs are packed.
             drop(gc_roots);
-            ctx.running
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            ctx.running.fetch_sub(1, atomic::Ordering::Relaxed);
             record_finished(&ctx, &key, fin);
         });
     }
@@ -133,7 +133,7 @@ async fn re_root_inputs(spec: &sandbox::SandboxSpec) -> Option<DaemonConn> {
 /// tail end of execute(). Logs are streamed by the tailer that
 /// adopt_assignment starts once a session re-dispatches the build.
 fn supervise_adopted(
-    ctx: &std::sync::Arc<WorkerCtx>,
+    ctx: &Arc<WorkerCtx>,
     st: &ResumeState,
     dir: PathBuf,
     signing_key: &SecretKey,
@@ -145,16 +145,16 @@ fn supervise_adopted(
     // previous generation may have consumed the status (take_status
     // deletes it on read) and died before recording the result. Waiting
     // forever would leak the slot and the supervising thread.
-    let mut gone_since: Option<std::time::Instant> = None;
+    let mut gone_since: Option<Instant> = None;
     let code = loop {
         if let Some(code) = reaper::take_status(&ctx.status_dir, &st.status_token) {
             break code;
         }
-        if nix::sys::signal::kill(pgrp, None).is_err() {
-            let since = gone_since.get_or_insert_with(std::time::Instant::now);
+        if signal::kill(pgrp, None).is_err() {
+            let since = gone_since.get_or_insert_with(Instant::now);
             // a couple of reaper sweeps of grace for a status file
             // that is still on its way
-            if since.elapsed() > std::time::Duration::from_secs(5) {
+            if since.elapsed() > Duration::from_secs(5) {
                 aborted.get_or_insert_with(|| {
                     "build exit status was lost during a worker handover".into()
                 });
@@ -167,12 +167,12 @@ fn supervise_adopted(
             let timed_out = (unix_now() >= st.deadline_unix).then(|| "build timed out".to_string());
             aborted = ctx.abort_reason(&st.dedupe_key, &log_path, timed_out);
             if aborted.is_some() {
-                let _ = nix::sys::signal::killpg(pgrp, nix::sys::signal::Signal::SIGKILL);
+                let _ = signal::killpg(pgrp, signal::Signal::SIGKILL);
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(200));
     };
-    let _ = nix::sys::signal::killpg(pgrp, nix::sys::signal::Signal::SIGKILL);
+    let _ = signal::killpg(pgrp, signal::Signal::SIGKILL);
     // Tear down cgroup and sandbox like teardown() would.
     if let Some(base) = ctx.cgroup_base.as_deref() {
         cgroup::kill_and_remove(base, &st.build_id);
@@ -196,7 +196,7 @@ fn supervise_adopted(
         // Fresh deadline: the build's own one bounded execution; this
         // one only stops packing a pathological (e.g. sparse-file)
         // output from running away.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_mins(10);
+        let deadline = Instant::now() + Duration::from_mins(10);
         // Resume path: skip the recursive-nix candidate widening.
         // The daemon was queried on the original execute(); a
         // worker-handover replay re-scans against inputs+outputs only,
@@ -220,18 +220,18 @@ fn supervise_adopted(
         outputs,
         extras: Vec::new(),
         dir,
-        finished_at: std::time::Instant::now(),
+        finished_at: Instant::now(),
     }
 }
 
 /// Forget finished builds nobody resumed. Without a client
 /// resubmitting (it gave up or died), the result has no taker; the
 /// entry would otherwise pin the build dir forever.
-pub(super) fn spawn_resumable_reaper(ctx: std::sync::Arc<WorkerCtx>) {
-    const TTL: std::time::Duration = std::time::Duration::from_mins(5);
+pub(super) fn spawn_resumable_reaper(ctx: Arc<WorkerCtx>) {
+    const TTL: Duration = Duration::from_mins(5);
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(std::time::Duration::from_mins(1)).await;
+            tokio::time::sleep(Duration::from_mins(1)).await;
             let mut expired = Vec::new();
             {
                 let mut map = ctx.resumable.lock().unwrap();
@@ -244,7 +244,7 @@ pub(super) fn spawn_resumable_reaper(ctx: std::sync::Arc<WorkerCtx>) {
                 });
             }
             for (key, dir) in expired {
-                let _ = std::fs::remove_dir_all(&dir);
+                let _ = fs::remove_dir_all(&dir);
                 tracing::warn!(
                     key,
                     "dropping undelivered build result (no resume within TTL)"
@@ -286,7 +286,7 @@ pub(super) struct FinishedBuild {
     pub(super) extras: Vec<PackedExtra>,
     /// Build dir holding the packed NARs; removed after delivery.
     pub(super) dir: PathBuf,
-    pub(super) finished_at: std::time::Instant,
+    pub(super) finished_at: Instant,
 }
 
 /// One closure-delta path: PathInfo from the worker daemon plus a
@@ -355,7 +355,7 @@ struct FinishedState {
 /// Record a build's result in the registry (persisted for redelivery
 /// across worker generations) and start delivering it. Shared by the
 /// normal execute path and re-adopted builds.
-pub(super) fn record_finished(ctx: &std::sync::Arc<WorkerCtx>, key: &str, fin: FinishedBuild) {
+pub(super) fn record_finished(ctx: &Arc<WorkerCtx>, key: &str, fin: FinishedBuild) {
     {
         let mut map = ctx.resumable.lock().unwrap();
         if let Some(e) = map.get_mut(key) {
@@ -395,9 +395,9 @@ fn persist_finished(key: &str, build_id: &str, fin: &FinishedBuild) {
         extras: fin.extras.clone(),
     };
     if let Ok(json) = serde_json::to_vec(&state) {
-        let _ = std::fs::write(fin.dir.join("finished.json"), json);
+        let _ = fs::write(fin.dir.join("finished.json"), json);
     }
-    let _ = std::fs::remove_file(fin.dir.join("resume.json"));
+    let _ = fs::remove_file(fin.dir.join("resume.json"));
 }
 
 /// Run a build to a FinishedBuild, whatever happens: errors and even
@@ -408,7 +408,7 @@ pub(super) fn execute_to_finished(
     build: &ActiveBuild,
     out_tx: &mpsc::Sender<WorkerMessage>,
     signing_key: &SecretKey,
-    timeout: std::time::Duration,
+    timeout: Duration,
 ) -> FinishedBuild {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         build.execute(out_tx, signing_key, timeout)
@@ -422,7 +422,7 @@ pub(super) fn execute_to_finished(
             outputs: vec![],
             extras: vec![],
             dir: build.dir.clone(),
-            finished_at: std::time::Instant::now(),
+            finished_at: Instant::now(),
         }
     })
 }
@@ -466,7 +466,7 @@ pub(super) fn deliver(
         error: fin.error.clone(),
     })))?;
     for o in &fin.outputs {
-        let mut f = std::fs::File::open(&o.nar_file)?;
+        let mut f = fs::File::open(&o.nar_file)?;
         let mut buf = vec![0u8; CHUNK_SIZE];
         loop {
             let n = f.read(&mut buf)?;
@@ -488,7 +488,7 @@ pub(super) fn deliver(
         })))?;
     }
     for e in &fin.extras {
-        let mut f = std::fs::File::open(&e.nar_file)?;
+        let mut f = fs::File::open(&e.nar_file)?;
         let mut buf = vec![0u8; CHUNK_SIZE];
         loop {
             let n = f.read(&mut buf)?;
@@ -517,7 +517,7 @@ pub(super) fn deliver(
 /// otherwise be lost and cost a rebuild. Matched by dedupe key (the
 /// stable identity); the ack's build_id may predate a concurrent
 /// resume that rotated the entry's id.
-pub(super) fn ack_delivery(ctx: &std::sync::Arc<WorkerCtx>, key: &str, build_id: &str) {
+pub(super) fn ack_delivery(ctx: &Arc<WorkerCtx>, key: &str, build_id: &str) {
     let removed = {
         let mut map = ctx.resumable.lock().unwrap();
         match map.get(key) {
@@ -526,7 +526,7 @@ pub(super) fn ack_delivery(ctx: &std::sync::Arc<WorkerCtx>, key: &str, build_id:
         }
     };
     if let Some(e) = removed {
-        if let Err(err) = std::fs::remove_dir_all(&e.dir) {
+        if let Err(err) = fs::remove_dir_all(&e.dir) {
             tracing::warn!("cleaning up {}: {err}", e.dir.display());
         }
         tracing::info!(id = build_id, "build result acknowledged");
@@ -538,7 +538,7 @@ pub(super) fn ack_delivery(ctx: &std::sync::Arc<WorkerCtx>, key: &str, build_id:
 /// assignment. The build is kept until the hub acknowledges the
 /// result; a failed or unacknowledged delivery is retried on the next
 /// assignment of the same key.
-pub(super) fn try_deliver(ctx: &std::sync::Arc<WorkerCtx>, key: &str) {
+pub(super) fn try_deliver(ctx: &Arc<WorkerCtx>, key: &str) {
     let (build_id, out_tx, fin, log_tail) = {
         let mut map = ctx.resumable.lock().unwrap();
         let Some(e) = map.get_mut(key) else { return };

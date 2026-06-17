@@ -1,8 +1,11 @@
 //! Build submission: request validation, dedupe keys, the AttachHub service.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Component, Path};
 use std::sync::Arc;
+use std::time::Instant;
 
+use nix::fcntl;
 use sha2::{Digest, Sha256};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -24,7 +27,7 @@ fn validate_request(req: &BuildRequest) -> Result<(), Status> {
     if req.store_dir != STORE_DIR {
         return Err(Status::invalid_argument("invalid store dir"));
     }
-    let mut seen_inputs = std::collections::HashSet::new();
+    let mut seen_inputs = HashSet::new();
     for p in &req.input_paths {
         if !valid_store_path(&req.store_dir, p) {
             return Err(bad("input path", p));
@@ -35,7 +38,7 @@ fn validate_request(req: &BuildRequest) -> Result<(), Status> {
             )));
         }
     }
-    let mut seen_outputs = std::collections::HashSet::new();
+    let mut seen_outputs = HashSet::new();
     for p in req.outputs.values() {
         if !valid_store_path(&req.store_dir, p) {
             return Err(bad("output path", p));
@@ -60,22 +63,15 @@ fn validate_request(req: &BuildRequest) -> Result<(), Status> {
     // from Linux clients, the real per-build topTmpDir from Darwin.
     let tmp_in_sandbox = Path::new(&req.tmp_dir_in_sandbox);
     if !tmp_in_sandbox.is_absolute()
-        || tmp_in_sandbox.components().any(|c| {
-            !matches!(
-                c,
-                std::path::Component::RootDir | std::path::Component::Normal(_)
-            )
-        })
+        || tmp_in_sandbox
+            .components()
+            .any(|c| !matches!(c, Component::RootDir | Component::Normal(_)))
         || req.tmp_dir_in_sandbox.starts_with(STORE_DIR)
     {
         return Err(Status::invalid_argument("invalid tmpDirInSandbox"));
     }
     let tmp = Path::new(&req.top_tmp_dir);
-    if !tmp.is_absolute()
-        || tmp
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
+    if !tmp.is_absolute() || tmp.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(Status::invalid_argument("invalid topTmpDir"));
     }
     Ok(())
@@ -97,7 +93,7 @@ pub(super) fn validate_top_tmp_dir(
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let dir = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags((nix::fcntl::OFlag::O_DIRECTORY | nix::fcntl::OFlag::O_NOFOLLOW).bits())
+        .custom_flags((fcntl::OFlag::O_DIRECTORY | fcntl::OFlag::O_NOFOLLOW).bits())
         .open(top_tmp_dir)
         .map_err(|e| Status::invalid_argument(format!("topTmpDir {top_tmp_dir}: {e}")))?;
     // O_DIRECTORY already guarantees a directory; only ownership is
@@ -203,13 +199,13 @@ impl attach_hub_server::AttachHub for AttachSvc {
         };
         if !servable() {
             tracing::info!(system = req.system, "no capable worker yet; waiting");
-            let deadline = std::time::Instant::now() + WORKER_GRACE;
+            let deadline = Instant::now() + WORKER_GRACE;
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 if servable() {
                     break;
                 }
-                if std::time::Instant::now() >= deadline {
+                if Instant::now() >= deadline {
                     let what = if features.is_empty() {
                         format!("system {}", req.system)
                     } else {

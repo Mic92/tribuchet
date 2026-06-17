@@ -1,7 +1,9 @@
 //! Build-log tailing with a persisted offset, for resumed sessions.
 
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic;
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
@@ -11,13 +13,13 @@ use crate::proto::{worker_message, LogChunk, WorkerMessage};
 /// A log-replay thread; `stop()` makes it drain to EOF, then waits
 /// for it.
 pub(super) struct LogTail {
-    pub(super) done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub(super) done: Arc<atomic::AtomicBool>,
     handle: std::thread::JoinHandle<()>,
 }
 
 impl LogTail {
     pub(super) fn stop(self) {
-        self.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.done.store(true, atomic::Ordering::Relaxed);
         let _ = self.handle.join();
     }
 }
@@ -26,14 +28,14 @@ impl LogTail {
 /// Persisted next to the log so resumed sessions and later worker
 /// generations continue where the previous tailer stopped instead of
 /// repeating the log from the start.
-fn read_log_offset(dir: &std::path::Path) -> u64 {
+fn read_log_offset(dir: &Path) -> u64 {
     std::fs::read_to_string(dir.join("log.offset"))
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0)
 }
 
-fn write_log_offset(dir: &std::path::Path, offset: u64) {
+fn write_log_offset(dir: &Path, offset: u64) {
     let _ = std::fs::write(dir.join("log.offset"), offset.to_string());
 }
 
@@ -43,7 +45,7 @@ fn write_log_offset(dir: &std::path::Path, offset: u64) {
 /// nothing more can arrive (one final read has then already drained
 /// what was flushed); a failed send ends it, the offset stays put.
 pub(super) fn tail_log(
-    dir: &std::path::Path,
+    dir: &Path,
     build_id: &str,
     out_tx: &mpsc::Sender<WorkerMessage>,
     done: impl Fn() -> bool,
@@ -86,16 +88,16 @@ pub(super) fn tail_log(
 /// Tail a resumed build's log on a thread until the registry entry
 /// has finished (or vanished) or `stop()` is called.
 pub(super) fn spawn_log_tail(
-    ctx: std::sync::Arc<WorkerCtx>,
+    ctx: Arc<WorkerCtx>,
     key: String,
     build_id: String,
     dir: PathBuf,
     out_tx: mpsc::Sender<WorkerMessage>,
 ) -> LogTail {
-    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done = Arc::new(atomic::AtomicBool::new(false));
     let thread_done = done.clone();
     let handle = std::thread::spawn(move || {
-        use std::sync::atomic::Ordering;
+        use atomic::Ordering;
         let done = || {
             thread_done.load(Ordering::Relaxed) || {
                 let map = ctx.resumable.lock().unwrap();

@@ -5,6 +5,7 @@
 //! teardown uses `cgroup.kill`, which reaches setsid'd escapees no
 //! killpg can. Without delegation builds run unscoped, with a warning.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Move this process into a `main` leaf below its own cgroup (cgroup
@@ -16,30 +17,28 @@ pub fn init() -> Option<PathBuf> {
         tracing::warn!("cgroup limits disabled: {why}; builds run without pids/memory caps");
         None
     };
-    let Ok(cg) = std::fs::read_to_string("/proc/self/cgroup") else {
+    let Ok(cg) = fs::read_to_string("/proc/self/cgroup") else {
         return unavailable("cannot read /proc/self/cgroup");
     };
     let Some(path) = cg.lines().find_map(|l| l.strip_prefix("0::")) else {
         return unavailable("not on cgroup v2");
     };
     let base = PathBuf::from(format!("/sys/fs/cgroup{}", path.trim()));
-    let Ok(controllers) = std::fs::read_to_string(base.join("cgroup.controllers")) else {
+    let Ok(controllers) = fs::read_to_string(base.join("cgroup.controllers")) else {
         return unavailable("cannot read cgroup.controllers");
     };
     if !controllers.split_whitespace().any(|c| c == "pids") {
         return unavailable("pids controller not delegated (systemd Delegate=yes?)");
     }
     let main = base.join("main");
-    if std::fs::create_dir_all(&main).is_err()
-        || std::fs::write(main.join("cgroup.procs"), "0").is_err()
-    {
+    if fs::create_dir_all(&main).is_err() || fs::write(main.join("cgroup.procs"), "0").is_err() {
         return unavailable("cannot move into a leaf cgroup");
     }
     let mut ctrl = String::from("+pids");
     if controllers.split_whitespace().any(|c| c == "memory") {
         ctrl.push_str(" +memory");
     }
-    if let Err(e) = std::fs::write(base.join("cgroup.subtree_control"), ctrl) {
+    if let Err(e) = fs::write(base.join("cgroup.subtree_control"), ctrl) {
         return unavailable(&format!("cannot enable controllers: {e}"));
     }
     tracing::info!(base = %base.display(), "per-build cgroup limits enabled");
@@ -55,10 +54,10 @@ fn build_dir(base: &Path, build_id: &str) -> PathBuf {
 pub fn create(base: &Path, build_id: &str, memory_max: Option<u64>) -> Option<PathBuf> {
     let dir = build_dir(base, build_id);
     let setup = || -> std::io::Result<()> {
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(dir.join("pids.max"), "4096")?;
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("pids.max"), "4096")?;
         if let Some(bytes) = memory_max {
-            std::fs::write(dir.join("memory.max"), bytes.to_string())?;
+            fs::write(dir.join("memory.max"), bytes.to_string())?;
         }
         Ok(())
     };
@@ -69,7 +68,7 @@ pub fn create(base: &Path, build_id: &str, memory_max: Option<u64>) -> Option<Pa
                 "creating build cgroup {}: {e}; build runs unscoped",
                 dir.display()
             );
-            let _ = std::fs::remove_dir(&dir);
+            let _ = fs::remove_dir(&dir);
             None
         }
     }
@@ -98,9 +97,9 @@ pub fn kill_and_remove(base: &Path, build_id: &str) {
     if !dir.exists() {
         return;
     }
-    let _ = std::fs::write(dir.join("cgroup.kill"), "1");
+    let _ = fs::write(dir.join("cgroup.kill"), "1");
     for _ in 0..50 {
-        if std::fs::remove_dir(&dir).is_ok() {
+        if fs::remove_dir(&dir).is_ok() {
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));

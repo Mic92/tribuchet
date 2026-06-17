@@ -44,6 +44,7 @@ pub async fn unpack_zstd_chunks(rx: mpsc::Receiver<Vec<u8>>, dest: &Path) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
     async fn round_trip_via_zstd(src: &Path, dest: &Path) -> Result<()> {
@@ -64,12 +65,12 @@ mod tests {
     #[tokio::test]
     async fn round_trip() -> Result<()> {
         let src = tempfile::tempdir()?;
-        std::fs::write(src.path().join("file"), b"hello")?;
-        std::fs::create_dir(src.path().join("dir"))?;
-        std::fs::write(src.path().join("dir/exe"), b"#!/bin/sh\n")?;
-        std::fs::set_permissions(
+        fs::write(src.path().join("file"), b"hello")?;
+        fs::create_dir(src.path().join("dir"))?;
+        fs::write(src.path().join("dir/exe"), b"#!/bin/sh\n")?;
+        fs::set_permissions(
             src.path().join("dir/exe"),
-            std::fs::Permissions::from_mode(0o755),
+            fs::Permissions::from_mode(0o755),
         )?;
         std::os::unix::fs::symlink("file", src.path().join("link"))?;
         std::os::unix::fs::symlink("/nowhere", src.path().join("dangling"))?;
@@ -78,17 +79,12 @@ mod tests {
         let dest = out.path().join("restored");
         round_trip_via_zstd(src.path(), &dest).await?;
 
-        assert_eq!(std::fs::read(dest.join("file"))?, b"hello");
-        let mode = std::fs::metadata(dest.join("dir/exe"))?
-            .permissions()
-            .mode();
+        assert_eq!(fs::read(dest.join("file"))?, b"hello");
+        let mode = fs::metadata(dest.join("dir/exe"))?.permissions().mode();
         assert_ne!(mode & 0o111, 0, "executable bit preserved");
+        assert_eq!(fs::read_link(dest.join("link"))?.to_str(), Some("file"));
         assert_eq!(
-            std::fs::read_link(dest.join("link"))?.to_str(),
-            Some("file")
-        );
-        assert_eq!(
-            std::fs::read_link(dest.join("dangling"))?.to_str(),
+            fs::read_link(dest.join("dangling"))?.to_str(),
             Some("/nowhere")
         );
 
@@ -105,7 +101,7 @@ mod tests {
     #[tokio::test]
     async fn matches_nix_store_dump() -> Result<()> {
         let src = tempfile::tempdir()?;
-        std::fs::write(src.path().join("a"), b"x")?;
+        fs::write(src.path().join("a"), b"x")?;
         std::os::unix::fs::symlink("a", src.path().join("b"))?;
         let mut ours = Vec::new();
         pack(src.path(), &mut ours).await?;

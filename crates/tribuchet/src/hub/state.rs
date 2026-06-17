@@ -1,14 +1,17 @@
 //! In-memory hub state: replay buffers, the job queue, worker capabilities.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
+use std::sync::atomic;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, Mutex, Notify};
 use tonic::Status;
 
 /// How long a submission waits for a capable worker before being
 /// rejected; covers the re-registration gap after a hub restart.
-pub(super) const WORKER_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+pub(super) const WORKER_GRACE: Duration = Duration::from_secs(30);
 
 use crate::proto::{attach_event, AttachEvent, BuildRequest};
 
@@ -133,7 +136,7 @@ pub(super) struct Job {
     /// The topTmpDir as validated at submission time, held open so the
     /// later tar step cannot be redirected by swapping the path for a
     /// symlink while the job is queued.
-    pub(super) tmp_dir: Arc<std::fs::File>,
+    pub(super) tmp_dir: Arc<fs::File>,
     /// requiredSystemFeatures; only workers advertising them get the job.
     pub(super) features: Vec<String>,
     pub(super) replay: Arc<Replay>,
@@ -142,7 +145,7 @@ pub(super) struct Job {
     pub(super) attempts: u32,
     /// Set on requeue: protects the job from fail_unservable() while
     /// its worker reconnects (reload or crash respawn).
-    pub(super) requeued_at: Option<std::time::Instant>,
+    pub(super) requeued_at: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -166,13 +169,13 @@ pub(super) struct HubState {
     /// submissions no worker can serve fail fast instead of queueing
     /// forever.
     pub(super) worker_caps: std::sync::Mutex<HashMap<u64, WorkerCaps>>,
-    pub(super) next_worker_id: std::sync::atomic::AtomicU64,
+    pub(super) next_worker_id: atomic::AtomicU64,
 }
 
 #[derive(Clone)]
 pub(super) struct WorkerCaps {
     /// system -> features the worker honors for it
-    pub(super) systems: HashMap<String, std::collections::HashSet<String>>,
+    pub(super) systems: HashMap<String, HashSet<String>>,
 }
 
 impl WorkerCaps {
@@ -194,7 +197,7 @@ impl Default for HubState {
                 harmonia_store_remote::PoolConfig::default(),
             ),
             worker_caps: std::sync::Mutex::default(),
-            next_worker_id: std::sync::atomic::AtomicU64::default(),
+            next_worker_id: atomic::AtomicU64::default(),
         }
     }
 }
@@ -220,10 +223,7 @@ impl HubState {
 
     /// Take a queued job whose dedupe key is in `keys` (builds the
     /// calling worker can resume), regardless of RequestJob credits.
-    pub(super) async fn take_job_by_key(
-        &self,
-        keys: &std::collections::HashSet<String>,
-    ) -> Option<Job> {
+    pub(super) async fn take_job_by_key(&self, keys: &HashSet<String>) -> Option<Job> {
         if keys.is_empty() {
             return None;
         }
@@ -238,7 +238,7 @@ impl HubState {
     /// fail_unservable() covers the case where no worker ever returns.
     pub(super) async fn requeue(self: &Arc<Self>, mut job: Job) {
         job.attempts += 1;
-        job.requeued_at = Some(std::time::Instant::now());
+        job.requeued_at = Some(Instant::now());
         for path in job.req.outputs.values() {
             job.replay
                 .publish(attach_event::Event::OutputRestart(path.clone()))
@@ -248,7 +248,7 @@ impl HubState {
         self.notify.notify_waiters();
         let state = self.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(WORKER_GRACE + std::time::Duration::from_secs(1)).await;
+            tokio::time::sleep(WORKER_GRACE + Duration::from_secs(1)).await;
             state.fail_unservable().await;
         });
     }
@@ -315,7 +315,7 @@ mod tests {
                 system: "x86_64-linux".into(),
                 ..Default::default()
             },
-            tmp_dir: Arc::new(std::fs::File::open(std::env::temp_dir()).unwrap()),
+            tmp_dir: Arc::new(fs::File::open(std::env::temp_dir()).unwrap()),
             features: vec![],
             replay: replay.clone(),
             attempts: 0,

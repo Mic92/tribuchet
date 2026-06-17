@@ -19,8 +19,12 @@ pub mod reaper;
 mod resume;
 pub mod sandbox;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use harmonia_store_remote::DaemonClient;
@@ -62,15 +66,15 @@ struct WorkerCtx {
     /// (macOS Seatbelt deny rules; Linux relies on the mount namespace).
     secret_paths: Vec<PathBuf>,
     /// Builds currently executing, reported in heartbeats.
-    running: std::sync::atomic::AtomicU32,
+    running: atomic::AtomicU32,
     /// dedupe_key -> build past staging; survives session loss so a
     /// replacement hub can resume instead of rebuilding.
-    resumable: std::sync::Mutex<HashMap<String, ResumableBuild>>,
+    resumable: Mutex<HashMap<String, ResumableBuild>>,
     /// system -> static emulator binary, from the emulate setting.
     emulators: HashMap<String, PathBuf>,
     /// pasta binary for fixed-output network isolation.
     pasta: Option<PathBuf>,
-    max_silent_time: std::time::Duration,
+    max_silent_time: Duration,
     max_log_size: u64,
     /// Builder gets the host nix-daemon socket bind-mounted in; the
     /// worker advertises the `recursive-nix` feature.
@@ -78,11 +82,11 @@ struct WorkerCtx {
     /// Slot i maps the uid block [uid_base + i*65536, 65536); disjoint
     /// blocks keep concurrent uid-range builds apart.
     uid_base: u32,
-    uid_slots: std::sync::Mutex<Vec<bool>>,
+    uid_slots: Mutex<Vec<bool>>,
     /// Dedupe keys of builds the hub cancelled; the supervising loops
     /// abort them. Keyed like the registry, since a resumed build's
     /// build_id changes while it runs.
-    cancelled: std::sync::Mutex<std::collections::HashSet<String>>,
+    cancelled: Mutex<HashSet<String>>,
 }
 
 impl WorkerCtx {
@@ -98,7 +102,7 @@ impl WorkerCtx {
         log_path: &Path,
         timed_out: Option<String>,
     ) -> Option<String> {
-        let log = std::fs::metadata(log_path).ok();
+        let log = fs::metadata(log_path).ok();
         let silent = log
             .as_ref()
             .and_then(|m| m.modified().ok())
@@ -135,7 +139,7 @@ impl WorkerCtx {
     /// A tailer streams the log to the new session from the persisted
     /// offset and keeps following it.
     fn adopt_assignment(
-        self: &std::sync::Arc<Self>,
+        self: &Arc<Self>,
         a: &BuildAssignment,
         out_tx: &mpsc::Sender<WorkerMessage>,
     ) -> bool {
@@ -148,7 +152,7 @@ impl WorkerCtx {
                     // An earlier resume's tailer feeds a dead session.
                     // Only flag it (no join): it may be waiting on the
                     // registry lock held right here.
-                    t.done.store(true, std::sync::atomic::Ordering::Relaxed);
+                    t.done.store(true, atomic::Ordering::Relaxed);
                 }
                 e.log_tail = Some(spawn_log_tail(
                     self.clone(),
@@ -189,7 +193,7 @@ fn hostname() -> String {
 fn load_signing_key(state_dir: &Path) -> Result<SecretKey> {
     let path = state_dir.join("signing.key");
     if path.exists() {
-        std::fs::read_to_string(&path)?
+        fs::read_to_string(&path)?
             .trim()
             .parse::<SecretKey>()
             .map_err(|e| {
@@ -209,7 +213,7 @@ fn load_signing_key(state_dir: &Path) -> Result<SecretKey> {
 
 /// Remove leftovers from interrupted runs: abandoned build dirs.
 fn sweep_state_dir(state_dir: &Path) {
-    if let Ok(entries) = std::fs::read_dir(state_dir.join("builds")) {
+    if let Ok(entries) = fs::read_dir(state_dir.join("builds")) {
         for entry in entries.flatten() {
             // Dirs with persisted resume/finished state belong to
             // builds another worker generation left for adoption.
@@ -261,13 +265,13 @@ async fn run_async(
 ) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let builds_dir = opts.state_dir.join("builds");
-    std::fs::create_dir_all(&builds_dir)?;
+    fs::create_dir_all(&builds_dir)?;
     // Traverse-only so leased build uids reach their own tree but
     // other local users get no listing; see BuildOwner.
-    std::fs::set_permissions(&builds_dir, std::fs::Permissions::from_mode(0o711))?;
+    fs::set_permissions(&builds_dir, fs::Permissions::from_mode(0o711))?;
     sweep_state_dir(&opts.state_dir);
     // Arc: SecretKey is not Clone (zeroized on drop); build threads share it.
-    let signing_key = std::sync::Arc::new(load_signing_key(&opts.state_dir)?);
+    let signing_key = Arc::new(load_signing_key(&opts.state_dir)?);
     let mut opts = opts;
     if opts.systems.is_empty() {
         opts.systems.push(host_system());
@@ -304,7 +308,7 @@ async fn run_async(
         }
     }
     let opts = opts;
-    let ctx = std::sync::Arc::new(WorkerCtx {
+    let ctx = Arc::new(WorkerCtx {
         state_dir: opts.state_dir.clone(),
         spawner,
         status_dir: opts.state_dir.join("exited"),
@@ -312,16 +316,16 @@ async fn run_async(
         cgroup_base,
         build_memory_max: opts.build_memory_max_bytes,
         secret_paths: vec![opts.key.clone(), opts.state_dir.join("signing.key")],
-        running: std::sync::atomic::AtomicU32::new(0),
-        cancelled: std::sync::Mutex::new(std::collections::HashSet::new()),
-        resumable: std::sync::Mutex::new(HashMap::new()),
+        running: atomic::AtomicU32::new(0),
+        cancelled: Mutex::new(HashSet::new()),
+        resumable: Mutex::new(HashMap::new()),
         emulators,
         pasta: opts.pasta.clone(),
-        max_silent_time: std::time::Duration::from_secs(opts.max_silent_time_secs),
+        max_silent_time: Duration::from_secs(opts.max_silent_time_secs),
         max_log_size: opts.max_log_size,
         recursive_nix: opts.recursive_nix,
         uid_base: opts.auto_allocate_uids_base,
-        uid_slots: std::sync::Mutex::new(vec![false; opts.max_jobs.max(1) as usize]),
+        uid_slots: Mutex::new(vec![false; opts.max_jobs.max(1) as usize]),
     });
 
     // Ready once local setup is done, not once the hub answers: the
@@ -334,19 +338,19 @@ async fn run_async(
     adopt_builds(&ctx, &signing_key).await;
 
     // Reconnect with backoff: a hub restart must not drain the fleet.
-    let mut backoff = std::time::Duration::from_secs(1);
+    let mut backoff = Duration::from_secs(1);
     loop {
         let started = std::time::Instant::now();
         match session(&opts, &signing_key, &ctx).await {
             Ok(()) => unreachable!("session only returns on error"),
             Err(e) => tracing::warn!("hub session ended: {e:#}"),
         }
-        if started.elapsed() > std::time::Duration::from_mins(1) {
-            backoff = std::time::Duration::from_secs(1);
+        if started.elapsed() > Duration::from_mins(1) {
+            backoff = Duration::from_secs(1);
         }
         tracing::info!("reconnecting to hub in {}s", backoff.as_secs());
         tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(std::time::Duration::from_mins(1));
+        backoff = (backoff * 2).min(Duration::from_mins(1));
     }
 }
 
@@ -373,23 +377,23 @@ fn spawn_handover() {
 
 async fn session(
     opts: &WorkerConfig,
-    signing_key: &std::sync::Arc<SecretKey>,
-    ctx: &std::sync::Arc<WorkerCtx>,
+    signing_key: &Arc<SecretKey>,
+    ctx: &Arc<WorkerCtx>,
 ) -> Result<()> {
     let tls = ClientTlsConfig::new()
         .ca_certificate(Certificate::from_pem(
-            std::fs::read(&opts.ca_cert).context("reading CA cert")?,
+            fs::read(&opts.ca_cert).context("reading CA cert")?,
         ))
         .identity(Identity::from_pem(
-            std::fs::read(&opts.cert).context("reading worker cert")?,
-            std::fs::read(&opts.key).context("reading worker key")?,
+            fs::read(&opts.cert).context("reading worker cert")?,
+            fs::read(&opts.key).context("reading worker key")?,
         ));
     let channel = Endpoint::from_shared(opts.hub.clone())?
         .tls_config(tls)?
         // Detect a silently dead hub connection instead of waiting on a
         // half-open TCP session forever.
-        .http2_keep_alive_interval(std::time::Duration::from_secs(30))
-        .keep_alive_timeout(std::time::Duration::from_secs(20))
+        .http2_keep_alive_interval(Duration::from_secs(30))
+        .keep_alive_timeout(Duration::from_secs(20))
         .keep_alive_while_idle(true)
         .connect()
         .await
@@ -413,7 +417,7 @@ async fn session(
     // reconnect) already occupy slots and are re-dispatched
     // credit-free, so they must not be funded again or the worker
     // would run more than max-jobs builds and exhaust its uid slots.
-    let occupied = u64::from(ctx.running.load(std::sync::atomic::Ordering::Relaxed));
+    let occupied = u64::from(ctx.running.load(atomic::Ordering::Relaxed));
     for _ in 0..u64::from(opts.max_jobs.max(1)).saturating_sub(occupied) {
         out_tx.send(request_job()).await?;
     }
@@ -421,14 +425,12 @@ async fn session(
     let heartbeat_tx = out_tx.clone();
     let heartbeat_ctx = ctx.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
         loop {
             interval.tick().await;
             if heartbeat_tx
                 .send(msg(worker_message::Msg::Heartbeat(Heartbeat {
-                    running_jobs: heartbeat_ctx
-                        .running
-                        .load(std::sync::atomic::Ordering::Relaxed),
+                    running_jobs: heartbeat_ctx.running.load(atomic::Ordering::Relaxed),
                     load1: loadavg1(),
                 })))
                 .await
@@ -452,7 +454,7 @@ async fn session(
         &out_tx,
         signing_key,
         ctx,
-        std::time::Duration::from_secs(opts.build_timeout_secs),
+        Duration::from_secs(opts.build_timeout_secs),
     )
     .await;
     // Builds still staging when the session dies must not keep their
@@ -467,9 +469,9 @@ async fn session_loop(
     inbound: &mut tonic::Streaming<crate::proto::HubMessage>,
     active: &mut HashMap<String, ActiveBuild>,
     out_tx: &mpsc::Sender<WorkerMessage>,
-    signing_key: &std::sync::Arc<SecretKey>,
-    ctx: &std::sync::Arc<WorkerCtx>,
-    build_timeout: std::time::Duration,
+    signing_key: &Arc<SecretKey>,
+    ctx: &Arc<WorkerCtx>,
+    build_timeout: Duration,
 ) -> Result<()> {
     while let Some(m) = inbound.message().await? {
         let Some(m) = m.msg else { continue };
@@ -586,11 +588,11 @@ async fn session_loop(
 /// thread; the result is delivered via the resumable registry, so the
 /// build outlives this session.
 fn launch_build(
-    ctx: &std::sync::Arc<WorkerCtx>,
+    ctx: &Arc<WorkerCtx>,
     build: ActiveBuild,
     out_tx: &mpsc::Sender<WorkerMessage>,
-    signing_key: &std::sync::Arc<SecretKey>,
-    build_timeout: std::time::Duration,
+    signing_key: &Arc<SecretKey>,
+    build_timeout: Duration,
 ) {
     let ctx = ctx.clone();
     let out_tx = out_tx.clone();
@@ -608,14 +610,12 @@ fn launch_build(
             log_tail: None,
         },
     );
-    ctx.running
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ctx.running.fetch_add(1, atomic::Ordering::Relaxed);
     tokio::task::spawn_blocking(move || {
         let fin = execute_to_finished(&build, &out_tx, &signing_key, build_timeout);
         build.teardown();
         drop(build);
-        ctx.running
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        ctx.running.fetch_sub(1, atomic::Ordering::Relaxed);
         record_finished(&ctx, &key, fin);
         let _ = out_tx.blocking_send(request_job());
     });
@@ -664,9 +664,9 @@ mod tests {
     #[test]
     fn sweep_removes_stale_builds_and_legacy_cache() -> Result<()> {
         let state = tempfile::tempdir()?;
-        std::fs::create_dir_all(state.path().join("builds/deadbeef"))?;
+        fs::create_dir_all(state.path().join("builds/deadbeef"))?;
         // legacy input cache from pre-daemon-import versions: must go
-        std::fs::create_dir_all(state.path().join("store/zzz-good"))?;
+        fs::create_dir_all(state.path().join("store/zzz-good"))?;
         sweep_state_dir(state.path());
         assert!(!state.path().join("builds/deadbeef").exists());
         assert!(!state.path().join("store").exists());

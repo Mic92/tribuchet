@@ -9,11 +9,15 @@
 //! - verifies worker output signatures while relaying compressed chunks
 
 use std::collections::HashMap;
+use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use harmonia_utils_signature::PublicKey;
+use nix::sys::stat;
+use nix::unistd::Group;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
@@ -35,7 +39,7 @@ use submit::AttachSvc;
 /// No worker message for this long tears the session down and fails
 /// its builds: heartbeats flow every 30s, so silence means a dead
 /// worker that would otherwise pin its builds (and dedupe keys) forever.
-const WORKER_SILENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(3);
+const WORKER_SILENCE_TIMEOUT: Duration = Duration::from_mins(3);
 /// A worker-session loss requeues a job at most this many times.
 const MAX_JOB_ATTEMPTS: u32 = 3;
 
@@ -258,7 +262,7 @@ async fn worker_loop(
             // closes the race between checking the queue and awaiting.
             tokio::select! {
                 () = state.notify.notified() => {}
-                () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                () = tokio::time::sleep(Duration::from_secs(1)) => {}
                 r = req_rx.recv() => match r {
                     Some(()) => credits += 1,
                     None => break 'outer, // route_loop ended: worker gone
@@ -329,25 +333,25 @@ async fn worker_loop(
 /// the socket is never connectable by others, not even briefly.
 fn bind_attach_socket(socket: &Path) -> Result<tokio::net::UnixListener> {
     if let Some(parent) = socket.parent() {
-        std::fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent)?;
     }
     // Refuse to replace the socket of a live hub: unlinking it would
     // leave all new attaches with ECONNREFUSED while the old hub runs.
     if std::os::unix::net::UnixStream::connect(socket).is_ok() {
         bail!("another hub is already serving {}", socket.display());
     }
-    let _ = std::fs::remove_file(socket);
-    let Ok(Some(group)) = nix::unistd::Group::from_name("nixbld") else {
+    let _ = fs::remove_file(socket);
+    let Ok(Some(group)) = Group::from_name("nixbld") else {
         bail!("group nixbld not found; refusing to serve a hub socket without a group to restrict it to");
     };
-    let old_umask = nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o117));
+    let old_umask = stat::umask(stat::Mode::from_bits_truncate(0o117));
     let uds = tokio::net::UnixListener::bind(socket);
-    nix::sys::stat::umask(old_umask);
+    stat::umask(old_umask);
     let uds = uds?;
     {
         use std::os::unix::fs::PermissionsExt;
         std::os::unix::fs::chown(socket, None, Some(group.gid.as_raw()))?;
-        std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o660))?;
+        fs::set_permissions(socket, fs::Permissions::from_mode(0o660))?;
     }
     Ok(uds)
 }
@@ -359,14 +363,14 @@ fn bind_attach_socket(socket: &Path) -> Result<tokio::net::UnixListener> {
 #[cfg(target_os = "macos")]
 fn restrict_attach_socket(socket: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let group = match nix::unistd::Group::from_name("nixbld")? {
+    let group = match Group::from_name("nixbld")? {
         Some(group) => group,
         None => bail!(
             "group nixbld not found; refusing to serve a hub socket without a group to restrict it to"
         ),
     };
     std::os::unix::fs::chown(socket, None, Some(group.gid.as_raw()))?;
-    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o660))?;
+    fs::set_permissions(socket, fs::Permissions::from_mode(0o660))?;
     Ok(())
 }
 
@@ -380,17 +384,17 @@ async fn run_async(socket: &Path, listen: &str, config_dir: &Path) -> Result<()>
 
     let ca_dir = config_dir.join("ca");
     let identity = Identity::from_pem(
-        std::fs::read(ca_dir.join("hub.crt")).context("reading hub.crt")?,
-        std::fs::read(ca_dir.join("hub.key")).context("reading hub.key")?,
+        fs::read(ca_dir.join("hub.crt")).context("reading hub.crt")?,
+        fs::read(ca_dir.join("hub.key")).context("reading hub.key")?,
     );
-    let ca = Certificate::from_pem(std::fs::read(ca_dir.join("ca.crt")).context("reading ca.crt")?);
+    let ca = Certificate::from_pem(fs::read(ca_dir.join("ca.crt")).context("reading ca.crt")?);
     let tls = ServerTlsConfig::new().identity(identity).client_ca_root(ca);
 
     // Optional operator pinning of worker signing keys (one Nix-format
     // "name:base64" public key per line, '#' comments; same syntax as
     // nix.conf trusted-public-keys). Without it, output signatures only
     // authenticate the TLS channel, not a particular worker.
-    let trusted_keys = match std::fs::read_to_string(config_dir.join("trusted-signing-keys")) {
+    let trusted_keys = match fs::read_to_string(config_dir.join("trusted-signing-keys")) {
         Ok(data) => {
             let mut keys = Vec::new();
             for line in data.lines() {
@@ -437,8 +441,8 @@ async fn run_async(socket: &Path, listen: &str, config_dir: &Path) -> Result<()>
         .tls_config(tls)?
         // Detect dead/half-open worker connections instead of relying on
         // the workers' own traffic.
-        .http2_keepalive_interval(Some(std::time::Duration::from_secs(30)))
-        .http2_keepalive_timeout(Some(std::time::Duration::from_secs(20)))
+        .http2_keepalive_interval(Some(Duration::from_secs(30)))
+        .http2_keepalive_timeout(Some(Duration::from_secs(20)))
         .add_service(
             crate::proto::worker_hub_server::WorkerHubServer::new(WorkerSvc {
                 state: state.clone(),

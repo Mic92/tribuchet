@@ -21,11 +21,19 @@
 //! replacement worker re-adopts them from the state they persisted on
 //! disk, matching the reaper generation id.
 
+use std::env;
+use std::fs;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixDatagram;
 use std::path::Path;
+use std::process::{Command, Stdio};
+use std::sync::atomic;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use nix::sys::{signal, socket, wait};
+use nix::unistd;
 use serde::{Deserialize, Serialize};
 
 /// What the reaper needs to exec a build; the sandbox details are
@@ -59,7 +67,7 @@ struct SpawnReply {
 
 /// Worker-side handle; one in-flight request at a time.
 pub struct Spawner {
-    sock: std::sync::Mutex<UnixDatagram>,
+    sock: Mutex<UnixDatagram>,
 }
 
 impl Spawner {
@@ -69,7 +77,7 @@ impl Spawner {
     pub fn spawn(
         &self,
         req: &mut SpawnRequest,
-        log: &std::fs::File,
+        log: &fs::File,
         stdin: Option<&OwnedFd>,
     ) -> Result<i32> {
         req.token = hex::encode(rand::random::<[u8; 16]>());
@@ -99,8 +107,8 @@ impl Spawner {
 /// reaped. The file is consumed (removed) on read.
 pub fn take_status(status_dir: &Path, token: &str) -> Option<i32> {
     let path = status_dir.join(token);
-    let code = std::fs::read_to_string(&path).ok()?.trim().parse().ok()?;
-    let _ = std::fs::remove_file(&path);
+    let code = fs::read_to_string(&path).ok()?.trim().parse().ok()?;
+    let _ = fs::remove_file(&path);
     Some(code)
 }
 
@@ -118,7 +126,7 @@ pub const ID_ENV: &str = "TRIBUCHET_REAPER_ID";
 /// returns: it serves spawn requests and respawns worker generations
 /// until told to stop, then exits with the last worker's code.
 pub fn ensure(status_dir: &Path) -> Result<Spawner> {
-    if let Ok(s) = std::env::var(FD_ENV) {
+    if let Ok(s) = env::var(FD_ENV) {
         let fd: RawFd = s.parse().context("parsing TRIBUCHET_REAPER_FD")?;
         let sock = unsafe { UnixDatagram::from_raw_fd(fd) };
         // Drop replies addressed to a previous worker generation.
@@ -127,14 +135,14 @@ pub fn ensure(status_dir: &Path) -> Result<Spawner> {
         while sock.recv(&mut scratch).is_ok() {}
         sock.set_nonblocking(false)?;
         return Ok(Spawner {
-            sock: std::sync::Mutex::new(sock),
+            sock: Mutex::new(sock),
         });
     }
-    std::fs::create_dir_all(status_dir)?;
+    fs::create_dir_all(status_dir)?;
     // Fresh reaper: previous statuses refer to pids it never spawned.
-    if let Ok(entries) = std::fs::read_dir(status_dir) {
+    if let Ok(entries) = fs::read_dir(status_dir) {
         for entry in entries.flatten() {
-            let _ = std::fs::remove_file(entry.path());
+            let _ = fs::remove_file(entry.path());
         }
     }
     // Enter the delegated-cgroup leaf before spawning anything: every
@@ -142,9 +150,9 @@ pub fn ensure(status_dir: &Path) -> Result<Spawner> {
     // subtree_control there fails (no-internal-processes rule).
     #[cfg(target_os = "linux")]
     if let Some(base) = super::cgroup::init() {
-        std::env::set_var(CGROUP_ENV, &base);
+        env::set_var(CGROUP_ENV, &base);
     }
-    std::env::set_var(
+    env::set_var(
         ID_ENV,
         format!("{}-{}", std::process::id(), super::unix_now()),
     );
@@ -158,11 +166,11 @@ pub fn ensure(status_dir: &Path) -> Result<Spawner> {
 /// argv[0] rather than /proc/self/exe means a reload picks up new
 /// code when that path is a stable indirection (profile symlink).
 fn spawn_worker(worker_sock: &UnixDatagram) -> Result<i32> {
-    let exe = std::env::args_os().next().context("missing argv[0]")?;
+    let exe = env::args_os().next().context("missing argv[0]")?;
     // dup() clears CLOEXEC, so the fd survives the exec.
-    let fd = nix::unistd::dup(worker_sock).context("duping spawner socket")?;
-    let child = std::process::Command::new(exe)
-        .args(std::env::args_os().skip(1))
+    let fd = unistd::dup(worker_sock).context("duping spawner socket")?;
+    let child = Command::new(exe)
+        .args(env::args_os().skip(1))
         .env(FD_ENV, fd.as_raw_fd().to_string())
         .spawn()
         .context("spawning worker")?;
@@ -174,8 +182,8 @@ fn spawn_worker(worker_sock: &UnixDatagram) -> Result<i32> {
 /// statuses, and respawn the worker generation when it exits or is
 /// reloaded. Returns the last worker's exit code once a stop was
 /// requested and every remaining build has been killed and reaped.
-static TERM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static HUP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TERM: atomic::AtomicBool = atomic::AtomicBool::new(false);
+static HUP: atomic::AtomicBool = atomic::AtomicBool::new(false);
 
 /// Crash-loop guard: respawning a worker that keeps dying instantly
 /// would present a broken unit as healthy forever (the reaper is the
@@ -188,14 +196,12 @@ const MAX_FAST_FAILURES: u32 = 5;
 /// (ExecReload) asks the worker to exit fast and gets a fresh one
 /// exec'd while its builds keep running.
 fn install_signals() {
-    use nix::sys::signal::{
-        sigaction, SaFlags, SigAction, SigHandler, SigSet, SIGHUP, SIGINT, SIGTERM,
-    };
+    use signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, SIGHUP, SIGINT, SIGTERM};
     extern "C" fn on_term(_: i32) {
-        TERM.store(true, std::sync::atomic::Ordering::Relaxed);
+        TERM.store(true, atomic::Ordering::Relaxed);
     }
     extern "C" fn on_hup(_: i32) {
-        HUP.store(true, std::sync::atomic::Ordering::Relaxed);
+        HUP.store(true, atomic::Ordering::Relaxed);
     }
     for (sig, handler) in [
         (SIGTERM, on_term as extern "C" fn(i32)),
@@ -226,29 +232,22 @@ fn reaper_main(sock: &UnixDatagram, worker_sock: &UnixDatagram, status_dir: &Pat
     let mut builds: Vec<(i32, String)> = Vec::new();
     let mut worker_code: Option<i32> = None;
     let mut stopping = false;
-    let mut spawned_at = std::time::Instant::now();
+    let mut spawned_at = Instant::now();
     let mut fast_failures = 0u32;
-    sock.set_read_timeout(Some(std::time::Duration::from_millis(200)))
-        .ok();
+    sock.set_read_timeout(Some(Duration::from_millis(200))).ok();
     loop {
-        if TERM.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        if TERM.swap(false, atomic::Ordering::Relaxed) {
             stopping = true;
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(worker_pid),
-                nix::sys::signal::Signal::SIGTERM,
-            );
+            let _ = signal::kill(unistd::Pid::from_raw(worker_pid), signal::Signal::SIGTERM);
         }
-        if HUP.swap(false, std::sync::atomic::Ordering::Relaxed) && !stopping {
+        if HUP.swap(false, atomic::Ordering::Relaxed) && !stopping {
             // Fast handover: state is already on disk, the builds are
             // ours, the replacement re-adopts them.
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(worker_pid),
-                nix::sys::signal::Signal::SIGUSR1,
-            );
+            let _ = signal::kill(unistd::Pid::from_raw(worker_pid), signal::Signal::SIGUSR1);
         }
         // Reap everything that exited.
         loop {
-            use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+            use wait::{waitpid, WaitPidFlag, WaitStatus};
             let code = match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
                 Ok(WaitStatus::Exited(pid, code)) => Some((pid.as_raw(), code)),
                 Ok(WaitStatus::Signaled(pid, sig, _)) => Some((pid.as_raw(), 128 + sig as i32)),
@@ -260,7 +259,7 @@ fn reaper_main(sock: &UnixDatagram, worker_sock: &UnixDatagram, status_dir: &Pat
                 worker_code = Some(code);
             } else if let Some(i) = builds.iter().position(|(p, _)| *p == pid) {
                 let (_, token) = builds.swap_remove(i);
-                let _ = std::fs::write(status_dir.join(token), format!("{code}\n"));
+                let _ = fs::write(status_dir.join(token), format!("{code}\n"));
             }
         }
         if let Some(code) = worker_code.take() {
@@ -268,7 +267,7 @@ fn reaper_main(sock: &UnixDatagram, worker_sock: &UnixDatagram, status_dir: &Pat
                 kill_builds(&mut builds);
                 return code;
             }
-            if code != 0 && spawned_at.elapsed() < std::time::Duration::from_mins(1) {
+            if code != 0 && spawned_at.elapsed() < Duration::from_mins(1) {
                 fast_failures += 1;
                 if fast_failures >= MAX_FAST_FAILURES {
                     eprintln!("tribuchet reaper: worker keeps crashing on startup; giving up");
@@ -280,11 +279,11 @@ fn reaper_main(sock: &UnixDatagram, worker_sock: &UnixDatagram, status_dir: &Pat
             }
             // Reload handover or worker crash: builds keep running,
             // the next generation re-adopts them.
-            std::thread::sleep(std::time::Duration::from_secs(1));
+            std::thread::sleep(Duration::from_secs(1));
             match spawn_worker(worker_sock) {
                 Ok(pid) => {
                     worker_pid = pid;
-                    spawned_at = std::time::Instant::now();
+                    spawned_at = Instant::now();
                 }
                 Err(e) => {
                     eprintln!("tribuchet reaper: respawn failed: {e:#}");
@@ -321,13 +320,10 @@ fn reaper_main(sock: &UnixDatagram, worker_sock: &UnixDatagram, status_dir: &Pat
 /// about to exit, and builds that outlive it would leak unreaped.
 fn kill_builds(builds: &mut Vec<(i32, String)>) {
     for (pid, _) in builds.iter() {
-        let _ = nix::sys::signal::killpg(
-            nix::unistd::Pid::from_raw(*pid),
-            nix::sys::signal::Signal::SIGKILL,
-        );
+        let _ = signal::killpg(unistd::Pid::from_raw(*pid), signal::Signal::SIGKILL);
     }
     for (pid, _) in builds.drain(..) {
-        let _ = nix::sys::wait::waitpid(Some(nix::unistd::Pid::from_raw(pid)), None);
+        let _ = wait::waitpid(Some(unistd::Pid::from_raw(pid)), None);
     }
 }
 
@@ -341,7 +337,7 @@ fn handle_spawn(req: &SpawnRequest, mut fds: Vec<OwnedFd>) -> Result<i32> {
     let log = fds.remove(0);
     let stdin = req.has_stdin.then(|| fds.remove(0));
     let (prog, args) = req.argv.split_first().context("empty argv")?;
-    let mut cmd = std::process::Command::new(prog);
+    let mut cmd = Command::new(prog);
     cmd.args(args).env_clear().envs(req.env.iter().cloned());
     if let Some(cwd) = &req.cwd {
         cmd.current_dir(cwd);
@@ -349,12 +345,12 @@ fn handle_spawn(req: &SpawnRequest, mut fds: Vec<OwnedFd>) -> Result<i32> {
     // Own process group, so orphaned builder children can be killed
     // after the builder exits (there is no PID namespace to do it).
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
-    let logf = std::fs::File::from(log);
-    cmd.stdout(std::process::Stdio::from(logf.try_clone()?))
-        .stderr(std::process::Stdio::from(logf));
+    let logf = fs::File::from(log);
+    cmd.stdout(Stdio::from(logf.try_clone()?))
+        .stderr(Stdio::from(logf));
     cmd.stdin(match stdin {
-        Some(fd) => std::process::Stdio::from(std::fs::File::from(fd)),
-        None => std::process::Stdio::null(),
+        Some(fd) => Stdio::from(fs::File::from(fd)),
+        None => Stdio::null(),
     });
     let child = cmd.spawn().context("spawning build")?;
     Ok(child.id().cast_signed())
@@ -382,7 +378,7 @@ fn recv_request(sock: &UnixDatagram) -> Result<(SpawnRequest, Vec<OwnedFd>)> {
     let (_, mut fds) = recv_with_fds(sock, &mut buf)?;
     anyhow::ensure!(!fds.is_empty(), "spawn request without request fd");
     let mut json = Vec::new();
-    std::fs::File::from(fds.remove(0))
+    fs::File::from(fds.remove(0))
         .take(MAX_MSG as u64)
         .read_to_end(&mut json)
         .context("reading spawn request")?;
@@ -391,7 +387,7 @@ fn recv_request(sock: &UnixDatagram) -> Result<(SpawnRequest, Vec<OwnedFd>)> {
 }
 
 fn send_with_fds(sock: &UnixDatagram, payload: &[u8], fds: &[RawFd]) -> Result<()> {
-    use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
+    use socket::{sendmsg, ControlMessage, MsgFlags};
     let iov = [std::io::IoSlice::new(payload)];
     let cmsg = [ControlMessage::ScmRights(fds)];
     sendmsg::<()>(
@@ -405,7 +401,7 @@ fn send_with_fds(sock: &UnixDatagram, payload: &[u8], fds: &[RawFd]) -> Result<(
 }
 
 fn recv_with_fds(sock: &UnixDatagram, buf: &mut [u8]) -> Result<(usize, Vec<OwnedFd>)> {
-    use nix::sys::socket::{recvmsg, MsgFlags};
+    use socket::{recvmsg, MsgFlags};
     let mut cmsg_buf = nix::cmsg_space!([RawFd; 8]);
     let mut iov = [std::io::IoSliceMut::new(buf)];
     let msg = recvmsg::<()>(
@@ -416,7 +412,7 @@ fn recv_with_fds(sock: &UnixDatagram, buf: &mut [u8]) -> Result<(usize, Vec<Owne
     )?;
     let mut fds = Vec::new();
     for c in msg.cmsgs()? {
-        if let nix::sys::socket::ControlMessageOwned::ScmRights(received) = c {
+        if let socket::ControlMessageOwned::ScmRights(received) = c {
             for fd in received {
                 fds.push(unsafe { OwnedFd::from_raw_fd(fd) });
             }
@@ -442,7 +438,7 @@ mod tests {
             has_stdin: false,
             token: "t".into(),
         };
-        let log = std::fs::File::open("/dev/null")?;
+        let log = fs::File::open("/dev/null")?;
         send_request(&worker, &req, &[log.as_raw_fd()])?;
         let (received, fds) = recv_request(&reaper)?;
         assert_eq!(received.env, req.env);

@@ -6,8 +6,10 @@
 //! performs self-reference rewriting and registration afterwards).
 //! Exits with the builder's exit code.
 
-use std::io::Write;
+use std::collections::{BTreeSet, HashMap};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use hyper_util::rt::TokioIo;
@@ -36,7 +38,7 @@ pub fn run(build_json: &Path, socket: &Path) -> Result<()> {
 /// within seconds, and the worker holds finished results for resume
 /// far longer than this.
 const RECONNECT_ATTEMPTS: u32 = 30;
-const RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
 async fn run_async(build: BuildJson, socket: PathBuf, build_json_path: PathBuf) -> Result<i32> {
     let fixed_output = build.is_fixed_output();
@@ -92,9 +94,7 @@ async fn connect(socket: &Path) -> Result<tonic::transport::Channel> {
         .connect_with_connector(service_fn(move |_: Uri| {
             let socket = socket.clone();
             async move {
-                Ok::<_, std::io::Error>(TokioIo::new(
-                    tokio::net::UnixStream::connect(socket).await?,
-                ))
+                Ok::<_, io::Error>(TokioIo::new(tokio::net::UnixStream::connect(socket).await?))
             }
         }))
         .await
@@ -130,11 +130,10 @@ async fn attempt_build(
         Err(e) => return Err(e).context("submitting build"),
     };
 
-    let mut unpackers: std::collections::HashMap<String, Unpacker> =
-        std::collections::HashMap::default();
+    let mut unpackers: HashMap<String, Unpacker> = HashMap::default();
     // BTreeSet dedupes events replayed across reconnects and gives
     // result.json a stable order.
-    let mut added_paths: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut added_paths: BTreeSet<String> = BTreeSet::new();
 
     loop {
         let ev = match stream.message().await {
@@ -160,7 +159,7 @@ async fn attempt_build(
         };
         match ev.event {
             Some(attach_event::Event::Log(data)) => {
-                std::io::stderr().write_all(&data)?;
+                io::stderr().write_all(&data)?;
             }
             Some(attach_event::Event::Output(out)) => {
                 handle_output_chunk(&mut unpackers, expected_outputs, out).await?;
@@ -219,7 +218,7 @@ fn ready_marker() -> Result<()> {
     static ONCE: Once = Once::new();
     let mut res = Ok(());
     ONCE.call_once(|| {
-        res = std::io::stderr().write_all(b"\x02\n").map_err(Into::into);
+        res = io::stderr().write_all(b"\x02\n").map_err(Into::into);
     });
     res
 }
@@ -241,7 +240,7 @@ fn remove_tree(path: &Path) {
 /// Unpack to a temp sibling, renamed into place at eof: the scratch
 /// path never holds a partial tree.
 async fn handle_output_chunk(
-    unpackers: &mut std::collections::HashMap<String, Unpacker>,
+    unpackers: &mut HashMap<String, Unpacker>,
     expected: &[String],
     out: crate::proto::OutputNar,
 ) -> Result<()> {
@@ -279,7 +278,7 @@ async fn handle_output_chunk(
 
 /// Sidecar the patched external-derivation-builder reads to extend
 /// addedPaths before the output reference scan.
-fn write_result_json(top_tmp_dir: &Path, added: &std::collections::BTreeSet<String>) -> Result<()> {
+fn write_result_json(top_tmp_dir: &Path, added: &BTreeSet<String>) -> Result<()> {
     let path = top_tmp_dir.join("result.json");
     let body = serde_json::json!({ "addedPaths": added });
     std::fs::write(&path, serde_json::to_vec(&body)?)
@@ -287,7 +286,7 @@ fn write_result_json(top_tmp_dir: &Path, added: &std::collections::BTreeSet<Stri
 }
 
 /// Stop in-flight unpackers and drop their partial temp trees.
-async fn cleanup_unpackers(unpackers: &mut std::collections::HashMap<String, Unpacker>) {
+async fn cleanup_unpackers(unpackers: &mut HashMap<String, Unpacker>) {
     for (store_path, (tx, task)) in unpackers.drain() {
         drop(tx);
         task.abort();
