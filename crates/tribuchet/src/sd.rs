@@ -88,7 +88,7 @@ fn launchd_sockets(out: &mut ActivatedSockets) -> Result<()> {
         let cname = std::ffi::CString::new(name).unwrap();
         let mut fds: *mut libc::c_int = std::ptr::null_mut();
         let mut cnt: libc::size_t = 0;
-        let rc = unsafe { launch_activate_socket(cname.as_ptr(), &mut fds, &mut cnt) };
+        let rc = unsafe { launch_activate_socket(cname.as_ptr(), &raw mut fds, &raw mut cnt) };
         match rc {
             0 => {}
             // Not running under launchd, or no socket of this name in

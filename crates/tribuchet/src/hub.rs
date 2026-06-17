@@ -363,11 +363,8 @@ fn bind_attach_socket(socket: &Path) -> Result<tokio::net::UnixListener> {
 #[cfg(target_os = "macos")]
 fn restrict_attach_socket(socket: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let group = match Group::from_name("nixbld")? {
-        Some(group) => group,
-        None => bail!(
-            "group nixbld not found; refusing to serve a hub socket without a group to restrict it to"
-        ),
+    let Some(group) = Group::from_name("nixbld")? else {
+        bail!("group nixbld not found; refusing to serve a hub socket without a group to restrict it to");
     };
     std::os::unix::fs::chown(socket, None, Some(group.gid.as_raw()))?;
     fs::set_permissions(socket, fs::Permissions::from_mode(0o660))?;

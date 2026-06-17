@@ -1,5 +1,6 @@
 //! macOS sandbox implementation: sandbox-exec with a deny-default write profile.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -85,10 +86,11 @@ pub fn command(spec: &SandboxSpec) -> Result<Command> {
             paths.push(&canonical);
         }
         for path in paths {
-            profile.push_str(&format!(
-                "(deny file-read* (literal \"{}\"))\n",
+            writeln!(
+                profile,
+                "(deny file-read* (literal \"{}\"))",
                 sb_escape(&path.to_string_lossy())?
-            ));
+            )?;
         }
     }
     profile.push_str("(allow file-write*\n");
@@ -100,11 +102,11 @@ pub fn command(spec: &SandboxSpec) -> Result<Command> {
         .chain(std::iter::once(build_dir.as_ref()))
         .chain(spec.outputs.iter().map(String::as_str))
     {
-        profile.push_str(&format!("  (subpath \"{}\")\n", sb_escape(path)?));
+        writeln!(profile, "  (subpath \"{}\")", sb_escape(path)?)?;
         if let Ok(canonical) = Path::new(path).canonicalize() {
             let canonical = canonical.to_string_lossy();
             if canonical != path {
-                profile.push_str(&format!("  (subpath \"{}\")\n", sb_escape(&canonical)?));
+                writeln!(profile, "  (subpath \"{}\")", sb_escape(&canonical)?)?;
             }
         }
     }
@@ -115,7 +117,7 @@ pub fn command(spec: &SandboxSpec) -> Result<Command> {
         "/dev/urandom",
         "/dev/tty",
     ] {
-        profile.push_str(&format!("  (literal \"{dev}\")\n"));
+        writeln!(profile, "  (literal \"{dev}\")")?;
     }
     profile.push_str(")\n");
     if spec.network {
@@ -143,7 +145,10 @@ pub fn stdin_mode() -> Stdio {
     Stdio::null()
 }
 
+// Result-returning to mirror the Linux implementation, which writes
+// the spec into the setup stage's stdin pipe and can fail.
 #[cfg(test)]
+#[allow(clippy::unnecessary_wraps)]
 pub fn send_spec(_child: &mut Child, _spec: &SandboxSpec) -> Result<()> {
     Ok(())
 }
