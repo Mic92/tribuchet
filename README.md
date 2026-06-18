@@ -1,25 +1,11 @@
-# tribuchet
+# Tribuchet
 
 Remote build execution for Nix, built on the experimental
 `external-builders` feature: a hub next to the nix-daemon hands builds
 to remote workers, which run them in their own sandboxes and stream
 logs and outputs back to the waiting `nix build`.
 
-```
-nix-daemon (external-builders) ──exec──> tribuchet attach
-                                              │ unix socket
-                                              ▼
-                                       tribuchet hub        (same machine as nix-daemon)
-                                       - queue per system, in-flight dedupe
-                                       - reads input paths directly from /nix/store
-                                       - NAR transfer with zstd, per-worker have/missing
-                                              ▲
-                                              │ gRPC over mTLS, workers dial in (NAT-friendly)
-                                       tribuchet worker     (any number of machines)
-                                       - inputs imported via its own nix-daemon
-                                       - own sandbox (Linux namespaces / macOS sandbox-exec)
-                                       - signs output NARs with ed25519
-```
+![Architecture](docs/architecture.svg)
 
 > **Status: experimental.** It depends on Nix's experimental
 > `external-builders` feature (plus a small patch for uid-range builds)
