@@ -28,22 +28,7 @@ GC by per-build temp roots. The worker must be a trusted daemon user
 
 ## Components (single binary, subcommands)
 
-```
-nix-daemon (external-builders) ──exec──> tribuchet attach
-                                              │ unix socket
-                                              ▼
-                                       tribuchet hub        (same machine as nix-daemon)
-                                       - queue per system, in-flight dedupe
-                                       - reads input paths directly from /nix/store
-                                       - NAR transfer with zstd, per-worker have/missing
-                                              ▲
-                                              │ gRPC over mTLS, worker dials in (NAT-friendly)
-                                       tribuchet worker     (2–10 machines, internet)
-                                       - inputs imported into /nix/store via nix-daemon
-                                       - own sandbox (Linux namespaces / macOS sandbox_init)
-                                       - signs output NARs with ed25519
-tribuchet ca                           - init CA, issue worker/hub certificates
-```
+![Architecture](docs/architecture.svg)
 
 ## Build flow
 
