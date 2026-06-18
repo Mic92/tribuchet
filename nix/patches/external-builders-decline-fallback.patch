@@ -1,0 +1,74 @@
+From: Tribuchet contributors
+Subject: [PATCH] external builders: fall back to local build on decline
+
+An external builder program may exit with a sentinel status to decline a
+build -- tribuchet's attach shim does this when the hub has no worker for
+the derivation's system. When the requesting host could build the
+derivation itself (matching platform, required system features, and a
+nonzero max-jobs), Nix retries it as a true local build instead of
+failing, keeping the already-held output locks. Foreign-system builds,
+which cannot run locally, still fail as before.
+
+diff --git a/src/libstore/build/derivation-building-goal.cc b/src/libstore/build/derivation-building-goal.cc
+index 81612b4db..295f98625 100644
+--- a/src/libstore/build/derivation-building-goal.cc
++++ b/src/libstore/build/derivation-building-goal.cc
+@@ -22,6 +22,9 @@
+ #include <sys/types.h>
+ #include <fcntl.h>
+ #include <unistd.h>
++#ifndef _WIN32
++#  include <sys/wait.h>
++#endif
+ 
+ #include <nlohmann/json.hpp>
+ 
+@@ -1052,6 +1055,30 @@ Goal::Co DerivationBuildingGoal::buildLocally(
+         builtOutputs = builder->unprepareBuild();
+     } catch (BuilderFailureError & e) {
+         builder.reset();
++
++        /* External builder declined; build locally if this host can. */
++        if (localBuildCap.externalBuilder && WIFEXITED(e.builderStatus)
++            && WEXITSTATUS(e.builderStatus) == externalBuilderDeclinedExitCode) {
++            bool platformOk = drv->platform == settings.thisSystem.get()
++                              || settings.extraPlatforms.get().count(drv->platform) || drv->isBuiltin();
++            auto required = drvOptions.getRequiredSystemFeatures(*drv);
++            auto & available = worker.store.config.systemFeatures.get();
++            bool featuresOk =
++                std::ranges::all_of(required, [&](const std::string & f) { return available.count(f); });
++            if (worker.settings.maxBuildJobs.get() != 0 && platformOk && featuresOk) {
++                debug(
++                    "external builder declined '%s'; falling back to a local build",
++                    worker.store.printStorePath(drvPath));
++                localBuildCap.externalBuilder = nullptr;
++                co_return buildLocally(
++                    std::move(localBuildCap),
++                    std::move(inputPaths),
++                    std::move(initialOutputs),
++                    std::move(drvOptions),
++                    std::move(outputLocks));
++            }
++        }
++
+         outputLocks.unlock();
+         co_return doneFailure(fixupBuilderFailureErrorMessage(std::move(e), *buildLog));
+     } catch (BuildError & e) {
+diff --git a/src/libstore/include/nix/store/build/derivation-builder.hh b/src/libstore/include/nix/store/build/derivation-builder.hh
+index ea2e46445..fef384da0 100644
+--- a/src/libstore/include/nix/store/build/derivation-builder.hh
++++ b/src/libstore/include/nix/store/build/derivation-builder.hh
+@@ -27,6 +27,13 @@ void rethrowExceptionAsError();
+  */
+ void handleChildException(bool sendException);
+ 
++/**
++ * Exit status with which an external builder declines a build, asking
++ * Nix to build it locally instead (used when no remote worker can serve
++ * the derivation's system).
++ */
++constexpr int externalBuilderDeclinedExitCode = 222;
++
+ /**
+  * Denotes a build failure that stemmed from the builder exiting with a
+  * failing exist status.

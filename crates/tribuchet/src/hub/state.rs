@@ -170,6 +170,8 @@ pub(super) struct HubState {
     /// forever.
     pub(super) worker_caps: std::sync::Mutex<HashMap<u64, WorkerCaps>>,
     pub(super) next_worker_id: atomic::AtomicU64,
+    /// Grace period before an unservable build is declined or failed.
+    pub(super) worker_grace: Duration,
 }
 
 #[derive(Clone)]
@@ -188,6 +190,12 @@ impl WorkerCaps {
 
 impl Default for HubState {
     fn default() -> Self {
+        Self::new(WORKER_GRACE)
+    }
+}
+
+impl HubState {
+    pub(super) fn new(worker_grace: Duration) -> Self {
         Self {
             queue: Mutex::default(),
             inflight: Mutex::default(),
@@ -198,6 +206,7 @@ impl Default for HubState {
             ),
             worker_caps: std::sync::Mutex::default(),
             next_worker_id: atomic::AtomicU64::default(),
+            worker_grace,
         }
     }
 }
@@ -248,7 +257,7 @@ impl HubState {
         self.notify.notify_waiters();
         let state = self.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(WORKER_GRACE + Duration::from_secs(1)).await;
+            tokio::time::sleep(state.worker_grace + Duration::from_secs(1)).await;
             state.fail_unservable().await;
         });
     }
@@ -275,7 +284,7 @@ impl HubState {
             // Requeued jobs get a grace period: their worker is mid
             // reload/restart and will re-announce them; a delayed
             // recheck is scheduled at requeue time.
-            let protected = j.requeued_at.is_some_and(|t| t.elapsed() < WORKER_GRACE);
+            let protected = j.requeued_at.is_some_and(|t| t.elapsed() < self.worker_grace);
             if protected || caps.iter().any(|c| c.serves(&j.req.system, &j.features)) {
                 kept.push_back(j);
             } else {

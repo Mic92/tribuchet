@@ -94,7 +94,11 @@ in
       patchNix = lib.mkOption {
         type = lib.types.bool;
         default = true;
-        description = "Patch Nix so uid-range derivations reach the external builder.";
+        description = ''
+          Patch Nix so uid-range derivations reach the external builder
+          and so a declined build (no worker for the system) falls back
+          to a local build instead of failing.
+        '';
       };
       recursiveNix = lib.mkOption {
         type = lib.types.bool;
@@ -139,7 +143,10 @@ in
       nix.package =
         let
           patches =
-            lib.optional hub.externalBuilders.patchNix ./patches/external-builders-uid-range.patch
+            lib.optionals hub.externalBuilders.patchNix [
+              ./patches/external-builders-uid-range.patch
+              ./patches/external-builders-decline-fallback.patch
+            ]
             ++ lib.optional hub.externalBuilders.recursiveNix ./patches/recursive-nix-external-builders.patch;
         in
         if patches == [ ] then

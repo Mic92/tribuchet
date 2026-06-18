@@ -28,6 +28,10 @@ pub struct HubConfig {
     /// Directory with the CA material and the hub TLS key pair.
     #[serde(default = "default_hub_config_dir")]
     pub config_dir: PathBuf,
+    /// Seconds to wait for a capable worker before declining a build
+    /// (lets a patched Nix fall back to a local build).
+    #[serde(default = "default_worker_grace_secs")]
+    pub worker_grace_secs: u64,
 }
 
 fn default_hub_socket() -> PathBuf {
@@ -38,6 +42,9 @@ fn default_hub_listen() -> String {
 }
 fn default_hub_config_dir() -> PathBuf {
     "/etc/tribuchet".into()
+}
+fn default_worker_grace_secs() -> u64 {
+    30
 }
 
 #[derive(Debug, Deserialize)]
