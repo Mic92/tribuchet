@@ -34,33 +34,23 @@ transfer, scheduling, and execution itself.
 
 ## Features
 
-- Workers dial the hub over gRPC with mutual TLS: they can sit behind
-  NAT, come and go, and register the systems and features they serve.
-- Scheduling in the hub: per-system queues, capability matching
-  (`kvm`, `uid-range`, `big-parallel`, …); identical concurrent
-  submissions share one build.
-- Only missing input paths travel, as zstd-compressed NARs; workers
-  keep a real Nix store and database.
-- Builds survive restarts: the hub is socket-activated and resumes
-  in-flight builds, the worker hands running builds over to its next
-  generation on reload, so deploys don't kill builds.
-- No store-path rewriting: the worker builds into the scratch output
-  paths Nix provided, and Nix does its usual hashing and registration
-  on the result.
-- Linux sandbox equivalent to Nix's own (user/mount/PID/IPC/UTS
-  namespaces, minimal `/dev`, private `/build`, per-build cgroup with
-  pid/memory limits); macOS sandbox via `sandbox-exec`.
-- `uid-range` builds (a 65536-uid block per build slot), enough to
-  boot a NixOS container with systemd-nspawn inside a remote build.
-- Cross-system builds under user-mode emulation (`emulate` setting,
-  per-sandbox binfmt_misc), e.g. aarch64-linux on an x86_64 worker.
+- Workers dial the hub over gRPC with mutual TLS, so they can sit
+  behind NAT and register the systems and features they serve.
+- Hub scheduling with per-system queues and capability matching
+  (`kvm`, `uid-range`, `big-parallel`, …); identical submissions share
+  one build.
+- Only missing input paths travel, as zstd-compressed NARs; outputs
+  come back as worker-signed (ed25519) NARs with no store-path
+  rewriting.
+- Builds survive hub and worker restarts/reloads, so deploys don't
+  kill in-flight builds; they're cancelled when the client goes away.
+- Sandboxing equivalent to Nix's own (Linux namespaces + per-build
+  cgroup limits, macOS `sandbox-exec`), plus `uid-range` builds and
+  cross-system user-mode emulation.
 - Fixed-output derivations get network through [pasta] in an otherwise
   isolated network namespace.
-- Live build logs, also across worker reloads and hub restarts;
-  max-log-size, max-silent-time, and timeout enforcement.
-- Output NARs signed by the worker (ed25519); the hub can pin trusted
-  worker keys.
-- Builds are cancelled when the requesting client goes away.
+- Live build logs across reloads/restarts, with max-log-size,
+  max-silent-time, and timeout enforcement.
 - NixOS and nix-darwin modules for both services.
 
 [pasta]: https://passt.top/

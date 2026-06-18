@@ -34,31 +34,7 @@
           ./nix/patches/recursive-nix-external-builders.patch
         ];
 
-        default = pkgs.rustPlatform.buildRustPackage (
-          {
-            pname = "tribuchet";
-            version = "0.1.0";
-            src = self;
-            cargoLock = {
-              lockFile = ./Cargo.lock;
-              # harmonia crates come from one pinned git rev; builtin
-              # fetchGit avoids enumerating an outputHash per crate
-              allowBuiltinFetchGit = true;
-            };
-            nativeBuildInputs = [ pkgs.protobuf ];
-            PROTOC = "${pkgs.protobuf}/bin/protoc";
-            # sandbox_runs_builder needs CAP_SYS_ADMIN that the outer
-            # Nix builder sandbox does not grant; `nix develop -c
-            # cargo test` runs it.
-            checkFlags = [
-              "--skip=worker::sandbox::tests::sandbox_runs_builder"
-            ];
-          }
-          // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
-            # default network backend for fixed-output builds
-            TRIBUCHET_PASTA = "${pkgs.passt}/bin/pasta";
-          }
-        );
+        default = pkgs.callPackage ./nix/package.nix { };
       });
 
       darwinModules.default = import ./nix/darwin-module.nix self;
