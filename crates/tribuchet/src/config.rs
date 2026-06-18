@@ -122,7 +122,7 @@ fn default_build_timeout() -> u64 {
     24 * 3600
 }
 fn default_max_jobs() -> u32 {
-    1
+    std::thread::available_parallelism().map_or(1, |n| n.get() as u32)
 }
 fn default_uid_base() -> u32 {
     872_415_232
