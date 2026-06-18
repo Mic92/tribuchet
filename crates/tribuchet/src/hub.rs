@@ -28,10 +28,12 @@ use crate::proto::{
     Register, WorkerMessage, MAX_MSG_SIZE,
 };
 
+mod metrics;
 mod relay;
 mod state;
 mod submit;
 
+use metrics::Metrics;
 use relay::{run_job, send};
 use state::{HubState, WorkerCaps};
 use submit::AttachSvc;
@@ -219,6 +221,7 @@ async fn worker_loop(
     in_rx: mpsc::Receiver<WorkerMessage>,
 ) {
     let caps = WorkerCaps {
+        name: register.worker_name.clone(),
         systems: register
             .caps
             .iter()
@@ -274,6 +277,7 @@ async fn worker_loop(
             worker = register.worker_name,
             "dispatching build"
         );
+        Metrics::inc(&state.metrics.dispatched);
         let in_rx = router.register(&job.id);
         let state = state.clone();
         let router = router.clone();
@@ -282,6 +286,8 @@ async fn worker_loop(
         tokio::spawn(async move {
             let res = run_job(&state, &job, &vkey, &out_tx, in_rx).await;
             router.unregister(&job.id);
+            // run_job counts the build verdict; only session/hub-side
+            // errors reach the branches below.
             let Err(err) = res else {
                 state.finish(&job).await;
                 return;
@@ -294,9 +300,11 @@ async fn worker_loop(
                     id = job.id,
                     "worker session lost; requeueing build: {err:#}"
                 );
+                Metrics::inc(&state.metrics.requeued);
                 state.requeue(job).await;
             } else {
                 tracing::warn!(id = job.id, "build failed: {err:#}");
+                Metrics::inc(&state.metrics.failed);
                 // The worker session is still up: it may hold a
                 // half-staged or running build (and its job credit) for
                 // this id. Cancelling lets it tear that down and send
@@ -371,30 +379,12 @@ fn restrict_attach_socket(socket: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn run(cfg: crate::config::HubConfig) -> Result<()> {
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(run_async(cfg))
-}
-
-async fn run_async(cfg: crate::config::HubConfig) -> Result<()> {
-    let socket = cfg.socket.as_path();
-    let listen = cfg.listen.as_str();
-    let config_dir = cfg.config_dir.as_path();
-    let state = Arc::new(HubState::new(std::time::Duration::from_secs(cfg.worker_grace_secs)));
-
-    let ca_dir = config_dir.join("ca");
-    let identity = Identity::from_pem(
-        fs::read(ca_dir.join("hub.crt")).context("reading hub.crt")?,
-        fs::read(ca_dir.join("hub.key")).context("reading hub.key")?,
-    );
-    let ca = Certificate::from_pem(fs::read(ca_dir.join("ca.crt")).context("reading ca.crt")?);
-    let tls = ServerTlsConfig::new().identity(identity).client_ca_root(ca);
-
-    // Optional operator pinning of worker signing keys (one Nix-format
-    // "name:base64" public key per line, '#' comments; same syntax as
-    // nix.conf trusted-public-keys). Without it, output signatures only
-    // authenticate the TLS channel, not a particular worker.
-    let trusted_keys = match fs::read_to_string(config_dir.join("trusted-signing-keys")) {
+/// Optional operator pinning of worker signing keys (one Nix-format
+/// "name:base64" public key per line, '#' comments; same syntax as
+/// nix.conf trusted-public-keys). Without it, output signatures only
+/// authenticate the TLS channel, not a particular worker.
+fn load_trusted_keys(config_dir: &Path) -> Result<Option<Arc<Vec<PublicKey>>>> {
+    match fs::read_to_string(config_dir.join("trusted-signing-keys")) {
         Ok(data) => {
             let mut keys = Vec::new();
             for line in data.lines() {
@@ -407,7 +397,7 @@ async fn run_async(cfg: crate::config::HubConfig) -> Result<()> {
                 })?);
             }
             tracing::info!(count = keys.len(), "worker signing keys pinned");
-            Some(Arc::new(keys))
+            Ok(Some(Arc::new(keys)))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             tracing::warn!(
@@ -415,10 +405,34 @@ async fn run_async(cfg: crate::config::HubConfig) -> Result<()> {
                  mTLS-authenticated workers",
                 config_dir.display()
             );
-            None
+            Ok(None)
         }
-        Err(e) => return Err(e).context("reading trusted-signing-keys"),
-    };
+        Err(e) => Err(e).context("reading trusted-signing-keys"),
+    }
+}
+
+pub fn run(cfg: crate::config::HubConfig) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(run_async(cfg))
+}
+
+async fn run_async(cfg: crate::config::HubConfig) -> Result<()> {
+    let socket = cfg.socket.as_path();
+    let listen = cfg.listen.as_str();
+    let config_dir = cfg.config_dir.as_path();
+    let state = Arc::new(HubState::new(std::time::Duration::from_secs(
+        cfg.worker_grace_secs,
+    )));
+
+    let ca_dir = config_dir.join("ca");
+    let identity = Identity::from_pem(
+        fs::read(ca_dir.join("hub.crt")).context("reading hub.crt")?,
+        fs::read(ca_dir.join("hub.key")).context("reading hub.key")?,
+    );
+    let ca = Certificate::from_pem(fs::read(ca_dir.join("ca.crt")).context("reading ca.crt")?);
+    let tls = ServerTlsConfig::new().identity(identity).client_ca_root(ca);
+
+    let trusted_keys = load_trusted_keys(config_dir)?;
 
     // Listeners come from systemd socket activation when available
     // (they survive hub restarts; clients queue instead of getting
@@ -473,6 +487,15 @@ async fn run_async(cfg: crate::config::HubConfig) -> Result<()> {
             .max_encoding_message_size(MAX_MSG_SIZE),
         )
         .serve_with_incoming(UnixListenerStream::new(uds));
+
+    if let Some(metrics_addr) = cfg.metrics_listen.clone() {
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = metrics::serve(state, metrics_addr).await {
+                tracing::error!("metrics endpoint stopped: {e:#}");
+            }
+        });
+    }
 
     tracing::info!(listen, socket = %socket.display(), "hub running");
     crate::sd::notify_ready();

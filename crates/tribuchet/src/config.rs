@@ -32,6 +32,10 @@ pub struct HubConfig {
     /// (lets a patched Nix fall back to a local build).
     #[serde(default = "default_worker_grace_secs")]
     pub worker_grace_secs: u64,
+    /// Optional address (e.g. 127.0.0.1:7438) for the Prometheus
+    /// metrics endpoint; disabled when unset.
+    #[serde(default)]
+    pub metrics_listen: Option<String>,
 }
 
 fn default_hub_socket() -> PathBuf {

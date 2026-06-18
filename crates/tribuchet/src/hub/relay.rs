@@ -114,6 +114,7 @@ pub(super) async fn run_job(
                         ))
                         .await;
                 }
+                super::metrics::Metrics::inc(&state.metrics.failed);
                 job.replay
                     .publish(attach_event::Event::ExitCode(res.exit_code))
                     .await;
@@ -189,8 +190,10 @@ pub(super) async fn recv(
 fn order_by_references(infos: Vec<PathInfoMsg>) -> Vec<PathInfoMsg> {
     use std::collections::HashMap;
     let roots: Vec<String> = infos.iter().map(|i| i.store_path.clone()).collect();
-    let mut nodes: HashMap<String, PathInfoMsg> =
-        infos.into_iter().map(|i| (i.store_path.clone(), i)).collect();
+    let mut nodes: HashMap<String, PathInfoMsg> = infos
+        .into_iter()
+        .map(|i| (i.store_path.clone(), i))
+        .collect();
     let mut order = Vec::with_capacity(roots.len());
     let mut visited: HashSet<String> = HashSet::new();
     for root in &roots {
@@ -213,7 +216,10 @@ fn order_by_references(infos: Vec<PathInfoMsg>) -> Vec<PathInfoMsg> {
             }
         }
     }
-    order.into_iter().map(|p| nodes.remove(&p).unwrap()).collect()
+    order
+        .into_iter()
+        .map(|p| nodes.remove(&p).unwrap())
+        .collect()
 }
 
 async fn query_path_infos(
@@ -633,10 +639,12 @@ async fn relay_extra_chunk(
 }
 
 async fn finish_relay(
+    state: &HubState,
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
     replay: &super::state::Replay,
     job: &Job,
 ) {
+    super::metrics::Metrics::inc(&state.metrics.succeeded);
     replay.publish(attach_event::Event::ExitCode(0)).await;
     ack_result(out_tx, job).await;
 }
@@ -720,6 +728,7 @@ async fn relay_build(
                             ))
                             .await;
                     }
+                    super::metrics::Metrics::inc(&state.metrics.failed);
                     job.replay
                         .publish(attach_event::Event::ExitCode(res.exit_code))
                         .await;
@@ -730,7 +739,7 @@ async fn relay_build(
                 extras = start_extras(state, vkey, res.extras)?;
                 awaiting_outputs = true;
                 if pending.is_empty() && extras.is_empty() {
-                    finish_relay(out_tx, &job.replay, job).await;
+                    finish_relay(state, out_tx, &job.replay, job).await;
                     return Ok(());
                 }
             }
@@ -743,7 +752,7 @@ async fn relay_build(
                     bail!("worker sent unexpected store path {}", n.store_path);
                 }
                 if pending.is_empty() && extras.is_empty() {
-                    finish_relay(out_tx, &job.replay, job).await;
+                    finish_relay(state, out_tx, &job.replay, job).await;
                     return Ok(());
                 }
             }
