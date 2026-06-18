@@ -172,10 +172,14 @@ pub(super) struct HubState {
     pub(super) next_worker_id: atomic::AtomicU64,
     /// Grace period before an unservable build is declined or failed.
     pub(super) worker_grace: Duration,
+    /// Build lifecycle counters scraped by the metrics endpoint.
+    pub(super) metrics: super::metrics::Metrics,
 }
 
 #[derive(Clone)]
 pub(super) struct WorkerCaps {
+    /// Registered worker name, used as the hostname metrics label.
+    pub(super) name: String,
     /// system -> features the worker honors for it
     pub(super) systems: HashMap<String, HashSet<String>>,
 }
@@ -207,6 +211,7 @@ impl HubState {
             worker_caps: std::sync::Mutex::default(),
             next_worker_id: atomic::AtomicU64::default(),
             worker_grace,
+            metrics: super::metrics::Metrics::default(),
         }
     }
 }
@@ -284,7 +289,9 @@ impl HubState {
             // Requeued jobs get a grace period: their worker is mid
             // reload/restart and will re-announce them; a delayed
             // recheck is scheduled at requeue time.
-            let protected = j.requeued_at.is_some_and(|t| t.elapsed() < self.worker_grace);
+            let protected = j
+                .requeued_at
+                .is_some_and(|t| t.elapsed() < self.worker_grace);
             if protected || caps.iter().any(|c| c.serves(&j.req.system, &j.features)) {
                 kept.push_back(j);
             } else {
@@ -345,6 +352,7 @@ mod tests {
     #[test]
     fn worker_caps_feature_matching() {
         let caps = WorkerCaps {
+            name: "w1".into(),
             systems: [
                 ("x86_64-linux".to_owned(), ["kvm".to_owned()].into()),
                 ("aarch64-linux".to_owned(), [].into()),

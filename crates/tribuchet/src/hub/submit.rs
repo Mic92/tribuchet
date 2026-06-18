@@ -207,6 +207,7 @@ impl attach_hub_server::AttachHub for AttachSvc {
                 }
                 if Instant::now() >= deadline {
                     tracing::info!(system = req.system, "no capable worker; declining");
+                    super::metrics::Metrics::inc(&self.state.metrics.declined);
                     let (tx, rx) = tokio::sync::mpsc::channel(1);
                     let _ = tx
                         .send(Ok(AttachEvent {
@@ -250,6 +251,7 @@ impl attach_hub_server::AttachHub for AttachSvc {
                 requeued_at: None,
             };
             tracing::info!(id = job.id, system = job.req.system, "queueing build");
+            super::metrics::Metrics::inc(&self.state.metrics.submitted);
             self.state.queue.lock().await.push_back(job);
             self.state.notify.notify_waiters();
             replay
