@@ -135,11 +135,15 @@ pub(super) async fn run_job(
 
     // The worker imports missing inputs through its Nix daemon, which
     // needs the full ValidPathInfo; ask the local nix-daemon for it.
-    let infos = query_path_infos(&state.daemon_pool, &missing).await?;
-    for (path, mut info) in missing.iter().zip(infos) {
+    // AddToStoreNar also needs a path's references valid first, and
+    // Nix's order is not topological, so reorder references before
+    // referrers.
+    let infos = order_by_references(query_path_infos(&state.daemon_pool, &missing).await?);
+    for mut info in infos {
+        let path = info.store_path.clone();
         info.build_id = job.id.clone();
         send(out_tx, hub_message::Msg::PathInfo(info)).await?;
-        stream_store_path(&job.id, path, out_tx).await?;
+        stream_store_path(&job.id, &path, out_tx).await?;
     }
     stream_tmp_dir(&job.id, job.tmp_dir.clone(), out_tx).await?;
 
@@ -180,6 +184,38 @@ pub(super) async fn recv(
 /// case for build requests -- would be invisible and concurrent
 /// checkpoints could yield torn reads. The daemon answers from its
 /// own consistent view.
+/// Topologically order path infos (references before referrers) via DFS
+/// post-order. Tolerates self-references and cycles.
+fn order_by_references(infos: Vec<PathInfoMsg>) -> Vec<PathInfoMsg> {
+    use std::collections::HashMap;
+    let roots: Vec<String> = infos.iter().map(|i| i.store_path.clone()).collect();
+    let mut nodes: HashMap<String, PathInfoMsg> =
+        infos.into_iter().map(|i| (i.store_path.clone(), i)).collect();
+    let mut order = Vec::with_capacity(roots.len());
+    let mut visited: HashSet<String> = HashSet::new();
+    for root in &roots {
+        let mut stack = vec![(root.clone(), false)];
+        while let Some((path, emit)) = stack.pop() {
+            if emit {
+                order.push(path);
+                continue;
+            }
+            if !visited.insert(path.clone()) {
+                continue;
+            }
+            stack.push((path.clone(), true));
+            if let Some(info) = nodes.get(&path) {
+                for r in &info.references {
+                    if !visited.contains(r) && nodes.contains_key(r) {
+                        stack.push((r.clone(), false));
+                    }
+                }
+            }
+        }
+    }
+    order.into_iter().map(|p| nodes.remove(&p).unwrap()).collect()
+}
+
 async fn query_path_infos(
     pool: &harmonia_store_remote::ConnectionPool,
     paths: &[String],
@@ -720,6 +756,38 @@ async fn relay_build(
 mod tests {
     use super::super::submit::validate_top_tmp_dir;
     use super::*;
+
+    fn info(path: &str, refs: &[&str]) -> PathInfoMsg {
+        PathInfoMsg {
+            build_id: String::new(),
+            store_path: path.into(),
+            nar_sha256: Vec::new(),
+            nar_size: 0,
+            references: refs.iter().map(ToString::to_string).collect(),
+            signatures: Vec::new(),
+            deriver: String::new(),
+            ca: String::new(),
+        }
+    }
+
+    #[test]
+    fn references_are_streamed_before_referrers() {
+        // keyring references more-itertools; offered in referrer-first
+        // order, as Nix's inputPaths can be.
+        let dep = "/nix/store/aaa-more-itertools";
+        let lib = "/nix/store/bbb-keyring";
+        let ordered = order_by_references(vec![info(lib, &[dep, lib]), info(dep, &[])]);
+        let seq: Vec<&str> = ordered.iter().map(|i| i.store_path.as_str()).collect();
+        assert_eq!(seq, vec![dep, lib]);
+    }
+
+    #[test]
+    fn reference_cycles_do_not_loop() {
+        let a = "/nix/store/aaa";
+        let b = "/nix/store/bbb";
+        let ordered = order_by_references(vec![info(a, &[b]), info(b, &[a])]);
+        assert_eq!(ordered.len(), 2);
+    }
 
     /// Run stream_tmp_dir over an already-validated handle and return
     /// the decompressed tar bytes.
