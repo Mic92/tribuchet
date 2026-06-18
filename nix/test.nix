@@ -118,6 +118,8 @@ in
         imports = [ nixosModule ];
         services.tribuchet-hub = {
           enable = true;
+          # keep the no-worker decline quick for the fallback subtest
+          settings.worker-grace-secs = 2;
           externalBuilders = {
             enable = true;
             recursiveNix = true;
@@ -377,12 +379,14 @@ in
             out = hub.succeed("nix-build /etc/tt/kvm.nix --no-out-link").strip()
             hub.succeed(f"grep -q kvm-ok {out}")
         else:
+            # No worker serves the kvm feature and the hub cannot build it
+            # locally either, so the declined build (exit 222) fails.
             err = hub.fail("nix-build /etc/tt/kvm.nix --no-out-link 2>&1")
-            assert "no connected worker" in err, err
+            assert "exit code 222" in err, err
 
     with subtest("emulated system does not inherit the host's kvm feature"):
         err = hub.fail("nix-build /etc/tt/kvm-emulated.nix --no-out-link 2>&1")
-        assert "no connected worker" in err, err
+        assert "exit code 222" in err, err
 
     with subtest("runaway build log is killed at max-log-size"):
         err = hub.fail("nix-build /etc/tt/logbomb.nix --no-out-link 2>&1")
@@ -418,6 +422,31 @@ in
     with subtest("systemd-nspawn boots a NixOS container in a remote build"):
         out = hub.succeed("nix-build /etc/tt/nspawn.nix --no-out-link", timeout=1800).strip()
         hub.succeed(f"[[ $(cat {out}/msg) = 'Hello World' ]]")
+
+    with subtest("no worker: build is declined and falls back to a local build"):
+        worker.succeed("systemctl stop tribuchet-worker")
+        # let the hub observe the worker's session tear down so it no
+        # longer counts as capable
+        hub.succeed("sleep 3")
+        hub.succeed("echo fallback-payload > /root/fallback")
+        uniq = hub.succeed("nix-store --add /root/fallback").strip()
+        hub.succeed(
+            "cat > /root/fallback.nix << 'NIXEOF'\n"
+            "let\n"
+            '  bash = builtins.storePath "${pkgs.bash}";\n'
+            f'  uniq = builtins.storePath "{uniq}";\n'
+            "in derivation {\n"
+            '  name = "tt-fallback-build";\n'
+            '  system = "x86_64-linux";\n'
+            '  builder = bash + "/bin/bash";\n'
+            '  args = [ "-c" ("read line < " + uniq + "; echo \\"$line built-locally\\" > $out") ];\n'
+            "}\n"
+            "NIXEOF"
+        )
+        out = hub.succeed("nix-build /root/fallback.nix --no-out-link", timeout=120).strip()
+        hub.succeed(f"grep -q 'fallback-payload built-locally' {out}")
+        hub.succeed("journalctl -u tribuchet-hub | grep -q 'no capable worker; declining'")
+        worker.succeed("systemctl start tribuchet-worker")
 
     with subtest("build really ran on the worker"):
         worker.succeed("journalctl -u tribuchet-worker | grep -q 'builder finished'")

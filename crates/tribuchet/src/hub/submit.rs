@@ -10,8 +10,8 @@ use sha2::{Digest, Sha256};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
-use super::state::{HubState, Job, Replay, WORKER_GRACE};
-use crate::proto::{attach_hub_server, AttachEvent, BuildRequest};
+use super::state::{HubState, Job, Replay};
+use crate::proto::{attach_event, attach_hub_server, AttachEvent, BuildRequest};
 use crate::store::{valid_store_path, STORE_DIR};
 
 #[expect(
@@ -190,30 +190,32 @@ impl attach_hub_server::AttachHub for AttachSvc {
         let key = dedupe_key(&req);
 
         let features = crate::build_json::required_system_features(&req.env);
-        // Reject submissions no worker can serve, but only after a
-        // grace period: right after a hub restart the workers have not
-        // re-registered yet, and that must not fail client builds.
+        // Wait for a capable worker through the grace period (workers
+        // re-register after a hub restart); on timeout decline the build
+        // so a patched Nix falls back to a local build.
         let servable = || {
             let caps = self.state.worker_caps.lock().unwrap();
             caps.values().any(|c| c.serves(&req.system, &features))
         };
         if !servable() {
             tracing::info!(system = req.system, "no capable worker yet; waiting");
-            let deadline = Instant::now() + WORKER_GRACE;
+            let deadline = Instant::now() + self.state.worker_grace;
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 if servable() {
                     break;
                 }
                 if Instant::now() >= deadline {
-                    let what = if features.is_empty() {
-                        format!("system {}", req.system)
-                    } else {
-                        format!("system {} with features {features:?}", req.system)
-                    };
-                    return Err(Status::failed_precondition(format!(
-                        "no connected worker builds for {what}"
-                    )));
+                    tracing::info!(system = req.system, "no capable worker; declining");
+                    let (tx, rx) = tokio::sync::mpsc::channel(1);
+                    let _ = tx
+                        .send(Ok(AttachEvent {
+                            event: Some(attach_event::Event::ExitCode(
+                                crate::proto::DECLINE_EXIT_CODE,
+                            )),
+                        }))
+                        .await;
+                    return Ok(Response::new(ReceiverStream::new(rx)));
                 }
             }
         }

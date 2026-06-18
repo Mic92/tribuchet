@@ -371,13 +371,16 @@ fn restrict_attach_socket(socket: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn run(socket: &Path, listen: &str, config_dir: &Path) -> Result<()> {
+pub fn run(cfg: crate::config::HubConfig) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(run_async(socket, listen, config_dir))
+    rt.block_on(run_async(cfg))
 }
 
-async fn run_async(socket: &Path, listen: &str, config_dir: &Path) -> Result<()> {
-    let state = Arc::new(HubState::default());
+async fn run_async(cfg: crate::config::HubConfig) -> Result<()> {
+    let socket = cfg.socket.as_path();
+    let listen = cfg.listen.as_str();
+    let config_dir = cfg.config_dir.as_path();
+    let state = Arc::new(HubState::new(std::time::Duration::from_secs(cfg.worker_grace_secs)));
 
     let ca_dir = config_dir.join("ca");
     let identity = Identity::from_pem(

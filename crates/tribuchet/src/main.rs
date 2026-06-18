@@ -71,7 +71,7 @@ fn main() -> anyhow::Result<()> {
         Command::Attach { build_json, socket } => attach::run(&build_json, &socket),
         Command::Hub { config } => {
             let cfg: config::HubConfig = config::load(&config)?;
-            hub::run(&cfg.socket, &cfg.listen, &cfg.config_dir)
+            hub::run(cfg)
         }
         Command::Worker { config } => {
             let cfg: config::WorkerConfig = config::load(&config)?;
