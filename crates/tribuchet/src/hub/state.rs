@@ -9,8 +9,11 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex, Notify};
 use tonic::Status;
 
-/// How long a submission waits for a capable worker before being
-/// rejected; covers the re-registration gap after a hub restart.
+/// How long a build waits for a platform we expect to come back: the
+/// startup window in which workers re-register after a hub restart, and
+/// the window a worker has to reconnect after its session drops (reload
+/// or crash). A platform we have never seen is declined immediately
+/// instead of waiting this out on every build.
 pub(super) const WORKER_GRACE: Duration = Duration::from_secs(30);
 
 use crate::proto::{attach_event, AttachEvent, BuildRequest};
@@ -172,6 +175,14 @@ pub(super) struct HubState {
     pub(super) next_worker_id: atomic::AtomicU64,
     /// Grace period before an unservable build is declined or failed.
     pub(super) worker_grace: Duration,
+    /// Hub start time and the capabilities of workers whose session
+    /// ended: together they tell `expected_deadline` which platforms are
+    /// still worth waiting for after a restart or a worker drop.
+    pub(super) started_at: Instant,
+    pub(super) departed: std::sync::Mutex<Vec<(WorkerCaps, Instant)>>,
+    /// Woken when worker capabilities change so waiting submissions
+    /// re-check servability without polling.
+    pub(super) caps_changed: Notify,
     /// Build lifecycle counters scraped by the metrics endpoint.
     pub(super) metrics: super::metrics::Metrics,
 }
@@ -211,12 +222,43 @@ impl HubState {
             worker_caps: std::sync::Mutex::default(),
             next_worker_id: atomic::AtomicU64::default(),
             worker_grace,
+            started_at: Instant::now(),
+            departed: std::sync::Mutex::default(),
+            caps_changed: Notify::default(),
             metrics: super::metrics::Metrics::default(),
         }
     }
 }
 
 impl HubState {
+    /// Remember a departed worker's capabilities so a build for the
+    /// platform it served waits for it to reconnect rather than
+    /// declining at once.
+    pub(super) fn record_departed(&self, caps: WorkerCaps) {
+        self.departed.lock().unwrap().push((caps, Instant::now()));
+    }
+
+    /// If this platform is not servable right now but we expect a
+    /// capable worker back, the instant to wait until; `None` means
+    /// nothing we know of will ever serve it, so decline immediately.
+    pub(super) fn expected_deadline(&self, system: &str, features: &[String]) -> Option<Instant> {
+        let now = Instant::now();
+        // During the startup window no worker has re-registered yet, so
+        // every platform is awaited; afterwards only one a worker served
+        // until it dropped within the reconnect window (reload/crash).
+        let startup = self.started_at + self.worker_grace;
+        if now < startup {
+            return Some(startup);
+        }
+        let mut departed = self.departed.lock().unwrap();
+        departed.retain(|(_, at)| now < *at + self.worker_grace);
+        departed
+            .iter()
+            .filter(|(c, _)| c.serves(system, features))
+            .map(|(_, at)| *at + self.worker_grace)
+            .max()
+    }
+
     pub(super) async fn take_job(&self, caps: &WorkerCaps) -> Option<Job> {
         let job = {
             let mut queue = self.queue.lock().await;
@@ -347,6 +389,45 @@ mod tests {
             })) => assert!(e.contains("no connected worker"), "{e}"),
             other => panic!("expected error event, got {other:?}"),
         }
+    }
+
+    fn caps(system: &str, features: &[&str]) -> WorkerCaps {
+        WorkerCaps {
+            name: "w".into(),
+            systems: [(
+                system.to_owned(),
+                features.iter().map(|f| (*f).to_owned()).collect(),
+            )]
+            .into(),
+        }
+    }
+
+    #[test]
+    fn startup_window_awaits_then_unseen_platform_declines() {
+        // Within the startup window any platform is awaited (workers
+        // have not re-registered yet); once it lapses a never-seen
+        // platform with no departed worker declines at once.
+        let within = HubState::new(Duration::from_secs(30));
+        assert!(within.expected_deadline("aarch64-linux", &[]).is_some());
+        let lapsed = HubState::new(Duration::ZERO);
+        assert!(lapsed.expected_deadline("aarch64-linux", &[]).is_none());
+    }
+
+    #[test]
+    fn departed_worker_keeps_its_platform_expected() {
+        // Past the startup window but inside the reconnect window.
+        let mut state = HubState::new(Duration::from_secs(30));
+        state.started_at = Instant::now()
+            .checked_sub(Duration::from_mins(1))
+            .unwrap();
+        state.record_departed(caps("x86_64-linux", &["kvm"]));
+        let kvm = vec!["kvm".to_owned()];
+        let kvm_bp = vec!["kvm".to_owned(), "big-parallel".to_owned()];
+        // The exact platform it served is still awaited.
+        assert!(state.expected_deadline("x86_64-linux", &kvm).is_some());
+        // A feature it never offered, or another system, is not.
+        assert!(state.expected_deadline("x86_64-linux", &kvm_bp).is_none());
+        assert!(state.expected_deadline("aarch64-linux", &[]).is_none());
     }
 
     #[test]

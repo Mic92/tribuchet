@@ -167,6 +167,60 @@ pub(super) struct AttachSvc {
     pub(super) state: Arc<HubState>,
 }
 
+type BuildStream = ReceiverStream<Result<AttachEvent, Status>>;
+
+impl AttachSvc {
+    /// Block until a worker can serve `system`+`features`, or return a
+    /// decline stream (single exit-code event, so a patched Nix falls
+    /// back to a local build). `None` means a worker is now available.
+    /// Platforms we never expect to see decline without any wait.
+    async fn await_capable_worker(
+        &self,
+        system: &str,
+        features: &[String],
+    ) -> Option<Response<BuildStream>> {
+        let servable = || {
+            let caps = self.state.worker_caps.lock().unwrap();
+            caps.values().any(|c| c.serves(system, features))
+        };
+        let decline = || {
+            tracing::info!(system, "no capable worker; declining");
+            super::metrics::Metrics::inc(&self.state.metrics.declined);
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            let _ = tx.try_send(Ok(AttachEvent {
+                event: Some(attach_event::Event::ExitCode(crate::proto::DECLINE_EXIT_CODE)),
+            }));
+            Response::new(ReceiverStream::new(rx))
+        };
+        if servable() {
+            return None;
+        }
+        // A platform no worker is expected to (re)serve declines at once.
+        let Some(deadline) = self.state.expected_deadline(system, features) else {
+            return Some(decline());
+        };
+        tracing::info!(system, "no capable worker yet; waiting");
+        loop {
+            // Arm the wakeup before re-checking, else a worker
+            // registering in the gap would be missed.
+            let notified = self.state.caps_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if servable() {
+                return None;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Some(decline());
+            }
+            tokio::select! {
+                () = &mut notified => {}
+                () = tokio::time::sleep(deadline - now) => {}
+            }
+        }
+    }
+}
+
 #[tonic::async_trait]
 impl attach_hub_server::AttachHub for AttachSvc {
     type BuildStream = ReceiverStream<Result<AttachEvent, Status>>;
@@ -190,35 +244,8 @@ impl attach_hub_server::AttachHub for AttachSvc {
         let key = dedupe_key(&req);
 
         let features = crate::build_json::required_system_features(&req.env);
-        // Wait for a capable worker through the grace period (workers
-        // re-register after a hub restart); on timeout decline the build
-        // so a patched Nix falls back to a local build.
-        let servable = || {
-            let caps = self.state.worker_caps.lock().unwrap();
-            caps.values().any(|c| c.serves(&req.system, &features))
-        };
-        if !servable() {
-            tracing::info!(system = req.system, "no capable worker yet; waiting");
-            let deadline = Instant::now() + self.state.worker_grace;
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                if servable() {
-                    break;
-                }
-                if Instant::now() >= deadline {
-                    tracing::info!(system = req.system, "no capable worker; declining");
-                    super::metrics::Metrics::inc(&self.state.metrics.declined);
-                    let (tx, rx) = tokio::sync::mpsc::channel(1);
-                    let _ = tx
-                        .send(Ok(AttachEvent {
-                            event: Some(attach_event::Event::ExitCode(
-                                crate::proto::DECLINE_EXIT_CODE,
-                            )),
-                        }))
-                        .await;
-                    return Ok(Response::new(ReceiverStream::new(rx)));
-                }
-            }
+        if let Some(declined) = self.await_capable_worker(&req.system, &features).await {
+            return Ok(declined);
         }
 
         let mut inflight = self.state.inflight.lock().await;
