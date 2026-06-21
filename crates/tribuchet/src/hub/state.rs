@@ -52,7 +52,9 @@ fn event_size(ev: &attach_event::Event) -> usize {
     match ev {
         attach_event::Event::Log(d) => d.len(),
         attach_event::Event::Output(o) => o.zstd_nar_chunk.len(),
-        attach_event::Event::OutputRestart(p) | attach_event::Event::AddedPath(p) => p.len(),
+        attach_event::Event::OutputRestart(p)
+        | attach_event::Event::AddedPath(p)
+        | attach_event::Event::Dispatched(p) => p.len(),
         attach_event::Event::Error(e) => e.len(),
         attach_event::Event::ExitCode(_) => 0,
     }

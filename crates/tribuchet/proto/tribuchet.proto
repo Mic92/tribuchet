@@ -223,6 +223,9 @@ message AttachEvent {
     // (recursive-nix extra). Goes into result.json for Nix's output
     // reference scan.
     string added_path = 6;
+    // Name of the worker the build was dispatched to, for the client
+    // to report where the build runs.
+    string dispatched = 7;
   }
 }
 

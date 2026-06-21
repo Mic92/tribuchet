@@ -283,6 +283,10 @@ async fn worker_loop(
             worker = register.worker_name,
             "dispatching build"
         );
+        // Tell the attach client where its build runs.
+        job.replay
+            .publish(attach_event::Event::Dispatched(register.worker_name.clone()))
+            .await;
         Metrics::inc(&state.metrics.dispatched);
         let in_rx = router.register(&job.id);
         let state = state.clone();
