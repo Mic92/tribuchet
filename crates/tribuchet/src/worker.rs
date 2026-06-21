@@ -403,6 +403,8 @@ async fn session(
         .max_encoding_message_size(crate::proto::MAX_MSG_SIZE);
 
     let (out_tx, out_rx) = mpsc::channel::<WorkerMessage>(64);
+    // Register must be the first message the hub reads; it fits in the
+    // channel buffer, so queue it before the stream is consumed.
     out_tx
         .send(msg(worker_message::Msg::Register(Register {
             worker_name: hostname(),
@@ -411,16 +413,6 @@ async fn session(
             resumable_keys: ctx.resumable_keys(),
         })))
         .await?;
-    // One outstanding RequestJob per *free* build slot; every finished
-    // build sends the next one, keeping the sum constant. Builds
-    // adopted from a previous generation (or running across a hub
-    // reconnect) already occupy slots and are re-dispatched
-    // credit-free, so they must not be funded again or the worker
-    // would run more than max-jobs builds and exhaust its uid slots.
-    let occupied = u64::from(ctx.running.load(atomic::Ordering::Relaxed));
-    for _ in 0..u64::from(opts.max_jobs.max(1)).saturating_sub(occupied) {
-        out_tx.send(request_job()).await?;
-    }
 
     let heartbeat_tx = out_tx.clone();
     let heartbeat_ctx = ctx.clone();
@@ -446,6 +438,16 @@ async fn session(
         .await?
         .into_inner();
     tracing::info!(hub = opts.hub, systems = ?opts.systems, "connected to hub");
+
+    // One outstanding RequestJob per *free* slot; occupied slots
+    // (adopted or running across a reconnect) are re-dispatched
+    // credit-free and must not be funded again. Sent only now that
+    // session() drains the channel: priming past its capacity first
+    // would deadlock the handshake.
+    let occupied = u64::from(ctx.running.load(atomic::Ordering::Relaxed));
+    for _ in 0..u64::from(opts.max_jobs.max(1)).saturating_sub(occupied) {
+        out_tx.send(request_job()).await?;
+    }
 
     let mut active: HashMap<String, ActiveBuild> = HashMap::new();
     let result = session_loop(
