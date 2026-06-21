@@ -28,8 +28,11 @@ pub struct HubConfig {
     /// Directory with the CA material and the hub TLS key pair.
     #[serde(default = "default_hub_config_dir")]
     pub config_dir: PathBuf,
-    /// Seconds to wait for a capable worker before declining a build
-    /// (lets a patched Nix fall back to a local build).
+    /// Seconds a build waits for a platform we expect a worker to
+    /// (re)serve before declining (lets a patched Nix fall back to a
+    /// local build). Covers the startup re-registration window and a
+    /// worker's reconnect window; a never-seen platform declines at
+    /// once.
     #[serde(default = "default_worker_grace_secs")]
     pub worker_grace_secs: u64,
     /// Optional address (e.g. 127.0.0.1:7438) for the Prometheus

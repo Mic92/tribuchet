@@ -59,6 +59,7 @@ struct WorkerSvc {
 struct CapsGuard {
     state: Arc<HubState>,
     id: u64,
+    caps: WorkerCaps,
 }
 
 impl CapsGuard {
@@ -66,14 +67,19 @@ impl CapsGuard {
         let id = state
             .next_worker_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        state.worker_caps.lock().unwrap().insert(id, caps);
-        Self { state, id }
+        state.worker_caps.lock().unwrap().insert(id, caps.clone());
+        // Wake submissions waiting for a capable worker to appear.
+        state.caps_changed.notify_waiters();
+        Self { state, id, caps }
     }
 }
 
 impl Drop for CapsGuard {
     fn drop(&mut self) {
         self.state.worker_caps.lock().unwrap().remove(&self.id);
+        // Remember the platform so a build for it briefly waits for the
+        // worker to reconnect instead of declining immediately.
+        self.state.record_departed(self.caps.clone());
     }
 }
 
