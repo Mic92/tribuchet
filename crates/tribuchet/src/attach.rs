@@ -167,6 +167,9 @@ async fn attempt_build(
             Some(attach_event::Event::AddedPath(path)) => {
                 added_paths.insert(path);
             }
+            Some(attach_event::Event::Dispatched(worker)) => {
+                eprintln!("tribuchet: building on {worker}");
+            }
             Some(attach_event::Event::OutputRestart(path)) => {
                 // The previous worker attempt died mid-NAR; the next
                 // attempt streams this output again from the start.
@@ -271,7 +274,7 @@ async fn handle_output_chunk(
         remove_tree(Path::new(&out.store_path));
         std::fs::rename(&tmp, &out.store_path)
             .with_context(|| format!("moving output into place at {}", out.store_path))?;
-        tracing::info!(path = out.store_path, "output unpacked");
+        tracing::debug!(path = out.store_path, "output unpacked");
     }
     Ok(())
 }
