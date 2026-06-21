@@ -12,6 +12,9 @@ in
 {
   name = "tribuchet";
 
+  # Faster eval
+  defaults.documentation.enable = false;
+
   nodes = {
     hub =
       {
