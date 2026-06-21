@@ -240,8 +240,7 @@ async fn query_path_infos(
     for p in paths {
         let sp: StorePath = store_dir.parse(p)?;
         let info = guard
-            .client()
-            .query_path_info(&sp)
+            .execute(|c| c.query_path_info(&sp))
             .await
             .with_context(|| format!("querying path info for {p}"))?
             .with_context(|| format!("{p} is not a valid path in the local store"))?;
@@ -573,8 +572,7 @@ async fn import_extra(
         async_compression::tokio::bufread::ZstdDecoder::new(tokio::io::BufReader::new(reader));
     let limited = tokio::io::BufReader::new(dec.take(info.info.nar_size));
     guard
-        .client()
-        .add_to_store_nar(&info, limited, false, true)
+        .execute(|c| c.add_to_store_nar(&info, limited, false, true))
         .await
         .map_err(|e| anyhow::anyhow!("registering extra {} via daemon: {e}", info.path))
 }
