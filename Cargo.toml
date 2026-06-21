@@ -41,9 +41,9 @@ futures-util = "0.3"
 async-compression = { version = "0.4", features = ["tokio", "zstd"] }
 tokio-util = { version = "0.7", features = ["io"] }
 bytes = "1"
-harmonia-file-nar = { git = "https://github.com/nix-community/harmonia", rev = "d9a7edd79aad8489109ac675706d19c425398f9f" }
-harmonia-store-path = { git = "https://github.com/nix-community/harmonia", rev = "d9a7edd79aad8489109ac675706d19c425398f9f" }
-harmonia-store-path-info = { git = "https://github.com/nix-community/harmonia", rev = "d9a7edd79aad8489109ac675706d19c425398f9f" }
-harmonia-utils-signature = { git = "https://github.com/nix-community/harmonia", rev = "d9a7edd79aad8489109ac675706d19c425398f9f" }
-harmonia-store-remote = { git = "https://github.com/nix-community/harmonia", rev = "d9a7edd79aad8489109ac675706d19c425398f9f" }
-harmonia-store-ref-scan = { git = "https://github.com/nix-community/harmonia", rev = "d9a7edd79aad8489109ac675706d19c425398f9f" }
+harmonia-file-nar = { git = "https://github.com/nix-community/harmonia", rev = "773c2f5635c4e38e7fb932b5e22a80d23b279153" }
+harmonia-store-path = { git = "https://github.com/nix-community/harmonia", rev = "773c2f5635c4e38e7fb932b5e22a80d23b279153" }
+harmonia-store-path-info = { git = "https://github.com/nix-community/harmonia", rev = "773c2f5635c4e38e7fb932b5e22a80d23b279153" }
+harmonia-utils-signature = { git = "https://github.com/nix-community/harmonia", rev = "773c2f5635c4e38e7fb932b5e22a80d23b279153" }
+harmonia-store-remote = { git = "https://github.com/nix-community/harmonia", rev = "773c2f5635c4e38e7fb932b5e22a80d23b279153" }
+harmonia-store-ref-scan = { git = "https://github.com/nix-community/harmonia", rev = "773c2f5635c4e38e7fb932b5e22a80d23b279153" }
