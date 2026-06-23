@@ -118,10 +118,13 @@ jobs:
         include:
           - os: ubuntu-latest
             system: x86_64-linux
+            slug: x86-64-linux
           - os: ubuntu-24.04-arm
             system: aarch64-linux
+            slug: aarch64-linux
           - os: macos-latest
             system: aarch64-darwin
+            slug: aarch64-darwin
     runs-on: ${{ matrix.os }}
     name: worker (${{ matrix.system }})
     timeout-minutes: 20
@@ -141,7 +144,9 @@ jobs:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:ci
-          hostname: tribuchet-worker-${{ matrix.system }}-${{ github.run_id }}
+          # Tailscale hostnames are DNS labels; matrix.system can
+          # contain '_' (x86_64-linux), so use the sanitised slug.
+          hostname: tw-${{ matrix.slug }}-${{ github.run_id }}
 
       - run: nix build .#default
 
