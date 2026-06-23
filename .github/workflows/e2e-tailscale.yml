@@ -1,7 +1,21 @@
 name: e2e-tailscale
 
+# Two GitHub-hosted runners join the same tailnet, one runs
+# `tribuchet hub` with auth="tailscale", the other runs the worker, and
+# a real `nix-build` goes through external-builders end to end.
+#
 # Runs after buildbot has pushed this commit's outputs to
 # cache.thalheim.io, so `nix build` below is a fetch, not a rebuild.
+#
+# Tailscale setup (one-time, see also Mic92/tribuchet-action README):
+#   1. ACL (https://login.tailscale.com/admin/acls):
+#        "tagOwners": { "tag:ci": ["autogroup:admin"] }
+#      and restrict the grant so a compromised runner cannot pivot:
+#        {"src": ["tag:ci"], "dst": ["tag:ci"], "ip": ["*"]}
+#   2. OAuth client (https://login.tailscale.com/admin/settings/oauth)
+#      with scope "Auth Keys: write", tag `tag:ci`.
+#   3. Repo secrets TS_OAUTH_CLIENT_ID / TS_OAUTH_SECRET.
+
 on:
   status:
   workflow_dispatch:
@@ -61,7 +75,7 @@ jobs:
 
       - run: nix build .#default
 
-      - run: .github/scripts/e2e/hub-start.sh
+      - run: python3 .github/scripts/e2e/run.py hub-start
 
       - uses: actions/upload-artifact@v4
         with:
@@ -69,7 +83,7 @@ jobs:
           path: addr.txt
           retention-days: 1
 
-      - run: .github/scripts/e2e/hub-build.sh
+      - run: python3 .github/scripts/e2e/run.py hub-build
 
       - uses: actions/upload-artifact@v4
         with:
@@ -107,11 +121,11 @@ jobs:
 
       - name: fetch hub address
         run: |
-          .github/scripts/e2e/fetch-artifact.sh \
+          python3 .github/scripts/e2e/run.py fetch-artifact \
             "hub-addr-${{ github.run_id }}-${{ github.run_attempt }}" addr
           echo "HUB_TS_IP=$(cat addr/addr.txt)" >> "$GITHUB_ENV"
 
-      - run: .github/scripts/e2e/worker-run.sh
+      - run: python3 .github/scripts/e2e/run.py worker --hub-ip "$HUB_TS_IP"
 
       - if: always()
         run: cat worker.log || true
