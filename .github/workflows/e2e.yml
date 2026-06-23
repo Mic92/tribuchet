@@ -22,6 +22,12 @@ on:
     types: [completed]
   workflow_dispatch:
 
+# A force-push (or nixbot re-run) fires a fresh check_run for the same
+# branch; cancel the superseded e2e instead of running both.
+concurrency:
+  group: e2e-${{ github.event.check_run.check_suite.head_branch || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   actions: read
   contents: read
