@@ -2,6 +2,7 @@
   description = "tribuchet - RBE-style remote build execution for Nix";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs.crane.url = "github:ipetkov/crane";
   # only used to evaluate the darwin module in checks
   inputs.nix-darwin = {
     url = "github:nix-darwin/nix-darwin";
@@ -12,6 +13,7 @@
     {
       self,
       nixpkgs,
+      crane,
       nix-darwin,
     }:
     let
@@ -34,7 +36,9 @@
           ./nix/patches/recursive-nix-external-builders.patch
         ];
 
-        default = pkgs.callPackage ./nix/package.nix { };
+        default = pkgs.callPackage ./nix/package.nix {
+          craneLib = crane.mkLib pkgs;
+        };
       });
 
       darwinModules.default = import ./nix/darwin-module.nix self;
