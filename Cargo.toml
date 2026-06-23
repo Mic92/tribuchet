@@ -30,8 +30,9 @@ tar = "0.4"
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
-tonic = { version = "0.12", features = ["tls"] }
-tonic-build = "0.14"
+tonic = { version = "0.14", features = ["tls-ring"] }
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
 tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
