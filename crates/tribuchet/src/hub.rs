@@ -460,7 +460,7 @@ fn load_trusted_keys(config_dir: &Path) -> Result<Option<Arc<Vec<PublicKey>>>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             tracing::warn!(
                 "no trusted-signing-keys file in {}; accepting any signing key from \
-                 mTLS-authenticated workers",
+                 transport-authenticated workers",
                 config_dir.display()
             );
             Ok(None)
