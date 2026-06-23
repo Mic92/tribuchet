@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Drive the two-runner e2e-tailscale workflow.
+"""Drive the two-runner e2e workflow.
 
 One script with subcommands keeps the orchestration in one place and
 out of the YAML; the workflow steps just call ``run.py <cmd>``.
