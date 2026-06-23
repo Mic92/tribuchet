@@ -10,6 +10,18 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+/// How the worker listener authenticates peers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Auth {
+    /// Mutual TLS against the `tribuchet ca` root (default).
+    #[default]
+    Mtls,
+    /// No TLS; identity comes from tailscaled's LocalAPI `whois`.
+    /// Transport security is the WireGuard tunnel.
+    Tailscale,
+}
+
 pub fn load<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading config file {}", path.display()))?;
@@ -19,6 +31,9 @@ pub fn load<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct HubConfig {
+    /// Worker authentication mode.
+    #[serde(default)]
+    pub auth: Auth,
     /// Unix socket `tribuchet attach` connects to.
     #[serde(default = "default_hub_socket")]
     pub socket: PathBuf,
@@ -39,6 +54,13 @@ pub struct HubConfig {
     /// metrics endpoint; disabled when unset.
     #[serde(default)]
     pub metrics_listen: Option<String>,
+    /// tailscaled LocalAPI socket (auth = tailscale).
+    #[serde(default = "default_tailscale_socket")]
+    pub tailscale_socket: PathBuf,
+    /// When set, only nodes carrying one of these ACL tags may
+    /// register as a worker (auth = tailscale).
+    #[serde(default)]
+    pub tailscale_allowed_tags: Vec<String>,
 }
 
 fn default_hub_socket() -> PathBuf {
@@ -53,12 +75,19 @@ fn default_hub_config_dir() -> PathBuf {
 fn default_worker_grace_secs() -> u64 {
     30
 }
+fn default_tailscale_socket() -> PathBuf {
+    "/var/run/tailscale/tailscaled.sock".into()
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct WorkerConfig {
-    /// Hub gRPC address, e.g. https://hub.example.org:7437
+    /// Hub gRPC address, e.g. https://hub.example.org:7437 (mTLS) or
+    /// http://hub:7437 (tailscale).
     pub hub: String,
+    /// Hub authentication mode; must match the hub.
+    #[serde(default)]
+    pub auth: Auth,
     #[serde(default = "default_state_dir")]
     pub state_dir: PathBuf,
     /// Systems this worker builds for (default: host system).

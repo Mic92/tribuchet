@@ -20,8 +20,10 @@ use nix::sys::stat;
 use nix::unistd::Group;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
-use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
+use tonic::transport::{server::TcpConnectInfo, Certificate, Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
+
+use crate::config::Auth;
 
 use crate::proto::{
     attach_event, attach_hub_server, hub_message, worker_message, CancelBuild, HubMessage,
@@ -45,12 +47,25 @@ const WORKER_SILENCE_TIMEOUT: Duration = Duration::from_mins(3);
 /// A worker-session loss requeues a job at most this many times.
 const MAX_JOB_ATTEMPTS: u32 = 3;
 
+/// In tailscale mode the hub asks tailscaled who the peer is on every
+/// session and uses that as the worker name; mTLS mode trusts the
+/// transport layer (only certs signed by our CA can connect) and the
+/// self-reported name.
+enum PeerAuth {
+    Mtls,
+    Tailscale {
+        socket: std::path::PathBuf,
+        allowed_tags: Vec<String>,
+    },
+}
+
 struct WorkerSvc {
     state: Arc<HubState>,
+    auth: Arc<PeerAuth>,
     /// Operator-pinned worker signing keys; when configured, a worker
     /// registering an unknown key is rejected. Without it the signature
     /// check only proves the NARs came from whoever registered the key,
-    /// which mTLS already guarantees.
+    /// which the transport auth already guarantees.
     trusted_keys: Option<Arc<Vec<PublicKey>>>,
 }
 
@@ -170,13 +185,44 @@ impl crate::proto::worker_hub_server::WorkerHub for WorkerSvc {
         &self,
         request: Request<Streaming<WorkerMessage>>,
     ) -> Result<Response<Self::SessionStream>, Status> {
+        let remote = request
+            .extensions()
+            .get::<TcpConnectInfo>()
+            .and_then(|i| i.remote_addr);
         let mut inbound = request.into_inner();
         let Some(WorkerMessage {
-            msg: Some(worker_message::Msg::Register(register)),
+            msg: Some(worker_message::Msg::Register(mut register)),
         }) = inbound.message().await?
         else {
             return Err(Status::invalid_argument("first message must be Register"));
         };
+        if let PeerAuth::Tailscale {
+            socket,
+            allowed_tags,
+        } = self.auth.as_ref()
+        {
+            let Some(addr) = remote else {
+                return Err(Status::unauthenticated("no peer address"));
+            };
+            let who = crate::tailscale::whois(socket, addr).await.map_err(|e| {
+                tracing::warn!(%addr, "tailscale whois failed: {e:#}");
+                Status::unauthenticated("peer is not on the tailnet")
+            })?;
+            if !allowed_tags.is_empty() && !who.tags.iter().any(|t| allowed_tags.contains(t)) {
+                tracing::warn!(
+                    node = who.node_name,
+                    tags = ?who.tags,
+                    "rejecting worker without an allowed tailscale tag"
+                );
+                return Err(Status::permission_denied(
+                    "tailscale node tag not in tailscale-allowed-tags",
+                ));
+            }
+            // The tailnet-asserted name is authoritative; the worker's
+            // self-reported one would let any tailnet peer impersonate
+            // another in logs and metrics.
+            register.worker_name = who.node_name;
+        }
         let vkey: PublicKey = register
             .signing_public_key
             .parse()
@@ -423,6 +469,41 @@ fn load_trusted_keys(config_dir: &Path) -> Result<Option<Arc<Vec<PublicKey>>>> {
     }
 }
 
+fn configure_auth(
+    cfg: &crate::config::HubConfig,
+    config_dir: &Path,
+) -> Result<(Option<ServerTlsConfig>, PeerAuth)> {
+    Ok(match cfg.auth {
+        Auth::Mtls => {
+            let ca_dir = config_dir.join("ca");
+            let identity = Identity::from_pem(
+                fs::read(ca_dir.join("hub.crt")).context("reading hub.crt")?,
+                fs::read(ca_dir.join("hub.key")).context("reading hub.key")?,
+            );
+            let ca =
+                Certificate::from_pem(fs::read(ca_dir.join("ca.crt")).context("reading ca.crt")?);
+            (
+                Some(ServerTlsConfig::new().identity(identity).client_ca_root(ca)),
+                PeerAuth::Mtls,
+            )
+        }
+        Auth::Tailscale => {
+            tracing::info!(
+                socket = %cfg.tailscale_socket.display(),
+                allowed_tags = ?cfg.tailscale_allowed_tags,
+                "tailscale auth: TLS disabled, identity via tailscaled whois"
+            );
+            (
+                None,
+                PeerAuth::Tailscale {
+                    socket: cfg.tailscale_socket.clone(),
+                    allowed_tags: cfg.tailscale_allowed_tags.clone(),
+                },
+            )
+        }
+    })
+}
+
 pub fn run(cfg: crate::config::HubConfig) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run_async(cfg))
@@ -436,14 +517,7 @@ async fn run_async(cfg: crate::config::HubConfig) -> Result<()> {
         cfg.worker_grace_secs,
     )));
 
-    let ca_dir = config_dir.join("ca");
-    let identity = Identity::from_pem(
-        fs::read(ca_dir.join("hub.crt")).context("reading hub.crt")?,
-        fs::read(ca_dir.join("hub.key")).context("reading hub.key")?,
-    );
-    let ca = Certificate::from_pem(fs::read(ca_dir.join("ca.crt")).context("reading ca.crt")?);
-    let tls = ServerTlsConfig::new().identity(identity).client_ca_root(ca);
-
+    let (tls, peer_auth) = configure_auth(&cfg, config_dir)?;
     let trusted_keys = load_trusted_keys(config_dir)?;
 
     // Listeners come from systemd socket activation when available
@@ -463,8 +537,11 @@ async fn run_async(cfg: crate::config::HubConfig) -> Result<()> {
         .await
         .context("binding worker listen address")?,
     };
-    let worker_server = Server::builder()
-        .tls_config(tls)?
+    let mut builder = Server::builder();
+    if let Some(tls) = tls {
+        builder = builder.tls_config(tls)?;
+    }
+    let worker_server = builder
         // Detect dead/half-open worker connections instead of relying on
         // the workers' own traffic.
         .http2_keepalive_interval(Some(Duration::from_secs(30)))
@@ -472,6 +549,7 @@ async fn run_async(cfg: crate::config::HubConfig) -> Result<()> {
         .add_service(
             crate::proto::worker_hub_server::WorkerHubServer::new(WorkerSvc {
                 state: state.clone(),
+                auth: Arc::new(peer_auth),
                 trusted_keys,
             })
             .max_decoding_message_size(MAX_MSG_SIZE)
