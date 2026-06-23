@@ -14,7 +14,6 @@ doc_markdown = "allow"
 [workspace.dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-ed25519-dalek = { version = "2", features = ["rand_core"] }
 hex = "0.4"
 hyper-util = "0.1"
 nix = { version = "0.31", features = ["dir", "mount", "sched", "user", "fs", "hostname", "signal", "process", "resource", "personality", "socket", "uio"] }
