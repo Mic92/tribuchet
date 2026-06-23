@@ -61,12 +61,16 @@ def log_contains(path: Path, needle: str) -> bool:
 
 
 def spawn_daemon(argv: list[str], log: Path) -> subprocess.Popen[bytes]:
-    """Start a long-running process under sudo with its output captured
-    to *log* (owned by the unprivileged runner so later steps can read
-    it)."""
-    fh = log.open("wb")
+    """Start a long-running process with its output captured to *log*
+    (owned by the unprivileged runner so later steps can read it).
+    ``start_new_session`` detaches it from this Python process so it
+    survives the step boundary."""
     print("+", " ".join(argv), ">", log, file=sys.stderr)
-    return subprocess.Popen(argv, stdout=fh, stderr=subprocess.STDOUT)
+    with log.open("wb") as fh:
+        # Popen dups the fd; closing our handle is fine afterwards.
+        return subprocess.Popen(
+            argv, stdout=fh, stderr=subprocess.STDOUT, start_new_session=True
+        )
 
 
 # ---------------------------------------------------------------- hub ----
@@ -122,7 +126,6 @@ def hub_start() -> None:
     proc = spawn_daemon(
         [
             "sudo",
-            "-E",
             "RUST_LOG=info",
             str(BIN),
             "hub",
@@ -166,8 +169,10 @@ def hub_build() -> None:
         ]
     )
     payload = Path(result).read_text()
-    assert "built-on-worker-via-tailnet" in payload, payload
-    assert log_contains(HUB_LOG, "dispatching build"), "hub never dispatched"
+    if "built-on-worker-via-tailnet" not in payload:
+        raise SystemExit(f"unexpected build output: {payload!r}")
+    if not log_contains(HUB_LOG, "dispatching build"):
+        raise SystemExit("hub never dispatched the build")
     (REPO / "done").touch()
 
 
@@ -199,8 +204,12 @@ def artifact_exists(name: str) -> bool:
             "Accept": "application/vnd.github+json",
         },
     )
-    with urllib.request.urlopen(req) as r:
-        data = json.load(r)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.load(r)
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        # Transient API errors are "not yet"; the wait loop keeps polling.
+        return False
     return any(a["name"] == name for a in data.get("artifacts", []))
 
 
@@ -223,7 +232,6 @@ def worker_run(hub_ip: str) -> None:
     proc = spawn_daemon(
         [
             "sudo",
-            "-E",
             "RUST_LOG=info",
             str(BIN),
             "worker",
