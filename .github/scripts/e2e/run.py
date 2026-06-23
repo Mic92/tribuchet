@@ -17,6 +17,7 @@ import time
 import urllib.request
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 REPO = Path(__file__).resolve().parents[3]
 BIN = REPO / "result" / "bin" / "tribuchet"
@@ -76,11 +77,13 @@ def spawn_daemon(argv: list[str], log: Path) -> subprocess.Popen[bytes]:
 # ---------------------------------------------------------------- hub ----
 
 
-def hub_start() -> None:
+def hub_start(systems: list[str]) -> None:
     run(["sudo", "mkdir", "-p", "/etc/tribuchet", "/run/tribuchet"])
 
     # auth=tailscale: no TLS material; identity via tailscaled whois.
     # Restrict to tag:ci so only this workflow's runners can register.
+    # worker-grace-secs covers the slowest matrix worker (macOS install
+    # + cold cache) so per-system builds wait instead of declining.
     sudo_write(
         "/etc/tribuchet/hub.toml",
         textwrap.dedent(
@@ -89,7 +92,7 @@ def hub_start() -> None:
             listen = "0.0.0.0:7437"
             socket = "/run/tribuchet/hub.sock"
             config-dir = "/etc/tribuchet"
-            worker-grace-secs = 90
+            worker-grace-secs = 600
             tailscale-allowed-tags = ["tag:ci"]
             """
         ),
@@ -103,12 +106,11 @@ def hub_start() -> None:
     )
     run(["sudo", "chmod", "+x", "/usr/local/bin/tribuchet-attach"])
 
-    # Route x86_64-linux builds through tribuchet. `args` is required by
-    # the external-builders schema even when empty.
+    # `args` is required by the external-builders schema even when empty.
     eb = json.dumps(
         [
             {
-                "systems": ["x86_64-linux"],
+                "systems": systems,
                 "program": "/usr/local/bin/tribuchet-attach",
                 "args": [],
             }
@@ -147,7 +149,7 @@ def hub_start() -> None:
     print(HUB_LOG.read_text())
 
 
-def hub_build() -> None:
+def hub_build(systems: list[str]) -> None:
     wait_for(
         lambda: log_contains(HUB_LOG, "worker registered"),
         timeout=360,
@@ -156,24 +158,34 @@ def hub_build() -> None:
     )
 
     nixpkgs = out(["nix", "eval", "--raw", "nixpkgs#path"])
-    result = out(
+    # One nix-build for all systems: the hub queues each derivation and
+    # dispatches it once the matching worker registers (within
+    # worker-grace-secs), so per-system arrival order does not matter.
+    results = out(
         [
             "nix-build",
             "--no-out-link",
+            "--max-jobs",
+            str(len(systems)),
             "-I",
             f"nixpkgs={nixpkgs}",
             "--argstr",
             "runId",
             os.environ["GITHUB_RUN_ID"],
+            "--arg",
+            "systems",
+            "[ " + " ".join(f'"{s}"' for s in systems) + " ]",
             str(REPO / ".github/scripts/e2e/probe.nix"),
         ]
-    )
-    payload = Path(result).read_text()
-    if "built-on-worker-via-tailnet" not in payload:
-        raise SystemExit(f"unexpected build output: {payload!r}")
+    ).splitlines()
+    if len(results) != len(systems):
+        raise SystemExit(f"expected {len(systems)} outputs, got {results!r}")
+    for path in results:
+        payload = Path(path).read_text().strip()
+        if not payload.endswith("-via-tailnet"):
+            raise SystemExit(f"unexpected build output in {path}: {payload!r}")
     if not log_contains(HUB_LOG, "dispatching build"):
-        raise SystemExit("hub never dispatched the build")
-    (REPO / "done").touch()
+        raise SystemExit("hub never dispatched a build")
 
 
 # ------------------------------------------------------------- worker ----
@@ -193,12 +205,11 @@ def fetch_artifact(name: str, dest: str) -> None:
     wait_for(attempt, timeout=600, interval=5, what=f"artifact {name}")
 
 
-def artifact_exists(name: str) -> bool:
-    """Cheaper than `gh run download` for a presence poll."""
-    repo = os.environ["GITHUB_REPOSITORY"]
-    run_id = os.environ["GITHUB_RUN_ID"]
+def gh_api(path: str) -> Any | None:
+    """GET the GitHub REST API; ``None`` on transient errors so callers
+    inside a poll loop treat them as "not yet"."""
     req = urllib.request.Request(
-        f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/artifacts",
+        f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}/{path}",
         headers={
             "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
             "Accept": "application/vnd.github+json",
@@ -206,11 +217,22 @@ def artifact_exists(name: str) -> bool:
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
-            data = json.load(r)
+            return json.load(r)
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
-        # Transient API errors are "not yet"; the wait loop keeps polling.
-        return False
-    return any(a["name"] == name for a in data.get("artifacts", []))
+        return None
+
+
+def job_conclusion(name: str) -> str | None:
+    """Conclusion of a sibling job in this run, or ``None`` while it is
+    still running / on transient API errors."""
+    data = gh_api(f"actions/runs/{os.environ['GITHUB_RUN_ID']}/jobs")
+    if data is None:
+        return None
+    for j in data.get("jobs", []):
+        if j["name"] == name:
+            c: str | None = j.get("conclusion")
+            return c
+    return None
 
 
 def worker_run(hub_ip: str) -> None:
@@ -241,15 +263,18 @@ def worker_run(hub_ip: str) -> None:
         WORKER_LOG,
     )
 
-    run_id = os.environ["GITHUB_RUN_ID"]
-    attempt = os.environ["GITHUB_RUN_ATTEMPT"]
-    done = f"hub-done-{run_id}-{attempt}"
-    wait_for(
-        lambda: proc.poll() is not None or artifact_exists(done),
-        timeout=900,
-        interval=5,
-        what="hub to finish",
-    )
+    def finished() -> bool:
+        if proc.poll() is not None:
+            return True
+        c = job_conclusion("hub")
+        if c is None:
+            return False
+        if c != "success":
+            sys.stderr.write(WORKER_LOG.read_text())
+            raise SystemExit(f"hub job concluded {c!r}; aborting")
+        return True
+
+    wait_for(finished, timeout=900, interval=5, what="hub to finish")
     if not log_contains(WORKER_LOG, "builder finished"):
         sys.stderr.write(WORKER_LOG.read_text())
         raise SystemExit("worker never ran a build")
@@ -261,8 +286,10 @@ def worker_run(hub_ip: str) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("hub-start")
-    sub.add_parser("hub-build")
+    p = sub.add_parser("hub-start")
+    p.add_argument("--systems", nargs="+", required=True)
+    p = sub.add_parser("hub-build")
+    p.add_argument("--systems", nargs="+", required=True)
     p = sub.add_parser("worker")
     p.add_argument("--hub-ip", required=True)
     p = sub.add_parser("fetch-artifact")
@@ -272,9 +299,9 @@ def main() -> None:
 
     match args.cmd:
         case "hub-start":
-            hub_start()
+            hub_start(args.systems)
         case "hub-build":
-            hub_build()
+            hub_build(args.systems)
         case "worker":
             worker_run(args.hub_ip)
         case "fetch-artifact":

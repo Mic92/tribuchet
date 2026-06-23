@@ -1,18 +1,26 @@
-# Trivial derivation the e2e workflow builds through tribuchet.
-# `runId` makes the output uncacheable so it always reaches the worker.
+# Trivial per-system derivations the e2e workflow builds through
+# tribuchet. `runId` makes the outputs uncacheable so each one always
+# reaches its worker.
 {
   runId,
-  pkgs ? import <nixpkgs> { },
+  systems,
+  nixpkgs ? <nixpkgs>,
 }:
-derivation {
-  name = "tribuchet-e2e-${runId}";
-  system = "x86_64-linux";
-  # A store-path builder gives the derivation an input closure that
-  # tribuchet must ship to the worker; /bin/sh would not exist in the
-  # sandbox.
-  builder = "${pkgs.bash}/bin/bash";
-  args = [
-    "-c"
-    "echo built-on-worker-via-tailnet > $out"
-  ];
-}
+let
+  one = system: {
+    name = system;
+    value = derivation {
+      name = "tribuchet-e2e-${system}-${runId}";
+      inherit system;
+      # A store-path builder gives the derivation an input closure that
+      # tribuchet must ship to the worker; /bin/sh would not exist in
+      # the Linux sandbox.
+      builder = "${(import nixpkgs { inherit system; }).bash}/bin/bash";
+      args = [
+        "-c"
+        "echo built-on-${system}-via-tailnet > $out"
+      ];
+    };
+  };
+in
+builtins.listToAttrs (map one systems)
