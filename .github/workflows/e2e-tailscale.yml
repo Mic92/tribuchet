@@ -1,4 +1,5 @@
 name: e2e-tailscale
+run-name: e2e-tailscale @ ${{ github.event.check_run.head_sha || github.sha }}
 
 # Two GitHub-hosted runners join the same tailnet, one runs
 # `tribuchet hub` with auth="tailscale", the other runs the worker, and
@@ -24,6 +25,10 @@ on:
 permissions:
   actions: read
   contents: read
+  # check_run-triggered runs are attached to the default branch, not the
+  # PR commit; we post a commit status back to the tested sha so the
+  # result shows up on the PR.
+  statuses: write
 
 env:
   NIX_EXTRA_CONF: |
@@ -52,6 +57,14 @@ jobs:
         env:
           TS: ${{ secrets.TS_OAUTH_SECRET }}
         run: echo "has=$([ -n "$TS" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - if: steps.check.outputs.has == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.check_run.head_sha || github.sha }}
+        run: |
+          gh api "repos/${{ github.repository }}/statuses/$SHA" \
+            -f state=pending -f context=e2e-tailscale \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
   hub:
     needs: gate
@@ -130,3 +143,17 @@ jobs:
 
       - if: always()
         run: cat worker.log || true
+
+  report:
+    needs: [gate, hub, worker]
+    if: always() && needs.gate.outputs.has-secrets == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.check_run.head_sha || github.sha }}
+          STATE: ${{ (needs.hub.result == 'success' && needs.worker.result == 'success') && 'success' || 'failure' }}
+        run: |
+          gh api "repos/${{ github.repository }}/statuses/$SHA" \
+            -f state="$STATE" -f context=e2e-tailscale \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
