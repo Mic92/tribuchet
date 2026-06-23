@@ -34,6 +34,7 @@ env:
   NIX_EXTRA_CONF: |
     extra-substituters = https://cache.thalheim.io
     extra-trusted-public-keys = cache.thalheim.io-1:R7msbosLEZKrxk/lKxf9BTjOOH7Ax3H0Qj0/6wiHOgc=
+  E2E_SYSTEMS: x86_64-linux aarch64-linux aarch64-darwin
 
 jobs:
   # nixbot reports via the Checks API; only act on its final success.
@@ -70,7 +71,7 @@ jobs:
     needs: gate
     if: needs.gate.outputs.has-secrets == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
         with:
@@ -89,7 +90,7 @@ jobs:
 
       - run: nix build .#default
 
-      - run: python3 .github/scripts/e2e/run.py hub-start
+      - run: python3 .github/scripts/e2e/run.py hub-start --systems $E2E_SYSTEMS
 
       - uses: actions/upload-artifact@v4
         with:
@@ -97,7 +98,7 @@ jobs:
           path: addr.txt
           retention-days: 1
 
-      - run: python3 .github/scripts/e2e/run.py hub-build
+      - run: python3 .github/scripts/e2e/run.py hub-build --systems $E2E_SYSTEMS
 
       - uses: actions/upload-artifact@v4
         with:
@@ -111,7 +112,18 @@ jobs:
   worker:
     needs: gate
     if: needs.gate.outputs.has-secrets == 'true'
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            system: x86_64-linux
+          - os: ubuntu-24.04-arm
+            system: aarch64-linux
+          - os: macos-latest
+            system: aarch64-darwin
+    runs-on: ${{ matrix.os }}
+    name: worker (${{ matrix.system }})
     timeout-minutes: 20
     env:
       GH_TOKEN: ${{ github.token }}
@@ -129,7 +141,7 @@ jobs:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:ci
-          hostname: tribuchet-worker-${{ github.run_id }}
+          hostname: tribuchet-worker-${{ matrix.system }}-${{ github.run_id }}
 
       - run: nix build .#default
 

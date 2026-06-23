@@ -76,11 +76,13 @@ def spawn_daemon(argv: list[str], log: Path) -> subprocess.Popen[bytes]:
 # ---------------------------------------------------------------- hub ----
 
 
-def hub_start() -> None:
+def hub_start(systems: list[str]) -> None:
     run(["sudo", "mkdir", "-p", "/etc/tribuchet", "/run/tribuchet"])
 
     # auth=tailscale: no TLS material; identity via tailscaled whois.
     # Restrict to tag:ci so only this workflow's runners can register.
+    # worker-grace-secs covers the slowest matrix worker (macOS install
+    # + cold cache) so per-system builds wait instead of declining.
     sudo_write(
         "/etc/tribuchet/hub.toml",
         textwrap.dedent(
@@ -89,7 +91,7 @@ def hub_start() -> None:
             listen = "0.0.0.0:7437"
             socket = "/run/tribuchet/hub.sock"
             config-dir = "/etc/tribuchet"
-            worker-grace-secs = 90
+            worker-grace-secs = 600
             tailscale-allowed-tags = ["tag:ci"]
             """
         ),
@@ -103,12 +105,11 @@ def hub_start() -> None:
     )
     run(["sudo", "chmod", "+x", "/usr/local/bin/tribuchet-attach"])
 
-    # Route x86_64-linux builds through tribuchet. `args` is required by
-    # the external-builders schema even when empty.
+    # `args` is required by the external-builders schema even when empty.
     eb = json.dumps(
         [
             {
-                "systems": ["x86_64-linux"],
+                "systems": systems,
                 "program": "/usr/local/bin/tribuchet-attach",
                 "args": [],
             }
@@ -147,7 +148,7 @@ def hub_start() -> None:
     print(HUB_LOG.read_text())
 
 
-def hub_build() -> None:
+def hub_build(systems: list[str]) -> None:
     wait_for(
         lambda: log_contains(HUB_LOG, "worker registered"),
         timeout=360,
@@ -156,23 +157,34 @@ def hub_build() -> None:
     )
 
     nixpkgs = out(["nix", "eval", "--raw", "nixpkgs#path"])
-    result = out(
+    # One nix-build for all systems: the hub queues each derivation and
+    # dispatches it once the matching worker registers (within
+    # worker-grace-secs), so per-system arrival order does not matter.
+    results = out(
         [
             "nix-build",
             "--no-out-link",
+            "--max-jobs",
+            str(len(systems)),
             "-I",
             f"nixpkgs={nixpkgs}",
             "--argstr",
             "runId",
             os.environ["GITHUB_RUN_ID"],
+            "--arg",
+            "systems",
+            "[ " + " ".join(f'"{s}"' for s in systems) + " ]",
             str(REPO / ".github/scripts/e2e/probe.nix"),
         ]
-    )
-    payload = Path(result).read_text()
-    if "built-on-worker-via-tailnet" not in payload:
-        raise SystemExit(f"unexpected build output: {payload!r}")
+    ).splitlines()
+    if len(results) != len(systems):
+        raise SystemExit(f"expected {len(systems)} outputs, got {results!r}")
+    for path in results:
+        payload = Path(path).read_text().strip()
+        if not payload.endswith("-via-tailnet"):
+            raise SystemExit(f"unexpected build output in {path}: {payload!r}")
     if not log_contains(HUB_LOG, "dispatching build"):
-        raise SystemExit("hub never dispatched the build")
+        raise SystemExit("hub never dispatched a build")
     (REPO / "done").touch()
 
 
@@ -261,8 +273,10 @@ def worker_run(hub_ip: str) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("hub-start")
-    sub.add_parser("hub-build")
+    p = sub.add_parser("hub-start")
+    p.add_argument("--systems", nargs="+", required=True)
+    p = sub.add_parser("hub-build")
+    p.add_argument("--systems", nargs="+", required=True)
     p = sub.add_parser("worker")
     p.add_argument("--hub-ip", required=True)
     p = sub.add_parser("fetch-artifact")
@@ -272,9 +286,9 @@ def main() -> None:
 
     match args.cmd:
         case "hub-start":
-            hub_start()
+            hub_start(args.systems)
         case "hub-build":
-            hub_build()
+            hub_build(args.systems)
         case "worker":
             worker_run(args.hub_ip)
         case "fetch-artifact":
