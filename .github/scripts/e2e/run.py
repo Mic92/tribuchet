@@ -157,7 +157,8 @@ def hub_build(systems: list[str]) -> None:
         what="a worker to register",
     )
 
-    nixpkgs = out(["nix", "eval", "--raw", "nixpkgs#path"])
+    # The flake-locked nixpkgs is what nixbot built and cached.
+    nixpkgs = out(["nix", "eval", "--raw", "--inputs-from", ".", "nixpkgs#path"])
     # One nix-build for all systems: the hub queues each derivation and
     # dispatches it once the matching worker registers (within
     # worker-grace-secs), so per-system arrival order does not matter.
