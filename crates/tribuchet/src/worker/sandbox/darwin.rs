@@ -17,35 +17,25 @@ pub fn prepare(spec: &mut SandboxSpec) -> Result<()> {
     // /nix/store paths (the worker imports them via the daemon),
     // so there is nothing to materialize.
     spec.binds_ro.clear();
-    // env refers to tmpDirInSandbox; link it to the real build dir.
-    // Darwin daemons always send a per-build tmp path here (Nix has
-    // no /build on macOS), so each build gets its own symlink.
-    let link = Path::new(&spec.cwd);
-    // Don't trust the hub: a root worker creating a symlink at an
-    // arbitrary path is a takeover primitive. Allow only tmp prefixes.
-    let allowed = [
-        "/tmp/",
-        "/private/tmp/",
-        "/private/var/folders/",
-        "/var/folders/",
-    ]
-    .iter()
-    .any(|p| spec.cwd.starts_with(p));
-    if !allowed {
-        anyhow::bail!("refusing tmpDirInSandbox outside tmp: {}", spec.cwd);
-    }
-    match fs::symlink_metadata(link) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            fs::remove_file(link)?; // stale link from a crashed build
+    // No mount namespace on macOS: use the worker's own per-build dir
+    // as cwd and rewrite env values referencing the hub's
+    // tmpDirInSandbox (e.g. "/build" from a Linux hub). Avoids any
+    // symlink at a hub-chosen path on a root worker.
+    let from = std::mem::take(&mut spec.cwd);
+    let to = spec
+        .build_dir
+        .to_str()
+        .context("build dir is not valid UTF-8")?
+        .to_owned();
+    let prefix = format!("{from}/");
+    for v in spec.env.values_mut() {
+        if *v == from {
+            v.clone_from(&to);
+        } else if let Some(rest) = v.strip_prefix(&prefix) {
+            *v = format!("{to}/{rest}");
         }
-        Ok(_) => anyhow::bail!("tmpDirInSandbox {} already exists", spec.cwd),
-        Err(_) => {}
     }
-    if let Some(parent) = link.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    std::os::unix::fs::symlink(&spec.build_dir, link)
-        .with_context(|| format!("creating {} symlink", link.display()))?;
+    spec.cwd = to;
     Ok(())
 }
 
@@ -97,11 +87,7 @@ pub fn command(spec: &SandboxSpec) -> Result<Command> {
     // Like deny_read above: writes resolve to the canonical vnode
     // path, so a subpath on the literal alone (e.g. a build dir under
     // the /var -> /private/var symlink) would never match. Emit both.
-    let build_dir = spec.build_dir.to_string_lossy();
-    for path in std::iter::once(spec.cwd.as_str())
-        .chain(std::iter::once(build_dir.as_ref()))
-        .chain(spec.outputs.iter().map(String::as_str))
-    {
+    for path in std::iter::once(spec.cwd.as_str()).chain(spec.outputs.iter().map(String::as_str)) {
         writeln!(profile, "  (subpath \"{}\")", sb_escape(path)?)?;
         if let Ok(canonical) = Path::new(path).canonicalize() {
             let canonical = canonical.to_string_lossy();
@@ -153,19 +139,12 @@ pub fn send_spec(_child: &mut Child, _spec: &SandboxSpec) -> Result<()> {
     Ok(())
 }
 
-pub fn cleanup(a: &BuildAssignment, dir: &Path) {
+pub fn cleanup(a: &BuildAssignment, _dir: &Path) {
     // Outputs were written straight into /nix/store; drop them after
-    // upload, and remove the /build symlink.
+    // upload.
     for scratch in a.outputs.values() {
         let p = Path::new(scratch);
         let _ = fs::remove_dir_all(p);
         let _ = fs::remove_file(p);
-    }
-    // Only remove the symlink this build created (it points at our
-    // build dir): a hub-chosen path that prepare() rejected must not
-    // become a delete-anything primitive on a root worker.
-    let link = Path::new(&a.tmp_dir_in_sandbox);
-    if fs::read_link(link).is_ok_and(|t| t == dir.join("top").join("build")) {
-        let _ = fs::remove_file(link);
     }
 }

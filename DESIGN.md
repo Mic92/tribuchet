@@ -107,10 +107,11 @@ Reference implementations: `nix/src/libstore/unix/build/` and
   unreachable, and root workers back such builds with an unprivileged
   uid.
 * macOS: no mount namespace, but inputs already live at their real
-  /nix/store paths thanks to the daemon import; the request's per-build
-  `tmpDirInSandbox` (a `/private/tmp/nix-build-*` path — Nix has no
-  `/build` on Darwin) becomes a symlink to the build dir, and the builder
-  runs under `/usr/bin/sandbox-exec` with a deny-default write profile
+  /nix/store paths thanks to the daemon import; the worker's own
+  per-build dir becomes the cwd and env values referencing the hub's
+  `tmpDirInSandbox` (e.g. `/build` from a Linux hub) are rewritten to
+  it, so no symlink is created at a hub-chosen path. The builder runs
+  under `/usr/bin/sandbox-exec` with a deny-default write profile
   modeled on Nix's `sandbox-defaults.sb` (reads stay permissive except
   for the worker's key material; writes are scoped to the build dir,
   outputs, and specific device nodes; signals are limited to the

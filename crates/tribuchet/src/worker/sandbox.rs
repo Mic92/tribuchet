@@ -473,19 +473,18 @@ mod tests {
         Ok(())
     }
 
-    /// End-to-end smoke test of the Darwin sandbox: prepare's tmp-dir
-    /// symlink, writes confined to the build dir, deny_read on worker
-    /// secrets, and exit-code plumbing through sandbox-exec.
+    /// End-to-end smoke test of the Darwin sandbox: prepare's env
+    /// rewrite of the hub's tmpDirInSandbox to the local build dir,
+    /// writes confined to that dir, deny_read on worker secrets, and
+    /// exit-code plumbing through sandbox-exec.
     #[cfg(target_os = "macos")]
     #[test]
     fn sandbox_runs_builder() -> Result<()> {
-        // tempdir lives under $TMPDIR (/var/folders/...), one of the
-        // tmp prefixes prepare() accepts for the cwd symlink.
         let dir = tempfile::tempdir()?;
         let secret = dir.path().join("secret");
         fs::write(&secret, "key-material")?;
         let outside = dir.path().join("outside");
-        let cwd = dir.path().join("build-link");
+        let build_dir = dir.path().join("top/build");
         let mut spec = SandboxSpec {
             builder: "/bin/sh".into(),
             system: "aarch64-darwin".into(),
@@ -493,22 +492,32 @@ mod tests {
                 "-c".into(),
                 // Each escape attempt exits with its own code so a
                 // failure names the broken rule; 7 means all held.
-                // $FOO asserts the derivation env reaches the builder.
+                // $FOO: derivation env reaches the builder.
+                // $NIX_BUILD_TOP/$ATTRS: prepare() rewrote /build to
+                // the local build dir (Linux-hub cross-dispatch).
                 format!(
                     "test \"$FOO\" = bar || exit 1; \
+                     test \"$NIX_BUILD_TOP\" = \"{build_dir}\" || exit 5; \
+                     test \"$ATTRS\" = \"{build_dir}/.attrs.json\" || exit 6; \
                      echo ok > out || exit 2; \
                      cat {secret} 2>/dev/null && exit 3; \
                      echo escaped > {outside} 2>/dev/null && exit 4; \
                      exit 7",
                     secret = secret.display(),
-                    outside = outside.display()
+                    outside = outside.display(),
+                    build_dir = build_dir.display(),
                 ),
             ],
-            env: HashMap::from([("FOO".into(), "bar".into())]),
-            cwd: cwd.to_string_lossy().into_owned(),
+            env: HashMap::from([
+                ("FOO".into(), "bar".into()),
+                ("NIX_BUILD_TOP".into(), "/build".into()),
+                ("ATTRS".into(), "/build/.attrs.json".into()),
+            ]),
+            // What a Linux hub sends; prepare() must rewrite it.
+            cwd: "/build".into(),
             network: false,
             root: dir.path().join("root"),
-            build_dir: dir.path().join("top/build"),
+            build_dir,
             binds_ro: vec![],
             binds_dev: vec![],
             outputs: vec![],
