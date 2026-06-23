@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
-use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
 
 #[derive(Subcommand)]
 pub enum CaAction {
@@ -87,13 +87,12 @@ pub fn run(action: CaAction) -> Result<()> {
                 &fs::read_to_string(dir.join("ca.key")).context("reading ca.key")?,
             )?;
             let ca_pem = fs::read_to_string(dir.join("ca.crt")).context("reading ca.crt")?;
-            let ca_params = CertificateParams::from_ca_cert_pem(&ca_pem)?;
-            let ca_cert = ca_params.self_signed(&ca_key)?;
+            let issuer = Issuer::from_ca_cert_pem(&ca_pem, ca_key)?;
 
             let key = KeyPair::generate()?;
             let mut params = CertificateParams::new(vec![name.clone()])?;
             validity(&mut params, 2 * 365);
-            let cert = params.signed_by(&key, &ca_cert, &ca_key)?;
+            let cert = params.signed_by(&key, &issuer)?;
 
             write_private(&dir.join(format!("{name}.key")), &key.serialize_pem())?;
             fs::write(dir.join(format!("{name}.crt")), cert.pem())?;

@@ -14,10 +14,6 @@ use super::state::{HubState, Job, Replay};
 use crate::proto::{attach_event, attach_hub_server, AttachEvent, BuildRequest};
 use crate::store::{valid_store_path, STORE_DIR};
 
-#[expect(
-    clippy::result_large_err,
-    reason = "tonic::Status is what the caller needs"
-)]
 fn validate_request(req: &BuildRequest) -> Result<(), Status> {
     let bad = |what: &str, p: &str| {
         Status::invalid_argument(format!("{what} is not a valid store path: {p}"))
@@ -82,10 +78,6 @@ fn validate_request(req: &BuildRequest) -> Result<(), Status> {
 /// the hub ship `/root` or another user's build dir. Returns the opened
 /// directory: tarring later goes through this fd, so swapping the path
 /// for a symlink after validation cannot redirect what gets shipped.
-#[expect(
-    clippy::result_large_err,
-    reason = "tonic::Status is what the caller needs"
-)]
 pub(super) fn validate_top_tmp_dir(
     top_tmp_dir: &str,
     peer_uid: u32,
@@ -159,7 +151,7 @@ pub(super) fn dedupe_key(req: &BuildRequest) -> String {
 
 fn new_id() -> String {
     let mut buf = [0u8; 16];
-    rand::Rng::fill(&mut rand::thread_rng(), &mut buf);
+    rand::RngExt::fill(&mut rand::rng(), &mut buf);
     hex::encode(buf)
 }
 
@@ -188,7 +180,9 @@ impl AttachSvc {
             super::metrics::Metrics::inc(&self.state.metrics.declined);
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             let _ = tx.try_send(Ok(AttachEvent {
-                event: Some(attach_event::Event::ExitCode(crate::proto::DECLINE_EXIT_CODE)),
+                event: Some(attach_event::Event::ExitCode(
+                    crate::proto::DECLINE_EXIT_CODE,
+                )),
             }));
             Response::new(ReceiverStream::new(rx))
         };
