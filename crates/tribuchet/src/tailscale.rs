@@ -47,11 +47,14 @@ pub async fn whois(socket: &Path, addr: SocketAddr) -> Result<WhoIs> {
         .with_context(|| format!("connecting to tailscaled at {}", socket.display()))?;
     // Host header is a fixed sentinel the daemon expects; the path
     // takes the full ip:port so tailscaled can match the exact
-    // 4-tuple it NATed.
+    // 4-tuple it NATed. The Go client percent-encodes the addr; do
+    // the same so an IPv6 `[::1]:p` is a valid query value.
+    // HTTP/1.0 so tailscaled cannot reply with Transfer-Encoding:
+    // chunked, which keeps the body parser below trivial.
     let req = format!(
-        "GET /localapi/v0/whois?addr={addr} HTTP/1.1\r\n\
-         Host: local-tailscaled.sock\r\n\
-         Connection: close\r\n\r\n"
+        "GET /localapi/v0/whois?addr={} HTTP/1.0\r\n\
+         Host: local-tailscaled.sock\r\n\r\n",
+        encode_addr(addr),
     );
     s.write_all(req.as_bytes()).await?;
     let mut buf = Vec::new();
@@ -71,9 +74,24 @@ pub async fn whois(socket: &Path, addr: SocketAddr) -> Result<WhoIs> {
     })
 }
 
-/// Split status line / headers from body and check for 200. Supports
-/// the `Connection: close` framing we asked for; tailscaled does not
-/// chunk these tiny responses.
+/// Minimal percent-encoding for the characters `SocketAddr` can emit
+/// that are reserved in a URI query (`[` `]` `:`).
+fn encode_addr(addr: SocketAddr) -> String {
+    let mut out = String::new();
+    for b in addr.to_string().bytes() {
+        match b {
+            b'[' => out.push_str("%5B"),
+            b']' => out.push_str("%5D"),
+            b':' => out.push_str("%3A"),
+            _ => out.push(b as char),
+        }
+    }
+    out
+}
+
+/// Split status line / headers from body and check for 200. The
+/// request is HTTP/1.0, so the body is delimited by connection close
+/// and never chunked.
 fn http_body(buf: &[u8]) -> Result<&[u8]> {
     let sep = buf
         .windows(4)
@@ -93,13 +111,19 @@ mod tests {
 
     #[test]
     fn parses_whois_body() {
-        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n\
+        let raw = b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n\
             {\"Node\":{\"Name\":\"worker-1.tailnet.ts.net.\",\"Tags\":[\"tag:ci\"]},\
              \"UserProfile\":{}}";
         let body = http_body(raw).unwrap();
         let r: Resp = serde_json::from_slice(body).unwrap();
         assert_eq!(r.node.name, "worker-1.tailnet.ts.net.");
         assert_eq!(r.node.tags, vec!["tag:ci"]);
+    }
+
+    #[test]
+    fn ipv6_addr_is_encoded() {
+        let a: SocketAddr = "[fd7a:115c::1]:1234".parse().unwrap();
+        assert_eq!(encode_addr(a), "%5Bfd7a%3A115c%3A%3A1%5D%3A1234");
     }
 
     #[test]

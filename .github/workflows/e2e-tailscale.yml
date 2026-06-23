@@ -1,0 +1,112 @@
+name: e2e-tailscale
+
+# Runs after buildbot has pushed this commit's outputs to
+# cache.thalheim.io, so `nix build` below is a fetch, not a rebuild.
+on:
+  status:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  NIX_EXTRA_CONF: |
+    extra-substituters = https://cache.thalheim.io
+    extra-trusted-public-keys = cache.thalheim.io-1:R7msbosLEZKrxk/lKxf9BTjOOH7Ax3H0Qj0/6wiHOgc=
+
+jobs:
+  # The status event fires for every commit status; only act on
+  # buildbot's final success, and only when the tailscale secrets are
+  # configured (forks / repos without them are skipped, not failed).
+  # `secrets` is not usable in a job-level `if`, hence the indirection.
+  gate:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.context == 'buildbot/nix-build' && github.event.state == 'success')
+    runs-on: ubuntu-latest
+    outputs:
+      has-secrets: ${{ steps.check.outputs.has }}
+    steps:
+      - id: check
+        env:
+          TS: ${{ secrets.TS_OAUTH_SECRET }}
+        run: echo "has=$([ -n "$TS" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+  hub:
+    needs: gate
+    if: needs.gate.outputs.has-secrets == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.sha || github.sha }}
+
+      - uses: NixOS/nix-installer-action@6b8548fe06acfb0155a50ab5d561accb215764cc
+        with:
+          extra-conf: ${{ env.NIX_EXTRA_CONF }}
+
+      - uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: tribuchet-hub-${{ github.run_id }}
+
+      - run: nix build .#default
+
+      - run: .github/scripts/e2e/hub-start.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hub-addr-${{ github.run_id }}-${{ github.run_attempt }}
+          path: addr.txt
+          retention-days: 1
+
+      - run: .github/scripts/e2e/hub-build.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hub-done-${{ github.run_id }}-${{ github.run_attempt }}
+          path: done
+          retention-days: 1
+
+      - if: always()
+        run: cat hub.log || true
+
+  worker:
+    needs: gate
+    if: needs.gate.outputs.has-secrets == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.sha || github.sha }}
+
+      - uses: NixOS/nix-installer-action@6b8548fe06acfb0155a50ab5d561accb215764cc
+        with:
+          extra-conf: ${{ env.NIX_EXTRA_CONF }}
+
+      - uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: tribuchet-worker-${{ github.run_id }}
+
+      - run: nix build .#default
+
+      - name: fetch hub address
+        run: |
+          .github/scripts/e2e/fetch-artifact.sh \
+            "hub-addr-${{ github.run_id }}-${{ github.run_attempt }}" addr
+          echo "HUB_TS_IP=$(cat addr/addr.txt)" >> "$GITHUB_ENV"
+
+      - run: .github/scripts/e2e/worker-run.sh
+
+      - if: always()
+        run: cat worker.log || true
