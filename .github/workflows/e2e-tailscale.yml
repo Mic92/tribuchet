@@ -17,7 +17,8 @@ name: e2e-tailscale
 #   3. Repo secrets TS_OAUTH_CLIENT_ID / TS_OAUTH_SECRET.
 
 on:
-  status:
+  check_run:
+    types: [completed]
   workflow_dispatch:
 
 permissions:
@@ -30,10 +31,9 @@ env:
     extra-trusted-public-keys = cache.thalheim.io-1:R7msbosLEZKrxk/lKxf9BTjOOH7Ax3H0Qj0/6wiHOgc=
 
 jobs:
-  # The status event fires for every commit status; only act on
-  # buildbot's final success on a commit that lives on a branch in
-  # *this* repo. status payloads list only such branches, so a fork-PR
-  # head has an empty `branches` and is skipped — otherwise its
+  # nixbot reports via the Checks API; only act on its final success.
+  # `head_branch` is null when the commit's branch is in a different
+  # repository, so fork-PR heads are skipped — otherwise their
   # checked-out flake and scripts would run with tailnet access. Own
   # branch PRs (push access ⇒ trusted) do run. Also skip when the
   # tailscale secrets are not configured. `secrets` is not usable in a
@@ -41,9 +41,9 @@ jobs:
   gate:
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      (github.event.context == 'buildbot/nix-build'
-       && github.event.state == 'success'
-       && github.event.branches[0] != null)
+      (github.event.check_run.name == 'buildbot/nix-build'
+       && github.event.check_run.conclusion == 'success'
+       && github.event.check_run.check_suite.head_branch != null)
     runs-on: ubuntu-latest
     outputs:
       has-secrets: ${{ steps.check.outputs.has }}
@@ -61,7 +61,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.sha || github.sha }}
+          ref: ${{ github.event.check_run.head_sha || github.sha }}
 
       - uses: NixOS/nix-installer-action@6b8548fe06acfb0155a50ab5d561accb215764cc
         with:
@@ -105,7 +105,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.sha || github.sha }}
+          ref: ${{ github.event.check_run.head_sha || github.sha }}
 
       - uses: NixOS/nix-installer-action@6b8548fe06acfb0155a50ab5d561accb215764cc
         with:
