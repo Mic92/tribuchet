@@ -13,7 +13,7 @@ use nix::errno::Errno;
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use nix::sched::{unshare, CloneFlags};
 use nix::sys::personality::{self, Persona};
-use nix::sys::resource::{self, getrlimit, setrlimit, Resource};
+use nix::sys::resource::{getrlimit, setrlimit, Resource};
 use nix::sys::{prctl, stat, wait};
 use nix::unistd::{self, getgid, getuid, pivot_root, sethostname};
 
@@ -767,14 +767,16 @@ fn register_binfmt(line: &str) -> io::Result<()> {
 /// predictable umask (output modes feed the NAR hash), 32-bit
 /// personality for 32-bit systems, no ASLR for determinism, no
 /// privilege gain via setuid binaries, and a fork-bomb-braking
-/// RLIMIT_NPROC clamped to the inherited hard limit (raising it needs
-/// init-ns CAP_SYS_RESOURCE, which the child userns does not have).
+/// RLIMIT_NPROC. Hard limits are never raised: the child userns has no
+/// CAP_SYS_RESOURCE in the initial namespace, so a host with finite
+/// hard limits (e.g. GitHub-hosted runners cap RLIMIT_CORE) would
+/// EPERM.
 fn apply_process_limits(system: &str) -> io::Result<()> {
     let (_, hard) = getrlimit(Resource::RLIMIT_NPROC).map_err(ioerr("getrlimit NPROC"))?;
     let limit = hard.min(4096);
     setrlimit(Resource::RLIMIT_NPROC, limit, limit).map_err(ioerr("setting RLIMIT_NPROC"))?;
-    setrlimit(Resource::RLIMIT_CORE, 0, resource::RLIM_INFINITY)
-        .map_err(ioerr("setting RLIMIT_CORE"))?;
+    let (_, hard) = getrlimit(Resource::RLIMIT_CORE).map_err(ioerr("getrlimit CORE"))?;
+    setrlimit(Resource::RLIMIT_CORE, 0, hard).map_err(ioerr("setting RLIMIT_CORE"))?;
     stat::umask(stat::Mode::from_bits_truncate(0o022));
     if matches!(
         system,
