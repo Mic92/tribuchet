@@ -17,6 +17,7 @@ import time
 import urllib.request
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 REPO = Path(__file__).resolve().parents[3]
 BIN = REPO / "result" / "bin" / "tribuchet"
@@ -185,7 +186,6 @@ def hub_build(systems: list[str]) -> None:
             raise SystemExit(f"unexpected build output in {path}: {payload!r}")
     if not log_contains(HUB_LOG, "dispatching build"):
         raise SystemExit("hub never dispatched a build")
-    (REPO / "done").touch()
 
 
 # ------------------------------------------------------------- worker ----
@@ -205,12 +205,11 @@ def fetch_artifact(name: str, dest: str) -> None:
     wait_for(attempt, timeout=600, interval=5, what=f"artifact {name}")
 
 
-def artifact_exists(name: str) -> bool:
-    """Cheaper than `gh run download` for a presence poll."""
-    repo = os.environ["GITHUB_REPOSITORY"]
-    run_id = os.environ["GITHUB_RUN_ID"]
+def gh_api(path: str) -> Any | None:
+    """GET the GitHub REST API; ``None`` on transient errors so callers
+    inside a poll loop treat them as "not yet"."""
     req = urllib.request.Request(
-        f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/artifacts",
+        f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}/{path}",
         headers={
             "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
             "Accept": "application/vnd.github+json",
@@ -218,11 +217,22 @@ def artifact_exists(name: str) -> bool:
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
-            data = json.load(r)
+            return json.load(r)
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
-        # Transient API errors are "not yet"; the wait loop keeps polling.
-        return False
-    return any(a["name"] == name for a in data.get("artifacts", []))
+        return None
+
+
+def job_conclusion(name: str) -> str | None:
+    """Conclusion of a sibling job in this run, or ``None`` while it is
+    still running / on transient API errors."""
+    data = gh_api(f"actions/runs/{os.environ['GITHUB_RUN_ID']}/jobs")
+    if data is None:
+        return None
+    for j in data.get("jobs", []):
+        if j["name"] == name:
+            c: str | None = j.get("conclusion")
+            return c
+    return None
 
 
 def worker_run(hub_ip: str) -> None:
@@ -253,15 +263,18 @@ def worker_run(hub_ip: str) -> None:
         WORKER_LOG,
     )
 
-    run_id = os.environ["GITHUB_RUN_ID"]
-    attempt = os.environ["GITHUB_RUN_ATTEMPT"]
-    done = f"hub-done-{run_id}-{attempt}"
-    wait_for(
-        lambda: proc.poll() is not None or artifact_exists(done),
-        timeout=900,
-        interval=5,
-        what="hub to finish",
-    )
+    def finished() -> bool:
+        if proc.poll() is not None:
+            return True
+        c = job_conclusion("hub")
+        if c is None:
+            return False
+        if c != "success":
+            sys.stderr.write(WORKER_LOG.read_text())
+            raise SystemExit(f"hub job concluded {c!r}; aborting")
+        return True
+
+    wait_for(finished, timeout=900, interval=5, what="hub to finish")
     if not log_contains(WORKER_LOG, "builder finished"):
         sys.stderr.write(WORKER_LOG.read_text())
         raise SystemExit("worker never ran a build")

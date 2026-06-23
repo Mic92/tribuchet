@@ -100,12 +100,6 @@ jobs:
 
       - run: python3 .github/scripts/e2e/run.py hub-build --systems $E2E_SYSTEMS
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: hub-done-${{ github.run_id }}-${{ github.run_attempt }}
-          path: done
-          retention-days: 1
-
       - if: always()
         run: cat hub.log || true
 
