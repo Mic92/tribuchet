@@ -91,10 +91,11 @@ def hub_start() -> None:
         ),
     )
 
-    # nix-daemon execs this for every external build.
+    # nix-daemon execs this as a nixbld* user, which cannot traverse
+    # /home/runner; resolve to the world-readable /nix/store path.
     sudo_write(
         "/usr/local/bin/tribuchet-attach",
-        f'#!/bin/sh\nexec {BIN} attach "$1" --socket /run/tribuchet/hub.sock\n',
+        f'#!/bin/sh\nexec {BIN.resolve()} attach "$1" --socket /run/tribuchet/hub.sock\n',
     )
     run(["sudo", "chmod", "+x", "/usr/local/bin/tribuchet-attach"])
 
