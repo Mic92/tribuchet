@@ -41,7 +41,7 @@ use resume::{
     try_deliver, ResumableBuild,
 };
 
-use crate::config::WorkerConfig;
+use crate::config::{Auth, WorkerConfig};
 use crate::proto::{
     hub_message, worker_hub_client::WorkerHubClient, worker_message, BuildAssignment, BuildResult,
     Heartbeat, MissingPaths, Register, RequestJob, Resumed, WorkerMessage,
@@ -380,16 +380,19 @@ async fn session(
     signing_key: &Arc<SecretKey>,
     ctx: &Arc<WorkerCtx>,
 ) -> Result<()> {
-    let tls = ClientTlsConfig::new()
-        .ca_certificate(Certificate::from_pem(
-            fs::read(&opts.ca_cert).context("reading CA cert")?,
-        ))
-        .identity(Identity::from_pem(
-            fs::read(&opts.cert).context("reading worker cert")?,
-            fs::read(&opts.key).context("reading worker key")?,
-        ));
-    let channel = Endpoint::from_shared(opts.hub.clone())?
-        .tls_config(tls)?
+    let mut endpoint = Endpoint::from_shared(opts.hub.clone())?;
+    if matches!(opts.auth, Auth::Mtls) {
+        let tls = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(
+                fs::read(&opts.ca_cert).context("reading CA cert")?,
+            ))
+            .identity(Identity::from_pem(
+                fs::read(&opts.cert).context("reading worker cert")?,
+                fs::read(&opts.key).context("reading worker key")?,
+            ));
+        endpoint = endpoint.tls_config(tls)?;
+    }
+    let channel = endpoint
         // Detect a silently dead hub connection instead of waiting on a
         // half-open TCP session forever.
         .http2_keep_alive_interval(Duration::from_secs(30))

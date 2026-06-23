@@ -126,16 +126,21 @@ signatures).
 
 ## Security
 
-* Transport: mTLS; `tribuchet ca` issues the CA and per-worker certs
-  (finite validity: 10y CA, 2y leaves; no revocation yet — rotate the CA
-  if a worker key leaks).
+* Transport: mTLS by default; `tribuchet ca` issues the CA and
+  per-worker certs (finite validity: 10y CA, 2y leaves; no revocation
+  yet — rotate the CA if a worker key leaks). With `auth =
+  "tailscale"` the listener runs plaintext and the hub asks
+  tailscaled's LocalAPI `whois` for the peer's node name and ACL tags
+  on each session, so WireGuard provides confidentiality/integrity
+  and the tailnet provides identity (optionally gated to
+  `tailscale-allowed-tags`).
 * Output authenticity: workers sign output NARs (ed25519); the hub
   verifies while relaying. By default the key is the one the worker
-  registers over its mTLS session; with a `trusted-signing-keys` file in
+  registers over its authenticated session; with a `trusted-signing-keys` file in
   the hub config dir (one Nix-format `name:base64` public key per line,
   same syntax as nix.conf `trusted-public-keys`) registration is
-  restricted to pinned keys, so a stolen TLS cert alone cannot serve
-  validly-signed outputs.
+  restricted to pinned keys, so a stolen transport credential alone
+  cannot serve validly-signed outputs.
 * The attach socket is group-restricted to `nixbld` (the hub refuses to
   start without that group). Request validation pins every client-chosen
   path; `topTmpDir` must be owned by the connecting peer.

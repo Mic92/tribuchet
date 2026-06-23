@@ -61,6 +61,13 @@ The hub reads `ca/{hub.crt,hub.key,ca.crt}` from `<config-dir>/ca`
 (default `/etc/tribuchet/ca`); each worker gets `ca.crt` plus its own
 key pair (default `/var/lib/tribuchet/tls/`).
 
+Alternatively, set `auth = "tailscale"` on both sides to skip TLS
+entirely: the worker dials `http://<hub-tailnet-name>:7437`, the hub
+looks the peer up against tailscaled's LocalAPI on each connection
+(so anything not on the tailnet is rejected) and uses the node name
+as the worker identity. Gate registration to specific ACL tags with
+`tailscale-allowed-tags = ["tag:tribuchet-worker"]`.
+
 ### 2. Hub (on the machine running nix-daemon)
 
 `/etc/tribuchet/hub.toml`:

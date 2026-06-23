@@ -9,6 +9,7 @@ mod nar;
 mod proto;
 mod sd;
 mod store;
+mod tailscale;
 mod worker;
 
 use std::path::PathBuf;

@@ -63,6 +63,13 @@
             }
           );
 
+          nixos-test-tailscale = pkgs.testers.runNixOSTest (
+            import ./nix/test-tailscale.nix {
+              tribuchet = self.packages.x86_64-linux.default;
+              nixosModule = self.nixosModules.default;
+            }
+          );
+
           # Evaluation-only check of the darwin module (the launchd plist
           # and activation script); building a darwin system needs a mac.
           darwin-module =
