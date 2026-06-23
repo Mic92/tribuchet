@@ -419,9 +419,7 @@ mod tests {
     fn departed_worker_keeps_its_platform_expected() {
         // Past the startup window but inside the reconnect window.
         let mut state = HubState::new(Duration::from_secs(30));
-        state.started_at = Instant::now()
-            .checked_sub(Duration::from_mins(1))
-            .unwrap();
+        state.started_at = Instant::now().checked_sub(Duration::from_mins(1)).unwrap();
         state.record_departed(caps("x86_64-linux", &["kvm"]));
         let kvm = vec!["kvm".to_owned()];
         let kvm_bp = vec!["kvm".to_owned(), "big-parallel".to_owned()];

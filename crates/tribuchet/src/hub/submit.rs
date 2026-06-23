@@ -188,7 +188,9 @@ impl AttachSvc {
             super::metrics::Metrics::inc(&self.state.metrics.declined);
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             let _ = tx.try_send(Ok(AttachEvent {
-                event: Some(attach_event::Event::ExitCode(crate::proto::DECLINE_EXIT_CODE)),
+                event: Some(attach_event::Event::ExitCode(
+                    crate::proto::DECLINE_EXIT_CODE,
+                )),
             }));
             Response::new(ReceiverStream::new(rx))
         };
