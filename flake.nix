@@ -10,7 +10,7 @@
   };
 
   outputs =
-    {
+    inputs@{
       self,
       nixpkgs,
       crane,
@@ -55,6 +55,16 @@
         in
         prefix "package" self.packages.${system}
         // prefix "devshell" self.devShells.${system}
+        // {
+          # nixbot pushes this closure, so downstream CI fetches the
+          # input sources from cache.thalheim.io instead of GitHub.
+          flake-inputs = pkgs.linkFarm "flake-inputs" (
+            nixpkgs.lib.mapAttrsToList (name: i: {
+              inherit name;
+              path = i.outPath;
+            }) (builtins.removeAttrs inputs [ "self" ])
+          );
+        }
         // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
           nixos-test = pkgs.testers.runNixOSTest (
             import ./nix/test.nix {
