@@ -79,7 +79,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.check_run.head_sha || github.sha }}
 
@@ -98,7 +98,7 @@ jobs:
 
       - run: python3 .github/scripts/e2e/run.py hub-start --systems $E2E_SYSTEMS
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: hub-addr-${{ github.run_id }}-${{ github.run_attempt }}
           path: addr.txt
@@ -131,7 +131,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.check_run.head_sha || github.sha }}
 
