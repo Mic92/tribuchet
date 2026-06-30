@@ -31,6 +31,8 @@ concurrency:
 permissions:
   actions: read
   contents: read
+  # the wait-buildbot step reads the buildbot check run via the Checks API
+  checks: read
   # check_run-triggered runs are attached to the default branch, not the
   # PR commit; we post a commit status back to the tested sha so the
   # result shows up on the PR.
@@ -78,6 +80,8 @@ jobs:
     if: needs.gate.outputs.has-secrets == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -96,6 +100,9 @@ jobs:
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:ci
           hostname: tribuchet-hub-${{ github.run_id }}
+
+      # nixbot's cache push lands shortly after buildbot succeeds.
+      - run: python3 .github/scripts/e2e/run.py wait-buildbot "${{ github.event.check_run.head_sha || github.sha }}"
 
       - run: nix build .#default
 
@@ -153,6 +160,9 @@ jobs:
           # Tailscale hostnames are DNS labels; matrix.system can
           # contain '_' (x86_64-linux), so use the sanitised slug.
           hostname: tw-${{ matrix.slug }}-${{ github.run_id }}
+
+      # nixbot's cache push lands shortly after buildbot succeeds.
+      - run: python3 .github/scripts/e2e/run.py wait-buildbot "${{ github.event.check_run.head_sha || github.sha }}"
 
       - run: nix build .#default
 

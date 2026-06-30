@@ -229,6 +229,22 @@ def gh_api(path: str) -> Any | None:
         return None
 
 
+def wait_buildbot(sha: str) -> None:
+    """Block until the buildbot check run for *sha* succeeds, so the
+    build below fetches nixbot's closure instead of rebuilding. Tolerates
+    a not-yet-listed check (workflow_dispatch can precede buildbot)."""
+    name = "buildbot/nix-build"
+
+    def ready() -> bool:
+        data = gh_api(f"commits/{sha}/check-runs?check_name={name}")
+        if data is None:
+            return False
+        runs = data.get("check_runs", [])
+        return bool(runs) and all(r.get("conclusion") == "success" for r in runs)
+
+    wait_for(ready, timeout=1800, interval=15, what=f"{name} on {sha[:8]}")
+
+
 def job_conclusion(name: str) -> str | None:
     """Conclusion of a sibling job in this run, or ``None`` while it is
     still running / on transient API errors."""
@@ -302,6 +318,8 @@ def main() -> None:
     p = sub.add_parser("fetch-artifact")
     p.add_argument("name")
     p.add_argument("dest")
+    p = sub.add_parser("wait-buildbot")
+    p.add_argument("sha")
     args = ap.parse_args()
 
     match args.cmd:
@@ -313,6 +331,8 @@ def main() -> None:
             worker_run(args.hub_ip)
         case "fetch-artifact":
             fetch_artifact(args.name, args.dest)
+        case "wait-buildbot":
+            wait_buildbot(args.sha)
 
 
 if __name__ == "__main__":
