@@ -235,15 +235,13 @@ fn order_by_references(infos: Vec<PathInfoMsg>) -> Vec<PathInfoMsg> {
         .collect()
 }
 
-async fn query_path_infos(
+/// Per-path query info from one daemon connection, for a slice of paths.
+async fn query_path_info_chunk(
     pool: &harmonia_store_remote::ConnectionPool,
     paths: &[String],
 ) -> Result<Vec<PathInfoMsg>> {
     use harmonia_store_path::{StoreDir, StorePath};
     use harmonia_store_remote::DaemonStore as _;
-    if paths.is_empty() {
-        return Ok(Vec::new());
-    }
     let store_dir = StoreDir::default();
     let mut guard = pool
         .acquire()
@@ -276,6 +274,24 @@ async fn query_path_infos(
         });
     }
     Ok(out)
+}
+
+async fn query_path_infos(
+    pool: &harmonia_store_remote::ConnectionPool,
+    paths: &[String],
+) -> Result<Vec<PathInfoMsg>> {
+    // Spread the per-path query_path_info round trips over several
+    // daemon connections; the pool caps real concurrency (one per CPU).
+    const PARALLELISM: usize = 8;
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let chunk_size = paths.len().div_ceil(PARALLELISM).max(1);
+    let chunks = paths
+        .chunks(chunk_size)
+        .map(|chunk| query_path_info_chunk(pool, chunk));
+    let results = futures_util::future::try_join_all(chunks).await?;
+    Ok(results.into_iter().flatten().collect())
 }
 
 /// NAR-pack a local store path, zstd-compress, and stream it to the

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use harmonia_store_path::{StoreDir, StorePath};
+use harmonia_store_path::{StoreDir, StorePath, StorePathSet};
 use harmonia_store_path_info::ValidPathInfo;
 use harmonia_store_remote::{DaemonClient, DaemonStore};
 use harmonia_utils_signature::SecretKey;
@@ -247,7 +247,8 @@ impl ActiveBuild {
             .connect_daemon()
             .await
             .context("connecting to the local nix-daemon")?;
-        let mut missing = Vec::new();
+        let mut parsed = Vec::with_capacity(offered.len());
+        let mut set = StorePathSet::new();
         for p in offered {
             // Only real store paths may become bind-mount sources; a
             // compromised hub must not get the worker's own files
@@ -262,11 +263,17 @@ impl ActiveBuild {
                 .add_temp_root(&sp)
                 .await
                 .with_context(|| format!("adding temp root for {p}"))?;
-            if daemon
-                .is_valid_path(&sp)
-                .await
-                .with_context(|| format!("querying validity of {p}"))?
-            {
+            set.insert(sp.clone());
+            parsed.push((p, sp));
+        }
+        // One bulk validity query instead of a round trip per path.
+        let valid = daemon
+            .query_valid_paths(&set, false)
+            .await
+            .context("querying valid paths")?;
+        let mut missing = Vec::new();
+        for (p, sp) in parsed {
+            if valid.contains(&sp) {
                 self.inputs.push(p.clone());
                 continue;
             }
