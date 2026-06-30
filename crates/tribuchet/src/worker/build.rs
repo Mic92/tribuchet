@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use super::caps::requires_uid_range;
+use super::imports::{Claim, ImportGuard, ImportWait, SessionImports};
 use super::logtail::tail_log;
 use super::resume::{FinishedBuild, PackedExtra, PackedOutput, ResumeState};
 use super::{cgroup, reaper, sandbox, unix_now, DaemonConn, WorkerCtx};
@@ -175,6 +176,12 @@ pub(super) struct ActiveBuild {
     daemon: Option<DaemonConn>,
     importer: Option<Importer>,
     tmp_unpacker: Option<Unpacker>,
+    /// Missing paths this build owns the import of (deduped across the
+    /// session); the guard wakes sibling builds awaiting the same path.
+    owned: HashMap<String, ImportGuard>,
+    /// Missing paths a sibling build imports; this build waits for them
+    /// to settle before it may launch (they are bind-mount sources).
+    awaited: Vec<ImportWait>,
 }
 
 fn store_base(store_path: &str) -> &str {
@@ -220,10 +227,21 @@ impl ActiveBuild {
             daemon: None,
             importer: None,
             tmp_unpacker: None,
+            owned: HashMap::new(),
+            awaited: Vec::new(),
         })
     }
 
-    pub(super) async fn negotiate(&mut self, offered: &[String]) -> Result<Vec<String>> {
+    /// Sibling-import waits to satisfy before this build may launch.
+    pub(super) fn take_awaited(&mut self) -> Vec<ImportWait> {
+        std::mem::take(&mut self.awaited)
+    }
+
+    pub(super) async fn negotiate(
+        &mut self,
+        offered: &[String],
+        imports: &SessionImports,
+    ) -> Result<Vec<String>> {
         let store_dir = StoreDir::default();
         let mut daemon = DaemonClient::builder()
             .connect_daemon()
@@ -250,9 +268,20 @@ impl ActiveBuild {
                 .with_context(|| format!("querying validity of {p}"))?
             {
                 self.inputs.push(p.clone());
-            } else {
-                self.pending.insert(p.clone(), None);
-                missing.push(p.clone());
+                continue;
+            }
+            // One owner per missing path imports it; siblings await it.
+            match imports.claim(p) {
+                Claim::Owner(guard) => {
+                    self.owned.insert(p.clone(), guard);
+                    self.pending.insert(p.clone(), None);
+                    missing.push(p.clone());
+                }
+                Claim::Awaiter(wait) => {
+                    // Imported by a sibling; valid as an input by launch.
+                    self.inputs.push(p.clone());
+                    self.awaited.push(wait);
+                }
             }
         }
         self.daemon = Some(daemon);
@@ -321,6 +350,11 @@ impl ActiveBuild {
             res?;
             if send_failed {
                 bail!("input import ended early for {}", n.store_path);
+            }
+            // Committed: wake siblings awaiting this path. A guard left
+            // in `owned` (build aborts first) signals failure on drop.
+            if let Some(guard) = self.owned.remove(&n.store_path) {
+                guard.complete(true);
             }
             self.inputs.push(n.store_path);
         }
