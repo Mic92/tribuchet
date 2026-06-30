@@ -79,6 +79,18 @@ in
             hubIp = "${nodes.hub.networking.primaryIPAddress}";
           }
         '';
+        environment.etc."tt/fod-dns.nix".text = ''
+          import ${./tests/fod-dns.nix} {
+            bash = "${pkgs.bash}";
+            host = "fod-dns.test";
+          }
+        '';
+        environment.etc."tt/fod-hosts.nix".text = ''
+          import ${./tests/fod-dns.nix} {
+            bash = "${pkgs.bash}";
+            host = "fod-hosts.test";
+          }
+        '';
         environment.etc."tt/logbomb.nix".text = ''
           import ${./tests/logbomb.nix} { bash = "${pkgs.bash}"; }
         '';
@@ -139,12 +151,28 @@ in
       };
 
     worker =
-      { pkgs, ... }:
+      { pkgs, nodes, ... }:
       {
+        # Resolvable only via /etc/hosts; the FOD-via-files subtest
+        # fetches the hub through this name.
+        networking.hosts."${nodes.hub.networking.primaryIPAddress}" = [ "fod-hosts.test" ];
         environment.systemPackages = [
           tribuchet
           pkgs.python3
         ];
+        # Resolver for the FOD-via-DNS subtest; pasta forwards the
+        # sandbox's queries here. The record is dropped into addn-hosts
+        # at test time, once the hub IP is known.
+        services.dnsmasq = {
+          enable = true;
+          resolveLocalQueries = false;
+          settings = {
+            no-resolv = true;
+            addn-hosts = "/var/lib/dnsmasq-fod";
+          };
+        };
+        systemd.tmpfiles.rules = [ "d /var/lib/dnsmasq-fod 0755 root root -" ];
+        networking.nameservers = [ "127.0.0.1" ];
         # Private store image instead of the shared host store, so input
         # paths the worker lacks really travel over the wire.
         virtualisation.useNixStoreImage = true;
@@ -405,6 +433,25 @@ in
         worker.succeed("systemd-run --unit=loopsrv python3 -m http.server 9999 --bind 127.0.0.1")
         worker.wait_for_open_port(9999)
         out = hub.succeed("nix-build /etc/tt/fod.nix --no-out-link").strip()
+        hub.succeed(f"grep -q hello-fod {out}")
+
+    with subtest("fixed-output build resolves a hostname via /etc/hosts"):
+        # fodsrv still listens on the hub's :8765. fod-hosts.test is in
+        # the worker's /etc/hosts but not in dnsmasq, so resolving it
+        # exercises the files source.
+        worker.succeed("grep -q fod-hosts.test /etc/hosts")
+        out = hub.succeed("nix-build /etc/tt/fod-hosts.nix --no-out-link").strip()
+        hub.succeed(f"grep -q hello-fod {out}")
+
+    with subtest("fixed-output build resolves a hostname via pasta's DNS forwarder"):
+        # fod-dns.test is served only by dnsmasq, never in /etc/hosts,
+        # so the lookup must go through pasta's forwarder.
+        hubip = worker.succeed("getent hosts hub | awk '{print $1}'").strip()
+        worker.succeed(f"echo '{hubip} fod-dns.test' > /var/lib/dnsmasq-fod/fod.hosts")
+        worker.succeed("systemctl restart dnsmasq")
+        worker.wait_until_succeeds("getent hosts fod-dns.test")
+        worker.fail("grep -q fod-dns.test /etc/hosts")
+        out = hub.succeed("nix-build /etc/tt/fod-dns.nix --no-out-link").strip()
         hub.succeed(f"grep -q hello-fod {out}")
 
     with subtest("aarch64 build runs under per-sandbox binfmt emulation"):

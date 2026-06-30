@@ -60,9 +60,8 @@ pub struct SandboxSpec {
     /// uid mapped to 1000, like Nix without auto-allocate-uids.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub uid_range: Option<u32>,
-    /// Root workers: unprivileged host uid backing fixed-output builds
-    /// (pasta is rootless-only; network builds should not be backed by
-    /// host root anyway).
+    /// Root workers: unprivileged host uid backing fixed-output builds,
+    /// so a network-facing build never runs as host root.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub fod_uid: Option<u32>,
     /// pasta binary: fixed-output builds get a private netns with
