@@ -295,39 +295,56 @@ async fn query_path_infos(
 }
 
 /// NAR-pack a local store path, zstd-compress, and stream it to the
-/// worker. Filesystem reads run on harmonia's blocking pool; the zstd
-/// level-3 encode here is cheap relative to the per-chunk awaits.
+/// worker. The pack (blocking store reads plus the zstd encode) runs on
+/// the blocking pool, overlapping the network send it feeds through the
+/// bounded channel and keeping the async workers free.
 async fn stream_store_path(
     build_id: &str,
     store_path: &str,
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
 ) -> Result<()> {
-    use tokio::io::AsyncReadExt as _;
-    let nar = harmonia_file_nar::archive::NarByteStream::new(PathBuf::from(store_path));
-    let mut enc = async_compression::tokio::bufread::ZstdEncoder::with_quality(
-        tokio_util::io::StreamReader::new(nar),
-        async_compression::Level::Precise(3),
-    );
-    let mut buf = vec![0u8; crate::chunkio::CHUNK_SIZE];
-    loop {
-        let n = enc
-            .read(&mut buf)
-            .await
-            .with_context(|| format!("packing {store_path}"))?;
-        if n == 0 {
-            break;
-        }
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+    let path = store_path.to_string();
+    let task = tokio::task::spawn_blocking(move || -> Result<()> {
+        // harmonia's NAR pack is async-only; drive it on a current-thread
+        // runtime here so its blocking file reads stay off the shared
+        // runtime workers.
+        use tokio::io::AsyncReadExt as _;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .context("building NAR pack runtime")?;
+        rt.block_on(async move {
+            let nar = harmonia_file_nar::archive::NarByteStream::new(PathBuf::from(&path));
+            let mut enc = async_compression::tokio::bufread::ZstdEncoder::with_quality(
+                tokio_util::io::StreamReader::new(nar),
+                async_compression::Level::Precise(3),
+            );
+            let mut buf = vec![0u8; crate::chunkio::CHUNK_SIZE];
+            loop {
+                let n = enc.read(&mut buf).await.with_context(|| format!("packing {path}"))?;
+                if n == 0 {
+                    break;
+                }
+                if tx.send(buf[..n].to_vec()).await.is_err() {
+                    break; // consumer gone
+                }
+            }
+            Ok(())
+        })
+    });
+    while let Some(chunk) = rx.recv().await {
         send(
             out_tx,
             hub_message::Msg::Nar(NarTransfer {
                 build_id: build_id.into(),
                 store_path: store_path.into(),
-                payload: Some(nar_transfer::Payload::ZstdNarChunk(buf[..n].to_vec())),
+                payload: Some(nar_transfer::Payload::ZstdNarChunk(chunk)),
                 eof: false,
             }),
         )
         .await?;
     }
+    task.await??;
     send(
         out_tx,
         hub_message::Msg::Nar(NarTransfer {
