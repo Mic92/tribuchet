@@ -382,6 +382,17 @@ mod tests {
         assert_ne!(a, dedupe_key(&req));
     }
 
+    /// Two submissions of the same derivation differ only in the
+    /// per-attempt `topTmpDir`; the key ignores it so they dedupe.
+    #[test]
+    fn dedupe_key_ignores_per_attempt_top_tmp_dir() {
+        let a = base_request();
+        let mut b = base_request();
+        b.top_tmp_dir = "/nix/var/nix/builds/nix-1909052-1544484239".into();
+        assert_ne!(a.top_tmp_dir, b.top_tmp_dir);
+        assert_eq!(dedupe_key(&a), dedupe_key(&b));
+    }
+
     /// Strings shifted between adjacent sections must not collide:
     /// args `["-c", "K", "V"]` with no env and args `["-c"]` with
     /// env `{K: V}` would feed identical bytes without section counts.
