@@ -405,13 +405,19 @@ fn fork_pasta_helper(bin: &Path) -> io::Result<PastaHelper> {
                 // build process died before signaling; nothing to do
                 unsafe { libc::_exit(1) }
             }
-            // pasta's default port forwarding and host-loopback
-            // mapping splice host services into the namespace, the
-            // exact leak the private netns is meant to close.
+            // -t/-u/-T/-U none and --map-host-loopback none: pasta's
+            // default port forwarding and host-loopback mapping would
+            // splice host services into the namespace, the exact leak
+            // the private netns closes. --runas 0: the build process is
+            // host root (mapped to an unprivileged uid only inside its
+            // userns), so pasta must stay root to setns into its
+            // /proc/<pid>/ns; it self-isolates afterwards regardless.
             let args: Vec<CString> = [
                 bin.to_string_lossy().as_ref(),
                 "--config-net",
                 "--quiet",
+                "--runas",
+                "0",
                 "--dns-forward",
                 PASTA_DNS,
                 "-t",
@@ -535,18 +541,6 @@ fn setup(p: &SetupParams) -> io::Result<()> {
         | CloneFlags::CLONE_NEWUTS;
     // Network builds keep the host namespace only without pasta;
     // with it they get a private one plus user-mode NAT.
-    // Drop host root before creating any namespace, so the userns
-    // is owned by the unprivileged uid and rootless pasta can
-    // attach to it.
-    if let Some(uid) = p.fod_uid {
-        unistd::setgroups(&[]).map_err(ioerr("fod setgroups"))?;
-        unistd::setgid(unistd::Gid::from_raw(uid)).map_err(ioerr("fod setgid"))?;
-        unistd::setuid(unistd::Uid::from_raw(uid)).map_err(ioerr("fod setuid"))?;
-        // setuid cleared the dumpable flag, which makes /proc/self
-        // root-owned; restore it so the uid/gid map writes below
-        // (and pasta's /proc access) work.
-        prctl::set_dumpable(true).map_err(ioerr("set_dumpable"))?;
-    }
     let private_net = !p.network || p.pasta.is_some();
     if private_net {
         flags |= CloneFlags::CLONE_NEWNET;
@@ -561,8 +555,13 @@ fn setup(p: &SetupParams) -> io::Result<()> {
         // delegated subtree (usable by nspawn inside the sandbox).
         flags |= CloneFlags::CLONE_NEWCGROUP;
     }
-    if p.uid_count == 1 {
-        // Unprivileged self-mapping of the caller's own uid.
+    // Mapping onto a host uid other than the worker's own (uid-range,
+    // or a FOD's backing uid) needs a still-privileged helper in the
+    // parent userns to write the map. Unsharing while root also avoids
+    // the unprivileged-userns restriction some kernels enforce (e.g.
+    // AppArmor on Ubuntu), which would reject the setgroups write
+    // below. Only an unprivileged worker self-maps its own uid.
+    if p.uid_count == 1 && p.fod_uid.is_none() {
         unshare(flags).map_err(ioerr("unshare"))?;
         fs::write("/proc/self/setgroups", "deny").map_err(werr("setgroups"))?;
         fs::write(
@@ -619,10 +618,10 @@ fn setup(p: &SetupParams) -> io::Result<()> {
     }
     apply_process_limits(p.system)?;
 
-    // uid-range: become the in-namespace root the mapping promised;
-    // the worker's own uid is outside the mapped block. Single-uid
-    // builds already run as the mapped uid.
-    if p.uid_count > 1 {
+    // Helper-mapped builds run as the still-root worker, unmapped but
+    // holding all caps in the new userns; drop to the in-namespace uid
+    // the map promised. A self-mapped worker already runs as it.
+    if p.uid_count > 1 || p.fod_uid.is_some() {
         unistd::setgroups(&[]).map_err(ioerr("setgroups"))?;
         unistd::setgid(unistd::Gid::from_raw(p.sandbox_gid)).map_err(ioerr("setgid"))?;
         unistd::setuid(unistd::Uid::from_raw(p.sandbox_uid)).map_err(ioerr("setuid"))?;
