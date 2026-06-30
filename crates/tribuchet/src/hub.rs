@@ -293,6 +293,11 @@ async fn worker_loop(
     // each received RequestJob funds at most one assignment
     let (req_tx, mut req_rx) = mpsc::channel::<()>(1024);
     let route = tokio::spawn(route_loop(in_rx, router.clone(), req_tx));
+    // Stage one build's inputs at a time per worker: the worker imports
+    // each closure in isolation (references before referrers, no
+    // shared-path lock contention) and a later build sees earlier shared
+    // inputs as valid, so it fetches only its delta.
+    let staging = Arc::new(tokio::sync::Semaphore::new(1));
 
     let mut credits: usize = 0;
     'outer: loop {
@@ -341,8 +346,9 @@ async fn worker_loop(
         let router = router.clone();
         let out_tx = out_tx.clone();
         let vkey = vkey.clone();
+        let staging = staging.clone();
         tokio::spawn(async move {
-            let res = run_job(&state, &job, &vkey, &out_tx, in_rx).await;
+            let res = run_job(&state, &job, &vkey, &out_tx, in_rx, staging).await;
             router.unregister(&job.id);
             // run_job counts the build verdict; only session/hub-side
             // errors reach the branches below.

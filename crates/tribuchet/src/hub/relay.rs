@@ -42,7 +42,14 @@ pub(super) async fn run_job(
     vkey: &PublicKey,
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
     mut in_rx: mpsc::Receiver<worker_message::Msg>,
+    staging: std::sync::Arc<tokio::sync::Semaphore>,
 ) -> Result<()> {
+    // Held for the whole input-transfer phase so builds do not
+    // interleave their imports; released when execution starts.
+    let permit = staging
+        .acquire_owned()
+        .await
+        .expect("staging semaphore closed");
     let req = &job.req;
     send(
         out_tx,
@@ -75,6 +82,8 @@ pub(super) async fn run_job(
             // restart); skip staging, its result arrives like any other.
             worker_message::Msg::Resumed(_) => {
                 tracing::info!(id = job.id, "worker resumed an in-flight build");
+                // Resume does no staging; let the next build stage.
+                drop(permit);
                 return relay_build(state, job, vkey, out_tx, &mut in_rx).await;
             }
             // A resumed build's log tail can race ahead of its Resumed
@@ -148,6 +157,10 @@ pub(super) async fn run_job(
     }
     stream_tmp_dir(&job.id, job.tmp_dir.clone(), out_tx).await?;
 
+    // Inputs delivered and (being in-order on the stream) committed
+    // before the next build's PathOffer is read: let staging overlap
+    // this build's execution.
+    drop(permit);
     relay_build(state, job, vkey, out_tx, &mut in_rx).await
 }
 
