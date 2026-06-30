@@ -45,9 +45,12 @@ GC by per-build temp roots. The worker must be a trusted daemon user
 2. Hub validates the request (store dir pinned to `/nix/store`, store-path
    basenames restricted to Nix's name charset, absolute builder,
    `tmpDirInSandbox` pinned to `/build`, no duplicate or input-aliasing
-   outputs) and dedupes by a hash of the full request: a second identical
-   request attaches to the in-flight build's log and result, and a
-   *different* request claiming an in-flight scratch path is rejected.
+   outputs) and dedupes by a hash of the request minus the per-attempt
+   `topTmpDir`. Nix derives the scratch outputs deterministically from
+   the drvPath, so submissions of the same derivation hash identically:
+   a matching request attaches to the in-flight build's log and result,
+   while a *different* request claiming an in-flight scratch path is
+   rejected.
    Otherwise it queues the request for a worker matching `system` (and
    later: required features). A system no connected worker serves is
    rejected immediately; otherwise submitters block and Nix's max-jobs
@@ -179,10 +182,6 @@ capable worker is left (or get rebuilt by another one).
 
 ## Known limitations (MVP)
 
-* Dedupe is keyed on the scratch output set, which Nix randomizes per
-  build attempt: it only catches concurrent duplicate submissions of the
-  same goal, not the same derivation submitted twice. Proper dedupe
-  needs a derivation identity in build.json (upstream patch).
 * Workers run up to `max-jobs` concurrent builds over one session.
 * The hub's tmp-dir tar and the worker's unpack walk their trees
   through directory fds with O_NOFOLLOW, but NAR pack/unpack go through
