@@ -1,0 +1,39 @@
+# Garbage-collect the hestia binary cache so the repo stays inside
+# GitHub's 10 GB cache quota. GC must run on the default branch: a PR
+# job's cache scope is read-only towards it and dies with the PR.
+name: Cache GC
+
+# A second GC's repack races the first's pack deletes; never overlap.
+concurrency:
+  group: hestia-gc
+  cancel-in-progress: false
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: Plan only; do not repack, touch, or delete anything.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  gc:
+    runs-on: ubuntu-latest
+    permissions:
+      # REST cache deletes need actions:write.
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: NixOS/nix-installer-action@6b8548fe06acfb0155a50ab5d561accb215764cc
+      # Installs the released hestia binary and captures the cache API
+      # tokens GC needs (HESTIA_BIN points at the binary).
+      - uses: Mic92/hestia@v1
+      - run: "$HESTIA_BIN gc ${{ inputs.dry-run && '--dry-run' || '' }}"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
