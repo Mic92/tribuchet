@@ -380,6 +380,46 @@ in
         elapsed = time.time() - t0
         assert elapsed < 27, f"builds did not overlap: {elapsed:.0f}s (serial would be >=30s)"
 
+    with subtest("concurrent builds share a missing input closure"):
+        # Two runtime-added paths the worker lacks, the referrer
+        # embedding the reference's path so Nix records the edge: the
+        # worker must import the reference before the referrer. Several
+        # builds depend on both, dispatched at once, so the worker would
+        # otherwise import the same paths concurrently -- contending on
+        # the daemon path lock (deadlock) or importing a referrer before
+        # its reference is valid. Per-worker staging serialization makes
+        # each build import the closure in isolation; the size widens
+        # the window a racy implementation would lose in.
+        hub.succeed("head -c 4000000 /dev/urandom > /root/ref")
+        ref = hub.succeed("nix-store --add /root/ref").strip()
+        hub.succeed(
+            f"head -c 4000000 /dev/urandom > /root/referrer; echo {ref} >> /root/referrer"
+        )
+        referrer = hub.succeed("nix-store --add /root/referrer").strip()
+        hub.succeed(
+            "cat > /root/shared.nix << 'NIXEOF'\n"
+            "let\n"
+            "  bash = builtins.storePath \"${pkgs.bash}\";\n"
+            f"  referrer = builtins.storePath \"{referrer}\";\n"
+            "  mk = n: derivation {\n"
+            "    name = \"tt-shared-\" + n;\n"
+            "    system = \"x86_64-linux\";\n"
+            "    builder = bash + \"/bin/bash\";\n"
+            "    args = [ \"-c\" (\"test -s \" + referrer + \"; echo shared-ok-\" + n + \" > $out\") ];\n"
+            "  };\n"
+            "in [ (mk \"a\") (mk \"b\") (mk \"c\") ]\n"
+            "NIXEOF"
+        )
+        # The reference must be missing on the worker for the closure to
+        # travel; drop it there in case an earlier subtest imported it.
+        worker.succeed(f"nix-store --delete {ref} {referrer} 2>/dev/null || true")
+        outs = hub.succeed(
+            "nix-build /root/shared.nix --no-out-link --max-jobs 2", timeout=120
+        ).strip().split()
+        assert len(outs) == 3, f"expected 3 outputs, got {outs}"
+        for o in outs:
+            hub.succeed(f"grep -q shared-ok- {o}")
+
     with subtest("uid-range build runs as sandbox root with a cgroup"):
         out = hub.succeed("nix-build /etc/tt/uidrange.nix --no-out-link").strip()
         hub.succeed(f"grep -q uid-range-ok {out}")
