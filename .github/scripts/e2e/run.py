@@ -159,32 +159,38 @@ def hub_build(systems: list[str]) -> None:
 
     # The flake-locked nixpkgs is what nixbot built and cached.
     nixpkgs = out(["nix", "eval", "--raw", "--inputs-from", ".", "nixpkgs#path"])
-    # One nix-build for all systems: the hub queues each derivation and
-    # dispatches it once the matching worker registers (within
-    # worker-grace-secs), so per-system arrival order does not matter.
-    results = out(
-        [
-            "nix-build",
-            "--no-out-link",
-            "--max-jobs",
-            str(len(systems)),
-            "-I",
-            f"nixpkgs={nixpkgs}",
-            "--argstr",
-            "runId",
-            os.environ["GITHUB_RUN_ID"],
-            "--arg",
-            "systems",
-            "[ " + " ".join(f'"{s}"' for s in systems) + " ]",
-            str(REPO / ".github/scripts/e2e/probe.nix"),
-        ]
-    ).splitlines()
-    if len(results) != len(systems):
-        raise SystemExit(f"expected {len(systems)} outputs, got {results!r}")
-    for path in results:
-        payload = Path(path).read_text().strip()
-        if not payload.endswith("-via-tailnet"):
-            raise SystemExit(f"unexpected build output in {path}: {payload!r}")
+
+    def build(probe: str, suffix: str) -> list[str]:
+        # One nix-build for all systems: the hub queues each derivation
+        # and dispatches it once the matching worker registers (within
+        # worker-grace-secs), so per-system arrival order does not matter.
+        paths = out(
+            [
+                "nix-build",
+                "--no-out-link",
+                "--max-jobs",
+                str(len(systems)),
+                "-I",
+                f"nixpkgs={nixpkgs}",
+                "--argstr",
+                "runId",
+                os.environ["GITHUB_RUN_ID"],
+                "--arg",
+                "systems",
+                "[ " + " ".join(f'"{s}"' for s in systems) + " ]",
+                str(REPO / ".github/scripts/e2e" / probe),
+            ]
+        ).splitlines()
+        if len(paths) != len(systems):
+            raise SystemExit(f"expected {len(systems)} outputs, got {paths!r}")
+        for path in paths:
+            payload = Path(path).read_text().strip()
+            if not payload.endswith(suffix):
+                raise SystemExit(f"unexpected build output in {path}: {payload!r}")
+        return paths
+
+    build("probe.nix", "-via-tailnet")
+    build("probe-fod.nix", "fod-dns-ok")  # DNS + TLS from inside the sandbox
     if not log_contains(HUB_LOG, "dispatching build"):
         raise SystemExit("hub never dispatched a build")
 
