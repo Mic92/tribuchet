@@ -511,7 +511,7 @@ fn configure_auth(
 }
 
 pub fn run(cfg: crate::config::HubConfig) -> Result<()> {
-    let rt = tokio::runtime::Runtime::new()?;
+    let rt = crate::rt::runtime("trib-hub")?;
     rt.block_on(run_async(cfg))
 }
 

@@ -306,10 +306,11 @@ async fn stream_store_path(
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
     let path = store_path.to_string();
     let task = tokio::task::spawn_blocking(move || -> Result<()> {
+        use tokio::io::AsyncReadExt as _;
+        crate::rt::name_current_thread("trib-pack");
         // harmonia's NAR pack is async-only; drive it on a current-thread
         // runtime here so its blocking file reads stay off the shared
         // runtime workers.
-        use tokio::io::AsyncReadExt as _;
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .context("building NAR pack runtime")?;

@@ -7,6 +7,7 @@ mod fsutil;
 mod hub;
 mod nar;
 mod proto;
+mod rt;
 mod sd;
 mod store;
 mod tailscale;
