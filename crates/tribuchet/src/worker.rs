@@ -255,7 +255,7 @@ pub fn run(opts: WorkerConfig) -> Result<()> {
     // before tokio because the reaper must stay single-threaded.
     let spawner = reaper::ensure(&opts.state_dir.join("exited"))?;
     let cgroup_base = std::env::var(reaper::CGROUP_ENV).ok().map(PathBuf::from);
-    let rt = tokio::runtime::Runtime::new()?;
+    let rt = crate::rt::runtime("trib-worker")?;
     rt.block_on(run_async(opts, spawner, cgroup_base))
 }
 
