@@ -399,6 +399,8 @@ async fn session(
         .http2_keep_alive_interval(Duration::from_secs(30))
         .keep_alive_timeout(Duration::from_secs(20))
         .keep_alive_while_idle(true)
+        .initial_stream_window_size(Some(crate::chunkio::H2_STREAM_WINDOW))
+        .initial_connection_window_size(Some(crate::chunkio::H2_CONNECTION_WINDOW))
         .connect()
         .await
         .context("connecting to hub")?;

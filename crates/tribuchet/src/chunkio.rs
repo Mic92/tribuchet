@@ -7,6 +7,12 @@ use tokio::sync::mpsc;
 
 pub const CHUNK_SIZE: usize = 1024 * 1024;
 
+/// HTTP/2 flow-control windows. The 64 KiB h2 default caps a stream at
+/// ~window/RTT, throttling NAR transfer (worst on the two-hop output
+/// relay). Sized to keep several CHUNK_SIZE messages in flight.
+pub const H2_STREAM_WINDOW: u32 = 4 * 1024 * 1024;
+pub const H2_CONNECTION_WINDOW: u32 = 8 * 1024 * 1024;
+
 /// `Write` implementation that emits fixed-size chunks into a tokio
 /// channel. Used from blocking threads (`blocking_send`).
 pub struct ChunkWriter {

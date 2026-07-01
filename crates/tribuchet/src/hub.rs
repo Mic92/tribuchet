@@ -552,6 +552,8 @@ async fn run_async(cfg: crate::config::HubConfig) -> Result<()> {
         // the workers' own traffic.
         .http2_keepalive_interval(Some(Duration::from_secs(30)))
         .http2_keepalive_timeout(Some(Duration::from_secs(20)))
+        .initial_stream_window_size(Some(crate::chunkio::H2_STREAM_WINDOW))
+        .initial_connection_window_size(Some(crate::chunkio::H2_CONNECTION_WINDOW))
         .add_service(
             crate::proto::worker_hub_server::WorkerHubServer::new(WorkerSvc {
                 state: state.clone(),
@@ -575,6 +577,8 @@ async fn run_async(cfg: crate::config::HubConfig) -> Result<()> {
         None => bind_attach_socket(socket)?,
     };
     let attach_server = Server::builder()
+        .initial_stream_window_size(Some(crate::chunkio::H2_STREAM_WINDOW))
+        .initial_connection_window_size(Some(crate::chunkio::H2_CONNECTION_WINDOW))
         .add_service(
             attach_hub_server::AttachHubServer::new(AttachSvc {
                 state: state.clone(),

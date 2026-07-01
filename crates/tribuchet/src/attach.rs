@@ -91,6 +91,8 @@ enum Outcome {
 async fn connect(socket: &Path) -> Result<tonic::transport::Channel> {
     let socket = socket.to_owned();
     Endpoint::try_from("http://hub.invalid")?
+        .initial_stream_window_size(Some(crate::chunkio::H2_STREAM_WINDOW))
+        .initial_connection_window_size(Some(crate::chunkio::H2_CONNECTION_WINDOW))
         .connect_with_connector(service_fn(move |_: Uri| {
             let socket = socket.clone();
             async move {
