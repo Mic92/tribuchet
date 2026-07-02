@@ -140,11 +140,13 @@ pub(super) fn validate_assignment(a: &BuildAssignment) -> Result<()> {
         if !valid_store_path(STORE_DIR, p) {
             bail!("invalid output path {p:?}");
         }
-        // Scratch outputs handed out by Nix never exist yet. An output
-        // naming an existing store path would give the build write
-        // access to it (macOS builds write outputs in place) and have
-        // the post-build cleanup delete it.
-        if fs::symlink_metadata(p).is_ok() {
+        // macOS builds write into /nix/store and cleanup deletes the
+        // output, so a pre-existing path would be tampered with and
+        // removed; reject it. Linux builds run in a private root with
+        // a no-op cleanup, so the real path is untouched -- and
+        // rejecting it would break re-dispatch of a path already valid
+        // here (e.g. a fixed-output derivation built before).
+        if cfg!(target_os = "macos") && fs::symlink_metadata(p).is_ok() {
             bail!("output path {p} already exists on this worker");
         }
     }
@@ -1019,8 +1021,9 @@ mod tests {
         a.outputs.insert("doc".into(), "/etc/shadow".into());
         assert!(validate_assignment(&a).is_err());
 
-        // an existing, registered store path must not be claimable as
-        // an output (in-place tampering, deletion by cleanup)
+        // An existing store path as an output: rejected on macOS
+        // (in-place tampering, deletion by cleanup), accepted on Linux
+        // (isolated build root, no-op cleanup).
         if let Some(existing) = fs::read_dir("/nix/store")
             .ok()
             .into_iter()
@@ -1031,7 +1034,11 @@ mod tests {
         {
             let mut a = base_assignment();
             a.outputs.insert("doc".into(), existing);
-            assert!(validate_assignment(&a).is_err());
+            if cfg!(target_os = "macos") {
+                assert!(validate_assignment(&a).is_err());
+            } else {
+                assert!(validate_assignment(&a).is_ok());
+            }
         }
 
         let mut a = base_assignment();
