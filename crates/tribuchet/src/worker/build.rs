@@ -416,6 +416,13 @@ impl ActiveBuild {
                 nix_daemon_socket: None,
             },
         )?;
+        tracing::info!(
+            id = a.build_id,
+            fixed_output = a.fixed_output,
+            network = spec.network,
+            pasta = spec.pasta.is_some(),
+            "sandbox network decision"
+        );
         spec.cgroup = self
             .ctx
             .cgroup_base
