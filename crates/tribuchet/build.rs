@@ -5,5 +5,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(p) = std::env::var("TRIBUCHET_PASTA") {
         println!("cargo:rustc-env=TRIBUCHET_PASTA={p}");
     }
+    // Baked-in default for --sandbox-bin-sh (set by the Nix package).
+    println!("cargo:rerun-if-env-changed=TRIBUCHET_BIN_SH");
+    if let Ok(p) = std::env::var("TRIBUCHET_BIN_SH") {
+        println!("cargo:rustc-env=TRIBUCHET_BIN_SH={p}");
+    }
     Ok(())
 }

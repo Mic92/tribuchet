@@ -284,9 +284,16 @@ async fn run_async(
         Some(p) => Some(p),
         None => option_env!("TRIBUCHET_PASTA").map(PathBuf::from),
     };
+    // "none" disables the baked-in /bin/sh; else fall back to it so
+    // builds using system(3)/#!/bin/sh work without extra config.
+    opts.sandbox_bin_sh = match opts.sandbox_bin_sh.take() {
+        Some(p) if p.as_os_str() == "none" => None,
+        Some(p) => Some(p),
+        None => option_env!("TRIBUCHET_BIN_SH").map(PathBuf::from),
+    };
     // main logs the config before this baked-in default applies, so it
     // always shows pasta: None; log the effective value.
-    tracing::info!(pasta = ?opts.pasta, "resolved pasta");
+    tracing::info!(pasta = ?opts.pasta, bin_sh = ?opts.sandbox_bin_sh, "resolved sandbox defaults");
     let mut emulators = HashMap::new();
     for (system, path) in &opts.emulate {
         if !cfg!(target_os = "linux") {
