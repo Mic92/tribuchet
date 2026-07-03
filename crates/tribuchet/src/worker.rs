@@ -284,6 +284,9 @@ async fn run_async(
         Some(p) => Some(p),
         None => option_env!("TRIBUCHET_PASTA").map(PathBuf::from),
     };
+    // main logs the config before this baked-in default applies, so it
+    // always shows pasta: None; log the effective value.
+    tracing::info!(pasta = ?opts.pasta, "resolved pasta");
     let mut emulators = HashMap::new();
     for (system, path) in &opts.emulate {
         if !cfg!(target_os = "linux") {
