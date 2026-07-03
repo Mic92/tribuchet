@@ -42,6 +42,7 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
 async fn run_async(build: BuildJson, socket: PathBuf, build_json_path: PathBuf) -> Result<i32> {
     let fixed_output = build.is_fixed_output();
+    tracing::info!(fixed_output, system = %build.system, "submitting build");
     let req = BuildRequest {
         system: build.system,
         builder: build.builder,
