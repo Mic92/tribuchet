@@ -20,9 +20,18 @@ use nix::unistd::{self, getgid, getuid, pivot_root, sethostname};
 use super::{binfmt, SandboxSpec};
 use crate::proto::BuildAssignment;
 
-/// Address pasta's in-namespace DNS forwarder listens on; written to
-/// the sandbox resolv.conf for fixed-output builds.
-const PASTA_DNS: &str = "169.254.1.53";
+// Link-local addressing for the pasta netns. Forwarding DNS on the
+// gateway (not an arbitrary address plus --map-host-loopback none)
+// lets it reach a host resolver on loopback, e.g. systemd-resolved's
+// 127.0.0.53 stub.
+const PASTA_HOST_V4: &str = "169.254.1.1";
+const PASTA_CHILD_V4: &str = "169.254.1.2";
+const PASTA_V4_NETMASK: &str = "16";
+// 6to4 prefix mapping the same IPv4 link-local range; IPv4LL is never
+// addressed over IPv6, so host collisions are not a concern.
+const PASTA_HOST_V6: &str = "64:ff9b:1:4b8e:472e:a5c8:a9fe:0101";
+const PASTA_CHILD_V6: &str = "64:ff9b:1:4b8e:472e:a5c8:a9fe:0102";
+const PASTA_NS_IFNAME: &str = "eth0";
 
 pub fn prepare(spec: &mut SandboxSpec) -> Result<()> {
     let root = &spec.root;
@@ -89,12 +98,12 @@ pub fn prepare(spec: &mut SandboxSpec) -> Result<()> {
             }
         }
         if spec.pasta.is_some() {
-            // pasta forwards DNS on this address; the host
-            // resolv.conf may point at an unreachable loopback
-            // stub (systemd-resolved).
+            // pasta answers DNS on the gateway addresses; point the
+            // sandbox at them, not the host resolv.conf whose
+            // nameserver may be an unreachable loopback stub.
             fs::write(
                 root.join("etc/resolv.conf"),
-                format!("nameserver {PASTA_DNS}\n"),
+                format!("nameserver {PASTA_HOST_V4}\nnameserver {PASTA_HOST_V6}\n"),
             )?;
         } else if let Ok(data) = fs::read("/etc/resolv.conf") {
             fs::write(root.join("etc/resolv.conf"), data)?;
@@ -405,21 +414,36 @@ fn fork_pasta_helper(bin: &Path) -> io::Result<PastaHelper> {
                 // build process died before signaling; nothing to do
                 unsafe { libc::_exit(1) }
             }
-            // -t/-u/-T/-U none and --map-host-loopback none: pasta's
-            // default port forwarding and host-loopback mapping would
-            // splice host services into the namespace, the exact leak
-            // the private netns closes. --runas 0: the build process is
-            // host root (mapped to an unprivileged uid only inside its
-            // userns), so pasta must stay root to setns into its
-            // /proc/<pid>/ns; it self-isolates afterwards regardless.
+            // -t/-u/-T/-U none disables port forwarding so host
+            // services stay unreachable; outbound NAT is unaffected, so
+            // builds still fetch. Host-loopback mapping is left at its
+            // default (the gateway) so pasta can forward DNS to a
+            // loopback resolver. --runas 0: the build is host root
+            // (mapped to an unprivileged uid only inside its userns),
+            // so pasta must stay root to setns into its /proc/<pid>/ns.
+            let pid = target.to_string();
             let args: Vec<CString> = [
                 bin.to_string_lossy().as_ref(),
                 "--config-net",
                 "--quiet",
                 "--runas",
                 "0",
+                "--gateway",
+                PASTA_HOST_V4,
+                "--address",
+                PASTA_CHILD_V4,
+                "--netmask",
+                PASTA_V4_NETMASK,
                 "--dns-forward",
-                PASTA_DNS,
+                PASTA_HOST_V4,
+                "--gateway",
+                PASTA_HOST_V6,
+                "--address",
+                PASTA_CHILD_V6,
+                "--dns-forward",
+                PASTA_HOST_V6,
+                "--ns-ifname",
+                PASTA_NS_IFNAME,
                 "-t",
                 "none",
                 "-u",
@@ -428,9 +452,7 @@ fn fork_pasta_helper(bin: &Path) -> io::Result<PastaHelper> {
                 "none",
                 "-U",
                 "none",
-                "--map-host-loopback",
-                "none",
-                &target.to_string(),
+                &pid,
             ]
             .iter()
             .map(|s| CString::new(*s).unwrap())
