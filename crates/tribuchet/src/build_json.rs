@@ -37,19 +37,12 @@ impl BuildJson {
         Ok(parsed)
     }
 
-    /// Fixed-output derivations carry `outputHash` in their environment
-    /// (under structured attrs: inside the `__json` blob, the env's only
-    /// key). They are granted network access in the sandbox.
+    /// Whether this is a fixed-output derivation, granted network in
+    /// the sandbox. Nix sets `NIX_OUTPUT_CHECKED=1` for exactly the
+    /// fixed-output case; build.json carries no output hash, and only
+    /// classic FODs expose `outputHash` in their env.
     pub fn is_fixed_output(&self) -> bool {
-        if self.env.contains_key("outputHash") {
-            return true;
-        }
-        if let Some(json) = self.env.get("__json") {
-            if let Ok(attrs) = serde_json::from_str::<serde_json::Value>(json) {
-                return attrs.get("outputHash").is_some_and(|h| !h.is_null());
-            }
-        }
-        false
+        self.env.get("NIX_OUTPUT_CHECKED").map(String::as_str) == Some("1")
     }
 }
 
@@ -118,11 +111,8 @@ mod tests {
     #[test]
     fn fixed_output_detection() {
         assert!(!doc(&serde_json::json!({})).is_fixed_output());
-        assert!(doc(&serde_json::json!({"outputHash": "sha256-..."})).is_fixed_output());
-        // structured attrs: outputHash lives in the __json blob
-        let env = serde_json::json!({"__json": "{\"outputHash\":\"sha256-...\"}"});
-        assert!(doc(&env).is_fixed_output());
-        let env = serde_json::json!({"__json": "{\"name\":\"x\"}"});
-        assert!(!doc(&env).is_fixed_output());
+        assert!(doc(&serde_json::json!({"NIX_OUTPUT_CHECKED": "1"})).is_fixed_output());
+        // outputHash alone does not grant network; only Nix's flag does
+        assert!(!doc(&serde_json::json!({"outputHash": "sha256-..."})).is_fixed_output());
     }
 }
