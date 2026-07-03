@@ -322,7 +322,10 @@ async fn stream_store_path(
             );
             let mut buf = vec![0u8; crate::chunkio::CHUNK_SIZE];
             loop {
-                let n = enc.read(&mut buf).await.with_context(|| format!("packing {path}"))?;
+                let n = enc
+                    .read(&mut buf)
+                    .await
+                    .with_context(|| format!("packing {path}"))?;
                 if n == 0 {
                     break;
                 }
