@@ -15,6 +15,12 @@ in
   # Faster eval
   defaults.documentation.enable = false;
 
+  # The e2e harness runs on the driver host and drives both VMs over the
+  # vsock ssh backdoor, so independent subtests run concurrently.
+  sshBackdoor.enable = true;
+  # required by sshBackdoor (asserted in the test framework)
+  defaults.virtualisation.qemu.enableSharedMemory = true;
+
   nodes = {
     hub =
       {
@@ -51,6 +57,9 @@ in
           # provides the actual uid range
           system-features = [ "uid-range" ];
           substituters = lib.mkForce [ ];
+          # dispatch several external builds at once so parallel subtests
+          # actually overlap instead of queueing on the hub daemon
+          max-jobs = 8;
         };
 
         # Test derivations are real files in nix/tests/ (single level
@@ -226,324 +235,40 @@ in
             "journalctl -u tribuchet-hub | grep -q 'worker registered'"
         )
 
-    with subtest("nix-daemon builds remotely via external-builders"):
-        # The input is added at runtime, so it cannot be in the worker's
-        # store image: it must travel over the wire.
-        hub.succeed("echo tribuchet-payload > /root/payload")
-        unique = hub.succeed("nix-store --add /root/payload").strip()
-        hub.succeed(
-            "cat > /root/test.nix << 'NIXEOF'\n"
-            "let\n"
-            "  bash = builtins.storePath \"${pkgs.bash}\";\n"
-            f"  unique = builtins.storePath \"{unique}\";\n"
-            "in derivation {\n"
-            "  name = \"tt-remote-build\";\n"
-            "  system = \"x86_64-linux\";\n"
-            "  builder = bash + \"/bin/bash\";\n"
-            "  args = [ \"-c\" (\"read line < \" + unique + \"; echo \\\"$line built-remotely\\\" > $out\") ];\n"
-            "}\n"
-            "NIXEOF"
-        )
-        out = hub.succeed("nix-build /root/test.nix --no-out-link").strip()
-        hub.succeed(f"grep -q 'tribuchet-payload built-remotely' {out}")
+    with subtest("worker sshd reachable for the harness backdoor"):
+        hub.wait_for_unit("sshd.service")
+        worker.wait_for_unit("sshd.service")
 
-    with subtest("hub restart: socket activation keeps clients connectable"):
-        # Type=notify means this only returns once the new hub serves.
-        hub.succeed("systemctl restart tribuchet-hub")
-        # The activated unix socket accepts immediately; the build
-        # waits for the worker to re-register rather than failing.
-        out = hub.succeed(
-            "nix-build /root/test.nix --no-out-link 2>/dev/null"
-        ).strip()
-        hub.succeed(f"grep -q 'tribuchet-payload built-remotely' {out}")
+    # Hand off to the Rust e2e harness. It runs on the driver host and drives
+    # both VMs over the vsock ssh backdoor, so independent subtests overlap.
+    import os, subprocess, tempfile
 
-    with subtest("restarting hub and worker mid-build cancels nothing"):
-        assigned = int(worker.succeed(
-            "journalctl -u tribuchet-worker | grep -c 'build assigned' || true"
-        ).strip())
-        # systemd-run: the build must survive this command returning.
-        hub.succeed(
-            "rm -f /tmp/drain.ok && systemd-run --unit=drainbuild bash -lc "
-            "'nix-build /etc/tt/drain.nix --no-out-link > /tmp/drain.out "
-            "&& touch /tmp/drain.ok'"
-        )
-        worker.wait_until_succeeds(
-            f"[ $(journalctl -u tribuchet-worker | grep -c 'build assigned') -gt {assigned} ]",
-            timeout=60,
-        )
-        # Hub restart and worker reload at once, mid-build: the hub
-        # exits immediately (attach reconnects and resubmits; the
-        # worker resumes by dedupe key) and the worker generation is
-        # replaced while the build keeps running.
-        worker.succeed("systemctl reload tribuchet-worker")
-        hub.succeed("systemctl restart --no-block tribuchet-hub")
-        hub.wait_until_succeeds("test -f /tmp/drain.ok", timeout=120)
-        out = hub.succeed("cat /tmp/drain.out").strip()
-        hub.succeed(f"grep -q drained-not-cancelled {out}")
-        worker.wait_until_succeeds("systemctl is-active tribuchet-worker")
-        hub.wait_until_succeeds("systemctl is-active tribuchet-hub")
+    ctldir = tempfile.mkdtemp(prefix="tt-ssh-")
+    e2e_env = dict(os.environ)
+    e2e_env.update({
+        "TT_SSH": "${pkgs.openssh}/bin/ssh",
+        "TT_SSH_CONFIG": "${pkgs.systemd}/lib/systemd/ssh_config.d/20-systemd-ssh-proxy.conf",
+        "TT_HUB_SOCK": str(hub.vsock_host),
+        "TT_WORKER_SOCK": str(worker.vsock_host),
+        "TT_CTLDIR": ctldir,
+        "TT_BASH": "${pkgs.bash}",
+    })
+    e2e = "${tribuchet.e2eTests}/bin/tribuchet-e2e"
 
-    with subtest("resubmitting a previously resumed derivation builds again"):
-        # Same dedupe key as the resumed build above: it must go
-        # through normal admission, not the one-shot resumable fast
-        # path of the worker's registration.
-        hub.succeed("nix-build /etc/tt/drain.nix --no-out-link --check", timeout=120)
-
-    with subtest("max-log-size applies to a build adopted across a reload"):
-        assigned = int(worker.succeed(
-            "journalctl -u tribuchet-worker | grep -c 'build assigned' || true"
-        ).strip())
-        # nix-build's stderr (the relayed build log) goes to a file,
-        # not the journal: ~1MB of payload would otherwise reach the
-        # VM's serial console and bloat the test driver's output.
-        hub.succeed(
-            "systemd-run --unit=slowlogbuild "
-            "-p StandardOutput=file:/tmp/slowlog.out "
-            "-p StandardError=file:/tmp/slowlog.out "
-            "bash -lc 'nix-build /etc/tt/slowlog.nix --no-out-link'"
-        )
-        worker.wait_until_succeeds(
-            f"[ $(journalctl -u tribuchet-worker | grep -c 'build assigned') -gt {assigned} ]",
-            timeout=60,
-        )
-        # ~64KB/s of log: the reload lands well before the 1MB limit,
-        # so only the re-adopted build can exceed it.
-        worker.succeed("systemctl reload tribuchet-worker")
-        hub.wait_until_succeeds(
-            "grep -q 'exceeded the limit' /tmp/slowlog.out", timeout=120
+    # Phase 1: independent builds, multi-threaded. The worker/hub max-jobs
+    # queues bound real build concurrency; test-threads only caps ssh sessions.
+    with subtest("parallel builds"):
+        subprocess.run(
+            [e2e, "build_", "--nocapture", "--test-threads=8"],
+            env=e2e_env, check=True,
         )
 
-    with subtest("worker reload mid-build re-adopts the running build"):
-        assigned = int(worker.succeed(
-            "journalctl -u tribuchet-worker | grep -c 'build assigned' || true"
-        ).strip())
-        # baseline: the earlier dual-restart subtest also adopts a build
-        adopted = int(worker.succeed(
-            "journalctl -u tribuchet-worker | grep -c 'adopted running build' || true"
-        ).strip())
-        hub.succeed(
-            "rm -f /tmp/reload.ok && systemd-run --unit=reloadbuild bash -lc "
-            "'nix-build /etc/tt/reload.nix --no-out-link > /tmp/reload.out "
-            "&& touch /tmp/reload.ok'"
+    # Phase 2: the stateful daemon-lifecycle sequence, serial and in order.
+    # Must run after phase 1: it restarts/reloads/stops the daemons.
+    with subtest("daemon lifecycle"):
+        subprocess.run(
+            [e2e, "lifecycle", "--nocapture", "--test-threads=1"],
+            env=e2e_env, check=True,
         )
-        worker.wait_until_succeeds(
-            f"[ $(journalctl -u tribuchet-worker | grep -c 'build assigned') -gt {assigned} ]",
-            timeout=60,
-        )
-        # Settings changes also arrive via reload: the new worker
-        # generation re-reads the config file.
-        worker.succeed(
-            "cp --remove-destination $(readlink -f /etc/tribuchet/worker.toml) /etc/tribuchet/worker.toml"
-            " && sed -i 's/max-jobs = 2/max-jobs = 3/' /etc/tribuchet/worker.toml"
-        )
-        # Reload mid-build: the reaper execs a new worker generation;
-        # the builder process keeps running and the new worker adopts
-        # it, delivering the result when it finishes.
-        worker.succeed("systemctl reload tribuchet-worker")
-        hub.wait_until_succeeds("test -f /tmp/reload.ok", timeout=120)
-        out = hub.succeed("cat /tmp/reload.out").strip()
-        hub.succeed(f"grep -q reload-survived {out}")
-        worker.succeed(
-            f"[ $(journalctl -u tribuchet-worker | grep -c 'adopted running build') -gt {adopted} ]"
-        )
-        # the marker is only printed after the reload, so seeing it in
-        # the client's build log means the adopted build streamed live
-        # logs through the new worker generation
-        hub.succeed("journalctl -u reloadbuild | grep -q log-after-reload")
-        # the new generation logs its configuration: the max-jobs bump
-        # made it through the reload
-        worker.succeed("journalctl -u tribuchet-worker | grep -q 'max_jobs: 3'")
-
-    with subtest("killing the client cancels the build on the worker"):
-        hub.succeed(
-            "systemd-run --unit=cancelbuild bash -lc "
-            "'nix-build /etc/tt/cancel.nix --no-out-link'"
-        )
-        # bracket trick: do not match the pgrep wrapper's own cmdline
-        worker.wait_until_succeeds("pgrep -f 'cancel-marker-runnin[g]'", timeout=60)
-        hub.succeed("systemctl kill --signal=SIGKILL cancelbuild")
-        # the hub notices the lost attach client and tells the worker;
-        # the builder process must disappear without a worker restart
-        worker.wait_until_succeeds("! pgrep -f 'cancel-marker-runnin[g]'", timeout=60)
-        hub.succeed("journalctl -u tribuchet-hub | grep -q 'cancelling build'")
-
-    with subtest("the cancelled derivation builds fine when asked again"):
-        # Same dedupe key as the build cancelled above: a stale cancel
-        # flag would kill it on its first supervision tick.
-        out = hub.succeed("nix-build /etc/tt/cancel.nix --no-out-link", timeout=120).strip()
-        hub.succeed(f"grep -q cancel-done {out}")
-
-    with subtest("concurrent builds share one worker session"):
-        import time
-        t0 = time.time()
-        hub.succeed("nix-build /etc/tt/par.nix --no-out-link --max-jobs 2")
-        elapsed = time.time() - t0
-        assert elapsed < 27, f"builds did not overlap: {elapsed:.0f}s (serial would be >=30s)"
-
-    with subtest("concurrent builds share a missing input closure"):
-        # Two runtime-added paths the worker lacks, the referrer
-        # embedding the reference's path so Nix records the edge: the
-        # worker must import the reference before the referrer. Several
-        # builds depend on both, dispatched at once, so the worker would
-        # otherwise import the same paths concurrently -- contending on
-        # the daemon path lock (deadlock) or importing a referrer before
-        # its reference is valid. Per-worker staging serialization makes
-        # each build import the closure in isolation; the size widens
-        # the window a racy implementation would lose in.
-        hub.succeed("head -c 4000000 /dev/urandom > /root/ref")
-        ref = hub.succeed("nix-store --add /root/ref").strip()
-        hub.succeed(
-            f"head -c 4000000 /dev/urandom > /root/referrer; echo {ref} >> /root/referrer"
-        )
-        referrer = hub.succeed("nix-store --add /root/referrer").strip()
-        hub.succeed(
-            "cat > /root/shared.nix << 'NIXEOF'\n"
-            "let\n"
-            "  bash = builtins.storePath \"${pkgs.bash}\";\n"
-            f"  referrer = builtins.storePath \"{referrer}\";\n"
-            "  mk = n: derivation {\n"
-            "    name = \"tt-shared-\" + n;\n"
-            "    system = \"x86_64-linux\";\n"
-            "    builder = bash + \"/bin/bash\";\n"
-            "    args = [ \"-c\" (\"test -s \" + referrer + \"; echo shared-ok-\" + n + \" > $out\") ];\n"
-            "  };\n"
-            "in [ (mk \"a\") (mk \"b\") (mk \"c\") ]\n"
-            "NIXEOF"
-        )
-        # The reference must be missing on the worker for the closure to
-        # travel; drop it there in case an earlier subtest imported it.
-        worker.succeed(f"nix-store --delete {ref} {referrer} 2>/dev/null || true")
-        outs = hub.succeed(
-            "nix-build /root/shared.nix --no-out-link --max-jobs 2", timeout=120
-        ).strip().split()
-        assert len(outs) == 3, f"expected 3 outputs, got {outs}"
-        for o in outs:
-            hub.succeed(f"grep -q shared-ok- {o}")
-
-    with subtest("uid-range build runs as sandbox root with a cgroup"):
-        out = hub.succeed("nix-build /etc/tt/uidrange.nix --no-out-link").strip()
-        hub.succeed(f"grep -q uid-range-ok {out}")
-
-    with subtest("exportReferencesGraph file reaches the remote builder"):
-        out = hub.succeed("nix-build /etc/tt/refgraph.nix --no-out-link").strip()
-        hub.succeed(f"grep -q refgraph-ok {out}")
-
-    with subtest("structured-attrs build reads .attrs.json with the exported closure"):
-        out = hub.succeed("nix-build /etc/tt/structured.nix --no-out-link").strip()
-        hub.succeed(f"grep -q structured-ok {out}")
-
-    with subtest("floating content-addressed derivation"):
-        out = hub.succeed("nix-build /etc/tt/ca.nix --no-out-link").strip()
-        hub.succeed(f"grep -q ca-ok {out}")
-
-    with subtest("impure derivation"):
-        # nix-build cannot print impure output paths (asserts on
-        # maybeOutputPath), so use nix build here.
-        out = hub.succeed(
-            "nix build --extra-experimental-features nix-command "
-            "-f /etc/tt/impure.nix --no-link --print-out-paths"
-        ).strip()
-        hub.succeed(f"grep -q impure-ok {out}")
-
-    with subtest("kvm feature: scheduled and device passed through, or rejected"):
-        if worker.execute("test -e /dev/kvm")[0] == 0:
-            out = hub.succeed("nix-build /etc/tt/kvm.nix --no-out-link").strip()
-            hub.succeed(f"grep -q kvm-ok {out}")
-        else:
-            # No worker serves the kvm feature and the hub cannot build it
-            # locally either, so the declined build (exit 222) fails.
-            err = hub.fail("nix-build /etc/tt/kvm.nix --no-out-link 2>&1")
-            assert "exit code 222" in err, err
-
-    with subtest("emulated system does not inherit the host's kvm feature"):
-        err = hub.fail("nix-build /etc/tt/kvm-emulated.nix --no-out-link 2>&1")
-        assert "exit code 222" in err, err
-
-    with subtest("runaway build log is killed at max-log-size"):
-        err = hub.fail("nix-build /etc/tt/logbomb.nix --no-out-link 2>&1")
-        assert "exceeded the limit" in err, err
-
-    with subtest("fixed-output build fetches through pasta, isolated from host sockets"):
-        hub.succeed("mkdir -p /srv/fod && echo hello-fod > /srv/fod/data")
-        hub.succeed(
-            "systemd-run --unit=fodsrv socat -U TCP-LISTEN:8765,fork,reuseaddr OPEN:/srv/fod/data,rdonly"
-        )
-        hub.wait_for_open_port(8765)
-        # loopback service on the worker that must NOT be reachable
-        worker.succeed("systemd-run --unit=loopsrv python3 -m http.server 9999 --bind 127.0.0.1")
-        worker.wait_for_open_port(9999)
-        out = hub.succeed("nix-build /etc/tt/fod.nix --no-out-link").strip()
-        hub.succeed(f"grep -q hello-fod {out}")
-
-    with subtest("fixed-output build resolves a hostname via /etc/hosts"):
-        # fodsrv still listens on the hub's :8765. fod-hosts.test is in
-        # the worker's /etc/hosts but not in dnsmasq, so resolving it
-        # exercises the files source.
-        worker.succeed("grep -q fod-hosts.test /etc/hosts")
-        out = hub.succeed("nix-build /etc/tt/fod-hosts.nix --no-out-link").strip()
-        hub.succeed(f"grep -q hello-fod {out}")
-
-    with subtest("fixed-output build resolves a hostname via pasta's DNS forwarder"):
-        # fod-dns.test is served only by dnsmasq, never in /etc/hosts,
-        # so the lookup must go through pasta's forwarder.
-        hubip = worker.succeed("getent hosts hub | awk '{print $1}'").strip()
-        worker.succeed(f"echo '{hubip} fod-dns.test' > /var/lib/dnsmasq-fod/fod.hosts")
-        worker.succeed("systemctl restart dnsmasq")
-        worker.wait_until_succeeds("getent hosts fod-dns.test")
-        worker.fail("grep -q fod-dns.test /etc/hosts")
-        out = hub.succeed("nix-build /etc/tt/fod-dns.nix --no-out-link").strip()
-        hub.succeed(f"grep -q hello-fod {out}")
-
-    with subtest("aarch64 build runs under per-sandbox binfmt emulation"):
-        out = hub.succeed("nix-build /etc/tt/cross.nix --no-out-link").strip()
-        hub.succeed(f"grep -q aarch64 {out}")
-        hub.succeed(f"grep -qx 1000 {out}")
-
-    with subtest("recursive-nix: builder registers a path through the daemon socket"):
-        out = hub.succeed("nix-build /etc/tt/recursive.nix --no-out-link").strip()
-        inner = hub.succeed(f"cat {out}").strip()
-        # The closure-delta must have travelled: the inner path is
-        # registered in the hub's store, not just referenced.
-        hub.succeed(f"nix-store --check-validity {inner}")
-        hub.succeed(f"grep -q recursive-payload {inner}")
-        # And the worker really added it locally too.
-        worker.succeed(f"nix-store --check-validity {inner}")
-
-    with subtest("systemd-nspawn boots a NixOS container in a remote build"):
-        out = hub.succeed("nix-build /etc/tt/nspawn.nix --no-out-link", timeout=1800).strip()
-        hub.succeed(f"[[ $(cat {out}/msg) = 'Hello World' ]]")
-
-    with subtest("no worker: build is declined and falls back to a local build"):
-        worker.succeed("systemctl stop tribuchet-worker")
-        # let the hub observe the worker's session tear down so it no
-        # longer counts as capable
-        hub.succeed("sleep 3")
-        hub.succeed("echo fallback-payload > /root/fallback")
-        uniq = hub.succeed("nix-store --add /root/fallback").strip()
-        hub.succeed(
-            "cat > /root/fallback.nix << 'NIXEOF'\n"
-            "let\n"
-            '  bash = builtins.storePath "${pkgs.bash}";\n'
-            f'  uniq = builtins.storePath "{uniq}";\n'
-            "in derivation {\n"
-            '  name = "tt-fallback-build";\n'
-            '  system = "x86_64-linux";\n'
-            '  builder = bash + "/bin/bash";\n'
-            '  args = [ "-c" ("read line < " + uniq + "; echo \\"$line built-locally\\" > $out") ];\n'
-            "}\n"
-            "NIXEOF"
-        )
-        out = hub.succeed("nix-build /root/fallback.nix --no-out-link", timeout=120).strip()
-        hub.succeed(f"grep -q 'fallback-payload built-locally' {out}")
-        hub.succeed("journalctl -u tribuchet-hub | grep -q 'no capable worker; declining'")
-        worker.succeed("systemctl start tribuchet-worker")
-
-    with subtest("build really ran on the worker"):
-        worker.succeed("journalctl -u tribuchet-worker | grep -q 'builder finished'")
-        worker.succeed("journalctl -u tribuchet-worker | grep -q 'per-build cgroup limits enabled'")
-        hub.succeed("journalctl -u tribuchet-hub | grep -q 'dispatching build'")
-        # inputs are imported through the worker's nix-daemon and
-        # registered as valid paths in its Nix database
-        worker.succeed(f"nix-store --check-validity {unique}")
   '';
 }

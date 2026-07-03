@@ -41,6 +41,15 @@ harmonia-store-ref-scan.workspace = true
 sd-notify = "0.5.0"
 tempfile.workspace = true
 
+[features]
+# Gates the NixOS e2e harness (tests/e2e.rs). It drives VMs over the test
+# driver's vsock ssh backdoor, so plain `cargo test` neither builds nor runs it.
+e2e = []
+
+[[test]]
+name = "e2e"
+required-features = ["e2e"]
+
 [dev-dependencies]
 
 [build-dependencies]
