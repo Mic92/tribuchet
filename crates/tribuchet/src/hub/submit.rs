@@ -11,8 +11,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 use super::state::{HubState, Job, Replay};
-use crate::proto::{attach_event, attach_hub_server, AttachEvent, BuildRequest};
-use crate::store::{valid_store_path, STORE_DIR};
+use crate::proto::{AttachEvent, BuildRequest, attach_event, attach_hub_server};
+use crate::store::{STORE_DIR, valid_store_path};
 
 fn validate_request(req: &BuildRequest) -> Result<(), Status> {
     let bad = |what: &str, p: &str| {

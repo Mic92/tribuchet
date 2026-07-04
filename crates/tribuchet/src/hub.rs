@@ -14,20 +14,20 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use harmonia_utils_signature::PublicKey;
 use nix::sys::stat;
 use nix::unistd::Group;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
-use tonic::transport::{server::TcpConnectInfo, Certificate, Identity, Server, ServerTlsConfig};
+use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig, server::TcpConnectInfo};
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::config::Auth;
 
 use crate::proto::{
-    attach_event, attach_hub_server, hub_message, worker_message, CancelBuild, HubMessage,
-    Register, WorkerMessage, MAX_MSG_SIZE,
+    CancelBuild, HubMessage, MAX_MSG_SIZE, Register, WorkerMessage, attach_event,
+    attach_hub_server, hub_message, worker_message,
 };
 
 mod metrics;
@@ -414,7 +414,9 @@ fn bind_attach_socket(socket: &Path) -> Result<tokio::net::UnixListener> {
     }
     let _ = fs::remove_file(socket);
     let Ok(Some(group)) = Group::from_name("nixbld") else {
-        bail!("group nixbld not found; refusing to serve a hub socket without a group to restrict it to");
+        bail!(
+            "group nixbld not found; refusing to serve a hub socket without a group to restrict it to"
+        );
     };
     let old_umask = stat::umask(stat::Mode::from_bits_truncate(0o117));
     let uds = tokio::net::UnixListener::bind(socket);
@@ -436,7 +438,9 @@ fn bind_attach_socket(socket: &Path) -> Result<tokio::net::UnixListener> {
 fn restrict_attach_socket(socket: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let Some(group) = Group::from_name("nixbld")? else {
-        bail!("group nixbld not found; refusing to serve a hub socket without a group to restrict it to");
+        bail!(
+            "group nixbld not found; refusing to serve a hub socket without a group to restrict it to"
+        );
     };
     std::os::unix::fs::chown(socket, None, Some(group.gid.as_raw()))?;
     fs::set_permissions(socket, fs::Permissions::from_mode(0o660))?;

@@ -27,25 +27,25 @@ use std::sync::atomic;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use harmonia_store_remote::DaemonClient;
 use harmonia_utils_signature::SecretKey;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
-use build::{validate_assignment, ActiveBuild};
+use build::{ActiveBuild, validate_assignment};
 use caps::{host_system, system_caps};
 use logtail::spawn_log_tail;
 use resume::{
-    ack_delivery, adopt_builds, execute_to_finished, record_finished, spawn_resumable_reaper,
-    try_deliver, ResumableBuild,
+    ResumableBuild, ack_delivery, adopt_builds, execute_to_finished, record_finished,
+    spawn_resumable_reaper, try_deliver,
 };
 
 use crate::config::{Auth, WorkerConfig};
 use crate::proto::{
-    hub_message, worker_hub_client::WorkerHubClient, worker_message, BuildAssignment, BuildResult,
-    Heartbeat, MissingPaths, Register, RequestJob, Resumed, WorkerMessage,
+    BuildAssignment, BuildResult, Heartbeat, MissingPaths, Register, RequestJob, Resumed,
+    WorkerMessage, hub_message, worker_hub_client::WorkerHubClient, worker_message,
 };
 
 /// Connection to the local nix-daemon; one per active build so its

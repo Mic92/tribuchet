@@ -27,8 +27,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixDatagram;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::atomic;
 use std::sync::Mutex;
+use std::sync::atomic;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -196,7 +196,7 @@ const MAX_FAST_FAILURES: u32 = 5;
 /// (ExecReload) asks the worker to exit fast and gets a fresh one
 /// exec'd while its builds keep running.
 fn install_signals() {
-    use signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, SIGHUP, SIGINT, SIGTERM};
+    use signal::{SIGHUP, SIGINT, SIGTERM, SaFlags, SigAction, SigHandler, SigSet, sigaction};
     extern "C" fn on_term(_: i32) {
         TERM.store(true, atomic::Ordering::Relaxed);
     }
@@ -247,7 +247,7 @@ fn reaper_main(sock: &UnixDatagram, worker_sock: &UnixDatagram, status_dir: &Pat
         }
         // Reap everything that exited.
         loop {
-            use wait::{waitpid, WaitPidFlag, WaitStatus};
+            use wait::{WaitPidFlag, WaitStatus, waitpid};
             let code = match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
                 Ok(WaitStatus::Exited(pid, code)) => Some((pid.as_raw(), code)),
                 Ok(WaitStatus::Signaled(pid, sig, _)) => Some((pid.as_raw(), 128 + sig as i32)),
@@ -387,7 +387,7 @@ fn recv_request(sock: &UnixDatagram) -> Result<(SpawnRequest, Vec<OwnedFd>)> {
 }
 
 fn send_with_fds(sock: &UnixDatagram, payload: &[u8], fds: &[RawFd]) -> Result<()> {
-    use socket::{sendmsg, ControlMessage, MsgFlags};
+    use socket::{ControlMessage, MsgFlags, sendmsg};
     let iov = [std::io::IoSlice::new(payload)];
     let cmsg = [ControlMessage::ScmRights(fds)];
     sendmsg::<()>(
@@ -401,7 +401,7 @@ fn send_with_fds(sock: &UnixDatagram, payload: &[u8], fds: &[RawFd]) -> Result<(
 }
 
 fn recv_with_fds(sock: &UnixDatagram, buf: &mut [u8]) -> Result<(usize, Vec<OwnedFd>)> {
-    use socket::{recvmsg, MsgFlags};
+    use socket::{MsgFlags, recvmsg};
     let mut cmsg_buf = nix::cmsg_space!([RawFd; 8]);
     let mut iov = [std::io::IoSliceMut::new(buf)];
     let msg = recvmsg::<()>(

@@ -5,11 +5,11 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{self, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{self, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use harmonia_store_path::{StoreDir, StorePath, StorePathSet};
 use harmonia_store_path_info::ValidPathInfo;
 use harmonia_store_remote::{DaemonClient, DaemonStore};
@@ -23,11 +23,11 @@ use super::caps::requires_uid_range;
 use super::imports::{Claim, ImportGuard, ImportWait, SessionImports};
 use super::logtail::tail_log;
 use super::resume::{FinishedBuild, PackedExtra, PackedOutput, ResumeState};
-use super::{cgroup, reaper, sandbox, unix_now, DaemonConn, WorkerCtx};
+use super::{DaemonConn, WorkerCtx, cgroup, reaper, sandbox, unix_now};
 use crate::chunkio::ChannelReader;
 use crate::nar;
-use crate::proto::{nar_transfer, BuildAssignment, NarTransfer, PathInfoMsg, WorkerMessage};
-use crate::store::{parse_path_info, valid_store_path, STORE_DIR};
+use crate::proto::{BuildAssignment, NarTransfer, PathInfoMsg, WorkerMessage, nar_transfer};
+use crate::store::{STORE_DIR, parse_path_info, valid_store_path};
 
 impl WorkerCtx {
     fn alloc_uid_slot(self: &Arc<Self>) -> Option<UidSlot> {
@@ -852,9 +852,9 @@ fn scan_candidates(
 /// aimed at a symlink planted by an earlier entry -- can place or chmod
 /// anything outside the destination.
 fn unpack_tmp_dir_archive(reader: impl Read, dest: &Path) -> Result<()> {
+    use Component;
     use fcntl::OFlag;
     use std::os::fd::{AsFd, OwnedFd};
-    use Component;
 
     fn open_dir_at(at: &impl AsFd, name: &OsStr) -> Result<OwnedFd> {
         Ok(fcntl::openat(

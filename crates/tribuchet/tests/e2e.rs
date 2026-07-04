@@ -278,9 +278,11 @@ fn ensure_ready() {
         // enough to trip Nix's --max-silent-time, and to distinguish progress
         // from a hang.
         let start = Instant::now();
-        thread::spawn(move || loop {
-            thread::sleep(Duration::from_secs(30));
-            println!("[e2e] heartbeat t={}s", start.elapsed().as_secs());
+        thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_secs(30));
+                println!("[e2e] heartbeat t={}s", start.elapsed().as_secs());
+            }
         });
 
         for node in [Node::Hub, Node::Worker] {
