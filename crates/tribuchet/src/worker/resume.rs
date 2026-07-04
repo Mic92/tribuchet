@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
-use std::sync::atomic;
 use std::sync::Arc;
+use std::sync::atomic;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -15,14 +15,14 @@ use harmonia_utils_signature::SecretKey;
 use nix::sys::signal;
 use tokio::sync::mpsc;
 
-use super::build::{pack_outputs, ActiveBuild};
+use super::build::{ActiveBuild, pack_outputs};
 use super::logtail::LogTail;
-use super::{cgroup, msg, reaper, sandbox, unix_now, DaemonConn, WorkerCtx};
+use super::{DaemonConn, WorkerCtx, cgroup, msg, reaper, sandbox, unix_now};
 use crate::chunkio::CHUNK_SIZE;
 use crate::fsutil::remove_path_all;
 use crate::proto::{
-    nar_transfer, worker_message, BuildAssignment, BuildResult, ExtraPath, NarTransfer,
-    OutputSignature, PathInfoMsg, WorkerMessage,
+    BuildAssignment, BuildResult, ExtraPath, NarTransfer, OutputSignature, PathInfoMsg,
+    WorkerMessage, nar_transfer, worker_message,
 };
 
 /// Pick up builds a previous worker generation left behind: still

@@ -326,10 +326,11 @@ mod tests {
                 ..Default::default()
             },
         )?;
-        assert!(off
-            .binds_ro
-            .iter()
-            .all(|(_, dst)| dst != Path::new(NIX_DAEMON_SOCKET)));
+        assert!(
+            off.binds_ro
+                .iter()
+                .all(|(_, dst)| dst != Path::new(NIX_DAEMON_SOCKET))
+        );
 
         let on_dir = tempfile::tempdir()?;
         let on = prepare(
@@ -342,10 +343,11 @@ mod tests {
                 ..Default::default()
             },
         )?;
-        assert!(on
-            .binds_ro
-            .iter()
-            .any(|(src, dst)| src == &host_sock && dst == Path::new(NIX_DAEMON_SOCKET)));
+        assert!(
+            on.binds_ro
+                .iter()
+                .any(|(src, dst)| src == &host_sock && dst == Path::new(NIX_DAEMON_SOCKET))
+        );
         Ok(())
     }
 
@@ -363,7 +365,7 @@ mod tests {
             match unsafe { nix::unistd::fork() }.expect("fork") {
                 nix::unistd::ForkResult::Child => setup_stage(),
                 nix::unistd::ForkResult::Parent { child } => {
-                    use nix::sys::wait::{waitpid, WaitStatus};
+                    use nix::sys::wait::{WaitStatus, waitpid};
                     let code = match waitpid(child, None) {
                         Ok(WaitStatus::Exited(_, code)) => code,
                         other => panic!("setup stage: {other:?}"),

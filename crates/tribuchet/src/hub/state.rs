@@ -2,11 +2,11 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::sync::atomic;
 use std::sync::Arc;
+use std::sync::atomic;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tonic::Status;
 
 /// How long a build waits for a platform we expect to come back: the
@@ -16,7 +16,7 @@ use tonic::Status;
 /// instead of waiting this out on every build.
 pub(super) const WORKER_GRACE: Duration = Duration::from_secs(30);
 
-use crate::proto::{attach_event, AttachEvent, BuildRequest};
+use crate::proto::{AttachEvent, BuildRequest, attach_event};
 
 type EventTx = mpsc::Sender<Result<AttachEvent, Status>>;
 

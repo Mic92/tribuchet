@@ -11,7 +11,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use hyper_util::rt::TokioIo;
 use tokio::sync::mpsc;
 use tonic::transport::{Endpoint, Uri};
@@ -19,7 +19,7 @@ use tower::service_fn;
 
 use crate::build_json::BuildJson;
 use crate::nar;
-use crate::proto::{attach_event, attach_hub_client::AttachHubClient, BuildRequest};
+use crate::proto::{BuildRequest, attach_event, attach_hub_client::AttachHubClient};
 
 pub fn run(build_json: &Path, socket: &Path) -> Result<()> {
     let build = BuildJson::load(build_json)?;
@@ -128,7 +128,7 @@ async fn attempt_build(
         Err(e) if retryable(&e) => {
             return Ok(Outcome::Retry(
                 anyhow::Error::new(e).context("submitting build"),
-            ))
+            ));
         }
         Err(e) => return Err(e).context("submitting build"),
     };

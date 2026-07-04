@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use harmonia_utils_signature::{PublicKey, Signature};
 use nix::{dir, fcntl};
 use sha2::{Digest, Sha256};
@@ -17,9 +17,9 @@ use tonic::Status;
 use super::state::{HubState, Job};
 use crate::chunkio::ChunkWriter;
 use crate::proto::{
-    attach_event, hub_message, nar_transfer, worker_message, BuildAssignment, CancelBuild,
-    ExtraPath, HubMessage, NarTransfer, OutputNar, OutputSignature, PathInfoMsg, PathOffer,
-    ResultAck, TmpDirArchive,
+    BuildAssignment, CancelBuild, ExtraPath, HubMessage, NarTransfer, OutputNar, OutputSignature,
+    PathInfoMsg, PathOffer, ResultAck, TmpDirArchive, attach_event, hub_message, nar_transfer,
+    worker_message,
 };
 
 /// How long a dispatched build may run with no attach client listening

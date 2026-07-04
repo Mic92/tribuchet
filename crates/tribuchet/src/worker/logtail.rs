@@ -2,13 +2,13 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic;
 use std::sync::Arc;
+use std::sync::atomic;
 
 use tokio::sync::mpsc;
 
-use super::{msg, WorkerCtx};
-use crate::proto::{worker_message, LogChunk, WorkerMessage};
+use super::{WorkerCtx, msg};
+use crate::proto::{LogChunk, WorkerMessage, worker_message};
 
 /// A log-replay thread; `stop()` makes it drain to EOF, then waits
 /// for it.

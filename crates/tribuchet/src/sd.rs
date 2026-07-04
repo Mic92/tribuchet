@@ -6,7 +6,7 @@
 use std::net::TcpListener;
 use std::os::fd::{FromRawFd as _, RawFd};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use nix::sys::socket;
 
 /// Listeners handed over by systemd socket activation, classified by
@@ -96,7 +96,7 @@ fn launchd_sockets(out: &mut ActivatedSockets) -> Result<()> {
             libc::ESRCH | libc::ENOENT => continue,
             _ => {
                 return Err(std::io::Error::from_raw_os_error(rc))
-                    .with_context(|| format!("launch_activate_socket({name})"))
+                    .with_context(|| format!("launch_activate_socket({name})"));
             }
         }
         if fds.is_null() || cnt == 0 {

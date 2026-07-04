@@ -10,14 +10,14 @@ use std::process::{Child, Stdio};
 
 use anyhow::{Context, Result};
 use nix::errno::Errno;
-use nix::mount::{mount, umount2, MntFlags, MsFlags};
-use nix::sched::{unshare, CloneFlags};
+use nix::mount::{MntFlags, MsFlags, mount, umount2};
+use nix::sched::{CloneFlags, unshare};
 use nix::sys::personality::{self, Persona};
-use nix::sys::resource::{getrlimit, setrlimit, Resource};
+use nix::sys::resource::{Resource, getrlimit, setrlimit};
 use nix::sys::{prctl, stat, wait};
 use nix::unistd::{self, getgid, getuid, pivot_root, sethostname};
 
-use super::{binfmt, SandboxSpec};
+use super::{SandboxSpec, binfmt};
 use crate::proto::BuildAssignment;
 
 // Link-local addressing for the pasta netns. Forwarding DNS on the
@@ -304,7 +304,7 @@ fn enter_and_exec(spec: &SandboxSpec) -> io::Result<std::convert::Infallible> {
 }
 
 fn existing_mount_flags(target: &Path) -> io::Result<MsFlags> {
-    use nix::sys::statvfs::{statvfs, FsFlags};
+    use nix::sys::statvfs::{FsFlags, statvfs};
     // statvfs on a unix socket returns ENXIO; the parent directory
     // describes the same mount, so fall back to it.
     let st = match statvfs(target) {
@@ -473,7 +473,7 @@ fn fork_pasta_helper(bin: &Path) -> io::Result<PastaHelper> {
 
 impl PastaHelper {
     fn attach(self) -> io::Result<()> {
-        use wait::{waitpid, WaitStatus};
+        use wait::{WaitStatus, waitpid};
         unistd::write(&self.req_w, b"x").map_err(ioerr("signaling pasta helper"))?;
         match waitpid(self.child, None) {
             Ok(WaitStatus::Exited(_, 0)) => Ok(()),
@@ -519,7 +519,7 @@ fn fork_into_pid_ns() -> io::Result<bool> {
     match unsafe { unistd::fork() }.map_err(ioerr("fork"))? {
         unistd::ForkResult::Child => Ok(true),
         unistd::ForkResult::Parent { child } => {
-            use wait::{waitpid, WaitStatus};
+            use wait::{WaitStatus, waitpid};
             // Drop every inherited fd: the long-lived shim must not
             // hold the log pipes (or the setup error file) open for
             // the build's whole lifetime.
