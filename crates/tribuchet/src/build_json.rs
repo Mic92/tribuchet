@@ -53,18 +53,16 @@ pub fn required_system_features(env: &HashMap<String, String>) -> Vec<String> {
     if let Some(features) = env.get("requiredSystemFeatures") {
         return features.split_whitespace().map(str::to_owned).collect();
     }
-    if let Some(json) = env.get("__json") {
-        if let Ok(attrs) = serde_json::from_str::<serde_json::Value>(json) {
-            if let Some(features) = attrs
-                .get("requiredSystemFeatures")
-                .and_then(|v| v.as_array())
-            {
-                return features
-                    .iter()
-                    .filter_map(|f| f.as_str().map(str::to_owned))
-                    .collect();
-            }
-        }
+    if let Some(json) = env.get("__json")
+        && let Ok(attrs) = serde_json::from_str::<serde_json::Value>(json)
+        && let Some(features) = attrs
+            .get("requiredSystemFeatures")
+            .and_then(|v| v.as_array())
+    {
+        return features
+            .iter()
+            .filter_map(|f| f.as_str().map(str::to_owned))
+            .collect();
     }
     Vec::new()
 }

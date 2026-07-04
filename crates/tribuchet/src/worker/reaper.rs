@@ -148,14 +148,18 @@ pub fn ensure(status_dir: &Path) -> Result<Spawner> {
     // Enter the delegated-cgroup leaf before spawning anything: every
     // process must leave the unit's root cgroup, or enabling
     // subtree_control there fails (no-internal-processes rule).
+    // SAFETY: reaper init runs during single-threaded startup, before any
+    // worker threads exist, so mutating the environment races nothing.
     #[cfg(target_os = "linux")]
     if let Some(base) = super::cgroup::init() {
-        env::set_var(CGROUP_ENV, &base);
+        unsafe { env::set_var(CGROUP_ENV, &base) };
     }
-    env::set_var(
-        ID_ENV,
-        format!("{}-{}", std::process::id(), super::unix_now()),
-    );
+    unsafe {
+        env::set_var(
+            ID_ENV,
+            format!("{}-{}", std::process::id(), super::unix_now()),
+        );
+    }
     let (reaper_sock, worker_sock) = UnixDatagram::pair().context("creating reaper socketpair")?;
     let code = reaper_main(&reaper_sock, &worker_sock, status_dir);
     std::process::exit(code);

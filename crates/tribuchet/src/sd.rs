@@ -77,7 +77,7 @@ impl ActivatedSockets {
 /// sockets.
 #[cfg(target_os = "macos")]
 fn launchd_sockets(out: &mut ActivatedSockets) -> Result<()> {
-    extern "C" {
+    unsafe extern "C" {
         fn launch_activate_socket(
             name: *const libc::c_char,
             fds: *mut *mut libc::c_int,

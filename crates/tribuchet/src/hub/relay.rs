@@ -669,11 +669,11 @@ async fn relay_extra_chunk(
     n: NarTransfer,
 ) -> Result<()> {
     let extra = extras.get_mut(&n.store_path).unwrap();
-    if let Some(nar_transfer::Payload::ZstdNarChunk(chunk)) = n.payload {
-        if extra.tx.send(chunk.into()).await.is_err() {
-            let extra = extras.remove(&n.store_path).unwrap();
-            return Err(extra.task.await?.unwrap_err());
-        }
+    if let Some(nar_transfer::Payload::ZstdNarChunk(chunk)) = n.payload
+        && extra.tx.send(chunk.into()).await.is_err()
+    {
+        let extra = extras.remove(&n.store_path).unwrap();
+        return Err(extra.task.await?.unwrap_err());
     }
     if n.eof {
         let extra = extras.remove(&n.store_path).unwrap();

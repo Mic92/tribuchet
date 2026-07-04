@@ -570,10 +570,10 @@ async fn session_loop(
             }
             hub_message::Msg::PathInfo(pi) => {
                 let id = pi.build_id.clone();
-                if let Some(build) = active.get_mut(&id) {
-                    if let Err(e) = build.feed_path_info(&pi) {
-                        abort_active(active, &id, out_tx, &e).await?;
-                    }
+                if let Some(build) = active.get_mut(&id)
+                    && let Err(e) = build.feed_path_info(&pi)
+                {
+                    abort_active(active, &id, out_tx, &e).await?;
                 }
             }
             hub_message::Msg::Cancel(c) => {

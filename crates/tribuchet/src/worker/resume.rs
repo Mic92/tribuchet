@@ -376,10 +376,10 @@ pub(super) fn record_finished(ctx: &Arc<WorkerCtx>, key: &str, fin: FinishedBuil
 /// Mark or release a leased uid slot by index (re-adopted builds,
 /// where no BuildOwner exists to do it on drop).
 fn set_uid_slot(ctx: &WorkerCtx, idx: Option<usize>, used: bool) {
-    if let Some(idx) = idx {
-        if let Some(s) = ctx.uid_slots.lock().unwrap().get_mut(idx) {
-            *s = used;
-        }
+    if let Some(idx) = idx
+        && let Some(s) = ctx.uid_slots.lock().unwrap().get_mut(idx)
+    {
+        *s = used;
     }
 }
 
