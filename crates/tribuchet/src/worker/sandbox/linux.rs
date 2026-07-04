@@ -305,11 +305,12 @@ fn enter_and_exec(spec: &SandboxSpec) -> io::Result<std::convert::Infallible> {
 
 fn existing_mount_flags(target: &Path) -> io::Result<MsFlags> {
     use nix::sys::statvfs::{FsFlags, statvfs};
-    // statvfs on a unix socket returns ENXIO; the parent directory
-    // describes the same mount, so fall back to it.
+    // statvfs on the bound target fails for some source mounts (ENXIO on a
+    // unix socket, ENOENT on an envfs/FUSE mount like NixOS's /bin); the
+    // parent describes the same mount, so fall back to it.
     let st = match statvfs(target) {
         Ok(st) => st,
-        Err(Errno::ENXIO) => {
+        Err(Errno::ENXIO | Errno::ENOENT) => {
             let parent = target.parent().unwrap_or(target);
             statvfs(parent).map_err(ioerr("statvfs"))?
         }
