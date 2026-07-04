@@ -187,8 +187,11 @@ pub fn command(spec: &SandboxSpec) -> Result<Command> {
         anyhow::bail!("no binfmt magic known for system {}", spec.system);
     }
 
-    // see setup_stage() for why builds re-exec this binary
-    let mut cmd = Command::new("/proc/self/exe");
+    // see setup_stage() for why builds re-exec this binary. Resolve it
+    // in the worker: the reaper execs this argv, and it outlives worker
+    // reloads, so it must not resolve the binary in its own context.
+    let exe = std::env::current_exe().context("resolving worker binary path")?;
+    let mut cmd = Command::new(exe);
     cmd.arg(SETUP_STAGE_ARG);
     Ok(cmd)
 }

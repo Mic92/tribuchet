@@ -1,12 +1,18 @@
 name: e2e
-run-name: e2e @ ${{ github.event.check_run.head_sha || github.sha }}
+run-name: e2e @ ${{ github.event.pull_request.head.sha || github.sha }}
 
 # Two GitHub-hosted runners join the same tailnet, one runs
 # `tribuchet hub` with auth="tailscale", the other runs the worker, and
-# a real `nix-build` goes through external-builders end to end.
+# a real `nix-build` goes through external-builders end to end. buildbot
+# readiness (its cache.thalheim.io push, so `nix build` is a fetch, not a
+# rebuild) is awaited inside the job via wait-buildbot.
 #
-# Runs after buildbot has pushed this commit's outputs to
-# cache.thalheim.io, so `nix build` below is a fetch, not a rebuild.
+# Triggers: push to main and to gitea-mq's merge-queue branches
+# (gitea-mq/*) runs in a trusted context with a writable Actions cache
+# token (unlike check_run), so hestia populates the caches every build
+# fetches; the mq branches are where the queue tests a merge before it
+# lands on main. pull_request covers PRs; fork PRs run without secrets, so
+# the gate skips the tailnet jobs and untrusted code never reaches it.
 #
 # Tailscale setup (one-time, see also Mic92/tribuchet-action README):
 #   1. ACL (https://login.tailscale.com/admin/acls):
@@ -16,16 +22,16 @@ run-name: e2e @ ${{ github.event.check_run.head_sha || github.sha }}
 #   2. OAuth client (https://login.tailscale.com/admin/settings/oauth)
 #      with scope "Auth Keys: write", tag `tag:ci`.
 #   3. Repo secrets TS_OAUTH_CLIENT_ID / TS_OAUTH_SECRET.
-
 on:
-  check_run:
-    types: [completed]
-  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+      - "gitea-mq/**"
 
-# A force-push (or nixbot re-run) fires a fresh check_run for the same
-# branch; cancel the superseded e2e instead of running both.
+# A new event on the same ref supersedes the in-flight e2e.
 concurrency:
-  group: e2e-${{ github.event.check_run.check_suite.head_branch || github.ref }}
+  group: e2e-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -33,9 +39,7 @@ permissions:
   contents: read
   # the wait-buildbot step reads the buildbot check run via the Checks API
   checks: read
-  # check_run-triggered runs are attached to the default branch, not the
-  # PR commit; we post a commit status back to the tested sha so the
-  # result shows up on the PR.
+  # post a commit status so the e2e result shows up on the PR
   statuses: write
 
 env:
@@ -45,19 +49,11 @@ env:
   E2E_SYSTEMS: x86_64-linux aarch64-linux aarch64-darwin
 
 jobs:
-  # nixbot reports via the Checks API; only act on its final success.
-  # `head_branch` is null when the commit's branch is in a different
-  # repository, so fork-PR heads are skipped — otherwise their
-  # checked-out flake and scripts would run with tailnet access. Own
-  # branch PRs (push access ⇒ trusted) do run. Also skip when the
-  # tailscale secrets are not configured. `secrets` is not usable in a
-  # job-level `if`, hence the indirection.
+  # Gate the rest of the workflow on the tailscale secrets being present;
+  # `secrets` is not usable in a job-level `if`, hence the indirection
+  # through an output. Fork PRs run without secrets, so this also keeps
+  # untrusted code off the tailnet.
   gate:
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.check_run.name == 'buildbot/nix-build'
-       && github.event.check_run.conclusion == 'success'
-       && github.event.check_run.check_suite.head_branch != null)
     runs-on: ubuntu-latest
     outputs:
       has-secrets: ${{ steps.check.outputs.has }}
@@ -69,7 +65,7 @@ jobs:
       - if: steps.check.outputs.has == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          SHA: ${{ github.event.check_run.head_sha || github.sha }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           gh api "repos/${{ github.repository }}/statuses/$SHA" \
             -f state=pending -f context=e2e \
@@ -85,7 +81,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.check_run.head_sha || github.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - uses: NixOS/nix-installer-action@6b8548fe06acfb0155a50ab5d561accb215764cc
         with:
@@ -102,7 +98,7 @@ jobs:
           hostname: tribuchet-hub-${{ github.run_id }}
 
       # nixbot's cache push lands shortly after buildbot succeeds.
-      - run: python3 .github/scripts/e2e/run.py wait-buildbot "${{ github.event.check_run.head_sha || github.sha }}"
+      - run: python3 .github/scripts/e2e/run.py wait-buildbot "${{ github.event.pull_request.head.sha || github.sha }}"
 
       - run: nix build .#default
 
@@ -143,7 +139,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.check_run.head_sha || github.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - uses: NixOS/nix-installer-action@6b8548fe06acfb0155a50ab5d561accb215764cc
         with:
@@ -162,7 +158,7 @@ jobs:
           hostname: tw-${{ matrix.slug }}-${{ github.run_id }}
 
       # nixbot's cache push lands shortly after buildbot succeeds.
-      - run: python3 .github/scripts/e2e/run.py wait-buildbot "${{ github.event.check_run.head_sha || github.sha }}"
+      - run: python3 .github/scripts/e2e/run.py wait-buildbot "${{ github.event.pull_request.head.sha || github.sha }}"
 
       - run: nix build .#default
 
@@ -184,7 +180,7 @@ jobs:
     steps:
       - env:
           GH_TOKEN: ${{ github.token }}
-          SHA: ${{ github.event.check_run.head_sha || github.sha }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           STATE: ${{ (needs.hub.result == 'success' && needs.worker.result == 'success') && 'success' || 'failure' }}
         run: |
           gh api "repos/${{ github.repository }}/statuses/$SHA" \

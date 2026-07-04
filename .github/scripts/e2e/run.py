@@ -14,7 +14,6 @@ import subprocess
 import sys
 import textwrap
 import time
-import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -213,26 +212,26 @@ def fetch_artifact(name: str, dest: str) -> None:
 
 
 def gh_api(path: str) -> Any | None:
-    """GET the GitHub REST API; ``None`` on transient errors so callers
-    inside a poll loop treat them as "not yet"."""
-    req = urllib.request.Request(
-        f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}/{path}",
-        headers={
-            "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
-            "Accept": "application/vnd.github+json",
-        },
+    """GET the GitHub REST API via ``gh``; ``None`` on transient errors so
+    poll-loop callers treat them as "not yet". ``gh`` carries its own CA
+    bundle, which the macOS runner's Python lacks."""
+    r = subprocess.run(
+        ["gh", "api", f"repos/{os.environ['GITHUB_REPOSITORY']}/{path}"],
+        capture_output=True,
+        text=True,
     )
+    if r.returncode != 0:
+        return None
     try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return json.load(r)
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return json.loads(r.stdout)
+    except json.JSONDecodeError:
         return None
 
 
 def wait_buildbot(sha: str) -> None:
     """Block until the buildbot check run for *sha* succeeds, so the
     build below fetches nixbot's closure instead of rebuilding. Tolerates
-    a not-yet-listed check (workflow_dispatch can precede buildbot)."""
+    a not-yet-listed check (push fires before buildbot registers one)."""
     name = "buildbot/nix-build"
 
     def ready() -> bool:
@@ -240,7 +239,13 @@ def wait_buildbot(sha: str) -> None:
         if data is None:
             return False
         runs = data.get("check_runs", [])
-        return bool(runs) and all(r.get("conclusion") == "success" for r in runs)
+        if not runs or any(r.get("status") != "completed" for r in runs):
+            return False
+        # Fail fast instead of waiting the full timeout: a red buildbot would
+        # otherwise hang every push-triggered e2e until the deadline.
+        if any(r.get("conclusion") != "success" for r in runs):
+            raise SystemExit(f"{name} on {sha[:8]} did not succeed; skipping e2e")
+        return True
 
     wait_for(ready, timeout=1800, interval=15, what=f"{name} on {sha[:8]}")
 
