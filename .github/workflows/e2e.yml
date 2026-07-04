@@ -39,8 +39,6 @@ permissions:
   contents: read
   # the wait-buildbot step reads the buildbot check run via the Checks API
   checks: read
-  # post a commit status so the e2e result shows up on the PR
-  statuses: write
 
 env:
   NIX_EXTRA_CONF: |
@@ -62,14 +60,6 @@ jobs:
         env:
           TS: ${{ secrets.TS_OAUTH_SECRET }}
         run: echo "has=$([ -n "$TS" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
-      - if: steps.check.outputs.has == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: |
-          gh api "repos/${{ github.repository }}/statuses/$SHA" \
-            -f state=pending -f context=e2e \
-            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
   hub:
     needs: gate
@@ -172,17 +162,3 @@ jobs:
 
       - if: always()
         run: cat worker.log || true
-
-  report:
-    needs: [gate, hub, worker]
-    if: always() && needs.gate.outputs.has-secrets == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - env:
-          GH_TOKEN: ${{ github.token }}
-          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-          STATE: ${{ (needs.hub.result == 'success' && needs.worker.result == 'success') && 'success' || 'failure' }}
-        run: |
-          gh api "repos/${{ github.repository }}/statuses/$SHA" \
-            -f state="$STATE" -f context=e2e \
-            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
