@@ -231,7 +231,7 @@ def gh_api(path: str) -> Any | None:
 def wait_buildbot(sha: str) -> None:
     """Block until the buildbot check run for *sha* succeeds, so the
     build below fetches nixbot's closure instead of rebuilding. Tolerates
-    a not-yet-listed check (workflow_dispatch can precede buildbot)."""
+    a not-yet-listed check (push fires before buildbot registers one)."""
     name = "buildbot/nix-build"
 
     def ready() -> bool:
@@ -239,7 +239,13 @@ def wait_buildbot(sha: str) -> None:
         if data is None:
             return False
         runs = data.get("check_runs", [])
-        return bool(runs) and all(r.get("conclusion") == "success" for r in runs)
+        if not runs or any(r.get("status") != "completed" for r in runs):
+            return False
+        # Fail fast instead of waiting the full timeout: a red buildbot would
+        # otherwise hang every push-triggered e2e until the deadline.
+        if any(r.get("conclusion") != "success" for r in runs):
+            raise SystemExit(f"{name} on {sha[:8]} did not succeed; skipping e2e")
+        return True
 
     wait_for(ready, timeout=1800, interval=15, what=f"{name} on {sha[:8]}")
 
