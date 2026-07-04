@@ -45,6 +45,9 @@ env:
     extra-substituters = https://cache.thalheim.io
     extra-trusted-public-keys = cache.thalheim.io-1:R7msbosLEZKrxk/lKxf9BTjOOH7Ax3H0Qj0/6wiHOgc=
   E2E_SYSTEMS: x86_64-linux aarch64-linux aarch64-darwin
+  # The tested commit: a PR's head (not the synthetic merge sha) or the
+  # pushed commit. buildbot's check run is keyed on it.
+  E2E_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
 jobs:
   # Gate the rest of the workflow on the tailscale secrets being present;
@@ -71,7 +74,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ env.E2E_SHA }}
 
       - uses: NixOS/nix-installer-action@6b8548fe06acfb0155a50ab5d561accb215764cc
         with:
@@ -88,7 +91,7 @@ jobs:
           hostname: tribuchet-hub-${{ github.run_id }}
 
       # nixbot's cache push lands shortly after buildbot succeeds.
-      - run: python3 .github/scripts/e2e/run.py wait-buildbot "${{ github.event.pull_request.head.sha || github.sha }}"
+      - run: python3 .github/scripts/e2e/run.py wait-buildbot "$E2E_SHA"
 
       - run: nix build .#default
 
@@ -129,7 +132,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ env.E2E_SHA }}
 
       - uses: NixOS/nix-installer-action@6b8548fe06acfb0155a50ab5d561accb215764cc
         with:
@@ -148,7 +151,7 @@ jobs:
           hostname: tw-${{ matrix.slug }}-${{ github.run_id }}
 
       # nixbot's cache push lands shortly after buildbot succeeds.
-      - run: python3 .github/scripts/e2e/run.py wait-buildbot "${{ github.event.pull_request.head.sha || github.sha }}"
+      - run: python3 .github/scripts/e2e/run.py wait-buildbot "$E2E_SHA"
 
       - run: nix build .#default
 
