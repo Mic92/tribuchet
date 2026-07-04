@@ -53,12 +53,17 @@ impl SessionImports {
         Self::default()
     }
 
-    /// Claim responsibility for `path`. The first caller owns the
-    /// import; later callers (this session) await that owner.
+    /// Claim responsibility for `path`: the first caller owns the
+    /// import, concurrent callers await it. Callers reach this only
+    /// after the daemon reports `path` invalid, so a settled entry means
+    /// the path was imported and then left the store; re-own it rather
+    /// than trust the stale success.
     pub(super) fn claim(&self, path: &str) -> Claim {
         let mut map = self.map.lock().unwrap();
         if let Some(rx) = map.get(path) {
-            return Claim::Awaiter(ImportWait { rx: rx.clone() });
+            if rx.borrow().is_none() {
+                return Claim::Awaiter(ImportWait { rx: rx.clone() });
+            }
         }
         let (tx, rx) = watch::channel(None);
         map.insert(path.to_owned(), rx);
@@ -127,6 +132,20 @@ mod tests {
         };
         guard.complete(false);
         assert!(!wait.wait().await);
+    }
+
+    #[tokio::test]
+    async fn stale_completed_claim_is_reowned() {
+        // A settled entry means an earlier import that no longer holds:
+        // the next claim must re-own, not await the stale success.
+        let imports = SessionImports::new();
+        let Claim::Owner(guard) = imports.claim("/nix/store/x") else {
+            unreachable!()
+        };
+        guard.complete(true);
+        let Claim::Owner(_) = imports.claim("/nix/store/x") else {
+            panic!("a settled entry must be re-owned, not awaited");
+        };
     }
 
     #[tokio::test]
