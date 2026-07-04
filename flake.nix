@@ -3,6 +3,10 @@
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   inputs.crane.url = "github:ipetkov/crane";
+  inputs.treefmt-nix = {
+    url = "github:numtide/treefmt-nix";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
   # only used to evaluate the darwin module in checks
   inputs.nix-darwin = {
     url = "github:nix-darwin/nix-darwin";
@@ -15,6 +19,7 @@
       nixpkgs,
       crane,
       nix-darwin,
+      treefmt-nix,
     }:
     let
       systems = [
@@ -23,6 +28,7 @@
         "aarch64-darwin"
       ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+      treefmtFor = pkgs: treefmt-nix.lib.evalModule pkgs ./nix/treefmt.nix;
     in
     {
       packages = forAllSystems (pkgs: {
@@ -41,6 +47,8 @@
         };
       });
 
+      formatter = forAllSystems (pkgs: (treefmtFor pkgs).config.build.wrapper);
+
       darwinModules.default = import ./nix/darwin-module.nix self;
 
       nixosModules.default = import ./nix/nixos-module.nix self;
@@ -56,6 +64,8 @@
         prefix "package" self.packages.${system}
         // prefix "devshell" self.devShells.${system}
         // {
+          treefmt = (treefmtFor pkgs).config.build.check self;
+
           # nixbot pushes this closure, so downstream CI fetches the
           # input sources from cache.thalheim.io instead of GitHub.
           flake-inputs = pkgs.linkFarm "flake-inputs" (
@@ -122,6 +132,7 @@
             clippy
             rust-analyzer
             protobuf
+            (treefmtFor pkgs).config.build.wrapper
           ];
           PROTOC = "${pkgs.protobuf}/bin/protoc";
         };
