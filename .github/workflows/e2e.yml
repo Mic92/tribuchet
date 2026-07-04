@@ -95,7 +95,10 @@ jobs:
 
       - run: nix build .#default
 
-      - run: python3 .github/scripts/e2e/run.py hub-start --systems $E2E_SYSTEMS
+        # E2E_SYSTEMS is a space-separated list, meant to word-split.
+      - run: |
+          # shellcheck disable=SC2086
+          python3 .github/scripts/e2e/run.py hub-start --systems $E2E_SYSTEMS
 
       - uses: actions/upload-artifact@v7
         with:
@@ -103,7 +106,10 @@ jobs:
           path: addr.txt
           retention-days: 1
 
-      - run: python3 .github/scripts/e2e/run.py hub-build --systems $E2E_SYSTEMS
+        # E2E_SYSTEMS is a space-separated list, meant to word-split.
+      - run: |
+          # shellcheck disable=SC2086
+          python3 .github/scripts/e2e/run.py hub-build --systems $E2E_SYSTEMS
 
       - if: always()
         run: cat hub.log || true
