@@ -60,10 +60,10 @@ impl SessionImports {
     /// than trust the stale success.
     pub(super) fn claim(&self, path: &str) -> Claim {
         let mut map = self.map.lock().unwrap();
-        if let Some(rx) = map.get(path) {
-            if rx.borrow().is_none() {
-                return Claim::Awaiter(ImportWait { rx: rx.clone() });
-            }
+        if let Some(rx) = map.get(path)
+            && rx.borrow().is_none()
+        {
+            return Claim::Awaiter(ImportWait { rx: rx.clone() });
         }
         let (tx, rx) = watch::channel(None);
         map.insert(path.to_owned(), rx);

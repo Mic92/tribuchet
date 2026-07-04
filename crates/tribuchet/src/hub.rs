@@ -227,17 +227,17 @@ impl crate::proto::worker_hub_server::WorkerHub for WorkerSvc {
             .signing_public_key
             .parse()
             .map_err(|e| Status::invalid_argument(format!("bad signing key: {e}")))?;
-        if let Some(trusted) = &self.trusted_keys {
-            if !trusted.contains(&vkey) {
-                tracing::warn!(
-                    worker = register.worker_name,
-                    key = %vkey,
-                    "rejecting worker with unpinned signing key"
-                );
-                return Err(Status::permission_denied(
-                    "signing key not in the hub's trusted-signing-keys",
-                ));
-            }
+        if let Some(trusted) = &self.trusted_keys
+            && !trusted.contains(&vkey)
+        {
+            tracing::warn!(
+                worker = register.worker_name,
+                key = %vkey,
+                "rejecting worker with unpinned signing key"
+            );
+            return Err(Status::permission_denied(
+                "signing key not in the hub's trusted-signing-keys",
+            ));
         }
         tracing::info!(
             worker = register.worker_name,
@@ -312,11 +312,11 @@ async fn worker_loop(
                 resumable.remove(&job.key);
                 break job;
             }
-            if credits > 0 {
-                if let Some(job) = state.take_job(&caps).await {
-                    credits -= 1;
-                    break job;
-                }
+            if credits > 0
+                && let Some(job) = state.take_job(&caps).await
+            {
+                credits -= 1;
+                break job;
             }
             // notify_waiters() wakes only current waiters; the timeout
             // closes the race between checking the queue and awaiting.
