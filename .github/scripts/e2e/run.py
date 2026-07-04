@@ -14,7 +14,6 @@ import subprocess
 import sys
 import textwrap
 import time
-import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -213,19 +212,19 @@ def fetch_artifact(name: str, dest: str) -> None:
 
 
 def gh_api(path: str) -> Any | None:
-    """GET the GitHub REST API; ``None`` on transient errors so callers
-    inside a poll loop treat them as "not yet"."""
-    req = urllib.request.Request(
-        f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}/{path}",
-        headers={
-            "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
-            "Accept": "application/vnd.github+json",
-        },
+    """GET the GitHub REST API via ``gh``; ``None`` on transient errors so
+    poll-loop callers treat them as "not yet". ``gh`` carries its own CA
+    bundle, which the macOS runner's Python lacks."""
+    r = subprocess.run(
+        ["gh", "api", f"repos/{os.environ['GITHUB_REPOSITORY']}/{path}"],
+        capture_output=True,
+        text=True,
     )
+    if r.returncode != 0:
+        return None
     try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return json.load(r)
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return json.loads(r.stdout)
+    except json.JSONDecodeError:
         return None
 
 
