@@ -85,6 +85,7 @@ impl CapsGuard {
         state.worker_caps.lock().unwrap().insert(id, caps.clone());
         // Wake submissions waiting for a capable worker to appear.
         state.caps_changed.notify_waiters();
+        state.regen_nix_config();
         Self { state, id, caps }
     }
 }
@@ -92,6 +93,7 @@ impl CapsGuard {
 impl Drop for CapsGuard {
     fn drop(&mut self) {
         self.state.worker_caps.lock().unwrap().remove(&self.id);
+        self.state.regen_nix_config();
         // Remember the platform so a build for it briefly waits for the
         // worker to reconnect instead of declining immediately.
         self.state.record_departed(self.caps.clone());
@@ -279,6 +281,7 @@ async fn worker_loop(
             .iter()
             .map(|c| (c.system.clone(), c.features.iter().cloned().collect()))
             .collect(),
+        max_jobs: register.max_jobs,
     };
     let caps_guard = CapsGuard::new(state.clone(), caps.clone());
     let router = Router::default();
@@ -523,9 +526,10 @@ async fn run_async(cfg: crate::config::HubConfig) -> Result<()> {
     let socket = cfg.socket.as_path();
     let listen = cfg.listen.as_str();
     let config_dir = cfg.config_dir.as_path();
-    let state = Arc::new(HubState::new(std::time::Duration::from_secs(
-        cfg.worker_grace_secs,
-    )));
+    let state = Arc::new(HubState::new(
+        std::time::Duration::from_secs(cfg.worker_grace_secs),
+        cfg.nix_config.clone(),
+    ));
 
     let (tls, peer_auth) = configure_auth(&cfg, config_dir)?;
     let trusted_keys = load_trusted_keys(config_dir)?;

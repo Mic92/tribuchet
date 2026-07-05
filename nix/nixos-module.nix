@@ -79,11 +79,47 @@ in
     };
     externalBuilders = {
       enable = lib.mkEnableOption "routing this machine's nix-daemon builds through the hub (experimental external-builders feature)";
+      dynamic = lib.mkEnableOption ''
+        deriving external-builders and max-jobs from the workers
+        currently connected to the hub instead of the static `systems`
+        list. The hub writes a nix.conf fragment on every worker
+        register/deregister; a path unit restarts nix-daemon to apply
+        it (in-flight build children survive the restart)
+      '';
       systems = lib.mkOption {
         type = lib.types.listOf lib.types.str;
         default = [ pkgs.stdenv.hostPlatform.system ];
         defaultText = lib.literalExpression "[ pkgs.stdenv.hostPlatform.system ]";
-        description = "Systems handed to tribuchet instead of being built locally.";
+        description = "Systems handed to tribuchet instead of being built locally (static mode; ignored when `dynamic` is set).";
+      };
+      nixConfigPath = lib.mkOption {
+        type = lib.types.path;
+        default = "/run/tribuchet/nix.conf";
+        description = "Path of the hub-generated nix.conf fragment (dynamic mode).";
+      };
+      oversubscribePercent = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 200;
+        description = ''
+          Percent to scale summed worker capacity by for the emitted
+          max-jobs (200 = 2x), capped. Oversubscribing keeps every
+          worker's hub queue fed regardless of the system mix Nix admits
+          into its single global slot pool and hides the
+          submit/dispatch/result/next-admit round trip. The surplus just
+          parks in the hub queue (an attach process plus a build goal on
+          this host, no NAR staged until dispatch).
+        '';
+      };
+      maxJobsCap = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 256;
+        description = ''
+          Ceiling on the emitted max-jobs. Bounds the local-build burst
+          if every worker vanishes and offloaded builds fall back to
+          local execution. `id-count` must cover it: an external build
+          still reserves an auto-allocated uid slot on this host, and
+          the slot pool holds `id-count / 65536` of them.
+        '';
       };
       nixPackage = lib.mkOption {
         type = lib.types.package;
@@ -155,6 +191,8 @@ in
           hub.externalBuilders.nixPackage.appendPatches patches;
       nix.settings = {
         experimental-features = [ "external-builders" ];
+      }
+      // lib.optionalAttrs (!hub.externalBuilders.dynamic) {
         external-builders = builtins.toJSON [
           {
             systems = hub.externalBuilders.systems;
@@ -162,6 +200,30 @@ in
             args = [ ];
           }
         ];
+      };
+    })
+
+    (lib.mkIf (hub.enable && hub.externalBuilders.enable && hub.externalBuilders.dynamic) {
+      # The hub owns external-builders/max-jobs; nix.conf just includes
+      # its fragment (soft include: nix still starts if it is absent).
+      nix.extraOptions = "!include ${hub.externalBuilders.nixConfigPath}\n";
+      services.tribuchet-hub.settings.nix-config = {
+        path = toString hub.externalBuilders.nixConfigPath;
+        attach-program = toString attachWrapper;
+        oversubscribe-percent = hub.externalBuilders.oversubscribePercent;
+        max-jobs-cap = hub.externalBuilders.maxJobsCap;
+      };
+      # Apply a regenerated fragment: restart swaps only the daemon's
+      # accept loop, in-flight build children keep running.
+      systemd.paths.tribuchet-nix-reload = {
+        wantedBy = [ "multi-user.target" ];
+        pathConfig.PathModified = toString hub.externalBuilders.nixConfigPath;
+      };
+      systemd.services.tribuchet-nix-reload = {
+        serviceConfig = {
+          Type = "oneshot";
+          ExecStart = "${pkgs.systemd}/bin/systemctl try-restart nix-daemon.service";
+        };
       };
     })
 

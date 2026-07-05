@@ -1,13 +1,17 @@
 //! In-memory hub state: replay buffers, the job queue, worker capabilities.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
+use std::io::Write;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic;
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, Notify, mpsc};
 use tonic::Status;
+
+use crate::config::NixConfig;
 
 /// How long a build waits for a platform we expect to come back: the
 /// startup window in which workers re-register after a hub restart, and
@@ -187,6 +191,9 @@ pub(super) struct HubState {
     pub(super) caps_changed: Notify,
     /// Build lifecycle counters scraped by the metrics endpoint.
     pub(super) metrics: super::metrics::Metrics,
+    /// When set, the connected-worker set is mirrored to this nix.conf
+    /// fragment on every register/deregister.
+    pub(super) nix_config: Option<NixConfig>,
 }
 
 #[derive(Clone)]
@@ -195,6 +202,48 @@ pub(super) struct WorkerCaps {
     pub(super) name: String,
     /// system -> features the worker honors for it
     pub(super) systems: HashMap<String, HashSet<String>>,
+    /// Advisory concurrent-build capacity, summed to size the
+    /// generated nix.conf max-jobs.
+    pub(super) max_jobs: u32,
+}
+
+/// nix.conf fragment for the connected workers: external-builders over
+/// every served system, and max-jobs at the oversubscribed, capped
+/// aggregate capacity. max-jobs is omitted with no workers, leaving the
+/// base nix.conf default to govern local fallback builds.
+fn render_nix_config(caps: &HashMap<u64, WorkerCaps>, cfg: &NixConfig) -> String {
+    use std::fmt::Write as _;
+
+    let systems: BTreeSet<&str> = caps
+        .values()
+        .flat_map(|c| c.systems.keys().map(String::as_str))
+        .collect();
+    let systems_json = systems
+        .iter()
+        .map(|s| format!("{s:?}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut out = format!(
+        "external-builders = [{{\"systems\":[{systems_json}],\"program\":\"{}\",\"args\":[]}}]\n",
+        cfg.attach_program.display(),
+    );
+    let capacity: u64 = caps.values().map(|c| u64::from(c.max_jobs)).sum();
+    if capacity > 0 {
+        let scaled = capacity * u64::from(cfg.oversubscribe_percent) / 100;
+        let jobs = scaled.clamp(1, u64::from(cfg.max_jobs_cap));
+        let _ = writeln!(out, "max-jobs = {jobs}");
+    }
+    out
+}
+
+fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(content.as_bytes())?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, path)
 }
 
 impl WorkerCaps {
@@ -207,12 +256,12 @@ impl WorkerCaps {
 
 impl Default for HubState {
     fn default() -> Self {
-        Self::new(WORKER_GRACE)
+        Self::new(WORKER_GRACE, None)
     }
 }
 
 impl HubState {
-    pub(super) fn new(worker_grace: Duration) -> Self {
+    pub(super) fn new(worker_grace: Duration, nix_config: Option<NixConfig>) -> Self {
         Self {
             queue: Mutex::default(),
             inflight: Mutex::default(),
@@ -228,6 +277,32 @@ impl HubState {
             departed: std::sync::Mutex::default(),
             caps_changed: Notify::default(),
             metrics: super::metrics::Metrics::default(),
+            nix_config,
+        }
+    }
+
+    /// Mirror the connected-worker set to the nix.conf fragment. Called
+    /// after a register/deregister mutates `worker_caps`.
+    pub(super) fn regen_nix_config(&self) {
+        let Some(cfg) = &self.nix_config else {
+            return;
+        };
+        // Render and write under the lock so concurrent register/
+        // deregister serialize and never leave stale content behind.
+        let caps = self.worker_caps.lock().unwrap();
+        let content = render_nix_config(&caps, cfg);
+        // Skip the write, and the daemon restart the watching path unit
+        // would trigger, when nothing changed (e.g. a worker reconnects
+        // with the same capabilities).
+        if fs::read_to_string(&cfg.path).is_ok_and(|cur| cur == content) {
+            return;
+        }
+        if let Err(e) = write_atomic(&cfg.path, &content) {
+            tracing::warn!(
+                error = %e,
+                path = %cfg.path.display(),
+                "failed to write nix.conf fragment"
+            );
         }
     }
 }
@@ -401,6 +476,7 @@ mod tests {
                 features.iter().map(|f| (*f).to_owned()).collect(),
             )]
             .into(),
+            max_jobs: 1,
         }
     }
 
@@ -409,16 +485,16 @@ mod tests {
         // Within the startup window any platform is awaited (workers
         // have not re-registered yet); once it lapses a never-seen
         // platform with no departed worker declines at once.
-        let within = HubState::new(Duration::from_secs(30));
+        let within = HubState::new(Duration::from_secs(30), None);
         assert!(within.expected_deadline("aarch64-linux", &[]).is_some());
-        let lapsed = HubState::new(Duration::ZERO);
+        let lapsed = HubState::new(Duration::ZERO, None);
         assert!(lapsed.expected_deadline("aarch64-linux", &[]).is_none());
     }
 
     #[test]
     fn departed_worker_keeps_its_platform_expected() {
         // Past the startup window but inside the reconnect window.
-        let mut state = HubState::new(Duration::from_secs(30));
+        let mut state = HubState::new(Duration::from_secs(30), None);
         state.started_at = Instant::now().checked_sub(Duration::from_mins(1)).unwrap();
         state.record_departed(caps("x86_64-linux", &["kvm"]));
         let kvm = vec!["kvm".to_owned()];
@@ -431,6 +507,50 @@ mod tests {
     }
 
     #[test]
+    fn nix_config_union_systems_and_capped_oversubscribed_jobs() {
+        let cfg = NixConfig {
+            path: "/run/x".into(),
+            attach_program: "/nix/store/attach".into(),
+            oversubscribe_percent: 200,
+            max_jobs_cap: 256,
+        };
+        let mut workers = HashMap::new();
+        workers.insert(1, {
+            let mut c = caps("x86_64-linux", &[]);
+            c.max_jobs = 100;
+            c
+        });
+        workers.insert(2, {
+            let mut c = caps("aarch64-linux", &[]);
+            c.max_jobs = 50;
+            c
+        });
+        let out = render_nix_config(&workers, &cfg);
+        assert!(
+            out.contains(r#""systems":["aarch64-linux","x86_64-linux"]"#),
+            "{out}"
+        );
+        assert!(out.contains(r#""program":"/nix/store/attach""#), "{out}");
+        // (100 + 50) * 2 = 300, clamped to the cap.
+        assert!(out.contains("max-jobs = 256\n"), "{out}");
+    }
+
+    #[test]
+    fn nix_config_without_workers_omits_max_jobs() {
+        let cfg = NixConfig {
+            path: "/run/x".into(),
+            attach_program: "/nix/store/attach".into(),
+            oversubscribe_percent: 200,
+            max_jobs_cap: 256,
+        };
+        let out = render_nix_config(&HashMap::new(), &cfg);
+        assert!(out.contains(r#""systems":[]"#), "{out}");
+        // No worker -> leave max-jobs to the base nix.conf default so a
+        // local fallback build is not run at the offload capacity.
+        assert!(!out.contains("max-jobs"), "{out}");
+    }
+
+    #[test]
     fn worker_caps_feature_matching() {
         let caps = WorkerCaps {
             name: "w1".into(),
@@ -439,6 +559,7 @@ mod tests {
                 ("aarch64-linux".to_owned(), [].into()),
             ]
             .into(),
+            max_jobs: 1,
         };
         assert!(caps.serves("x86_64-linux", &[]));
         assert!(caps.serves("x86_64-linux", &["kvm".into()]));

@@ -427,6 +427,7 @@ async fn session(
             caps: system_caps(opts, ctx),
             signing_public_key: signing_key.to_public_key().to_string(),
             resumable_keys: ctx.resumable_keys(),
+            max_jobs: opts.max_jobs.max(1),
         })))
         .await?;
 

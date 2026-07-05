@@ -95,6 +95,9 @@ message Register {
   // ed25519 public key used to sign output NARs, in Nix's
   // "name:base64" format (nix-store --generate-binary-cache-key).
   string signing_public_key = 5;
+  // Advisory capacity, summed across workers to size the max-jobs of
+  // the generated nix.conf fragment. Not the RequestJob dispatch path.
+  uint32 max_jobs = 8;
 }
 
 message Heartbeat {
