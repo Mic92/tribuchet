@@ -1,4 +1,5 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("cargo:rerun-if-changed=proto/tribuchet.proto");
     tonic_prost_build::compile_protos("proto/tribuchet.proto")?;
     // Baked-in default for --pasta (set by the Nix package).
     println!("cargo:rerun-if-env-changed=TRIBUCHET_PASTA");

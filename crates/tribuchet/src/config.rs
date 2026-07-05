@@ -61,6 +61,42 @@ pub struct HubConfig {
     /// register as a worker (auth = tailscale).
     #[serde(default)]
     pub tailscale_allowed_tags: Vec<String>,
+    /// When set, the hub rewrites a nix.conf fragment (the
+    /// external-builders and max-jobs settings) whenever the
+    /// connected-worker set changes, so a local nix-daemon offloads to
+    /// whatever systems are available right now.
+    #[serde(default)]
+    pub nix_config: Option<NixConfig>,
+}
+
+/// A hub-maintained nix.conf fragment. A local nix.conf `include`s the
+/// path; a systemd path unit watching it restarts nix-daemon to apply
+/// changes (in-flight build children survive the restart).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct NixConfig {
+    /// File the fragment is written to.
+    pub path: PathBuf,
+    /// external-builders `program`: the attach shim nix runs.
+    pub attach_program: PathBuf,
+    /// Percent to scale summed worker capacity by for the emitted
+    /// max-jobs (200 = 2x). Oversubscription keeps every worker's queue
+    /// fed regardless of the system mix nix admits into its single
+    /// global slot pool, and hides the per-build dispatch round trip.
+    #[serde(default = "default_oversubscribe_percent")]
+    pub oversubscribe_percent: u32,
+    /// Hard ceiling on the emitted max-jobs. Bounds the local-build
+    /// burst if every worker vanishes and offloaded builds fall back
+    /// to local execution.
+    #[serde(default = "default_max_jobs_cap")]
+    pub max_jobs_cap: u32,
+}
+
+fn default_oversubscribe_percent() -> u32 {
+    200
+}
+fn default_max_jobs_cap() -> u32 {
+    256
 }
 
 fn default_hub_socket() -> PathBuf {
