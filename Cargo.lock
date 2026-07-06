@@ -620,7 +620,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -790,7 +790,7 @@ dependencies = [
 [[package]]
 name = "harmonia-file-core"
 version = "3.1.0"
-source = "git+https://github.com/nix-community/harmonia?rev=0760dbe508a1162f05dc36bdf333b45318ee77a0#0760dbe508a1162f05dc36bdf333b45318ee77a0"
+source = "git+https://github.com/nix-community/harmonia?rev=a30fa10b60356a76d04967822f7fa5a9860fc2f1#a30fa10b60356a76d04967822f7fa5a9860fc2f1"
 dependencies = [
  "serde",
  "serde_json",
@@ -800,7 +800,7 @@ dependencies = [
 [[package]]
 name = "harmonia-file-nar"
 version = "3.1.0"
-source = "git+https://github.com/nix-community/harmonia?rev=0760dbe508a1162f05dc36bdf333b45318ee77a0#0760dbe508a1162f05dc36bdf333b45318ee77a0"
+source = "git+https://github.com/nix-community/harmonia?rev=a30fa10b60356a76d04967822f7fa5a9860fc2f1#a30fa10b60356a76d04967822f7fa5a9860fc2f1"
 dependencies = [
  "bstr",
  "bytes",
@@ -824,7 +824,7 @@ dependencies = [
 [[package]]
 name = "harmonia-protocol"
 version = "3.1.0"
-source = "git+https://github.com/nix-community/harmonia?rev=0760dbe508a1162f05dc36bdf333b45318ee77a0#0760dbe508a1162f05dc36bdf333b45318ee77a0"
+source = "git+https://github.com/nix-community/harmonia?rev=a30fa10b60356a76d04967822f7fa5a9860fc2f1#a30fa10b60356a76d04967822f7fa5a9860fc2f1"
 dependencies = [
  "async-stream",
  "bstr",
@@ -858,7 +858,7 @@ dependencies = [
 [[package]]
 name = "harmonia-protocol-derive"
 version = "3.1.0"
-source = "git+https://github.com/nix-community/harmonia?rev=0760dbe508a1162f05dc36bdf333b45318ee77a0#0760dbe508a1162f05dc36bdf333b45318ee77a0"
+source = "git+https://github.com/nix-community/harmonia?rev=a30fa10b60356a76d04967822f7fa5a9860fc2f1#a30fa10b60356a76d04967822f7fa5a9860fc2f1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -868,7 +868,7 @@ dependencies = [
 [[package]]
 name = "harmonia-store-aterm"
 version = "0.0.0-alpha.0"
-source = "git+https://github.com/nix-community/harmonia?rev=0760dbe508a1162f05dc36bdf333b45318ee77a0#0760dbe508a1162f05dc36bdf333b45318ee77a0"
+source = "git+https://github.com/nix-community/harmonia?rev=a30fa10b60356a76d04967822f7fa5a9860fc2f1#a30fa10b60356a76d04967822f7fa5a9860fc2f1"
 dependencies = [
  "bytes",
  "harmonia-store-content-address",
@@ -884,7 +884,7 @@ dependencies = [
 [[package]]
 name = "harmonia-store-build-result"
 version = "3.1.0"
-source = "git+https://github.com/nix-community/harmonia?rev=0760dbe508a1162f05dc36bdf333b45318ee77a0#0760dbe508a1162f05dc36bdf333b45318ee77a0"
+source = "git+https://github.com/nix-community/harmonia?rev=a30fa10b60356a76d04967822f7fa5a9860fc2f1#a30fa10b60356a76d04967822f7fa5a9860fc2f1"
 dependencies = [
  "harmonia-store-derivation",
  "num_enum",
@@ -895,7 +895,7 @@ dependencies = [
 [[package]]
 name = "harmonia-store-content-address"
 version = "3.1.0"
-source = "git+https://github.com/nix-community/harmonia?rev=0760dbe508a1162f05dc36bdf333b45318ee77a0#0760dbe508a1162f05dc36bdf333b45318ee77a0"
+source = "git+https://github.com/nix-community/harmonia?rev=a30fa10b60356a76d04967822f7fa5a9860fc2f1#a30fa10b60356a76d04967822f7fa5a9860fc2f1"
 dependencies = [
  "derive_more",
  "harmonia-store-path",
@@ -907,7 +907,7 @@ dependencies = [
 [[package]]
 name = "harmonia-store-derivation"
 version = "0.0.0-alpha.0"
-source = "git+https://github.com/nix-community/harmonia?rev=0760dbe508a1162f05dc36bdf333b45318ee77a0#0760dbe508a1162f05dc36bdf333b45318ee77a0"
+source = "git+https://github.com/nix-community/harmonia?rev=a30fa10b60356a76d04967822f7fa5a9860fc2f1#a30fa10b60356a76d04967822f7fa5a9860fc2f1"
 dependencies = [
  "bytes",
  "data-encoding",
@@ -926,7 +926,7 @@ dependencies = [
 [[package]]
 name = "harmonia-store-path"
 version = "3.1.0"
-source = "git+https://github.com/nix-community/harmonia?rev=0760dbe508a1162f05dc36bdf333b45318ee77a0#0760dbe508a1162f05dc36bdf333b45318ee77a0"
+source = "git+https://github.com/nix-community/harmonia?rev=a30fa10b60356a76d04967822f7fa5a9860fc2f1#a30fa10b60356a76d04967822f7fa5a9860fc2f1"
 dependencies = [
  "derive_more",
  "harmonia-utils-base-encoding",
@@ -939,7 +939,7 @@ dependencies = [
 [[package]]
 name = "harmonia-store-path-info"
 version = "3.1.0"
-source = "git+https://github.com/nix-community/harmonia?rev=0760dbe508a1162f05dc36bdf333b45318ee77a0#0760dbe508a1162f05dc36bdf333b45318ee77a0"
+source = "git+https://github.com/nix-community/harmonia?rev=a30fa10b60356a76d04967822f7fa5a9860fc2f1#a30fa10b60356a76d04967822f7fa5a9860fc2f1"
 dependencies = [
  "harmonia-store-content-address",
  "harmonia-store-path",
@@ -951,7 +951,7 @@ dependencies = [
 [[package]]
 name = "harmonia-store-ref-scan"
 version = "0.0.0-alpha.0"
-source = "git+https://github.com/nix-community/harmonia?rev=0760dbe508a1162f05dc36bdf333b45318ee77a0#0760dbe508a1162f05dc36bdf333b45318ee77a0"
+source = "git+https://github.com/nix-community/harmonia?rev=a30fa10b60356a76d04967822f7fa5a9860fc2f1#a30fa10b60356a76d04967822f7fa5a9860fc2f1"
 dependencies = [
  "harmonia-store-path",
  "harmonia-utils-base-encoding",
@@ -960,7 +960,7 @@ dependencies = [
 [[package]]
 name = "harmonia-store-remote"
 version = "3.1.0"
-source = "git+https://github.com/nix-community/harmonia?rev=0760dbe508a1162f05dc36bdf333b45318ee77a0#0760dbe508a1162f05dc36bdf333b45318ee77a0"
+source = "git+https://github.com/nix-community/harmonia?rev=a30fa10b60356a76d04967822f7fa5a9860fc2f1#a30fa10b60356a76d04967822f7fa5a9860fc2f1"
 dependencies = [
  "async-stream",
  "futures-core",
@@ -980,7 +980,7 @@ dependencies = [
 [[package]]
 name = "harmonia-utils-base-encoding"
 version = "0.0.0-alpha.0"
-source = "git+https://github.com/nix-community/harmonia?rev=0760dbe508a1162f05dc36bdf333b45318ee77a0#0760dbe508a1162f05dc36bdf333b45318ee77a0"
+source = "git+https://github.com/nix-community/harmonia?rev=a30fa10b60356a76d04967822f7fa5a9860fc2f1#a30fa10b60356a76d04967822f7fa5a9860fc2f1"
 dependencies = [
  "data-encoding",
  "derive_more",
@@ -990,7 +990,7 @@ dependencies = [
 [[package]]
 name = "harmonia-utils-hash"
 version = "0.0.0-alpha.0"
-source = "git+https://github.com/nix-community/harmonia?rev=0760dbe508a1162f05dc36bdf333b45318ee77a0#0760dbe508a1162f05dc36bdf333b45318ee77a0"
+source = "git+https://github.com/nix-community/harmonia?rev=a30fa10b60356a76d04967822f7fa5a9860fc2f1#a30fa10b60356a76d04967822f7fa5a9860fc2f1"
 dependencies = [
  "blake3",
  "data-encoding",
@@ -1008,7 +1008,7 @@ dependencies = [
 [[package]]
 name = "harmonia-utils-io"
 version = "0.0.0-alpha.0"
-source = "git+https://github.com/nix-community/harmonia?rev=0760dbe508a1162f05dc36bdf333b45318ee77a0#0760dbe508a1162f05dc36bdf333b45318ee77a0"
+source = "git+https://github.com/nix-community/harmonia?rev=a30fa10b60356a76d04967822f7fa5a9860fc2f1#a30fa10b60356a76d04967822f7fa5a9860fc2f1"
 dependencies = [
  "bytes",
  "futures-util",
@@ -1021,7 +1021,7 @@ dependencies = [
 [[package]]
 name = "harmonia-utils-signature"
 version = "3.1.0"
-source = "git+https://github.com/nix-community/harmonia?rev=0760dbe508a1162f05dc36bdf333b45318ee77a0#0760dbe508a1162f05dc36bdf333b45318ee77a0"
+source = "git+https://github.com/nix-community/harmonia?rev=a30fa10b60356a76d04967822f7fa5a9860fc2f1#a30fa10b60356a76d04967822f7fa5a9860fc2f1"
 dependencies = [
  "data-encoding",
  "ed25519-dalek",
@@ -1785,7 +1785,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2068,10 +2068,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2592,7 +2592,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
