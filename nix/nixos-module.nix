@@ -288,6 +288,9 @@ in
           # delegate the cgroup subtree so the worker can apply
           # per-build pids/memory limits and cgroup.kill teardown
           Delegate = true;
+          # Builders inherit this; match nix-daemon so they are not stuck at
+          # the systemd default soft limit of 1024 and fail with EMFILE.
+          LimitNOFILE = 1048576;
           Restart = "on-failure";
         };
       };
