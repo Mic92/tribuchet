@@ -729,7 +729,7 @@ fn lifecycle() {
     assert_journal(
         Node::Worker,
         "tribuchet-worker",
-        "per-build cgroup limits enabled",
+        "per-build cgroup scoping enabled",
     );
     assert_journal(Node::Hub, "tribuchet-hub", "dispatching build");
     // Inputs are imported through the worker's nix-daemon and registered as

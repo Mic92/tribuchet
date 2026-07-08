@@ -1,22 +1,26 @@
 //! Best-effort cgroup v2 scoping for builds.
 //!
 //! With a delegated cgroup (systemd `Delegate=yes`), each build runs in
-//! a child cgroup with `pids.max` (and optionally `memory.max`), and
-//! teardown uses `cgroup.kill`, which reaches setsid'd escapees no
-//! killpg can. Without delegation builds run unscoped, with a warning.
+//! a child cgroup with an optional `memory.max`, and teardown uses
+//! `cgroup.kill`, which reaches setsid'd escapees no killpg can.
+//! Without delegation builds run unscoped, with a warning.
+//!
+//! No `pids.max`: the pids controller counts threads and a parallel
+//! build on a many-core machine legitimately needs thousands, so
+//! process caps are left to whatever encloses the worker.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Move this process into a `main` leaf below its own cgroup (cgroup
 /// v2's no-internal-process rule forbids enabling controllers while the
-/// parent holds processes) and enable pids/memory for siblings.
+/// parent holds processes) and enable the memory controller for siblings.
 /// Returns the delegated base, or None when cgroups are unavailable.
 // Only the Linux reaper calls this; builds are unscoped on macOS.
 #[cfg(target_os = "linux")]
 pub fn init() -> Option<PathBuf> {
     let unavailable = |why: &str| {
-        tracing::warn!("cgroup limits disabled: {why}; builds run without pids/memory caps");
+        tracing::warn!("cgroup scoping disabled: {why}; builds run unscoped");
         None
     };
     let Ok(cg) = fs::read_to_string("/proc/self/cgroup") else {
@@ -29,21 +33,16 @@ pub fn init() -> Option<PathBuf> {
     let Ok(controllers) = fs::read_to_string(base.join("cgroup.controllers")) else {
         return unavailable("cannot read cgroup.controllers");
     };
-    if !controllers.split_whitespace().any(|c| c == "pids") {
-        return unavailable("pids controller not delegated (systemd Delegate=yes?)");
-    }
     let main = base.join("main");
     if fs::create_dir_all(&main).is_err() || fs::write(main.join("cgroup.procs"), "0").is_err() {
         return unavailable("cannot move into a leaf cgroup");
     }
-    let mut ctrl = String::from("+pids");
-    if controllers.split_whitespace().any(|c| c == "memory") {
-        ctrl.push_str(" +memory");
-    }
-    if let Err(e) = fs::write(base.join("cgroup.subtree_control"), ctrl) {
+    if controllers.split_whitespace().any(|c| c == "memory")
+        && let Err(e) = fs::write(base.join("cgroup.subtree_control"), "+memory")
+    {
         return unavailable(&format!("cannot enable controllers: {e}"));
     }
-    tracing::info!(base = %base.display(), "per-build cgroup limits enabled");
+    tracing::info!(base = %base.display(), "per-build cgroup scoping enabled");
     Some(base)
 }
 
@@ -57,7 +56,6 @@ pub fn create(base: &Path, build_id: &str, memory_max: Option<u64>) -> Option<Pa
     let dir = build_dir(base, build_id);
     let setup = || -> std::io::Result<()> {
         fs::create_dir_all(&dir)?;
-        fs::write(dir.join("pids.max"), "4096")?;
         if let Some(bytes) = memory_max {
             fs::write(dir.join("memory.max"), bytes.to_string())?;
         }
