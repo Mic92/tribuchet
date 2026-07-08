@@ -93,7 +93,7 @@ Reference implementations: `nix/src/libstore/unix/build/` and
   `/etc/passwd`, then `pivot_root` + detach of the old root. The uid is
   remapped via the user namespace (no separate build uid yet). When the
   worker's cgroup is delegated (systemd `Delegate=yes`), each build runs
-  in its own cgroup with `pids.max` (and optional `memory.max`), torn
+  in its own cgroup with an optional `memory.max`, torn
   down via `cgroup.kill`. `--sandbox-bin-sh` binds a static shell at
   `/bin/sh` like Nix's busybox sandbox path. Builds requiring the
   `uid-range` system feature get a disjoint 65536-uid block (Nix's

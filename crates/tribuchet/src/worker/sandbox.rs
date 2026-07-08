@@ -51,8 +51,8 @@ pub struct SandboxSpec {
     /// candidates alongside outputs.
     #[serde(default)]
     pub store_inputs: Vec<String>,
-    /// Per-build cgroup; the builder enters it from pre_exec so pids/
-    /// memory limits cover the whole build, including the setup phase.
+    /// Per-build cgroup; the builder enters it from pre_exec so the
+    /// memory limit covers the whole build, including the setup phase.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub cgroup: Option<PathBuf>,
     /// uid-range feature: host base of a 65536-uid block mapped into
