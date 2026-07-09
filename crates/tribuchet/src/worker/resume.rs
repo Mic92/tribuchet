@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic;
 use std::time::{Duration, Instant};
@@ -466,49 +466,41 @@ pub(super) fn deliver(
         error: fin.error.clone(),
     })))?;
     for o in &fin.outputs {
-        let mut f = fs::File::open(&o.nar_file)?;
-        let mut buf = vec![0u8; CHUNK_SIZE];
-        loop {
-            let n = f.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            out_tx.blocking_send(msg(worker_message::Msg::Nar(NarTransfer {
-                build_id: build_id.into(),
-                store_path: o.scratch.clone(),
-                payload: Some(nar_transfer::Payload::ZstdNarChunk(buf[..n].to_vec())),
-                eof: false,
-            })))?;
-        }
-        out_tx.blocking_send(msg(worker_message::Msg::Nar(NarTransfer {
-            build_id: build_id.into(),
-            store_path: o.scratch.clone(),
-            payload: None,
-            eof: true,
-        })))?;
+        stream_nar(out_tx, build_id, &o.scratch, &o.nar_file)?;
     }
     for e in &fin.extras {
-        let mut f = fs::File::open(&e.nar_file)?;
-        let mut buf = vec![0u8; CHUNK_SIZE];
-        loop {
-            let n = f.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            out_tx.blocking_send(msg(worker_message::Msg::Nar(NarTransfer {
-                build_id: build_id.into(),
-                store_path: e.path.clone(),
-                payload: Some(nar_transfer::Payload::ZstdNarChunk(buf[..n].to_vec())),
-                eof: false,
-            })))?;
+        stream_nar(out_tx, build_id, &e.path, &e.nar_file)?;
+    }
+    Ok(())
+}
+
+/// Stream one NAR file to the hub in chunks, followed by an eof marker.
+fn stream_nar(
+    out_tx: &mpsc::Sender<WorkerMessage>,
+    build_id: &str,
+    store_path: &str,
+    nar_file: &Path,
+) -> Result<()> {
+    let mut f = fs::File::open(nar_file)?;
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
         }
         out_tx.blocking_send(msg(worker_message::Msg::Nar(NarTransfer {
             build_id: build_id.into(),
-            store_path: e.path.clone(),
-            payload: None,
-            eof: true,
+            store_path: store_path.into(),
+            payload: Some(nar_transfer::Payload::ZstdNarChunk(buf[..n].to_vec())),
+            eof: false,
         })))?;
     }
+    out_tx.blocking_send(msg(worker_message::Msg::Nar(NarTransfer {
+        build_id: build_id.into(),
+        store_path: store_path.into(),
+        payload: None,
+        eof: true,
+    })))?;
     Ok(())
 }
 
