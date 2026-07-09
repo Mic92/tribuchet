@@ -25,6 +25,7 @@ use super::binfmt;
 use crate::proto::BuildAssignment;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(test, derive(Default))]
 pub struct SandboxSpec {
     pub builder: String,
     /// Derivation system, e.g. "i686-linux" (drives Linux personality).
@@ -388,6 +389,25 @@ mod tests {
         }
     }
 
+    /// Common fields for a /bin/sh test build rooted in `dir`;
+    /// tests override what they exercise via struct update syntax.
+    fn test_spec(dir: &Path) -> SandboxSpec {
+        SandboxSpec {
+            builder: "/bin/sh".into(),
+            system: if cfg!(target_os = "linux") {
+                "x86_64-linux".into()
+            } else {
+                "aarch64-darwin".into()
+            },
+            // The hub's tmpDirInSandbox; on macOS prepare() must
+            // rewrite it to the local build dir.
+            cwd: "/build".into(),
+            root: dir.join("root"),
+            build_dir: dir.join("top/build"),
+            ..SandboxSpec::default()
+        }
+    }
+
     /// The derivation env is client-controlled (LD_PRELOAD, …) and must
     /// not be applied to the setup stage, which runs the worker binary
     /// with the worker's host credentials before entering the sandbox.
@@ -396,26 +416,8 @@ mod tests {
     fn derivation_env_stays_off_the_setup_stage() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let spec = SandboxSpec {
-            builder: "/bin/sh".into(),
-            system: "x86_64-linux".into(),
-            args: vec![],
             env: HashMap::from([("LD_PRELOAD".into(), "/nix/store/evil.so".into())]),
-            cwd: "/build".into(),
-            network: false,
-            root: dir.path().join("root"),
-            build_dir: dir.path().join("top/build"),
-            binds_ro: vec![],
-            store_inputs: vec![],
-            symlink_inputs: vec![],
-            recursive_nix: false,
-            binds_dev: vec![],
-            outputs: vec![],
-            cgroup: None,
-            uid_range: None,
-            fod_uid: None,
-            pasta: None,
-            emulator: None,
-            deny_read: vec![],
+            ..test_spec(dir.path())
         };
         fs::create_dir_all(&spec.build_dir)?;
         let (req, _r, _w) = spawn_request(&spec)?;
@@ -434,8 +436,6 @@ mod tests {
         }
         let dir = tempfile::tempdir()?;
         let mut spec = SandboxSpec {
-            builder: "/bin/sh".into(),
-            system: "x86_64-linux".into(),
             args: vec![
                 "-c".into(),
                 // sleep keeps the builder alive so the timing assertion
@@ -449,26 +449,12 @@ mod tests {
                     .into(),
             ],
             env: HashMap::from([("FOO".into(), "bar".into())]),
-            cwd: "/build".into(),
-            network: false,
-            root: dir.path().join("root"),
-            build_dir: dir.path().join("top/build"),
-            store_inputs: vec![],
-            symlink_inputs: vec![],
-            recursive_nix: false,
             binds_ro: ["/bin", "/usr", "/lib", "/lib64", "/nix/store"]
                 .iter()
                 .filter(|p| Path::new(p).exists())
                 .map(|p| (PathBuf::from(p), PathBuf::from(p)))
                 .collect(),
-            binds_dev: vec![],
-            outputs: vec![],
-            cgroup: None,
-            uid_range: None,
-            fod_uid: None,
-            pasta: None,
-            emulator: None,
-            deny_read: vec![],
+            ..test_spec(dir.path())
         };
         fs::create_dir_all(&spec.build_dir)?;
         platform::prepare(&mut spec)?;
@@ -501,8 +487,6 @@ mod tests {
         let outside = dir.path().join("outside");
         let build_dir = dir.path().join("top/build");
         let mut spec = SandboxSpec {
-            builder: "/bin/sh".into(),
-            system: "aarch64-darwin".into(),
             args: vec![
                 "-c".into(),
                 // Each escape attempt exits with its own code so a
@@ -528,23 +512,9 @@ mod tests {
                 ("NIX_BUILD_TOP".into(), "/build".into()),
                 ("ATTRS".into(), "/build/.attrs.json".into()),
             ]),
-            // What a Linux hub sends; prepare() must rewrite it.
-            cwd: "/build".into(),
-            network: false,
-            root: dir.path().join("root"),
             build_dir,
-            binds_ro: vec![],
-            binds_dev: vec![],
-            outputs: vec![],
-            store_inputs: vec![],
-            symlink_inputs: vec![],
-            cgroup: None,
-            uid_range: None,
-            fod_uid: None,
-            pasta: None,
-            emulator: None,
             deny_read: vec![secret],
-            recursive_nix: false,
+            ..test_spec(dir.path())
         };
         fs::create_dir_all(&spec.build_dir)?;
         platform::prepare(&mut spec)?;
