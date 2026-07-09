@@ -17,9 +17,9 @@ use tonic::Status;
 use super::state::{HubState, Job};
 use crate::chunkio::ChunkWriter;
 use crate::proto::{
-    BuildAssignment, CancelBuild, ExtraPath, HubMessage, NarTransfer, OutputNar, OutputSignature,
-    PathInfoMsg, PathOffer, ResultAck, TmpDirArchive, attach_event, hub_message, nar_transfer,
-    worker_message,
+    BuildAssignment, BuildResult, CancelBuild, ExtraPath, HubMessage, NarTransfer, OutputNar,
+    OutputSignature, PathInfoMsg, PathOffer, ResultAck, TmpDirArchive, attach_event, hub_message,
+    nar_transfer, worker_message,
 };
 
 /// How long a dispatched build may run with no attach client listening
@@ -105,21 +105,7 @@ pub(super) async fn run_job(
             // Result before ever sending MissingPaths. Pass the error
             // on to the client instead of calling it unexpected.
             worker_message::Msg::Result(res) if res.exit_code != 0 => {
-                if !(1..=255).contains(&res.exit_code) {
-                    bail!("worker sent invalid exit code {}", res.exit_code);
-                }
-                if !res.error.is_empty() {
-                    job.replay
-                        .publish(attach_event::Event::Log(
-                            format!("tribuchet worker error: {}\n", res.error).into_bytes(),
-                        ))
-                        .await;
-                }
-                super::metrics::Metrics::inc(&state.metrics.failed);
-                job.replay
-                    .publish(attach_event::Event::ExitCode(res.exit_code))
-                    .await;
-                ack_result(out_tx, job).await;
+                publish_worker_failure(state, out_tx, job, &res).await?;
                 return Ok(());
             }
             other => bail!(
@@ -696,6 +682,35 @@ async fn finish_relay(
     ack_result(out_tx, job).await;
 }
 
+/// Report a worker-side build failure to attached clients: forward
+/// the error text and exit code, count the failure, and ack so the
+/// worker can drop the build.
+async fn publish_worker_failure(
+    state: &HubState,
+    out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
+    job: &Job,
+    res: &BuildResult,
+) -> Result<()> {
+    // Unix exposes only the low 8 bits to the parent; a nonzero
+    // multiple of 256 would look like success.
+    if !(1..=255).contains(&res.exit_code) {
+        bail!("worker sent invalid exit code {}", res.exit_code);
+    }
+    if !res.error.is_empty() {
+        job.replay
+            .publish(attach_event::Event::Log(
+                format!("tribuchet worker error: {}\n", res.error).into_bytes(),
+            ))
+            .await;
+    }
+    super::metrics::Metrics::inc(&state.metrics.failed);
+    job.replay
+        .publish(attach_event::Event::ExitCode(res.exit_code))
+        .await;
+    ack_result(out_tx, job).await;
+    Ok(())
+}
+
 /// Tell the worker its result (and all output NARs) arrived intact,
 /// so it can stop keeping the build for redelivery. Best effort: a
 /// lost ack only means the worker holds the build dir until its TTL.
@@ -763,23 +778,7 @@ async fn relay_build(
                     bail!("worker sent a duplicate build result");
                 }
                 if res.exit_code != 0 {
-                    // Unix exposes only the low 8 bits to the parent; a
-                    // nonzero multiple of 256 would look like success.
-                    if !(1..=255).contains(&res.exit_code) {
-                        bail!("worker sent invalid exit code {}", res.exit_code);
-                    }
-                    if !res.error.is_empty() {
-                        job.replay
-                            .publish(attach_event::Event::Log(
-                                format!("tribuchet worker error: {}\n", res.error).into_bytes(),
-                            ))
-                            .await;
-                    }
-                    super::metrics::Metrics::inc(&state.metrics.failed);
-                    job.replay
-                        .publish(attach_event::Event::ExitCode(res.exit_code))
-                        .await;
-                    ack_result(out_tx, job).await;
+                    publish_worker_failure(state, out_tx, job, &res).await?;
                     return Ok(());
                 }
                 pending = verify_set(res.outputs, &job.req.outputs)?;
