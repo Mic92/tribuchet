@@ -183,6 +183,20 @@ pub fn command(spec: &SandboxSpec) -> Result<Command> {
         }
     }
 
+    // Symlink store objects cannot be bind-mounted (the mount would
+    // resolve them); recreate them inside the private root instead.
+    for (dst, target) in &spec.symlink_inputs {
+        let link = spec.root.join(dst.strip_prefix("/").unwrap_or(dst));
+        if link.symlink_metadata().is_ok() {
+            continue;
+        }
+        if let Some(parent) = link.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        std::os::unix::fs::symlink(target, &link)
+            .with_context(|| format!("creating symlink input {}", link.display()))?;
+    }
+
     if spec.emulator.is_some() && binfmt::register_line(&spec.system).is_none() {
         anyhow::bail!("no binfmt magic known for system {}", spec.system);
     }

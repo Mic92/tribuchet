@@ -97,6 +97,35 @@ mod tests {
         Ok(())
     }
 
+    /// A store object that is itself a symlink round-trips as a symlink.
+    #[tokio::test]
+    async fn root_symlink_round_trip() -> Result<()> {
+        let src = tempfile::tempdir()?;
+        fs::write(src.path().join("target"), b"hello")?;
+        let link = src.path().join("link");
+        std::os::unix::fs::symlink(src.path().join("target"), &link)?;
+
+        let out = tempfile::tempdir()?;
+        let dest = out.path().join("restored");
+        round_trip_via_zstd(&link, &dest).await?;
+
+        let meta = fs::symlink_metadata(&dest)?;
+        assert!(meta.file_type().is_symlink(), "root symlink dereferenced");
+        assert_eq!(fs::read_link(&dest)?, src.path().join("target"));
+
+        let mut ours = Vec::new();
+        pack(&link, &mut ours).await?;
+        if let Ok(o) = std::process::Command::new("nix-store")
+            .arg("--dump")
+            .arg(&link)
+            .output()
+            && o.status.success()
+        {
+            assert_eq!(ours, o.stdout);
+        }
+        Ok(())
+    }
+
     /// The NAR matches nix-store --dump byte for byte when nix exists.
     #[tokio::test]
     async fn matches_nix_store_dump() -> Result<()> {
