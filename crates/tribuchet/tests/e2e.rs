@@ -411,6 +411,44 @@ in [ (mk "a") (mk "b") (mk "c") ]
 }
 
 #[test]
+fn build_symlink_input() {
+    // A store object that is itself a symlink must stay a symlink
+    // inside the sandbox.
+    succeed(Node::Hub, "echo symlink-target > /root/sym-target");
+    let target = succeed(Node::Hub, "nix-store --add /root/sym-target")
+        .trim()
+        .to_string();
+    succeed(Node::Hub, &format!("ln -sfn {target} /root/sym-link"));
+    let link = succeed(Node::Hub, "nix-store --add /root/sym-link")
+        .trim()
+        .to_string();
+    let expr = format!(
+        r#"let
+  bash = builtins.storePath "{bash}";
+  link = builtins.storePath "{link}";
+in derivation {{
+  name = "tt-symlink-input";
+  system = "x86_64-linux";
+  builder = bash + "/bin/bash";
+  args = [ "-c" ("test -L " + link + " && echo symlink-input-ok > $out") ];
+}}
+"#,
+        bash = bash(),
+    );
+    write_file(Node::Hub, "/root/symlink-input.nix", &expr);
+    // The path must be missing on the worker so it travels over the wire.
+    succeed(
+        Node::Worker,
+        &format!("nix-store --delete {link} 2>/dev/null || true"),
+    );
+    let out = succeed(Node::Hub, "nix-build /root/symlink-input.nix --no-out-link");
+    succeed(
+        Node::Hub,
+        &format!("grep -q symlink-input-ok {}", out.trim()),
+    );
+}
+
+#[test]
 fn build_uidrange() {
     build_grep("/etc/tt/uidrange.nix", "uid-range-ok");
 }

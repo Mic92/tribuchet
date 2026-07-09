@@ -51,6 +51,12 @@ pub struct SandboxSpec {
     /// candidates alongside outputs.
     #[serde(default)]
     pub store_inputs: Vec<String>,
+    /// Store objects that are themselves symlinks: (path inside the
+    /// sandbox, link target). Bind-mounting such a path would silently
+    /// dereference it, so they are recreated as symlinks instead.
+    #[serde(default)]
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub symlink_inputs: Vec<(PathBuf, PathBuf)>,
     /// Per-build cgroup; the builder enters it from pre_exec so the
     /// memory limit covers the whole build, including the setup phase.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
@@ -135,7 +141,13 @@ pub fn prepare(
         // inputs live at their real store paths (daemon import)
         binds_ro: inputs
             .iter()
+            .filter(|p| !Path::new(p).is_symlink())
             .map(|p| (PathBuf::from(p), PathBuf::from(p)))
+            .collect(),
+        symlink_inputs: inputs
+            .iter()
+            .filter(|p| Path::new(p).is_symlink())
+            .filter_map(|p| Some((PathBuf::from(p), fs::read_link(p).ok()?)))
             .collect(),
         binds_dev: Vec::new(),
         outputs: a.outputs.values().cloned().collect(),
@@ -394,6 +406,7 @@ mod tests {
             build_dir: dir.path().join("top/build"),
             binds_ro: vec![],
             store_inputs: vec![],
+            symlink_inputs: vec![],
             recursive_nix: false,
             binds_dev: vec![],
             outputs: vec![],
@@ -441,6 +454,7 @@ mod tests {
             root: dir.path().join("root"),
             build_dir: dir.path().join("top/build"),
             store_inputs: vec![],
+            symlink_inputs: vec![],
             recursive_nix: false,
             binds_ro: ["/bin", "/usr", "/lib", "/lib64", "/nix/store"]
                 .iter()
@@ -523,6 +537,7 @@ mod tests {
             binds_dev: vec![],
             outputs: vec![],
             store_inputs: vec![],
+            symlink_inputs: vec![],
             cgroup: None,
             uid_range: None,
             fod_uid: None,
