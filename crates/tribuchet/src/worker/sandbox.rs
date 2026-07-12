@@ -77,11 +77,12 @@ pub struct SandboxSpec {
     /// so a network-facing build never runs as host root.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub fod_uid: Option<u32>,
-    /// pasta binary: fixed-output builds get a private netns with
+    /// Fixed-output build: private netns with the presto-pasta
     /// user-mode NAT; host abstract sockets and loopback services
     /// stay unreachable.
+    #[serde(default)]
     #[cfg_attr(target_os = "macos", allow(dead_code))]
-    pub pasta: Option<PathBuf>,
+    pub net_isolation: bool,
     /// Static emulator binary for foreign-system builds, bound at
     /// binfmt::INTERP_PATH and registered in a per-userns binfmt_misc
     /// instance (Linux only).
@@ -120,7 +121,8 @@ pub struct PrepareOpts<'a> {
     /// User namespace leased from nsresourced (rootless uid-range).
     pub leased_userns: Option<PathBuf>,
     pub emulator: Option<&'a Path>,
-    pub pasta: Option<&'a Path>,
+    /// Fixed-output builds get a private netns with user-mode NAT.
+    pub net_isolation: bool,
     pub fod_uid: Option<u32>,
     /// Bind-mount the host nix-daemon socket into the sandbox so the
     /// builder can register inner-build outputs.
@@ -165,7 +167,7 @@ pub fn prepare(
         uid_range: opts.uid_range,
         leased_userns: opts.leased_userns.clone(),
         fod_uid: opts.fod_uid.filter(|_| a.fixed_output),
-        pasta: opts.pasta.filter(|_| a.fixed_output).map(Path::to_path_buf),
+        net_isolation: opts.net_isolation && a.fixed_output,
         emulator: opts.emulator.map(Path::to_path_buf),
         deny_read: opts.secrets.to_vec(),
         recursive_nix: opts.recursive_nix,

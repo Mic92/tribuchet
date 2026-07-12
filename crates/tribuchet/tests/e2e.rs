@@ -515,7 +515,7 @@ fn build_logbomb() {
 /// original order rather than racing three tasks on shared network state.
 #[test]
 fn build_fod() {
-    // FOD source on the hub, fetched by the isolated sandbox through pasta.
+    // FOD source on the hub, fetched by the isolated sandbox through presto-pasta.
     succeed(
         Node::Hub,
         "mkdir -p /srv/fod && echo hello-fod > /srv/fod/data",
@@ -548,7 +548,7 @@ fn build_fod() {
     succeed(Node::Worker, "grep -q fod-hosts.test /etc/hosts");
     build_grep("/etc/tt/fod-hosts.nix", "hello-fod");
 
-    // 3) resolve fod-dns.test only via dnsmasq, through pasta's DNS forwarder
+    // 3) resolve fod-dns.test only via dnsmasq, through presto-pasta's DNS forwarder
     let hubip = succeed(Node::Worker, "getent hosts hub | awk '{print $1}'")
         .trim()
         .to_string();

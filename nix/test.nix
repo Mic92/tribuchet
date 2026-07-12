@@ -169,7 +169,7 @@ in
           tribuchet
           pkgs.python3
         ];
-        # Resolver for the FOD-via-DNS subtest; pasta forwards the
+        # Resolver for the FOD-via-DNS subtest; presto-pasta forwards the
         # sandbox's queries here. The record is dropped into addn-hosts
         # at test time, once the hub IP is known.
         services.dnsmasq = {

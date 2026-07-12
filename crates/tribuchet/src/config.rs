@@ -166,11 +166,6 @@ pub struct WorkerConfig {
     /// (Linux, kernel 6.7+).
     #[serde(default)]
     pub emulate: BTreeMap<String, PathBuf>,
-    /// pasta binary; fixed-output builds then get a private network
-    /// namespace with user-mode NAT (Linux). Defaults to the path
-    /// baked in at build time, if any; "none" disables it.
-    #[serde(default)]
-    pub pasta: Option<PathBuf>,
     /// Advertise the `recursive-nix` system feature so the hub routes
     /// derivations using it here. Requires the patched Nix on the
     /// client side (see `nix/patches/`).

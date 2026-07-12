@@ -3,6 +3,7 @@
 use std::ffi::CString;
 use std::fs;
 use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(test)]
@@ -14,24 +15,32 @@ use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use nix::sched::{CloneFlags, unshare};
 use nix::sys::personality::{self, Persona};
 use nix::sys::resource::{Resource, getrlimit, setrlimit};
+use nix::sys::socket::{
+    AddressFamily, ControlMessage, ControlMessageOwned, MsgFlags, SockFlag, SockType, recv,
+    recvmsg, sendmsg, socketpair,
+};
 use nix::sys::{prctl, stat, wait};
 use nix::unistd::{self, getgid, getuid, pivot_root, sethostname};
 
 use super::{SandboxSpec, binfmt};
 use crate::proto::BuildAssignment;
 
-// Link-local addressing for the pasta netns. Forwarding DNS on the
-// gateway (not an arbitrary address plus --map-host-loopback none)
-// lets it reach a host resolver on loopback, e.g. systemd-resolved's
-// 127.0.0.53 stub.
-const PASTA_HOST_V4: &str = "169.254.1.1";
-const PASTA_CHILD_V4: &str = "169.254.1.2";
-const PASTA_V4_NETMASK: &str = "16";
-// 6to4 prefix mapping the same IPv4 link-local range; IPv4LL is never
-// addressed over IPv6, so host collisions are not a concern.
-const PASTA_HOST_V6: &str = "64:ff9b:1:4b8e:472e:a5c8:a9fe:0101";
-const PASTA_CHILD_V6: &str = "64:ff9b:1:4b8e:472e:a5c8:a9fe:0102";
-const PASTA_NS_IFNAME: &str = "eth0";
+// Interface name for the presto-pasta tap inside the build netns.
+// Addressing (link-local guest/gateway, DNS forwarded on the gateway
+// address so a loopback host resolver like systemd-resolved's stub
+// stays reachable) comes from presto_pasta::Config::default().
+const NET_IFNAME: &str = "eth0";
+
+// linux/if_tun.h
+const IFF_TAP: i16 = 0x0002;
+const IFF_NO_PI: i16 = 0x1000;
+const IFF_VNET_HDR: i16 = 0x4000;
+
+nix::ioctl_write_ptr_bad!(
+    tun_set_iff,
+    nix::request_code_write!(b'T', 202, std::mem::size_of::<libc::c_int>()),
+    libc::ifreq
+);
 
 pub fn prepare(spec: &mut SandboxSpec) -> Result<()> {
     let root = &spec.root;
@@ -86,14 +95,13 @@ pub fn prepare(spec: &mut SandboxSpec) -> Result<()> {
                 fs::write(root.join("etc").join(f), data)?;
             }
         }
-        if spec.pasta.is_some() {
-            // pasta answers DNS on the gateway addresses; point the
-            // sandbox at them, not the host resolv.conf whose
+        if spec.net_isolation {
+            // presto-pasta answers DNS on the gateway addresses; point
+            // the sandbox at them, not the host resolv.conf whose
             // nameserver may be an unreachable loopback stub.
-            fs::write(
-                root.join("etc/resolv.conf"),
-                format!("nameserver {PASTA_HOST_V4}\nnameserver {PASTA_HOST_V6}\n"),
-            )?;
+            let net = presto_pasta::Config::default();
+            let conf = format!("nameserver {}\nnameserver {}\n", net.gateway4, net.gateway6);
+            fs::write(root.join("etc/resolv.conf"), conf)?;
         } else if let Ok(data) = fs::read("/etc/resolv.conf") {
             fs::write(root.join("etc/resolv.conf"), data)?;
         }
@@ -359,7 +367,7 @@ fn enter_and_exec(spec: &SandboxSpec) -> io::Result<std::convert::Infallible> {
         root: &spec.root,
         system: &spec.system,
         binfmt_line: binfmt_line.as_deref(),
-        pasta: spec.pasta.as_deref(),
+        net_isolation: spec.net_isolation,
         fod_uid: spec.fod_uid,
         leased_userns: spec.leased_userns.as_deref(),
         build_dir: &spec.build_dir,
@@ -482,93 +490,138 @@ fn map_uid_range_via_helper(
     }
 }
 
-struct PastaHelper {
-    child: unistd::Pid,
-    req_w: std::os::fd::OwnedFd,
+struct NetHelper {
+    sock: OwnedFd,
 }
 
-/// Fork a helper that stays in the host namespaces and execs pasta
-/// against this process once [`PastaHelper::attach`] is called
-/// (after unshare). pasta's parent exits once the namespace is
-/// configured, so waiting for the helper is the readiness barrier.
-fn fork_pasta_helper(bin: &Path, runas: Option<(u32, u32)>) -> io::Result<PastaHelper> {
+/// Fork a helper that stays in the host namespaces and runs the
+/// presto-pasta datapath on the tap fd the sandbox side sends over
+/// once its netns exists (see [`NetHelper::attach`]). FOD builds drop
+/// the helper to the unprivileged backing uid before any traffic is
+/// processed. The helper exits when the build process (its parent)
+/// dies, watched via a pidfd.
+fn fork_net_helper(runas: Option<(u32, u32)>) -> io::Result<NetHelper> {
     let target = unistd::getpid();
-    let (req_r, req_w) = unistd::pipe().map_err(ioerr("pipe"))?;
-    match unsafe { unistd::fork() }.map_err(ioerr("fork pasta helper"))? {
+    let (ours, theirs) = socketpair(
+        AddressFamily::Unix,
+        SockType::Datagram,
+        None,
+        SockFlag::SOCK_CLOEXEC,
+    )
+    .map_err(ioerr("socketpair"))?;
+    match unsafe { unistd::fork() }.map_err(ioerr("fork net helper"))? {
         unistd::ForkResult::Child => {
-            // Close our copy of the write end, or a build process
-            // dying before attach() would never EOF the read below
-            // and leak this helper forever.
-            drop(req_w);
-            let mut buf = [0u8; 1];
-            let ok = unistd::read(&req_r, &mut buf).is_ok_and(|n| n == 1);
-            if !ok {
-                // build process died before signaling; nothing to do
-                unsafe { libc::_exit(1) }
-            }
-            // -t/-u/-T/-U none disables port forwarding so host
-            // services stay unreachable; outbound NAT is unaffected, so
-            // builds still fetch. Host-loopback mapping is left at its
-            // default (the gateway) so pasta can forward DNS to a
-            // loopback resolver. pasta setns()s into the root-owned
-            // build namespaces as root; --runas (interpreted in the
-            // build userns, see nix/patches) then drops it to the
-            // sandbox uid before it processes traffic.
-            let pid = target.to_string();
-            let runas = runas.map(|(uid, gid)| format!("{uid}:{gid}"));
-            let bin = bin.to_string_lossy();
-            let mut args: Vec<&str> = vec![bin.as_ref(), "--config-net", "--quiet"];
-            if let Some(ids) = &runas {
-                args.extend(["--runas", ids]);
-            }
-            args.extend([
-                "--gateway",
-                PASTA_HOST_V4,
-                "--address",
-                PASTA_CHILD_V4,
-                "--netmask",
-                PASTA_V4_NETMASK,
-                "--dns-forward",
-                PASTA_HOST_V4,
-                "--gateway",
-                PASTA_HOST_V6,
-                "--address",
-                PASTA_CHILD_V6,
-                "--dns-forward",
-                PASTA_HOST_V6,
-                "--ns-ifname",
-                PASTA_NS_IFNAME,
-                "-t",
-                "none",
-                "-u",
-                "none",
-                "-T",
-                "none",
-                "-U",
-                "none",
-                &pid,
-            ]);
-            let args: Vec<CString> = args.iter().map(|s| CString::new(*s).unwrap()).collect();
-            drop(req_r); // do not leak the pipe into pasta
-            let _ = unistd::execv(&args[0], &args);
-            unsafe { libc::_exit(127) }
+            drop(ours);
+            let code = net_helper(&theirs, target, runas);
+            unsafe { libc::_exit(code) }
         }
-        unistd::ForkResult::Parent { child } => {
-            drop(req_r);
-            Ok(PastaHelper { child, req_w })
+        unistd::ForkResult::Parent { .. } => {
+            drop(theirs);
+            Ok(NetHelper { sock: ours })
         }
     }
 }
 
-impl PastaHelper {
+/// Helper body: receive the tap fd, drop privileges, start the
+/// datapath, acknowledge readiness, then wait for the build process
+/// to die.
+fn net_helper(sock: &OwnedFd, build_pid: unistd::Pid, runas: Option<(u32, u32)>) -> i32 {
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, build_pid.as_raw(), 0) };
+    if pidfd < 0 {
+        return 1;
+    }
+    let mut cmsg = nix::cmsg_space!([RawFd; 1]);
+    let mut buf = [0u8; 8];
+    let mut iov = [io::IoSliceMut::new(&mut buf)];
+    let Ok(msg) = recvmsg::<()>(
+        sock.as_raw_fd(),
+        &mut iov,
+        Some(&mut cmsg),
+        MsgFlags::empty(),
+    ) else {
+        return 1;
+    };
+    let Ok(mut cmsgs) = msg.cmsgs() else { return 1 };
+    let Some(ControlMessageOwned::ScmRights(fds)) = cmsgs.next() else {
+        // build process died before creating the tap; nothing to do
+        return 1;
+    };
+    let tap = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    if let Some((uid, gid)) = runas {
+        let dropped = unistd::setgroups(&[]).is_ok()
+            && unistd::setgid(unistd::Gid::from_raw(gid)).is_ok()
+            && unistd::setuid(unistd::Uid::from_raw(uid)).is_ok();
+        if !dropped {
+            return 1;
+        }
+    }
+    let presto = presto_pasta::Presto::new(presto_pasta::Config::default(), tap);
+    // Readiness ack: the sandbox side waits for this before building.
+    if nix::sys::socket::send(sock.as_raw_fd(), b"ok", MsgFlags::empty()).is_err() {
+        return 1;
+    }
+    std::thread::spawn(move || {
+        if let Err(e) = presto.run() {
+            tracing::warn!("presto-pasta datapath exited: {e}");
+        }
+    });
+    // Exit (and release the tap, letting the netns go away) once the
+    // build process is gone.
+    let mut pfd = libc::pollfd {
+        #[expect(clippy::cast_possible_truncation, reason = "pidfds are small")]
+        fd: pidfd as libc::c_int,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    while unsafe { libc::poll(&raw mut pfd, 1, -1) } < 0 {}
+    0
+}
+
+/// Open the tap device inside the just-created netns.
+fn open_tap(name: &str) -> io::Result<OwnedFd> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/net/tun")?;
+    let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+    unsafe {
+        // ifr_name is [c_char; _]; c_char's signedness is target-dependent,
+        // so write the bytes via a u8 pointer instead of an `as` cast.
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            ifr.ifr_name.as_mut_ptr().cast::<u8>(),
+            name.len().min(ifr.ifr_name.len() - 1),
+        );
+        ifr.ifr_ifru.ifru_flags = IFF_TAP | IFF_NO_PI | IFF_VNET_HDR;
+        tun_set_iff(file.as_raw_fd(), &raw const ifr).map_err(ioerr("TUNSETIFF"))?;
+    }
+    Ok(OwnedFd::from(file))
+}
+
+impl NetHelper {
+    /// Called after unshare: create and configure the tap in the new
+    /// netns, hand its fd to the helper and wait until the datapath
+    /// runs. The local tap fd is closed afterwards; the helper's copy
+    /// keeps the interface carrier up.
     fn attach(self) -> io::Result<()> {
-        use wait::{WaitStatus, waitpid};
-        unistd::write(&self.req_w, b"x").map_err(ioerr("signaling pasta helper"))?;
-        match waitpid(self.child, None) {
-            Ok(WaitStatus::Exited(_, 0)) => Ok(()),
-            other => Err(io::Error::other(format!(
-                "pasta failed to attach to the build netns: {other:?}"
-            ))),
+        let net = presto_pasta::Config::default();
+        let tap = open_tap(NET_IFNAME)?;
+        presto_pasta::netdev::configure(NET_IFNAME, &net)?;
+        let fds = [tap.as_raw_fd()];
+        sendmsg::<()>(
+            self.sock.as_raw_fd(),
+            &[io::IoSlice::new(b"tap")],
+            &[ControlMessage::ScmRights(&fds)],
+            MsgFlags::empty(),
+            None,
+        )
+        .map_err(ioerr("sending tap fd"))?;
+        let mut ack = [0u8; 2];
+        match recv(self.sock.as_raw_fd(), &mut ack, MsgFlags::empty()) {
+            Ok(n) if n > 0 => Ok(()),
+            _ => Err(io::Error::other(
+                "presto-pasta helper failed to start the datapath",
+            )),
         }
     }
 }
@@ -632,7 +685,7 @@ struct SetupParams<'a> {
     root: &'a Path,
     system: &'a str,
     binfmt_line: Option<&'a str>,
-    pasta: Option<&'a Path>,
+    net_isolation: bool,
     fod_uid: Option<u32>,
     /// Leased user namespace to join (rootless uid-range).
     leased_userns: Option<&'a Path>,
@@ -655,18 +708,18 @@ fn setup(p: &SetupParams) -> io::Result<()> {
         | CloneFlags::CLONE_NEWPID
         | CloneFlags::CLONE_NEWIPC
         | CloneFlags::CLONE_NEWUTS;
-    // Network builds keep the host namespace only without pasta;
+    // Network builds keep the host namespace only without isolation;
     // with it they get a private one plus user-mode NAT.
-    let private_net = !p.network || p.pasta.is_some();
+    let private_net = !p.network || p.net_isolation;
     if private_net {
         flags |= CloneFlags::CLONE_NEWNET;
     }
-    let pasta_helper = match p.pasta {
-        Some(bin) if p.network => Some(fork_pasta_helper(
-            bin,
-            p.fod_uid.map(|_| (p.sandbox_uid, p.sandbox_gid)),
-        )?),
-        _ => None,
+    // The helper stays in the host namespaces, so it drops to the
+    // host-side backing uid of the FOD build.
+    let net_helper = if p.net_isolation && p.network {
+        Some(fork_net_helper(p.fod_uid.map(|u| (u, u)))?)
+    } else {
+        None
     };
     if p.has_cgroup {
         // Cgroup namespace rooted at the just-entered build cgroup:
@@ -719,7 +772,7 @@ fn setup(p: &SetupParams) -> io::Result<()> {
     if private_net {
         loopback_up().map_err(werr("bringing lo up"))?;
     }
-    if let Some(helper) = pasta_helper {
+    if let Some(helper) = net_helper {
         helper.attach()?;
     }
 

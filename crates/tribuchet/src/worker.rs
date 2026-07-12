@@ -75,8 +75,9 @@ struct WorkerCtx {
     resumable: Mutex<HashMap<String, ResumableBuild>>,
     /// system -> static emulator binary, from the emulate setting.
     emulators: HashMap<String, PathBuf>,
-    /// pasta binary for fixed-output network isolation.
-    pasta: Option<PathBuf>,
+    /// Fixed-output builds get a private netns with the presto-pasta
+    /// user-mode NAT (Linux root workers with /dev/net/tun).
+    fod_isolation: bool,
     max_silent_time: Duration,
     max_log_size: u64,
     /// Builder gets the host nix-daemon socket bind-mounted in; the
@@ -295,13 +296,6 @@ async fn run_async(
     if opts.systems.is_empty() {
         opts.systems.push(host_system());
     }
-    // "none" disables pasta even when a default path was baked in at
-    // build time.
-    opts.pasta = match opts.pasta.take() {
-        Some(p) if p.as_os_str() == "none" => None,
-        Some(p) => Some(p),
-        None => option_env!("TRIBUCHET_PASTA").map(PathBuf::from),
-    };
     // "none" disables the baked-in /bin/sh; else fall back to it so
     // builds using system(3)/#!/bin/sh work without extra config.
     opts.sandbox_bin_sh = match opts.sandbox_bin_sh.take() {
@@ -309,9 +303,10 @@ async fn run_async(
         Some(p) => Some(p),
         None => option_env!("TRIBUCHET_BIN_SH").map(PathBuf::from),
     };
-    // main logs the config before this baked-in default applies, so it
-    // always shows pasta: None; log the effective value.
-    tracing::info!(pasta = ?opts.pasta, bin_sh = ?opts.sandbox_bin_sh, "resolved sandbox defaults");
+    let fod_isolation = cfg!(target_os = "linux") && Path::new("/dev/net/tun").exists();
+    // main logs the config before the baked-in bin_sh default applies;
+    // log the effective values.
+    tracing::info!(fod_isolation, bin_sh = ?opts.sandbox_bin_sh, "resolved sandbox defaults");
     let mut emulators = HashMap::new();
     for (system, path) in &opts.emulate {
         if !cfg!(target_os = "linux") {
@@ -328,14 +323,6 @@ async fn run_async(
         }
         emulators.insert(system.clone(), path.clone());
     }
-    if let Some(p) = &opts.pasta {
-        if !cfg!(target_os = "linux") {
-            anyhow::bail!("pasta requires Linux (network namespaces)");
-        }
-        if !p.is_file() {
-            anyhow::bail!("pasta: {} not found", p.display());
-        }
-    }
     let opts = opts;
     let ctx = Arc::new(WorkerCtx {
         state_dir: opts.state_dir.clone(),
@@ -349,7 +336,7 @@ async fn run_async(
         cancelled: Mutex::new(HashSet::new()),
         resumable: Mutex::new(HashMap::new()),
         emulators,
-        pasta: opts.pasta.clone(),
+        fod_isolation,
         max_silent_time: Duration::from_secs(opts.max_silent_time_secs),
         max_log_size: opts.max_log_size,
         recursive_nix: opts.recursive_nix,

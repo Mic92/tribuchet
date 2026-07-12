@@ -3,7 +3,6 @@
   stdenv,
   craneLib,
   protobuf,
-  passt,
   busybox-sandbox-shell,
   jq,
 }:
@@ -66,7 +65,6 @@ craneLib.buildPackage (
   }
   // lib.optionalAttrs stdenv.isLinux {
     # default network backend for fixed-output builds
-    TRIBUCHET_PASTA = "${passt}/bin/pasta";
     # static /bin/sh for the sandbox, as Nix uses for its sandbox-shell
     TRIBUCHET_BIN_SH = "${busybox-sandbox-shell}/bin/busybox";
   }

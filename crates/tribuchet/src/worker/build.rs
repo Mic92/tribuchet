@@ -58,9 +58,9 @@ impl Drop for UidSlot {
 /// Host credentials backing one build's sandbox.
 ///
 /// Root workers lease a uid slot for two cases: uid-range builds (the
-/// builder is namespace root over a 65536-uid block) and pasta FOD
-/// builds (pasta is rootless-only, so the build drops to a single
-/// unprivileged uid). A leased uid runs the whole sandbox setup itself
+/// builder is namespace root over a 65536-uid block) and isolated FOD
+/// builds (the network-facing build drops to a single unprivileged
+/// uid, which the presto-pasta datapath helper also runs as). A leased uid runs the whole sandbox setup itself
 /// after the drop, which is why sandbox::prepare hands it the per-build
 /// tree (chown + 0700) and the worker state dirs are traverse-only
 /// (0711). Everything else runs as the worker's own uid.
@@ -104,7 +104,7 @@ impl BuildOwner {
             let slot = ctx.alloc_uid_slot().context("no free uid range slot")?;
             return Ok(Self::UidRange(slot));
         }
-        if a.fixed_output && ctx.pasta.is_some() && cfg!(target_os = "linux") && is_root {
+        if a.fixed_output && ctx.fod_isolation && cfg!(target_os = "linux") && is_root {
             let slot = ctx.alloc_uid_slot().context("no free uid slot")?;
             return Ok(Self::Fod(slot));
         }
@@ -441,7 +441,7 @@ impl ActiveBuild {
                 uid_range: owner.uid_range(),
                 leased_userns: owner.leased_userns(),
                 emulator: self.ctx.emulators.get(&a.system).map(PathBuf::as_path),
-                pasta: self.ctx.pasta.as_deref(),
+                net_isolation: self.ctx.fod_isolation,
                 fod_uid: owner.fod_uid(),
                 recursive_nix: self.ctx.recursive_nix,
                 nix_daemon_socket: None,
@@ -451,7 +451,7 @@ impl ActiveBuild {
             id = a.build_id,
             fixed_output = a.fixed_output,
             network = spec.network,
-            pasta = spec.pasta.is_some(),
+            net_isolation = spec.net_isolation,
             "sandbox network decision"
         );
         spec.cgroup = self
