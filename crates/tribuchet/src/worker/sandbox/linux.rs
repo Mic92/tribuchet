@@ -458,7 +458,7 @@ struct PastaHelper {
 /// against this process once [`PastaHelper::attach`] is called
 /// (after unshare). pasta's parent exits once the namespace is
 /// configured, so waiting for the helper is the readiness barrier.
-fn fork_pasta_helper(bin: &Path) -> io::Result<PastaHelper> {
+fn fork_pasta_helper(bin: &Path, runas: Option<(u32, u32)>) -> io::Result<PastaHelper> {
     let target = unistd::getpid();
     let (req_r, req_w) = unistd::pipe().map_err(ioerr("pipe"))?;
     match unsafe { unistd::fork() }.map_err(ioerr("fork pasta helper"))? {
@@ -477,16 +477,18 @@ fn fork_pasta_helper(bin: &Path) -> io::Result<PastaHelper> {
             // services stay unreachable; outbound NAT is unaffected, so
             // builds still fetch. Host-loopback mapping is left at its
             // default (the gateway) so pasta can forward DNS to a
-            // loopback resolver. --runas 0: the build is host root
-            // (mapped to an unprivileged uid only inside its userns),
-            // so pasta must stay root to setns into its /proc/<pid>/ns.
+            // loopback resolver. pasta setns()s into the root-owned
+            // build namespaces as root; --runas (interpreted in the
+            // build userns, see nix/patches) then drops it to the
+            // sandbox uid before it processes traffic.
             let pid = target.to_string();
-            let args: Vec<CString> = [
-                bin.to_string_lossy().as_ref(),
-                "--config-net",
-                "--quiet",
-                "--runas",
-                "0",
+            let runas = runas.map(|(uid, gid)| format!("{uid}:{gid}"));
+            let bin = bin.to_string_lossy();
+            let mut args: Vec<&str> = vec![bin.as_ref(), "--config-net", "--quiet"];
+            if let Some(ids) = &runas {
+                args.extend(["--runas", ids]);
+            }
+            args.extend([
                 "--gateway",
                 PASTA_HOST_V4,
                 "--address",
@@ -512,10 +514,8 @@ fn fork_pasta_helper(bin: &Path) -> io::Result<PastaHelper> {
                 "-U",
                 "none",
                 &pid,
-            ]
-            .iter()
-            .map(|s| CString::new(*s).unwrap())
-            .collect();
+            ]);
+            let args: Vec<CString> = args.iter().map(|s| CString::new(*s).unwrap()).collect();
             drop(req_r); // do not leak the pipe into pasta
             let _ = unistd::execv(&args[0], &args);
             unsafe { libc::_exit(127) }
@@ -627,7 +627,10 @@ fn setup(p: &SetupParams) -> io::Result<()> {
         flags |= CloneFlags::CLONE_NEWNET;
     }
     let pasta_helper = match p.pasta {
-        Some(bin) if p.network => Some(fork_pasta_helper(bin)?),
+        Some(bin) if p.network => Some(fork_pasta_helper(
+            bin,
+            p.fod_uid.map(|_| (p.sandbox_uid, p.sandbox_gid)),
+        )?),
         _ => None,
     };
     if p.has_cgroup {
