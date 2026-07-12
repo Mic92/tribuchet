@@ -3,7 +3,7 @@
 use std::ffi::CString;
 use std::fs;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(test)]
@@ -45,67 +45,11 @@ nix::ioctl_write_ptr_bad!(
 
 pub fn prepare(spec: &mut SandboxSpec) -> Result<()> {
     let root = &spec.root;
-    for sub in [
-        "nix/store",
-        "build",
-        "dev",
-        "dev/shm",
-        "dev/pts",
-        "proc",
-        "sys/fs/cgroup",
-        "etc",
-        "tmp",
-    ] {
-        fs::create_dir_all(root.join(sub))?;
-    }
-    fs::write(
-        root.join("etc/passwd"),
-        "root:x:0:0:Nix build user:/build:/noshell\n\
-         nixbld:x:1000:100:Nix build user:/build:/noshell\n\
-         nobody:x:65534:65534:Nobody:/:/noshell\n",
-    )?;
-    fs::write(
-        root.join("etc/group"),
-        "root:x:0:\nnixbld:x:100:\nnogroup:x:65534:\n",
-    )?;
-    fs::write(
-        root.join("etc/hosts"),
-        "127.0.0.1 localhost\n::1 localhost\n",
-    )?;
-
+    write_skeleton(spec)?;
     populate_dev(root, &mut spec.binds_dev)?;
-    for (link, target) in [
-        ("dev/fd", "/proc/self/fd"),
-        ("dev/stdin", "/proc/self/fd/0"),
-        ("dev/stdout", "/proc/self/fd/1"),
-        ("dev/stderr", "/proc/self/fd/2"),
-        ("dev/ptmx", "/dev/pts/ptmx"),
-    ] {
-        std::os::unix::fs::symlink(target, root.join(link))?;
-    }
     if spec.network {
-        // Like Nix's fixed-output setup: name resolution via files
-        // and DNS only, host resolver/services/hosts copied in, host
-        // CA bundle at the standard path for TLS fetches.
-        fs::write(
-            root.join("etc/nsswitch.conf"),
-            "hosts: files dns\nservices: files\n",
-        )?;
-        for f in ["services", "hosts"] {
-            if let Ok(data) = fs::read(Path::new("/etc").join(f)) {
-                fs::write(root.join("etc").join(f), data)?;
-            }
-        }
-        if spec.net_isolation {
-            // presto-pasta answers DNS on the gateway addresses; point
-            // the sandbox at them, not the host resolv.conf whose
-            // nameserver may be an unreachable loopback stub.
-            let net = presto_pasta::Config::default();
-            let conf = format!("nameserver {}\nnameserver {}\n", net.gateway4, net.gateway6);
-            fs::write(root.join("etc/resolv.conf"), conf)?;
-        } else if let Ok(data) = fs::read("/etc/resolv.conf") {
-            fs::write(root.join("etc/resolv.conf"), data)?;
-        }
+        // Host CA bundle at the standard path for TLS fetches, like
+        // Nix's fixed-output setup.
         let ca = Path::new("/etc/ssl/certs/ca-certificates.crt");
         if let Ok(real) = ca.canonicalize() {
             spec.binds_ro.push((real, ca.to_path_buf()));
@@ -141,15 +85,14 @@ pub fn prepare(spec: &mut SandboxSpec) -> Result<()> {
             chown_recursive(&dir, base)?;
         }
     } else if spec.leased_userns.is_some() {
-        // A rootless worker cannot chown to the leased range; the
-        // writable trees are opened up instead. The 0700 per-build
-        // parent (see BuildOwner) keeps other local users out.
+        // A rootless worker cannot chown to the leased range: the
+        // sandbox root is recreated on an in-namespace tmpfs instead
+        // (mount_filesystems); the on-disk trees the build still
+        // writes are opened up. The 0700 per-build parent (see
+        // BuildOwner) keeps other local users out.
         use std::os::unix::fs::PermissionsExt;
         for dir in [
-            root.clone(),
             root.join("nix/store"),
-            root.join("etc"),
-            root.join("tmp"),
             spec.build_dir.clone(),
             spec.build_dir
                 .parent()
@@ -158,6 +101,118 @@ pub fn prepare(spec: &mut SandboxSpec) -> Result<()> {
         ] {
             fs::set_permissions(&dir, fs::Permissions::from_mode(0o1777))?;
         }
+    }
+    Ok(())
+}
+
+/// Sandbox root skeleton: directories, /etc files, /dev symlinks. Runs
+/// on the on-disk root in the worker and again on a leased build's
+/// in-namespace tmpfs root.
+fn write_skeleton(spec: &SandboxSpec) -> Result<()> {
+    let root = &spec.root;
+    for sub in [
+        "nix/store",
+        "build",
+        "dev",
+        "dev/shm",
+        "dev/pts",
+        "proc",
+        "sys/fs/cgroup",
+        "etc",
+        "tmp",
+    ] {
+        fs::create_dir_all(root.join(sub))?;
+    }
+    fs::write(
+        root.join("etc/passwd"),
+        "root:x:0:0:Nix build user:/build:/noshell\n\
+         nixbld:x:1000:100:Nix build user:/build:/noshell\n\
+         nobody:x:65534:65534:Nobody:/:/noshell\n",
+    )?;
+    fs::write(
+        root.join("etc/group"),
+        "root:x:0:\nnixbld:x:100:\nnogroup:x:65534:\n",
+    )?;
+    fs::write(
+        root.join("etc/hosts"),
+        "127.0.0.1 localhost\n::1 localhost\n",
+    )?;
+    for (link, target) in [
+        ("dev/fd", "/proc/self/fd"),
+        ("dev/stdin", "/proc/self/fd/0"),
+        ("dev/stdout", "/proc/self/fd/1"),
+        ("dev/stderr", "/proc/self/fd/2"),
+        ("dev/ptmx", "/dev/pts/ptmx"),
+    ] {
+        std::os::unix::fs::symlink(target, root.join(link))?;
+    }
+    if spec.network {
+        // Like Nix's fixed-output setup: name resolution via files
+        // and DNS only, host resolver/services/hosts copied in.
+        fs::write(
+            root.join("etc/nsswitch.conf"),
+            "hosts: files dns\nservices: files\n",
+        )?;
+        for f in ["services", "hosts"] {
+            if let Ok(data) = fs::read(Path::new("/etc").join(f)) {
+                fs::write(root.join("etc").join(f), data)?;
+            }
+        }
+        if spec.net_isolation {
+            // presto-pasta answers DNS on the gateway addresses; point
+            // the sandbox at them, not the host resolv.conf whose
+            // nameserver may be an unreachable loopback stub.
+            let net = presto_pasta::Config::default();
+            let conf = format!("nameserver {}\nnameserver {}\n", net.gateway4, net.gateway6);
+            fs::write(root.join("etc/resolv.conf"), conf)?;
+        } else if let Ok(data) = fs::read("/etc/resolv.conf") {
+            fs::write(root.join("etc/resolv.conf"), data)?;
+        }
+    }
+    Ok(())
+}
+
+/// Mount points for the cwd, bind targets and symlinked store inputs
+/// inside the sandbox root. Like `write_skeleton`, runs in the worker
+/// and again on a leased build's tmpfs root.
+fn create_mount_points(spec: &SandboxSpec) -> Result<()> {
+    // The shipped tmp dir is mounted at the request's sandbox build
+    // dir; pre-create the mount point inside the private root.
+    fs::create_dir_all(
+        spec.root.join(
+            Path::new(&spec.cwd)
+                .strip_prefix("/")
+                .unwrap_or(Path::new(&spec.cwd)),
+        ),
+    )?;
+    // Pre-create bind targets matching the source type.
+    for (src, dst) in spec.binds_ro.iter().chain(&spec.binds_dev) {
+        let target = spec.root.join(dst.strip_prefix("/").unwrap_or(dst));
+        if target.exists() || target.symlink_metadata().is_ok() {
+            continue;
+        }
+        if src.is_dir() {
+            fs::create_dir_all(&target)?;
+        } else {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::File::create(&target)?;
+        }
+    }
+
+    // Symlink store objects cannot be bind-mounted (the mount would
+    // resolve them); recreate them inside the private root instead.
+    for (dst, target) in &spec.symlink_inputs {
+        let link = spec.root.join(dst.strip_prefix("/").unwrap_or(dst));
+        if link.symlink_metadata().is_ok() {
+            continue;
+        }
+        if let Some(parent) = link.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        std::os::unix::fs::symlink(target, &link)
+            .with_context(|| format!("creating symlink input {}", link.display()))?;
     }
     Ok(())
 }
@@ -226,44 +281,7 @@ fn chown_recursive(path: &Path, uid: u32) -> Result<()> {
 }
 
 pub fn command(spec: &SandboxSpec) -> Result<Command> {
-    // The shipped tmp dir is mounted at the request's sandbox build
-    // dir; pre-create the mount point inside the private root.
-    fs::create_dir_all(
-        spec.root.join(
-            Path::new(&spec.cwd)
-                .strip_prefix("/")
-                .unwrap_or(Path::new(&spec.cwd)),
-        ),
-    )?;
-    // Pre-create bind targets matching the source type.
-    for (src, dst) in spec.binds_ro.iter().chain(&spec.binds_dev) {
-        let target = spec.root.join(dst.strip_prefix("/").unwrap_or(dst));
-        if target.exists() || target.symlink_metadata().is_ok() {
-            continue;
-        }
-        if src.is_dir() {
-            fs::create_dir_all(&target)?;
-        } else {
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::File::create(&target)?;
-        }
-    }
-
-    // Symlink store objects cannot be bind-mounted (the mount would
-    // resolve them); recreate them inside the private root instead.
-    for (dst, target) in &spec.symlink_inputs {
-        let link = spec.root.join(dst.strip_prefix("/").unwrap_or(dst));
-        if link.symlink_metadata().is_ok() {
-            continue;
-        }
-        if let Some(parent) = link.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        std::os::unix::fs::symlink(target, &link)
-            .with_context(|| format!("creating symlink input {}", link.display()))?;
-    }
+    create_mount_points(spec)?;
 
     if spec.emulator.is_some() && binfmt::register_line(&spec.system).is_none() {
         anyhow::bail!("no binfmt magic known for system {}", spec.system);
@@ -365,6 +383,7 @@ fn enter_and_exec(spec: &SandboxSpec) -> io::Result<std::convert::Infallible> {
         (None, None) => (100, backing_gid),
     };
     setup(&SetupParams {
+        spec,
         root: &spec.root,
         system: &spec.system,
         binfmt_line: binfmt_line.as_deref(),
@@ -695,6 +714,7 @@ fn fork_into_pid_ns() -> io::Result<bool> {
 }
 
 struct SetupParams<'a> {
+    spec: &'a SandboxSpec,
     root: &'a Path,
     system: &'a str,
     binfmt_line: Option<&'a str>,
@@ -851,14 +871,18 @@ fn mount_filesystems(p: &SetupParams) -> io::Result<()> {
     let none: Option<&str> = None;
     mount(none, "/", none, MsFlags::MS_REC | MsFlags::MS_PRIVATE, none)
         .map_err(ioerr("making / private"))?;
-    mount(
-        Some(root),
-        root,
-        none,
-        MsFlags::MS_BIND | MsFlags::MS_REC,
-        none,
-    )
-    .map_err(ioerr("binding root"))?;
+    if p.leased_userns.is_some() {
+        tmpfs_root(p)?;
+    } else {
+        mount(
+            Some(root),
+            root,
+            none,
+            MsFlags::MS_BIND | MsFlags::MS_REC,
+            none,
+        )
+        .map_err(ioerr("binding root"))?;
+    }
 
     let bind_one = |src: &Path, dst: &Path, ro: bool, extra: MsFlags| -> io::Result<()> {
         let target = root.join(dst.strip_prefix("/").unwrap_or(dst));
@@ -950,6 +974,71 @@ fn mount_filesystems(p: &SetupParams) -> io::Result<()> {
         .map_err(ioerr("mounting /sys/fs/cgroup"))?;
     }
     Ok(())
+}
+
+/// A leased build cannot own the worker-created on-disk skeleton (the
+/// worker uid is unmapped here); recreate it on a tmpfs owned by this
+/// namespace so the build can chmod and chown it like under a root
+/// worker. Only the scratch store stays on disk: outputs must survive
+/// the namespace.
+fn tmpfs_root(p: &SetupParams) -> io::Result<()> {
+    let root = p.root;
+    let none: Option<&str> = None;
+    let store = open_tree(&root.join("nix/store")).map_err(ioerr("detaching scratch store"))?;
+    // Creating inodes on the ns-owned tmpfs needs a mapped fsuid (the
+    // worker uid is not); the mapped ids also make the build own the
+    // skeleton. fsuid/fsgid are per-thread and the setup stage is
+    // single-threaded; restored afterwards because the on-disk paths
+    // bound later are only reachable as the worker uid.
+    let saved_user = unistd::setfsuid(unistd::Uid::from_raw(p.sandbox_uid));
+    let saved_group = unistd::setfsgid(unistd::Gid::from_raw(p.sandbox_gid));
+    let populated = (|| {
+        mount(Some("tmpfs"), root, Some("tmpfs"), MsFlags::empty(), none)
+            .map_err(ioerr("mounting tmpfs root"))?;
+        write_skeleton(p.spec)
+            .and_then(|()| create_mount_points(p.spec))
+            .map_err(|e| io::Error::other(format!("populating tmpfs root: {e:#}")))
+    })();
+    unistd::setfsuid(saved_user);
+    unistd::setfsgid(saved_group);
+    populated?;
+    move_mount(store.as_fd(), &root.join("nix/store")).map_err(ioerr("attaching scratch store"))
+}
+
+/// Detach a directory as a floating bind mount (new mount API; raw
+/// syscall, the nix crate has no wrapper yet).
+fn open_tree(path: &Path) -> nix::Result<OwnedFd> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = CString::new(path.as_os_str().as_bytes()).map_err(|_| Errno::EINVAL)?;
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_open_tree,
+            libc::AT_FDCWD,
+            c.as_ptr(),
+            libc::OPEN_TREE_CLONE | libc::OPEN_TREE_CLOEXEC,
+        )
+    };
+    let fd = Errno::result(fd)?;
+    let fd = RawFd::try_from(fd).map_err(|_| Errno::EBADF)?;
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Attach a floating mount from `open_tree` at `target`.
+fn move_mount(from: BorrowedFd, target: &Path) -> nix::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x4;
+    let c = CString::new(target.as_os_str().as_bytes()).map_err(|_| Errno::EINVAL)?;
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_move_mount,
+            from.as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_FDCWD,
+            c.as_ptr(),
+            MOVE_MOUNT_F_EMPTY_PATH,
+        )
+    };
+    Errno::result(ret).map(drop)
 }
 
 /// Fresh per-userns binfmt_misc instance (kernel 6.7+) so emulated

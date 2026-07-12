@@ -13,6 +13,8 @@ derivation {
       read -r _ _ count < /proc/self/uid_map
       [ "$count" = 65536 ] || exit 1
       [ -w /sys/fs/cgroup/cgroup.procs ] || exit 1
+      # skeleton lives on an in-namespace tmpfs owned by the build
+      [ -O / ] && [ -O /etc ] || exit 1
       echo uid-range-rootless-ok > $out
     ''
   ];
