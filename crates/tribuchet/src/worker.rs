@@ -16,6 +16,8 @@ mod caps;
 mod cgroup;
 mod imports;
 mod logtail;
+#[cfg(target_os = "linux")]
+mod nsresourced;
 pub mod reaper;
 mod resume;
 pub mod sandbox;
@@ -80,6 +82,9 @@ struct WorkerCtx {
     /// Builder gets the host nix-daemon socket bind-mounted in; the
     /// worker advertises the `recursive-nix` feature.
     pub(super) recursive_nix: bool,
+    /// systemd-nsresourced socket, if it delegates uid ranges to this
+    /// user; lets a rootless worker run uid-range builds.
+    nsresourced: Option<PathBuf>,
     /// Slot i maps the uid block [uid_base + i*65536, 65536); disjoint
     /// blocks keep concurrent uid-range builds apart.
     uid_base: u32,
@@ -249,6 +254,19 @@ fn request_job() -> WorkerMessage {
     msg(worker_message::Msg::RequestJob(RequestJob {}))
 }
 
+#[cfg(target_os = "linux")]
+fn nsresourced_socket() -> Option<PathBuf> {
+    let socket = Path::new(nsresourced::SOCKET_PATH);
+    let available = nsresourced::available(socket);
+    tracing::info!(available, "systemd-nsresourced uid range delegation");
+    available.then(|| socket.to_path_buf())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn nsresourced_socket() -> Option<PathBuf> {
+    None
+}
+
 pub fn run(opts: WorkerConfig) -> Result<()> {
     // ensure() either becomes the reaper (never returns) or, in the
     // worker generation it exec'd, hands back the spawner. It runs
@@ -335,6 +353,7 @@ async fn run_async(
         max_silent_time: Duration::from_secs(opts.max_silent_time_secs),
         max_log_size: opts.max_log_size,
         recursive_nix: opts.recursive_nix,
+        nsresourced: nsresourced_socket(),
         uid_base: opts.auto_allocate_uids_base,
         uid_slots: Mutex::new(vec![false; opts.max_jobs.max(1) as usize]),
     });

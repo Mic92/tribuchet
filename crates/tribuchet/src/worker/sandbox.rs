@@ -67,6 +67,12 @@ pub struct SandboxSpec {
     /// uid mapped to 1000, like Nix without auto-allocate-uids.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub uid_range: Option<u32>,
+    /// uid-range on a rootless worker: path to a user namespace whose
+    /// 65536-uid range was leased from systemd-nsresourced; the setup
+    /// stage joins it instead of writing uid maps itself.
+    #[serde(default)]
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub leased_userns: Option<PathBuf>,
     /// Root workers: unprivileged host uid backing fixed-output builds,
     /// so a network-facing build never runs as host root.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
@@ -111,6 +117,8 @@ pub struct PrepareOpts<'a> {
     pub bin_sh: Option<&'a Path>,
     pub secrets: &'a [PathBuf],
     pub uid_range: Option<u32>,
+    /// User namespace leased from nsresourced (rootless uid-range).
+    pub leased_userns: Option<PathBuf>,
     pub emulator: Option<&'a Path>,
     pub pasta: Option<&'a Path>,
     pub fod_uid: Option<u32>,
@@ -155,6 +163,7 @@ pub fn prepare(
         store_inputs: inputs.to_vec(),
         cgroup: None,
         uid_range: opts.uid_range,
+        leased_userns: opts.leased_userns.clone(),
         fod_uid: opts.fod_uid.filter(|_| a.fixed_output),
         pasta: opts.pasta.filter(|_| a.fixed_output).map(Path::to_path_buf),
         emulator: opts.emulator.map(Path::to_path_buf),

@@ -131,6 +131,24 @@ pub fn prepare(spec: &mut SandboxSpec) -> Result<()> {
         ] {
             chown_recursive(&dir, base)?;
         }
+    } else if spec.leased_userns.is_some() {
+        // A rootless worker cannot chown to the leased range; the
+        // writable trees are opened up instead. The 0700 per-build
+        // parent (see BuildOwner) keeps other local users out.
+        use std::os::unix::fs::PermissionsExt;
+        for dir in [
+            root.clone(),
+            root.join("nix/store"),
+            root.join("etc"),
+            root.join("tmp"),
+            spec.build_dir.clone(),
+            spec.build_dir
+                .parent()
+                .unwrap_or(&spec.build_dir)
+                .to_path_buf(),
+        ] {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o1777))?;
+        }
     }
     Ok(())
 }
@@ -311,14 +329,18 @@ fn enter_and_exec(spec: &SandboxSpec) -> io::Result<std::convert::Infallible> {
     // Single uid 1000 (Nix default) or, for uid-range builds,
     // in-namespace root over a 65536-uid block. Emulated builds map
     // uid 0 for the binfmt registration, dropped to 1000 in setup().
+    // Leased namespaces already carry their maps; host uids are unused.
     let backing_uid = spec.fod_uid.unwrap_or_else(|| getuid().as_raw());
     let backing_gid = spec.fod_uid.unwrap_or_else(|| getgid().as_raw());
+    let leased = spec.leased_userns.is_some();
     let (sandbox_uid, host_uid, uid_count) = match spec.uid_range {
+        _ if leased => (0, 0, 65536u32),
         Some(base) => (0, base, 65536u32),
         None if binfmt_line.is_some() => (0, backing_uid, 1),
         None => (1000, backing_uid, 1),
     };
     let (sandbox_gid, host_gid) = match spec.uid_range {
+        _ if leased => (0, 0),
         Some(base) => (0, base),
         None if binfmt_line.is_some() => (0, backing_gid),
         None => (100, backing_gid),
@@ -329,6 +351,7 @@ fn enter_and_exec(spec: &SandboxSpec) -> io::Result<std::convert::Infallible> {
         binfmt_line: binfmt_line.as_deref(),
         pasta: spec.pasta.as_deref(),
         fod_uid: spec.fod_uid,
+        leased_userns: spec.leased_userns.as_deref(),
         build_dir: &spec.build_dir,
         binds: &spec.binds_ro,
         binds_dev: &spec.binds_dev,
@@ -601,6 +624,8 @@ struct SetupParams<'a> {
     binfmt_line: Option<&'a str>,
     pasta: Option<&'a Path>,
     fod_uid: Option<u32>,
+    /// Leased user namespace to join (rootless uid-range).
+    leased_userns: Option<&'a Path>,
     build_dir: &'a Path,
     binds: &'a [(PathBuf, PathBuf)],
     binds_dev: &'a [(PathBuf, PathBuf)],
@@ -645,7 +670,15 @@ fn setup(p: &SetupParams) -> io::Result<()> {
     // the unprivileged-userns restriction some kernels enforce (e.g.
     // AppArmor on Ubuntu), which would reject the setgroups write
     // below. Only an unprivileged worker self-maps its own uid.
-    if p.uid_count == 1 && p.fod_uid.is_none() {
+    if let Some(userns) = p.leased_userns {
+        // Rootless uid-range: nsresourced already wrote the maps of the
+        // leased namespace; join it (allowed: this uid owns it) and
+        // unshare the rest inside.
+        let ns = fs::File::open(userns)
+            .map_err(|e| io::Error::other(format!("opening leased userns: {e}")))?;
+        nix::sched::setns(ns, CloneFlags::CLONE_NEWUSER).map_err(ioerr("joining leased userns"))?;
+        unshare(flags & !CloneFlags::CLONE_NEWUSER).map_err(ioerr("unshare"))?;
+    } else if p.uid_count == 1 && p.fod_uid.is_none() {
         unshare(flags).map_err(ioerr("unshare"))?;
         fs::write("/proc/self/setgroups", "deny").map_err(werr("setgroups"))?;
         fs::write(
@@ -703,8 +736,9 @@ fn setup(p: &SetupParams) -> io::Result<()> {
     apply_process_limits(p.system)?;
 
     // Helper-mapped builds run as the still-root worker, unmapped but
-    // holding all caps in the new userns; drop to the in-namespace uid
-    // the map promised. A self-mapped worker already runs as it.
+    // holding all caps in the new userns (a leased namespace likewise
+    // maps neither root nor the worker uid); drop to the in-namespace
+    // uid the map promised. A self-mapped worker already runs as it.
     if p.uid_count > 1 || p.fod_uid.is_some() {
         unistd::setgroups(&[]).map_err(ioerr("setgroups"))?;
         unistd::setgid(unistd::Gid::from_raw(p.sandbox_gid)).map_err(ioerr("setgid"))?;
