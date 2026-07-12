@@ -92,6 +92,14 @@
             }
           );
 
+          nixos-test-rootless = pkgs.testers.runNixOSTest (
+            import ./nix/test-rootless.nix {
+              tribuchet = self.packages.x86_64-linux.default;
+              nixosModule = self.nixosModules.default;
+              nsresourcedModule = self.nixosModules.nsresourced;
+            }
+          );
+
           nixos-test-nsresourced = pkgs.testers.runNixOSTest (
             import ./nix/test-nsresourced.nix {
               nsresourcedModule = self.nixosModules.nsresourced;
