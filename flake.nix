@@ -60,6 +60,7 @@
       darwinModules.default = import ./nix/darwin-module.nix self;
 
       nixosModules.default = import ./nix/nixos-module.nix self;
+      nixosModules.nsresourced = ./nix/nsresourced.nix;
 
       # CI builds every package and devShell on every system, plus the
       # x86_64-linux-only checks below.
@@ -88,6 +89,12 @@
             import ./nix/test.nix {
               tribuchet = self.packages.x86_64-linux.default;
               nixosModule = self.nixosModules.default;
+            }
+          );
+
+          nixos-test-nsresourced = pkgs.testers.runNixOSTest (
+            import ./nix/test-nsresourced.nix {
+              nsresourcedModule = self.nixosModules.nsresourced;
             }
           );
 
