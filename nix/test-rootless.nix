@@ -111,7 +111,8 @@
         )
 
     with subtest("uid-range build runs in a leased user namespace"):
-        out = hub.succeed("cat $(nix-build /etc/tt/uidrange-rootless.nix --no-out-link)")
+        path = hub.succeed("nix-build /etc/tt/uidrange-rootless.nix --no-out-link").strip()
+        out = hub.succeed(f"cat {path}")
         assert "uid-range-rootless-ok" in out, out
         worker.succeed("journalctl -u tribuchet-worker | grep -q 'leased uid range'")
   '';

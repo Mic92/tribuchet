@@ -78,6 +78,27 @@ pub fn allocate_user_range(
     Ok(UsernsLease { userns, name })
 }
 
+/// Hand ownership of the build's cgroup to the leased namespace's root
+/// (replaces the chown a root worker does); nsresourced also removes
+/// the cgroup when the namespace is released. Call only after entering
+/// the cgroup: delegation takes cgroup.procs away from the worker uid.
+pub fn add_cgroup_to_userns(socket: &Path, userns: &Path, cgroup: &Path) -> Result<()> {
+    let ns =
+        std::fs::File::open(userns).with_context(|| format!("open userns {}", userns.display()))?;
+    let cg =
+        std::fs::File::open(cgroup).with_context(|| format!("open cgroup {}", cgroup.display()))?;
+    call(
+        socket,
+        "io.systemd.NamespaceResource.AddControlGroupToUserNamespace",
+        &json!({
+            "userNamespaceFileDescriptor": 0,
+            "controlGroupFileDescriptor": 1,
+        }),
+        &[ns.as_raw_fd(), cg.as_raw_fd()],
+    )?;
+    Ok(())
+}
+
 /// One varlink method call: JSON + NUL over a unix socket, request fds
 /// attached via SCM_RIGHTS (referenced by index in the parameters).
 fn call(

@@ -319,6 +319,16 @@ fn enter_and_exec(spec: &SandboxSpec) -> io::Result<std::convert::Infallible> {
     if let Some(cg) = &spec.cgroup {
         fs::write(cg.join("cgroup.procs"), "0")
             .map_err(|e| io::Error::other(format!("entering build cgroup: {e}")))?;
+        // Hand the just-entered cgroup to the leased namespace's root
+        // (nspawn inside the sandbox manages it).
+        if let Some(ns) = &spec.leased_userns {
+            crate::worker::nsresourced::add_cgroup_to_userns(
+                Path::new(crate::worker::nsresourced::SOCKET_PATH),
+                ns,
+                cg,
+            )
+            .map_err(|e| io::Error::other(format!("delegating build cgroup: {e:#}")))?;
+        }
     }
     let binfmt_line = match &spec.emulator {
         Some(_) => Some(binfmt::register_line(&spec.system).ok_or_else(|| {

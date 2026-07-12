@@ -464,6 +464,12 @@ impl ActiveBuild {
             // `cgroups` setting); needed by nspawn inside the sandbox
             cgroup::chown_to_builder(cg, base);
         }
+        // cgroup.kill is the only way this worker can reap leased-uid
+        // processes, so an unscoped build is not allowed; the setup
+        // stage delegates the cgroup to the leased namespace itself.
+        if owner.leased_userns().is_some() && spec.cgroup.is_none() {
+            bail!("leased uid-range build needs a delegated cgroup");
+        }
         Ok(spec)
     }
 
