@@ -1,0 +1,153 @@
+From f129d7fb4cbf535b776c42f3627e343afd50f710 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?J=C3=B6rg=20Thalheim?= <joerg@thalheim.io>
+Date: Sun, 12 Jul 2026 11:08:43 +0200
+Subject: [PATCH 2/2] pasta: Open netns watch directory before dropping
+ credentials
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+pasta_netns_quit_init() opens the directory containing the target
+netns (e.g. /proc/<pid>/ns) to watch for its removal. With --runas now
+applied before this point when joining an existing user namespace, the
+open fails with EACCES if the directory is only accessible to the
+original user.
+
+Open the directory before isolate_user(), keep the descriptor in the
+context and use it from pasta_netns_quit_init().
+
+Signed-off-by: Jörg Thalheim <joerg@thalheim.io>
+---
+ conf.c  |  3 +++
+ passt.c |  2 +-
+ passt.h |  2 ++
+ pasta.c | 39 ++++++++++++++++++++++++++++-----------
+ pasta.h |  1 +
+ 5 files changed, 35 insertions(+), 12 deletions(-)
+
+diff --git a/conf.c b/conf.c
+index 66b9e63..6df4e1d 100644
+--- a/conf.c
++++ b/conf.c
+@@ -2073,6 +2073,9 @@ void conf(struct ctx *c, int argc, char **argv)
+ 
+ 	conf_open_files(c);	/* Before any possible setuid() / setgid() */
+ 
++	if (c->mode == MODE_PASTA && *netns)
++		pasta_netns_quit_prepare(c, netns);
++
+ 	isolate_user(uid, gid, !netns_only, userns, c->mode);
+ 
+ 	if (c->no_icmp)
+diff --git a/passt.c b/passt.c
+index 31fbb75..bc5a5c8 100644
+--- a/passt.c
++++ b/passt.c
+@@ -261,7 +261,7 @@ int main(int argc, char **argv)
+ 	isolate_initial(argc, argv);
+ 
+ 	c.pasta_netns_fd = c.fd_tap = c.pidfile_fd = -1;
+-	c.device_state_fd = -1;
++	c.device_state_fd = c.netns_dir_fd = -1;
+ 
+ 	sigemptyset(&sa.sa_mask);
+ 	sa.sa_flags = 0;
+diff --git a/passt.h b/passt.h
+index 0075eb4..26519b3 100644
+--- a/passt.h
++++ b/passt.h
+@@ -200,6 +200,7 @@ struct ip6_ctx {
+  * @no_netns_quit:	In pasta mode, don't exit if fs-bound namespace is gone
+  * @netns_base:		Base name for fs-bound namespace, if any, in pasta mode
+  * @netns_dir:		Directory of fs-bound namespace, if any, in pasta mode
++ * @netns_dir_fd:	Descriptor for @netns_dir, opened before credential drop
+  * @epollfd:		File descriptor for epoll instance
+  * @fd_tap_listen:	File descriptor for listening AF_UNIX socket, if any
+  * @fd_tap:		AF_UNIX socket, tuntap device, or pre-opened socket
+@@ -267,6 +268,7 @@ struct ctx {
+ 	int no_netns_quit;
+ 	char netns_base[PATH_MAX];
+ 	char netns_dir[PATH_MAX];
++	int netns_dir_fd;
+ 
+ 	int epollfd;
+ 	int fd_tap_listen;
+diff --git a/pasta.c b/pasta.c
+index 687406b..981cf82 100644
+--- a/pasta.c
++++ b/pasta.c
+@@ -133,6 +133,31 @@ static int ns_check(void *arg)
+ 
+ }
+ 
++/**
++ * pasta_netns_quit_prepare() - Open netns watch directory before isolation
++ * @c:		Execution context
++ * @netns:	network namespace path
++ *
++ * The directory (e.g. /proc/<pid>/ns) may only be accessible with our initial
++ * credentials, so open it before isolate_user().
++ */
++void pasta_netns_quit_prepare(struct ctx *c, const char *netns)
++{
++	char buf[PATH_MAX] = { 0 };
++
++	if (c->no_netns_quit)
++		return;
++
++	strncpy(buf, netns, PATH_MAX - 1);
++	strncpy(c->netns_base, basename(buf), PATH_MAX - 1);
++	strncpy(buf, netns, PATH_MAX - 1);
++	strncpy(c->netns_dir, dirname(buf), PATH_MAX - 1);
++
++	c->netns_dir_fd = open(c->netns_dir, O_CLOEXEC | O_RDONLY);
++	if (c->netns_dir_fd < 0)
++		die("netns dir open: %s, exiting", strerror_(errno));
++}
++
+ /**
+  * pasta_open_ns() - Open network namespace descriptors
+  * @c:		Execution context
+@@ -154,15 +179,6 @@ void pasta_open_ns(struct ctx *c, const char *netns)
+ 
+ 	if (c->pasta_netns_fd < 0)
+ 		die_perror("Couldn't switch to pasta namespaces");
+-
+-	if (!c->no_netns_quit) {
+-		char buf[PATH_MAX] = { 0 };
+-
+-		strncpy(buf, netns, PATH_MAX - 1);
+-		strncpy(c->netns_base, basename(buf), PATH_MAX - 1);
+-		strncpy(buf, netns, PATH_MAX - 1);
+-		strncpy(c->netns_dir, dirname(buf), PATH_MAX - 1);
+-	}
+ }
+ 
+ /**
+@@ -454,8 +470,9 @@ void pasta_netns_quit_init(const struct ctx *c)
+ 	if (c->mode != MODE_PASTA || c->no_netns_quit || !*c->netns_base)
+ 		return;
+ 
+-	if ((dir_fd = open(c->netns_dir, O_CLOEXEC | O_RDONLY)) < 0)
+-		die("netns dir open: %s, exiting", strerror_(errno));
++	dir_fd = c->netns_dir_fd;
++	if (dir_fd < 0)
++		die("netns watch directory not open, exiting");
+ 
+ 	if (fstatfs(dir_fd, &s)          || s.f_type == DEVPTS_SUPER_MAGIC ||
+ 	    s.f_type == PROC_SUPER_MAGIC || s.f_type == SYSFS_MAGIC)
+diff --git a/pasta.h b/pasta.h
+index 4b063d1..6ae7e23 100644
+--- a/pasta.h
++++ b/pasta.h
+@@ -8,6 +8,7 @@
+ 
+ extern int pasta_child_pid;
+ 
++void pasta_netns_quit_prepare(struct ctx *c, const char *netns);
+ void pasta_open_ns(struct ctx *c, const char *netns);
+ void pasta_start_ns(struct ctx *c, uid_t uid, gid_t gid,
+ 		    int argc, char *argv[]);
+-- 
+2.54.0
+
