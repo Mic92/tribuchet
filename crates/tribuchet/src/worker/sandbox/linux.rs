@@ -63,18 +63,7 @@ pub fn prepare(spec: &mut SandboxSpec) -> Result<()> {
         "127.0.0.1 localhost\n::1 localhost\n",
     )?;
 
-    for dev in ["null", "zero", "full", "random", "urandom", "tty"] {
-        let host = PathBuf::from("/dev").join(dev);
-        fs::File::create(root.join("dev").join(dev))?;
-        spec.binds_dev.push((host.clone(), host)); // dev nodes: bind, rw via node perms
-    }
-    // Nix's `kvm` system feature: pass the device through when the
-    // host has it (VM builds, NixOS tests).
-    let kvm = PathBuf::from("/dev/kvm");
-    if kvm.exists() {
-        fs::File::create(root.join("dev/kvm"))?;
-        spec.binds_dev.push((kvm.clone(), kvm));
-    }
+    populate_dev(root, &mut spec.binds_dev)?;
     for (link, target) in [
         ("dev/fd", "/proc/self/fd"),
         ("dev/stdin", "/proc/self/fd/0"),
@@ -142,6 +131,58 @@ pub fn prepare(spec: &mut SandboxSpec) -> Result<()> {
         ] {
             chown_recursive(&dir, base)?;
         }
+    }
+    Ok(())
+}
+
+/// A build whose sandbox uid 0 maps to host root (emulated builds on a
+/// root worker) could chmod/chown a bind-mounted host device node, so a
+/// worker with CAP_MKNOD creates its own nodes instead. Without the
+/// capability (rootless worker) it binds the host nodes; there the
+/// sandbox never maps to a uid owning them.
+fn populate_dev(root: &Path, binds_dev: &mut Vec<(PathBuf, PathBuf)>) -> Result<()> {
+    let mut devices = vec!["null", "zero", "full", "random", "urandom", "tty"];
+    // Nix's `kvm` system feature (VM builds, NixOS tests).
+    if Path::new("/dev/kvm").exists() {
+        devices.push("kvm");
+    }
+    let mut can_mknod = true;
+    for dev in devices {
+        let host = PathBuf::from("/dev").join(dev);
+        let target = root.join("dev").join(dev);
+        if can_mknod {
+            let rdev = stat::stat(&host)
+                .with_context(|| format!("stat {}", host.display()))?
+                .st_rdev;
+            match stat::mknod(
+                &target,
+                stat::SFlag::S_IFCHR,
+                stat::Mode::from_bits_truncate(0o666),
+                rdev,
+            ) {
+                Ok(()) => {
+                    // umask clips mknod's mode; sandbox uids need 0666.
+                    fs::set_permissions(
+                        &target,
+                        std::os::unix::fs::PermissionsExt::from_mode(0o666),
+                    )
+                    .with_context(|| format!("chmod {}", target.display()))?;
+                    continue;
+                }
+                // Bind-mounting host nodes is only safe when the sandbox
+                // cannot map to a host uid owning them; a root worker
+                // stripped of CAP_MKNOD must not fall back silently.
+                Err(Errno::EPERM) if !unistd::geteuid().is_root() => can_mknod = false,
+                Err(Errno::EPERM) => {
+                    anyhow::bail!("worker runs as root but lacks CAP_MKNOD to create device nodes")
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| format!("mknod {}", target.display()));
+                }
+            }
+        }
+        fs::File::create(&target)?;
+        binds_dev.push((host.clone(), host));
     }
     Ok(())
 }
