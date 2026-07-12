@@ -68,12 +68,18 @@ pub struct SandboxSpec {
     /// uid mapped to 1000, like Nix without auto-allocate-uids.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub uid_range: Option<u32>,
-    /// uid-range on a rootless worker: path to a user namespace whose
-    /// 65536-uid range was leased from systemd-nsresourced; the setup
-    /// stage joins it instead of writing uid maps itself.
+    /// Rootless worker: path to a user namespace whose uid range was
+    /// leased from systemd-nsresourced; the setup stage joins it
+    /// instead of writing uid maps itself.
     #[serde(default)]
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub leased_userns: Option<PathBuf>,
+    /// Sandbox uid nsresourced mapped in that namespace (0 for
+    /// uid-range and emulated builds, 1000 otherwise) and the lease
+    /// size (1 or 65536).
+    #[serde(default)]
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub leased_uids: Option<(u32, u32)>,
     /// Root workers: unprivileged host uid backing fixed-output builds,
     /// so a network-facing build never runs as host root.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
@@ -123,8 +129,10 @@ pub struct PrepareOpts<'a> {
     pub bin_sh: Option<&'a Path>,
     pub secrets: &'a [PathBuf],
     pub uid_range: Option<u32>,
-    /// User namespace leased from nsresourced (rootless uid-range).
+    /// User namespace leased from nsresourced (rootless worker).
     pub leased_userns: Option<PathBuf>,
+    /// Sandbox uid mapped in the leased namespace and the lease size.
+    pub leased_uids: Option<(u32, u32)>,
     pub emulator: Option<&'a Path>,
     /// Fixed-output builds get a private netns with user-mode NAT.
     pub net_isolation: bool,
@@ -173,6 +181,7 @@ pub fn prepare(
         cgroup: None,
         uid_range: opts.uid_range,
         leased_userns: opts.leased_userns.clone(),
+        leased_uids: opts.leased_uids,
         fod_uid: opts.fod_uid.filter(|_| a.fixed_output),
         net_isolation: opts.net_isolation && a.fixed_output,
         net_policy: opts.net_policy.clone(),

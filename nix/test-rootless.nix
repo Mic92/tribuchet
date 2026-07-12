@@ -31,6 +31,9 @@
         environment.etc."tt/uidrange-rootless.nix".text = ''
           import ${./tests/uidrange-rootless.nix} { bash = "${pkgs.bash}"; }
         '';
+        environment.etc."tt/singleuid-rootless.nix".text = ''
+          import ${./tests/singleuid-rootless.nix} { bash = "${pkgs.bash}"; }
+        '';
 
         imports = [ nixosModule ];
         services.tribuchet-hub = {
@@ -115,5 +118,14 @@
         out = hub.succeed(f"cat {path}")
         assert "uid-range-rootless-ok" in out, out
         worker.succeed("journalctl -u tribuchet-worker | grep -q 'leased uid range'")
+
+    with subtest("regular build runs as a leased single uid"):
+        path = hub.succeed("nix-build /etc/tt/singleuid-rootless.nix --no-out-link").strip()
+        out = hub.succeed(f"cat {path}")
+        assert "single-uid-rootless-ok" in out, out
+        # the builder must not run as the worker's own uid
+        backing_uid = out.split()[-1]
+        worker_uid = worker.succeed("id -u tribuchet").strip()
+        assert backing_uid != worker_uid, out
   '';
 }

@@ -348,21 +348,21 @@ fn enter_and_exec(spec: &SandboxSpec) -> io::Result<std::convert::Infallible> {
     // Single uid 1000 (Nix default) or, for uid-range builds,
     // in-namespace root over a 65536-uid block. Emulated builds map
     // uid 0 for the binfmt registration, dropped to 1000 in setup().
-    // Leased namespaces already carry their maps; host uids are unused.
+    // Leased namespaces already carry their maps; host uids are unused
+    // and the sandbox uid is whatever nsresourced mapped.
     let backing_uid = spec.fod_uid.unwrap_or_else(|| getuid().as_raw());
     let backing_gid = spec.fod_uid.unwrap_or_else(|| getgid().as_raw());
-    let leased = spec.leased_userns.is_some();
-    let (sandbox_uid, host_uid, uid_count) = match spec.uid_range {
-        _ if leased => (0, 0, 65536u32),
-        Some(base) => (0, base, 65536u32),
-        None if binfmt_line.is_some() => (0, backing_uid, 1),
-        None => (1000, backing_uid, 1),
+    let (sandbox_uid, host_uid, uid_count) = match (spec.leased_uids, spec.uid_range) {
+        (Some((uid, count)), _) => (uid, 0, count),
+        (None, Some(base)) => (0, base, 65536u32),
+        (None, None) if binfmt_line.is_some() => (0, backing_uid, 1),
+        (None, None) => (1000, backing_uid, 1),
     };
-    let (sandbox_gid, host_gid) = match spec.uid_range {
-        _ if leased => (0, 0),
-        Some(base) => (0, base),
-        None if binfmt_line.is_some() => (0, backing_gid),
-        None => (100, backing_gid),
+    let (sandbox_gid, host_gid) = match (spec.leased_uids, spec.uid_range) {
+        (Some((gid, _)), _) => (gid, 0),
+        (None, Some(base)) => (0, base),
+        (None, None) if binfmt_line.is_some() => (0, backing_gid),
+        (None, None) => (100, backing_gid),
     };
     setup(&SetupParams {
         root: &spec.root,
@@ -819,10 +819,18 @@ fn setup(p: &SetupParams) -> io::Result<()> {
     // holding all caps in the new userns (a leased namespace likewise
     // maps neither root nor the worker uid); drop to the in-namespace
     // uid the map promised. A self-mapped worker already runs as it.
-    if p.uid_count > 1 || p.fod_uid.is_some() {
+    if p.uid_count > 1 || p.fod_uid.is_some() || p.leased_userns.is_some() {
         unistd::setgroups(&[]).map_err(ioerr("setgroups"))?;
         unistd::setgid(unistd::Gid::from_raw(p.sandbox_gid)).map_err(ioerr("setgid"))?;
         unistd::setuid(unistd::Uid::from_raw(p.sandbox_uid)).map_err(ioerr("setuid"))?;
+        if p.leased_userns.is_some() && p.binfmt_line.is_some() {
+            // Leased emulated build: registration needed uid 0; remap
+            // to Nix's uid 1000 via a nested userns.
+            unshare(CloneFlags::CLONE_NEWUSER).map_err(ioerr("nested unshare"))?;
+            fs::write("/proc/self/setgroups", "deny").map_err(werr("nested setgroups"))?;
+            fs::write("/proc/self/uid_map", "1000 0 1").map_err(werr("nested uid_map"))?;
+            fs::write("/proc/self/gid_map", "100 0 1").map_err(werr("nested gid_map"))?;
+        }
     } else if p.binfmt_line.is_some() {
         // binfmt registration needed in-namespace root; remap to
         // Nix's uid 1000 via a nested userns. Exec lookup falls back

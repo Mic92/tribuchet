@@ -64,15 +64,23 @@ impl Drop for UidSlot {
 /// after the drop, which is why sandbox::prepare hands it the per-build
 /// tree (chown + 0700) and the worker state dirs are traverse-only
 /// (0711). Everything else runs as the worker's own uid.
-/// Rootless workers instead lease a whole 65536-uid range from
-/// systemd-nsresourced for uid-range builds; the sandbox setup stage
+/// Rootless workers instead lease from systemd-nsresourced: a whole
+/// 65536-uid range for uid-range builds, a single transient uid for
+/// everything else (target 0 for emulated builds, 1000 otherwise), so
+/// no build runs as the worker's own uid. The sandbox setup stage
 /// joins the pre-mapped namespace and no host file is chowned.
 enum BuildOwner {
     Worker,
     UidRange(UidSlot),
     Fod(UidSlot),
     #[cfg(target_os = "linux")]
-    Leased(super::nsresourced::UsernsLease),
+    Leased {
+        lease: super::nsresourced::UsernsLease,
+        /// Sandbox uid nsresourced mapped (the `target`).
+        sandbox_uid: u32,
+        /// Number of uids in the lease (1 or 65536).
+        size: u32,
+    },
 }
 
 impl BuildOwner {
@@ -84,31 +92,53 @@ impl BuildOwner {
             }
             #[cfg(target_os = "linux")]
             if !is_root {
-                let Some(socket) = &ctx.nsresourced else {
-                    bail!("uid-range builds need a root worker or systemd-nsresourced");
-                };
-                let lease = super::nsresourced::allocate_user_range(
-                    socket,
-                    &format!("trib-{}", &a.build_id[..12]),
-                    65536,
-                    0,
-                )
-                .context("leasing a uid range from systemd-nsresourced")?;
-                tracing::info!(
-                    build_id = a.build_id,
-                    userns = lease.name,
-                    "leased uid range"
-                );
-                return Ok(Self::Leased(lease));
+                return Self::lease(ctx, a, 65536, 0);
             }
             let slot = ctx.alloc_uid_slot().context("no free uid range slot")?;
             return Ok(Self::UidRange(slot));
+        }
+        #[cfg(target_os = "linux")]
+        if !is_root && ctx.nsresourced.is_some() {
+            // Emulated builds need in-namespace root for the binfmt
+            // registration; everything else runs as Nix's uid 1000.
+            let target = if ctx.emulators.contains_key(&a.system) {
+                0
+            } else {
+                1000
+            };
+            return Self::lease(ctx, a, 1, target);
         }
         if a.fixed_output && ctx.fod_isolation && cfg!(target_os = "linux") && is_root {
             let slot = ctx.alloc_uid_slot().context("no free uid slot")?;
             return Ok(Self::Fod(slot));
         }
         Ok(Self::Worker)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn lease(ctx: &Arc<WorkerCtx>, a: &BuildAssignment, size: u32, target: u32) -> Result<Self> {
+        let socket = ctx
+            .nsresourced
+            .as_deref()
+            .context("leasing uids needs a root worker or systemd-nsresourced")?;
+        let lease = super::nsresourced::allocate_user_range(
+            socket,
+            &format!("trib-{}", &a.build_id[..12]),
+            size,
+            target,
+        )
+        .context("leasing a uid range from systemd-nsresourced")?;
+        tracing::info!(
+            build_id = a.build_id,
+            userns = lease.name,
+            size,
+            "leased uid range"
+        );
+        Ok(Self::Leased {
+            lease,
+            sandbox_uid: target,
+            size,
+        })
     }
 
     pub(super) fn uid_range(&self) -> Option<u32> {
@@ -129,7 +159,18 @@ impl BuildOwner {
     fn leased_userns(&self) -> Option<std::path::PathBuf> {
         match self {
             #[cfg(target_os = "linux")]
-            Self::Leased(lease) => Some(lease.ns_path()),
+            Self::Leased { lease, .. } => Some(lease.ns_path()),
+            _ => None,
+        }
+    }
+
+    /// Sandbox uid and lease size inside the leased namespace.
+    fn leased_uids(&self) -> Option<(u32, u32)> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Leased {
+                sandbox_uid, size, ..
+            } => Some((*sandbox_uid, *size)),
             _ => None,
         }
     }
@@ -440,6 +481,7 @@ impl ActiveBuild {
                 secrets: &self.ctx.secret_paths,
                 uid_range: owner.uid_range(),
                 leased_userns: owner.leased_userns(),
+                leased_uids: owner.leased_uids(),
                 emulator: self.ctx.emulators.get(&a.system).map(PathBuf::as_path),
                 net_isolation: self.ctx.fod_isolation,
                 net_policy: self.ctx.fod_network.clone(),
