@@ -151,5 +151,11 @@ in
         backing_uid = out.split()[-1]
         worker_uid = worker.succeed("id -u tribuchet").strip()
         assert backing_uid != worker_uid, out
+
+    with subtest("leased build dirs are cleaned up"):
+        worker.wait_until_succeeds(
+            "test -z \"$(ls /var/lib/tribuchet/builds 2>/dev/null)\""
+        )
+        worker.fail("journalctl -u tribuchet-worker | grep 'cleaning up'")
   '';
 }

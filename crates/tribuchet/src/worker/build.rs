@@ -175,6 +175,23 @@ impl BuildOwner {
         }
     }
 
+    /// Remove the leased-uid-owned files a build left on disk while
+    /// the lease is still held (see `sandbox::cleanup_leased`).
+    fn cleanup_disk(&self, spec: &sandbox::SandboxSpec) {
+        #[cfg(target_os = "linux")]
+        if let Self::Leased {
+            lease, sandbox_uid, ..
+        } = self
+        {
+            let paths = [spec.root.join("nix/store"), spec.build_dir.clone()];
+            if let Err(e) = sandbox::cleanup_leased(&lease.ns_path(), *sandbox_uid, &paths) {
+                tracing::warn!("cleaning up leased build files: {e:#}");
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = spec;
+    }
+
     /// Slot index for resume state: a re-adopting worker must mark it
     /// used again so new builds get disjoint uid ranges.
     fn slot_idx(&self) -> Option<usize> {
@@ -607,6 +624,7 @@ impl ActiveBuild {
         tracing::info!(id = a.build_id, exit_code, "builder finished");
 
         if exit_code != 0 {
+            owner.cleanup_disk(&spec);
             // present on Linux when the sandbox setup stage failed
             let error = sandbox::setup_error_detail(&spec).unwrap_or_default();
             if !error.is_empty() {
@@ -622,9 +640,16 @@ impl ActiveBuild {
             });
         }
 
-        let (packed, extras) = tokio::runtime::Handle::current().block_on(
-            pack_outputs_and_extras(&self.dir, &spec, deadline, signing_key, &a.build_id),
-        )?;
+        let packed = tokio::runtime::Handle::current().block_on(pack_outputs_and_extras(
+            &self.dir,
+            &spec,
+            deadline,
+            signing_key,
+            &a.build_id,
+        ));
+        // packing reads the scratch store, so clean up only afterwards
+        owner.cleanup_disk(&spec);
+        let (packed, extras) = packed?;
         Ok(FinishedBuild {
             exit_code: 0,
             error: String::new(),
