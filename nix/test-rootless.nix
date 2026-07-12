@@ -7,6 +7,9 @@
   nsresourcedModule,
 }:
 { pkgs, lib, ... }:
+let
+  nspawn = import ./nspawn-container.nix { nixpkgs = pkgs.path; };
+in
 {
   name = "tribuchet-rootless";
 
@@ -19,7 +22,14 @@
         environment.systemPackages = [ tribuchet ];
         networking.firewall.allowedTCPPorts = [ 7437 ];
         virtualisation.writableStore = true;
-        virtualisation.additionalPaths = [ pkgs.bash ];
+        # container eval and closure streaming need room
+        virtualisation.memorySize = 4096;
+        virtualisation.diskSize = 4096;
+        virtualisation.additionalPaths = [
+          pkgs.bash
+          pkgs.stdenvNoCC
+          nspawn.toplevel
+        ];
 
         nix.settings = {
           # let the daemon accept uid-range builds; tribuchet's worker
@@ -33,6 +43,9 @@
         '';
         environment.etc."tt/singleuid-rootless.nix".text = ''
           import ${./tests/singleuid-rootless.nix} { bash = "${pkgs.bash}"; }
+        '';
+        environment.etc."tt/nspawn.nix".text = ''
+          import ${./nspawn-container.nix} { nixpkgs = ${pkgs.path}; }
         '';
 
         imports = [ nixosModule ];
@@ -54,7 +67,13 @@
         # paths the worker lacks really travel over the wire.
         virtualisation.useNixStoreImage = true;
         virtualisation.writableStore = true;
-        virtualisation.memorySize = 2048;
+        # booting a NixOS container inside the sandbox needs room
+        virtualisation.memorySize = 4096;
+        virtualisation.diskSize = 4096;
+        virtualisation.additionalPaths = [
+          pkgs.stdenvNoCC
+          nspawn.toplevel
+        ];
 
         imports = [
           nixosModule
@@ -118,6 +137,11 @@
         out = hub.succeed(f"cat {path}")
         assert "uid-range-rootless-ok" in out, out
         worker.succeed("journalctl -u tribuchet-worker | grep -q 'leased uid range'")
+
+    with subtest("nspawn container boots inside a leased uid-range build"):
+        path = hub.succeed("nix-build /etc/tt/nspawn.nix --no-out-link").strip()
+        out = hub.succeed(f"cat {path}/msg")
+        assert "Hello World" in out, out
 
     with subtest("regular build runs as a leased single uid"):
         path = hub.succeed("nix-build /etc/tt/singleuid-rootless.nix --no-out-link").strip()
