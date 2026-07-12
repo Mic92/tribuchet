@@ -22,6 +22,7 @@ use std::process::{Child, Stdio};
 use anyhow::{Context, Result};
 
 use super::binfmt;
+use crate::netpolicy::NetPolicy;
 use crate::proto::BuildAssignment;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -83,6 +84,10 @@ pub struct SandboxSpec {
     #[serde(default)]
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub net_isolation: bool,
+    /// Flow policy applied to that network.
+    #[serde(default)]
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub net_policy: NetPolicy,
     /// Static emulator binary for foreign-system builds, bound at
     /// binfmt::INTERP_PATH and registered in a per-userns binfmt_misc
     /// instance (Linux only).
@@ -123,6 +128,8 @@ pub struct PrepareOpts<'a> {
     pub emulator: Option<&'a Path>,
     /// Fixed-output builds get a private netns with user-mode NAT.
     pub net_isolation: bool,
+    /// Flow policy applied to that network.
+    pub net_policy: NetPolicy,
     pub fod_uid: Option<u32>,
     /// Bind-mount the host nix-daemon socket into the sandbox so the
     /// builder can register inner-build outputs.
@@ -168,6 +175,7 @@ pub fn prepare(
         leased_userns: opts.leased_userns.clone(),
         fod_uid: opts.fod_uid.filter(|_| a.fixed_output),
         net_isolation: opts.net_isolation && a.fixed_output,
+        net_policy: opts.net_policy.clone(),
         emulator: opts.emulator.map(Path::to_path_buf),
         deny_read: opts.secrets.to_vec(),
         recursive_nix: opts.recursive_nix,

@@ -109,7 +109,10 @@ Reference implementations: `nix/src/libstore/unix/build/` and
   [presto-pasta](https://github.com/Mic92/presto-pasta) datapath, run
   by a helper process that drops to an unprivileged uid) instead of
   the host namespace: host abstract sockets and loopback services are
-  unreachable.
+  unreachable. The worker's `[fod-network]` setting adds an ordered
+  allow/deny rule list (destination CIDR or the `private` keyword,
+  protocol, ports/port ranges; first match wins) evaluated for every
+  outbound connection of such builds.
 * macOS: no mount namespace, but inputs already live at their real
   /nix/store paths thanks to the daemon import; the worker's own
   per-build dir becomes the cwd and env values referencing the hub's

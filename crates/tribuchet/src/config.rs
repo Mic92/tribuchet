@@ -166,6 +166,11 @@ pub struct WorkerConfig {
     /// (Linux, kernel 6.7+).
     #[serde(default)]
     pub emulate: BTreeMap<String, PathBuf>,
+    /// Flow policy for the fixed-output build network: ordered
+    /// allow/deny rules on destination address, protocol and port,
+    /// evaluated when a build opens an outbound connection.
+    #[serde(default)]
+    pub fod_network: crate::netpolicy::NetPolicy,
     /// Advertise the `recursive-nix` system feature so the hub routes
     /// derivations using it here. Requires the patched Nix on the
     /// client side (see `nix/patches/`).

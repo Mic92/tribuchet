@@ -78,6 +78,8 @@ struct WorkerCtx {
     /// Fixed-output builds get a private netns with the presto-pasta
     /// user-mode NAT (Linux root workers with /dev/net/tun).
     fod_isolation: bool,
+    /// Flow policy for that network, from the fod-network setting.
+    fod_network: crate::netpolicy::NetPolicy,
     max_silent_time: Duration,
     max_log_size: u64,
     /// Builder gets the host nix-daemon socket bind-mounted in; the
@@ -337,6 +339,7 @@ async fn run_async(
         resumable: Mutex::new(HashMap::new()),
         emulators,
         fod_isolation,
+        fod_network: opts.fod_network.clone(),
         max_silent_time: Duration::from_secs(opts.max_silent_time_secs),
         max_log_size: opts.max_log_size,
         recursive_nix: opts.recursive_nix,

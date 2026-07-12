@@ -6,6 +6,7 @@ mod config;
 mod fsutil;
 mod hub;
 mod nar;
+mod netpolicy;
 mod proto;
 mod rt;
 mod sd;

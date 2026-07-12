@@ -34,7 +34,9 @@ transfer, scheduling, and execution itself.
   cgroup limits, macOS `sandbox-exec`), plus `uid-range` builds and
   cross-system user-mode emulation.
 - Fixed-output derivations get network through [presto-pasta]
-  (embedded user-mode NAT) in an otherwise isolated network namespace.
+  (embedded user-mode NAT) in an otherwise isolated network namespace,
+  with an optional allow/deny flow policy (`fod-network` in
+  worker.toml).
 - Live build logs across reloads/restarts, with max-log-size,
   max-silent-time, and timeout enforcement.
 - NixOS and nix-darwin modules for both services.

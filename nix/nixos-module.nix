@@ -165,6 +165,23 @@ in
           max-jobs = 4;
           max-log-size = 67108864;
           emulate.aarch64-linux = "''${pkgs.pkgsStatic.qemu-user}/bin/qemu-aarch64";
+          # flow policy for the fixed-output build network:
+          # ordered rules, first match wins, then `default`
+          fod-network = {
+            default = "allow";
+            rules = [
+              {
+                action = "deny";
+                dst = "10.0.0.0/8";
+              }
+              {
+                action = "deny";
+                proto = "tcp";
+                dst = "any";
+                ports = [ "25" "465" "587" ];
+              }
+            ];
+          };
         }
       '';
       description = ''

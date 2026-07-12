@@ -23,6 +23,7 @@ use nix::sys::{prctl, stat, wait};
 use nix::unistd::{self, getgid, getuid, pivot_root, sethostname};
 
 use super::{SandboxSpec, binfmt};
+use crate::netpolicy::NetPolicy;
 use crate::proto::BuildAssignment;
 
 // Interface name for the presto-pasta tap inside the build netns.
@@ -368,6 +369,7 @@ fn enter_and_exec(spec: &SandboxSpec) -> io::Result<std::convert::Infallible> {
         system: &spec.system,
         binfmt_line: binfmt_line.as_deref(),
         net_isolation: spec.net_isolation,
+        net_policy: &spec.net_policy,
         fod_uid: spec.fod_uid,
         leased_userns: spec.leased_userns.as_deref(),
         build_dir: &spec.build_dir,
@@ -500,7 +502,7 @@ struct NetHelper {
 /// the helper to the unprivileged backing uid before any traffic is
 /// processed. The helper exits when the build process (its parent)
 /// dies, watched via a pidfd.
-fn fork_net_helper(runas: Option<(u32, u32)>) -> io::Result<NetHelper> {
+fn fork_net_helper(policy: NetPolicy, runas: Option<(u32, u32)>) -> io::Result<NetHelper> {
     let target = unistd::getpid();
     let (ours, theirs) = socketpair(
         AddressFamily::Unix,
@@ -512,7 +514,7 @@ fn fork_net_helper(runas: Option<(u32, u32)>) -> io::Result<NetHelper> {
     match unsafe { unistd::fork() }.map_err(ioerr("fork net helper"))? {
         unistd::ForkResult::Child => {
             drop(ours);
-            let code = net_helper(&theirs, target, runas);
+            let code = net_helper(&theirs, target, policy, runas);
             unsafe { libc::_exit(code) }
         }
         unistd::ForkResult::Parent { .. } => {
@@ -525,7 +527,12 @@ fn fork_net_helper(runas: Option<(u32, u32)>) -> io::Result<NetHelper> {
 /// Helper body: receive the tap fd, drop privileges, start the
 /// datapath, acknowledge readiness, then wait for the build process
 /// to die.
-fn net_helper(sock: &OwnedFd, build_pid: unistd::Pid, runas: Option<(u32, u32)>) -> i32 {
+fn net_helper(
+    sock: &OwnedFd,
+    build_pid: unistd::Pid,
+    policy: NetPolicy,
+    runas: Option<(u32, u32)>,
+) -> i32 {
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, build_pid.as_raw(), 0) };
     if pidfd < 0 {
         return 1;
@@ -555,7 +562,13 @@ fn net_helper(sock: &OwnedFd, build_pid: unistd::Pid, runas: Option<(u32, u32)>)
             return 1;
         }
     }
-    let presto = presto_pasta::Presto::new(presto_pasta::Config::default(), tap);
+    let net = presto_pasta::Config {
+        allow_flow: Some(std::sync::Arc::new(move |d: &presto_pasta::FlowDst| {
+            policy.allows(d.proto, d.ip, d.port)
+        })),
+        ..presto_pasta::Config::default()
+    };
+    let presto = presto_pasta::Presto::new(net, tap);
     // Readiness ack: the sandbox side waits for this before building.
     if nix::sys::socket::send(sock.as_raw_fd(), b"ok", MsgFlags::empty()).is_err() {
         return 1;
@@ -686,6 +699,7 @@ struct SetupParams<'a> {
     system: &'a str,
     binfmt_line: Option<&'a str>,
     net_isolation: bool,
+    net_policy: &'a NetPolicy,
     fod_uid: Option<u32>,
     /// Leased user namespace to join (rootless uid-range).
     leased_userns: Option<&'a Path>,
@@ -717,7 +731,10 @@ fn setup(p: &SetupParams) -> io::Result<()> {
     // The helper stays in the host namespaces, so it drops to the
     // host-side backing uid of the FOD build.
     let net_helper = if p.net_isolation && p.network {
-        Some(fork_net_helper(p.fod_uid.map(|u| (u, u)))?)
+        Some(fork_net_helper(
+            p.net_policy.clone(),
+            p.fod_uid.map(|u| (u, u)),
+        )?)
     } else {
         None
     };

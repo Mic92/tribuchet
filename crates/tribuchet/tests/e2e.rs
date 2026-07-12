@@ -541,8 +541,23 @@ fn build_fod() {
         30,
     );
 
+    // A second hub listener on a port the worker's fod-network policy
+    // denies; reachable from the worker's host netns, not the sandbox.
+    succeed(
+        Node::Hub,
+        "systemd-run --unit=fodsrv2 socat -U TCP-LISTEN:8766,fork,reuseaddr OPEN:/srv/fod/data,rdonly",
+    );
+    wait_until_succeeds(
+        Node::Worker,
+        "timeout 1 bash -c 'exec 3<>/dev/tcp/hub/8766'",
+        30,
+    );
+
     // 1) fetch via the hub's IP, isolated from the worker's loopback socket
     build_grep("/etc/tt/fod.nix", "hello-fod");
+
+    // 1b) fod-network policy: denied port unreachable, allowed port works
+    build_grep("/etc/tt/fod-policy.nix", "hello-fod");
 
     // 2) resolve fod-hosts.test via the worker's /etc/hosts (files source)
     succeed(Node::Worker, "grep -q fod-hosts.test /etc/hosts");

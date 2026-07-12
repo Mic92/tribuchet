@@ -36,6 +36,9 @@ in
         networking.firewall.allowedTCPPorts = [
           7437
           8765
+          # listener for the fod-policy subtest; the worker's
+          # fod-network rule denies it inside the sandbox
+          8766
         ];
         virtualisation.writableStore = true;
         # container eval and closure streaming need room
@@ -43,6 +46,7 @@ in
         virtualisation.diskSize = 4096;
         virtualisation.additionalPaths = [
           pkgs.bash
+          pkgs.coreutils
           pkgs.stdenvNoCC
           nspawn.toplevel
         ];
@@ -85,6 +89,13 @@ in
         environment.etc."tt/fod.nix".text = ''
           import ${./tests/fod.nix} {
             bash = "${pkgs.bash}";
+            hubIp = "${nodes.hub.networking.primaryIPAddress}";
+          }
+        '';
+        environment.etc."tt/fod-policy.nix".text = ''
+          import ${./tests/fod-policy.nix} {
+            bash = "${pkgs.bash}";
+            coreutils = "${pkgs.coreutils}";
             hubIp = "${nodes.hub.networking.primaryIPAddress}";
           }
         '';
@@ -203,6 +214,14 @@ in
             max-jobs = 2;
             max-log-size = 1048576;
             recursive-nix = true;
+            # exercised by the fod-policy subtest
+            fod-network.rules = [
+              {
+                action = "deny";
+                proto = "tcp";
+                ports = [ "8766" ];
+              }
+            ];
             emulate.aarch64-linux = "${pkgs.pkgsStatic.qemu-user}/bin/qemu-aarch64";
           };
         };

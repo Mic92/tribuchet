@@ -442,6 +442,7 @@ impl ActiveBuild {
                 leased_userns: owner.leased_userns(),
                 emulator: self.ctx.emulators.get(&a.system).map(PathBuf::as_path),
                 net_isolation: self.ctx.fod_isolation,
+                net_policy: self.ctx.fod_network.clone(),
                 fod_uid: owner.fod_uid(),
                 recursive_nix: self.ctx.recursive_nix,
                 nix_daemon_socket: None,
