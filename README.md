@@ -164,30 +164,43 @@ On root Linux workers with `/dev/net/tun`, fixed-output builds run in
 a private network namespace and get outbound connectivity through the
 embedded [presto-pasta] user-mode NAT. The worker's loopback services
 and abstract sockets are never reachable from there. On top of that,
-the optional `[fod-network]` section of `worker.toml` filters which
-destinations such builds may connect to:
+the optional `fod-network` setting filters which destinations such
+builds may connect to. It lives in the worker's freeform settings, so
+with the NixOS module it is plain Nix:
 
-```toml
-[fod-network]
-# action when no rule matches (default: "allow")
-default = "allow"
+```nix
+services.tribuchet-worker.settings.fod-network = {
+  # action when no rule matches (default: "allow")
+  default = "allow";
 
-# ordered rules, first match wins
-[[fod-network.rules]]
-action = "deny"
-dst = "private"          # loopback, RFC 1918, link-local, ULA, CGNAT, ...
-
-[[fod-network.rules]]
-action = "allow"
-dst = "10.20.0.15"       # single IP or CIDR, IPv4 or IPv6
-ports = ["443"]
-
-[[fod-network.rules]]
-action = "deny"
-proto = "tcp"            # "tcp", "udp" or "any" (default)
-dst = "any"
-ports = ["25", "465", "587", "8000-8999"]
+  # ordered rules, first match wins
+  rules = [
+    {
+      action = "deny";
+      dst = "private"; # loopback, RFC 1918, link-local, ULA, CGNAT, ...
+    }
+    {
+      action = "allow";
+      dst = "10.20.0.15"; # single IP or CIDR, IPv4 or IPv6
+      ports = [ "443" ];
+    }
+    {
+      action = "deny";
+      proto = "tcp"; # "tcp", "udp" or "any" (default)
+      dst = "any";
+      ports = [
+        "25"
+        "465"
+        "587"
+        "8000-8999"
+      ];
+    }
+  ];
+};
 ```
+
+Without the module, the same structure goes into worker.toml as a
+`[fod-network]` table with `[[fod-network.rules]]` entries.
 
 Each rule matches on the destination of a new outbound connection:
 
@@ -205,9 +218,6 @@ would only apply to whatever a name resolves to at connect time and
 are trivially bypassed by a build resolving names itself. DNS lookups
 are forwarded to the host resolver by presto-pasta independently of
 these rules, so a `deny` rule cannot break name resolution.
-
-The example in the NixOS module (`services.tribuchet-worker.settings`)
-shows the same configuration in Nix syntax.
 
 ## How a build flows
 
