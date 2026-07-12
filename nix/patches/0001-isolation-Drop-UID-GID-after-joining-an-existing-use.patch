@@ -1,0 +1,128 @@
+From e6c6c11415999557122076867916ec806b12b675 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?J=C3=B6rg=20Thalheim?= <joerg@thalheim.io>
+Date: Sun, 12 Jul 2026 09:47:43 +0200
+Subject: [PATCH 1/2] isolation: Drop UID/GID after joining an existing user
+ namespace
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+If pasta is started as root and told to attach to an existing user
+namespace (target PID or --userns), --runas is applied before the
+target namespace is opened, so opening /proc/<pid>/ns/user fails with
+EACCES for root-owned namespaces. A supervisor that creates namespaces
+as root can therefore not have pasta attach privileged and process
+traffic unprivileged.
+
+In that case, defer setgroups()/setgid()/setuid() until after
+setns(CLONE_NEWUSER): joining gives us full capabilities in the
+namespace, so the drop still succeeds, and the UID/GID are interpreted
+as mapped inside it. Document this in the man page.
+
+Unprivileged invocations and the path creating a new user namespace
+are unchanged: there the UID must be set in the original namespace so
+that it owns the new one.
+
+Signed-off-by: Jörg Thalheim <joerg@thalheim.io>
+---
+ isolation.c | 50 ++++++++++++++++++++++++++++++++++++--------------
+ passt.1     |  4 ++++
+ 2 files changed, 40 insertions(+), 14 deletions(-)
+
+diff --git a/isolation.c b/isolation.c
+index bbcd23b..da6db5a 100644
+--- a/isolation.c
++++ b/isolation.c
+@@ -215,10 +215,31 @@ void isolate_initial(int argc, char **argv)
+ 	close_open_files(argc, argv);
+ }
+ 
++/**
++ * set_ugid() - Drop supplementary groups and switch to final UID/GID
++ * @uid:	User ID to run as
++ * @gid:	Group ID to run as
++ */
++static void set_ugid(uid_t uid, gid_t gid)
++{
++	if (setgroups(0, NULL)) {
++		/* If we don't have CAP_SETGID, this will EPERM */
++		if (errno != EPERM)
++			die_perror("Can't drop supplementary groups");
++	}
++
++	if (setgid(gid) != 0)
++		die_perror("Can't set GID to %u", gid);
++
++	if (setuid(uid) != 0)
++		die_perror("Can't set UID to %u", uid);
++}
++
+ /**
+  * isolate_user() - Switch to final UID/GID and move into userns
+- * @uid:	User ID to run as (in original userns)
+- * @gid:	Group ID to run as (in original userns)
++ * @uid:	User ID to run as (in original userns, or in @userns if
++ *		started privileged and joining an existing userns)
++ * @gid:	Group ID to run as (same namespace as @uid)
+  * @use_userns:	Whether to join or create a userns
+  * @userns:	userns path to enter, may be empty
+  * @mode:	Mode (passt or pasta)
+@@ -232,20 +253,15 @@ void isolate_initial(int argc, char **argv)
+ void isolate_user(uid_t uid, gid_t gid, bool use_userns, const char *userns,
+ 		  enum passt_modes mode)
+ {
++	bool drop_after_join = *userns && !geteuid();
+ 	uint64_t ns_caps = 0;
+ 
+-	/* First set our UID & GID in the original namespace */
+-	if (setgroups(0, NULL)) {
+-		/* If we don't have CAP_SETGID, this will EPERM */
+-		if (errno != EPERM)
+-			die_perror("Can't drop supplementary groups");
+-	}
+-
+-	if (setgid(gid) != 0)
+-		die_perror("Can't set GID to %u", gid);
+-
+-	if (setuid(uid) != 0)
+-		die_perror("Can't set UID to %u", uid);
++	/* Set our UID & GID in the original namespace, unless we are
++	 * privileged and joining an existing userns: its path may only
++	 * be accessible to root, so join first, then drop.
++	 */
++	if (!drop_after_join)
++		set_ugid(uid, gid);
+ 
+ 	if (*userns) { /* If given a userns, join it */
+ 		int ufd;
+@@ -264,6 +280,12 @@ void isolate_user(uid_t uid, gid_t gid, bool use_userns, const char *userns,
+ 			die_perror("Couldn't create user namespace");
+ 	}
+ 
++	/* We have full capabilities in the joined userns: drop to the
++	 * target UID/GID as mapped there.
++	 */
++	if (drop_after_join)
++		set_ugid(uid, gid);
++
+ 	/* Joining a new userns gives us full capabilities; drop the
+ 	 * ones we don't need.  With --netns-only we haven't changed
+ 	 * userns but we can drop more capabilities now than at
+diff --git a/passt.1 b/passt.1
+index 0c17454..9f2b6e8 100644
+--- a/passt.1
++++ b/passt.1
+@@ -127,6 +127,10 @@ login name and group name can be passed. This requires privileges (either
+ initial effective UID 0 or CAP_SETUID capability) to work.
+ Default is to change to user \fInobody\fR if started as root.
+ 
++For \fBpasta\fR(1), if started as root and given an existing user namespace to
++join (via a target PID or \fB\-\-userns\fR), the UID and GID are changed after
++joining that user namespace, and are interpreted as mapped inside it.
++
+ .TP
+ .BR \-h ", " \-\-help
+ Display a help message and exit.
+-- 
+2.54.0
+

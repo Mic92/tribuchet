@@ -44,6 +44,14 @@
 
         default = pkgs.callPackage ./nix/package.nix {
           craneLib = crane.mkLib pkgs;
+          # pasta patched so --runas drops UID/GID only after joining the
+          # root-owned build user namespace (patches sent to passt-dev).
+          passt = pkgs.passt.overrideAttrs (old: {
+            patches = (old.patches or [ ]) ++ [
+              ./nix/patches/0001-isolation-Drop-UID-GID-after-joining-an-existing-use.patch
+              ./nix/patches/0002-pasta-Open-netns-watch-directory-before-dropping-cre.patch
+            ];
+          });
         };
       });
 
