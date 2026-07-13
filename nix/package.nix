@@ -25,6 +25,8 @@ let
     strictDeps = true;
     nativeBuildInputs = [ protobuf ];
     PROTOC = "${protobuf}/bin/protoc";
+    # tribuchet-sandboxd is Linux-only (user namespaces, cgroups)
+    cargoExtraArgs = lib.optionalString (!stdenv.isLinux) "--workspace --exclude tribuchet-sandboxd";
   };
 
   cargoArtifacts = craneLib.buildDepsOnly commonArgs;
@@ -58,6 +60,11 @@ craneLib.buildPackage (
   // {
     inherit cargoArtifacts;
     passthru = { inherit cargoArtifacts e2eTests; };
+  }
+  // lib.optionalAttrs stdenv.isDarwin {
+    # nested sandbox-exec is not permitted inside the Nix build sandbox;
+    # `nix develop -c cargo test` runs it
+    cargoTestExtraArgs = "-- --skip=worker::sandbox::tests::sandbox_runs_builder";
   }
   // lib.optionalAttrs stdenv.isLinux {
     # default network backend for fixed-output builds
