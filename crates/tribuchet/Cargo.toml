@@ -28,6 +28,7 @@ time.workspace = true
 zstd.workspace = true
 nix.workspace = true
 libc.workspace = true
+sandbox-proto = { path = "../sandbox-proto" }
 futures-util.workspace = true
 async-compression.workspace = true
 tokio-util.workspace = true
@@ -40,6 +41,10 @@ harmonia-store-remote.workspace = true
 harmonia-store-ref-scan.workspace = true
 sd-notify = "0.5.0"
 tempfile.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# User-mode NAT datapath for fixed-output build network isolation.
+presto-pasta = "0.0.5"
 
 [features]
 # Gates the NixOS e2e harness (tests/e2e.rs). It drives VMs over the test

@@ -1,108 +1,39 @@
-//! Best-effort cgroup v2 scoping for builds.
-//!
-//! With a delegated cgroup (systemd `Delegate=yes`), each build runs in
-//! a child cgroup with an optional `memory.max`, and teardown uses
-//! `cgroup.kill`, which reaches setsid'd escapees no killpg can.
-//! Without delegation builds run unscoped, with a warning.
-//!
-//! No `pids.max`: the pids controller counts threads and a parallel
-//! build on a many-core machine legitimately needs thousands, so
-//! process caps are left to whatever encloses the worker.
+//! Per-build cgroups are created and torn down by tribuchet-sandboxd
+//! (as siblings under the worker's cgroup). This module only vacates
+//! the delegated unit's root cgroup and enables the memory controller
+//! there, so those siblings get a `memory.max` knob. Without a
+//! delegated subtree that step fails silently and builds simply run
+//! without a memory limit.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Move this process into a `main` leaf below its own cgroup (cgroup
 /// v2's no-internal-process rule forbids enabling controllers while the
-/// parent holds processes) and enable the memory controller for siblings.
-/// Returns the delegated base, or None when cgroups are unavailable.
-// Only the Linux reaper calls this; builds are unscoped on macOS.
+/// parent holds processes) and enable the memory controller for
+/// siblings. Best-effort: on a non-delegated host the writes fail and
+/// sandboxd's build cgroups just have no memory.max.
+// Only the Linux reaper calls this; there is no macOS equivalent.
 #[cfg(target_os = "linux")]
-pub fn init() -> Option<PathBuf> {
-    let unavailable = |why: &str| {
-        tracing::warn!("cgroup scoping disabled: {why}; builds run unscoped");
-        None
-    };
+pub fn init() {
     let Ok(cg) = fs::read_to_string("/proc/self/cgroup") else {
-        return unavailable("cannot read /proc/self/cgroup");
+        return;
     };
     let Some(path) = cg.lines().find_map(|l| l.strip_prefix("0::")) else {
-        return unavailable("not on cgroup v2");
+        return;
     };
     let base = PathBuf::from(format!("/sys/fs/cgroup{}", path.trim()));
     let Ok(controllers) = fs::read_to_string(base.join("cgroup.controllers")) else {
-        return unavailable("cannot read cgroup.controllers");
+        return;
     };
     let main = base.join("main");
     if fs::create_dir_all(&main).is_err() || fs::write(main.join("cgroup.procs"), "0").is_err() {
-        return unavailable("cannot move into a leaf cgroup");
+        tracing::info!("no delegated cgroup; per-build memory.max unavailable");
+        return;
     }
     if controllers.split_whitespace().any(|c| c == "memory")
         && let Err(e) = fs::write(base.join("cgroup.subtree_control"), "+memory")
     {
-        return unavailable(&format!("cannot enable controllers: {e}"));
+        tracing::warn!("enabling +memory on {}: {e}", base.display());
     }
-    tracing::info!(base = %base.display(), "per-build cgroup scoping enabled");
-    Some(base)
-}
-
-fn build_dir(base: &Path, build_id: &str) -> PathBuf {
-    base.join(format!("build-{build_id}"))
-}
-
-/// Create the per-build cgroup with its limits. The spawned builder
-/// enters it from pre_exec by writing to cgroup.procs.
-pub fn create(base: &Path, build_id: &str, memory_max: Option<u64>) -> Option<PathBuf> {
-    let dir = build_dir(base, build_id);
-    let setup = || -> std::io::Result<()> {
-        fs::create_dir_all(&dir)?;
-        if let Some(bytes) = memory_max {
-            fs::write(dir.join("memory.max"), bytes.to_string())?;
-        }
-        Ok(())
-    };
-    match setup() {
-        Ok(()) => Some(dir),
-        Err(e) => {
-            tracing::warn!(
-                "creating build cgroup {}: {e}; build runs unscoped",
-                dir.display()
-            );
-            let _ = fs::remove_dir(&dir);
-            None
-        }
-    }
-}
-
-/// Hand the build's cgroup to the builder uid (Nix's `cgroups`
-/// setting); nspawn inside the sandbox needs it. Best effort: without
-/// it only nested container managers fail.
-pub fn chown_to_builder(dir: &Path, uid: u32) {
-    for p in [
-        dir.to_path_buf(),
-        dir.join("cgroup.procs"),
-        dir.join("cgroup.threads"),
-        dir.join("cgroup.subtree_control"),
-    ] {
-        if let Err(e) = std::os::unix::fs::chown(&p, Some(uid), Some(uid)) {
-            tracing::warn!("chowning {}: {e}", p.display());
-        }
-    }
-}
-
-/// Kill everything left in the build's cgroup and remove it. cgroup.kill
-/// reaches setsid'd survivors that escape process-group signals.
-pub fn kill_and_remove(base: &Path, build_id: &str) {
-    let dir = build_dir(base, build_id);
-    if !dir.exists() {
-        return;
-    }
-    let _ = fs::write(dir.join("cgroup.kill"), "1");
-    for _ in 0..50 {
-        if fs::remove_dir(&dir).is_ok() {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    tracing::warn!("could not remove build cgroup {}", dir.display());
 }

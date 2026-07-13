@@ -20,8 +20,10 @@ from typing import Any
 
 REPO = Path(__file__).resolve().parents[3]
 BIN = REPO / "result" / "bin" / "tribuchet"
+SANDBOXD_BIN = REPO / "result" / "bin" / "tribuchet-sandboxd"
 HUB_LOG = REPO / "hub.log"
 WORKER_LOG = REPO / "worker.log"
+SANDBOXD_LOG = REPO / "sandboxd.log"
 
 
 def run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
@@ -263,6 +265,30 @@ def job_conclusion(name: str) -> str | None:
     return None
 
 
+def start_sandboxd(user: str) -> None:
+    """Root daemon leasing per-build sandboxes to the unprivileged worker."""
+    proc = spawn_daemon(
+        [
+            "sudo",
+            "RUST_LOG=info",
+            str(SANDBOXD_BIN),
+            "--worker-user",
+            user,
+        ],
+        SANDBOXD_LOG,
+    )
+    wait_for(
+        lambda: (
+            Path("/run/tribuchet-sandboxd.sock").exists() or proc.poll() is not None
+        ),
+        timeout=30,
+        what="sandboxd to start",
+    )
+    if proc.poll() is not None:
+        sys.stderr.write(SANDBOXD_LOG.read_text())
+        raise SystemExit("sandboxd exited")
+
+
 def worker_run(hub_ip: str) -> None:
     run(["sudo", "mkdir", "-p", "/etc/tribuchet", "/var/lib/tribuchet"])
     sudo_write(
@@ -277,19 +303,29 @@ def worker_run(hub_ip: str) -> None:
         ),
     )
 
-    # Root for the Linux sandbox (mount/user namespaces) and for
-    # importing inputs through nix-daemon as a trusted user.
-    proc = spawn_daemon(
-        [
-            "sudo",
-            "RUST_LOG=info",
-            str(BIN),
-            "worker",
-            "--config",
-            "/etc/tribuchet/worker.toml",
-        ],
-        WORKER_LOG,
-    )
+    worker_cmd = [
+        "RUST_LOG=info",
+        str(BIN),
+        "worker",
+        "--config",
+        "/etc/tribuchet/worker.toml",
+    ]
+    if sys.platform == "linux":
+        # The Linux worker is unprivileged: it runs as the runner user and
+        # leases each build's user namespace and cgroup from sandboxd.
+        # Importing inputs through nix-daemon without signatures needs a
+        # trusted user.
+        user = out(["id", "-un"])
+        run(["sudo", "chown", user, "/var/lib/tribuchet"])
+        # Ubuntu 24.04 blocks unprivileged user namespaces by default
+        run(["sudo", "sysctl", "-w", "kernel.apparmor_restrict_unprivileged_userns=0"])
+        sudo_write("/etc/nix/nix.conf", f"trusted-users = root {user}\n", append=True)
+        run(["sudo", "systemctl", "restart", "nix-daemon"])
+        start_sandboxd(user)
+        proc = spawn_daemon(["env", *worker_cmd], WORKER_LOG)
+    else:
+        # macOS: root for the Seatbelt sandbox and nix-daemon trust.
+        proc = spawn_daemon(["sudo", *worker_cmd], WORKER_LOG)
 
     def finished() -> bool:
         if proc.poll() is not None:

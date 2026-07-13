@@ -3,7 +3,6 @@
   stdenv,
   craneLib,
   protobuf,
-  passt,
   busybox-sandbox-shell,
   jq,
 }:
@@ -26,6 +25,8 @@ let
     strictDeps = true;
     nativeBuildInputs = [ protobuf ];
     PROTOC = "${protobuf}/bin/protoc";
+    # tribuchet-sandboxd is Linux-only (user namespaces, cgroups)
+    cargoExtraArgs = lib.optionalString (!stdenv.isLinux) "--workspace --exclude tribuchet-sandboxd";
   };
 
   cargoArtifacts = craneLib.buildDepsOnly commonArgs;
@@ -58,15 +59,15 @@ craneLib.buildPackage (
   commonArgs
   // {
     inherit cargoArtifacts;
-    # sandbox_runs_builder needs CAP_SYS_ADMIN that the outer
-    # Nix builder sandbox does not grant; `nix develop -c
-    # cargo test` runs it.
-    cargoTestExtraArgs = "-- --skip=worker::sandbox::tests::sandbox_runs_builder";
     passthru = { inherit cargoArtifacts e2eTests; };
+  }
+  // lib.optionalAttrs stdenv.isDarwin {
+    # nested sandbox-exec is not permitted inside the Nix build sandbox;
+    # `nix develop -c cargo test` runs it
+    cargoTestExtraArgs = "-- --skip=worker::sandbox::tests::sandbox_runs_builder";
   }
   // lib.optionalAttrs stdenv.isLinux {
     # default network backend for fixed-output builds
-    TRIBUCHET_PASTA = "${passt}/bin/pasta";
     # static /bin/sh for the sandbox, as Nix uses for its sandbox-shell
     TRIBUCHET_BIN_SH = "${busybox-sandbox-shell}/bin/busybox";
   }

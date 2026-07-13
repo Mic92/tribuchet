@@ -103,12 +103,16 @@ Reference implementations: `nix/src/libstore/unix/build/` and
   system=/path/to/static-qemu` advertises foreign systems; such builds
   get the emulator bound into the sandbox and registered in a per-userns
   binfmt_misc instance (kernel 6.7+); a nested user namespace drops the
-  registration-time root back to uid 1000 for the build. With a pasta
-  binary configured (baked in by the Nix package), fixed-output builds
-  get a private network namespace with user-mode NAT instead of the
-  host namespace: host abstract sockets and loopback services are
-  unreachable, and root workers back such builds with an unprivileged
-  uid.
+  registration-time root back to uid 1000 for the build. On root
+  workers with `/dev/net/tun`, fixed-output builds get a private
+  network namespace with user-mode NAT (the embedded
+  [presto-pasta](https://github.com/Mic92/presto-pasta) datapath, run
+  by a helper process that drops to an unprivileged uid) instead of
+  the host namespace: host abstract sockets and loopback services are
+  unreachable. The worker's `[fod-network]` setting adds an ordered
+  allow/deny rule list (destination CIDR or the `private` keyword,
+  protocol, ports/port ranges; first match wins) evaluated for every
+  outbound connection of such builds.
 * macOS: no mount namespace, but inputs already live at their real
   /nix/store paths thanks to the daemon import; the worker's own
   per-build dir becomes the cwd and env values referencing the hub's

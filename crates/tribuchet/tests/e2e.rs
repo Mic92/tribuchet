@@ -454,6 +454,17 @@ fn build_uidrange() {
 }
 
 #[test]
+fn build_singleuid() {
+    let out = succeed(Node::Hub, "nix-build /etc/tt/singleuid.nix --no-out-link");
+    let out = succeed(Node::Hub, &format!("cat {}", out.trim()));
+    let backing_uid = out.split_whitespace().last().unwrap_or_default();
+    assert!(out.contains("single-uid-ok"), "{out}");
+    // the builder ran on a leased uid, not as the worker user
+    let worker_uid = succeed(Node::Worker, "id -u tribuchet");
+    assert_ne!(backing_uid, worker_uid.trim(), "{out}");
+}
+
+#[test]
 fn build_refgraph() {
     build_grep("/etc/tt/refgraph.nix", "refgraph-ok");
 }
@@ -515,7 +526,7 @@ fn build_logbomb() {
 /// original order rather than racing three tasks on shared network state.
 #[test]
 fn build_fod() {
-    // FOD source on the hub, fetched by the isolated sandbox through pasta.
+    // FOD source on the hub, fetched by the isolated sandbox through presto-pasta.
     succeed(
         Node::Hub,
         "mkdir -p /srv/fod && echo hello-fod > /srv/fod/data",
@@ -541,14 +552,29 @@ fn build_fod() {
         30,
     );
 
+    // A second hub listener on a port the worker's fod-network policy
+    // denies; reachable from the worker's host netns, not the sandbox.
+    succeed(
+        Node::Hub,
+        "systemd-run --unit=fodsrv2 socat -U TCP-LISTEN:8766,fork,reuseaddr OPEN:/srv/fod/data,rdonly",
+    );
+    wait_until_succeeds(
+        Node::Worker,
+        "timeout 1 bash -c 'exec 3<>/dev/tcp/hub/8766'",
+        30,
+    );
+
     // 1) fetch via the hub's IP, isolated from the worker's loopback socket
     build_grep("/etc/tt/fod.nix", "hello-fod");
+
+    // 1b) fod-network policy: denied port unreachable, allowed port works
+    build_grep("/etc/tt/fod-policy.nix", "hello-fod");
 
     // 2) resolve fod-hosts.test via the worker's /etc/hosts (files source)
     succeed(Node::Worker, "grep -q fod-hosts.test /etc/hosts");
     build_grep("/etc/tt/fod-hosts.nix", "hello-fod");
 
-    // 3) resolve fod-dns.test only via dnsmasq, through pasta's DNS forwarder
+    // 3) resolve fod-dns.test only via dnsmasq, through presto-pasta's DNS forwarder
     let hubip = succeed(Node::Worker, "getent hosts hub | awk '{print $1}'")
         .trim()
         .to_string();
@@ -743,8 +769,32 @@ fn lifecycle() {
         "builds did not overlap: {elapsed}s (serial would be >=30s)"
     );
 
+    // --- finished builds leave no leased cgroup behind ---------------------
+    let no_build_cgroups = "[ -z \"$(find /sys/fs/cgroup/system.slice/tribuchet-worker.service \
+         -name 'build-*' 2>/dev/null)\" ]";
+    wait_until_succeeds(Node::Worker, no_build_cgroups, 60);
+
+    // --- stopping the worker mid-build kills the build and its lease ------
+    succeed(
+        Node::Hub,
+        "systemd-run --unit=stopbuild bash -lc 'nix-build /etc/tt/stop.nix --no-out-link'",
+    );
+    wait_until_succeeds(Node::Worker, "pgrep -f 'stop-marker-runnin[g]'", 60);
+    let released = count(Node::Worker, "tribuchet-sandboxd", "released");
+
     // --- no worker: build is declined and falls back to a local build -----
     succeed(Node::Worker, "systemctl stop tribuchet-worker");
+    // systemd kills the unit's cgroup subtree; sandboxd reaps the lease
+    wait_until_succeeds(Node::Worker, "! pgrep -f 'stop-marker-runnin[g]'", 60);
+    wait_until_succeeds(Node::Worker, no_build_cgroups, 60);
+    // sandboxd reaped the lease of the killed build and returned its block
+    wait_until_succeeds(
+        Node::Worker,
+        &format!("[ $(journalctl -u tribuchet-sandboxd | grep -c released) -gt {released} ]"),
+        60,
+    );
+    // stop the client before its declined build falls back to a local run
+    run(Node::Hub, "systemctl kill --signal=SIGKILL stopbuild");
     // Let the hub observe the session tear down so it no longer counts capable.
     succeed(Node::Hub, "sleep 3");
     write_echo_deriv(
@@ -764,11 +814,6 @@ fn lifecycle() {
 
     // --- build really ran on the worker -----------------------------------
     assert_journal(Node::Worker, "tribuchet-worker", "builder finished");
-    assert_journal(
-        Node::Worker,
-        "tribuchet-worker",
-        "per-build cgroup scoping enabled",
-    );
     assert_journal(Node::Hub, "tribuchet-hub", "dispatching build");
     // Inputs are imported through the worker's nix-daemon and registered as
     // valid paths in its Nix database.

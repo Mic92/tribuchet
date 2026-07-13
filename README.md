@@ -33,13 +33,15 @@ transfer, scheduling, and execution itself.
 - Sandboxing equivalent to Nix's own (Linux namespaces + per-build
   cgroup limits, macOS `sandbox-exec`), plus `uid-range` builds and
   cross-system user-mode emulation.
-- Fixed-output derivations get network through [pasta] in an otherwise
-  isolated network namespace.
+- Fixed-output derivations get network through [presto-pasta]
+  (embedded user-mode NAT) in an otherwise isolated network namespace,
+  with an optional allow/deny flow policy (`fod-network` in
+  worker.toml).
 - Live build logs across reloads/restarts, with max-log-size,
   max-silent-time, and timeout enforcement.
 - NixOS and nix-darwin modules for both services.
 
-[pasta]: https://passt.top/
+[presto-pasta]: https://github.com/Mic92/presto-pasta
 
 ## Getting started
 
@@ -99,7 +101,10 @@ syntax as `trusted-public-keys`).
 ### 3. Workers
 
 Workers need a running nix-daemon of their own (inputs are imported
-through it and protected from garbage collection by temp roots).
+through it and protected from garbage collection by temp roots). On
+Linux the worker runs unprivileged and leases each build's user
+namespace, uid range and cgroup from the small `tribuchet-sandboxd`
+root daemon (set up by the NixOS module).
 
 `/etc/tribuchet/worker.toml`:
 
@@ -155,6 +160,67 @@ deploys.
 launchd: the hub adopts its sockets from launchd, the worker daemon
 execs through a stable symlink that activation flips and SIGHUPs, again
 keeping builds alive across upgrades.
+
+## Fixed-output network policy
+
+On Linux workers with `/dev/net/tun`, fixed-output builds run in
+a private network namespace and get outbound connectivity through the
+embedded [presto-pasta] user-mode NAT. The worker's loopback services
+and abstract sockets are never reachable from there. On top of that,
+the optional `fod-network` setting filters which destinations such
+builds may connect to. It lives in the worker's freeform settings, so
+with the NixOS module it is plain Nix:
+
+```nix
+services.tribuchet-worker.settings.fod-network = {
+  # action when no rule matches (default: "allow")
+  default = "allow";
+
+  # ordered rules, first match wins
+  rules = [
+    {
+      action = "deny";
+      dst = "private"; # loopback, RFC 1918, link-local, ULA, CGNAT, ...
+    }
+    {
+      action = "allow";
+      dst = "10.20.0.15"; # single IP or CIDR, IPv4 or IPv6
+      ports = [ "443" ];
+    }
+    {
+      action = "deny";
+      proto = "tcp"; # "tcp", "udp" or "any" (default)
+      dst = "any";
+      ports = [
+        "25"
+        "465"
+        "587"
+        "8000-8999"
+      ];
+    }
+  ];
+};
+```
+
+Without the module, the same structure goes into worker.toml as a
+`[fod-network]` table with `[[fod-network.rules]]` entries.
+
+Each rule matches on the destination of a new outbound connection:
+
+- `dst`: `"any"`, `"private"` (everything non-public: loopback,
+  RFC 1918, link-local, ULA, CGNAT, multicast), a single IP, or a CIDR
+  like `"192.0.2.0/24"` / `"2001:db8::/32"`.
+- `proto`: `"tcp"`, `"udp"`, or `"any"`.
+- `ports`: destination ports, single (`"443"`) or inclusive ranges
+  (`"8000-8999"`); empty or omitted means any port.
+
+Rules are evaluated in order for every new flow before a host socket
+is created; denied connections simply never leave the sandbox (TCP
+SYNs get no answer). Rules are IP-based on purpose — hostname rules
+would only apply to whatever a name resolves to at connect time and
+are trivially bypassed by a build resolving names itself. DNS lookups
+are forwarded to the host resolver by presto-pasta independently of
+these rules, so a `deny` rule cannot break name resolution.
 
 ## How a build flows
 

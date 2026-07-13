@@ -165,6 +165,23 @@ in
           max-jobs = 4;
           max-log-size = 67108864;
           emulate.aarch64-linux = "''${pkgs.pkgsStatic.qemu-user}/bin/qemu-aarch64";
+          # flow policy for the fixed-output build network:
+          # ordered rules, first match wins, then `default`
+          fod-network = {
+            default = "allow";
+            rules = [
+              {
+                action = "deny";
+                dst = "10.0.0.0/8";
+              }
+              {
+                action = "deny";
+                proto = "tcp";
+                dst = "any";
+                ports = [ "25" "465" "587" ];
+              }
+            ];
+          };
         }
       '';
       description = ''
@@ -260,8 +277,54 @@ in
 
     (lib.mkIf worker.enable {
       environment.etc."tribuchet/worker.toml".source = workerToml;
+
+      users.users.tribuchet = {
+        isSystemUser = true;
+        group = "tribuchet";
+        # /dev/kvm for kvm-requiring builds
+        extraGroups = [ "kvm" ];
+      };
+      users.groups.tribuchet = { };
+      # the worker imports build inputs through the nix-daemon without
+      # signatures, which only trusted users may do
+      nix.settings.trusted-users = [ "tribuchet" ];
+
+      # Root daemon leasing per-build user namespaces, uid ranges and
+      # delegated cgroups to the unprivileged worker. Socket-activated,
+      # but the daemon binds the socket itself when started directly.
+      systemd.sockets.tribuchet-sandboxd = {
+        wantedBy = [ "sockets.target" ];
+        listenStreams = [ "/run/tribuchet-sandboxd.sock" ];
+        # access control is sandboxd's SO_PEERCRED check
+        socketConfig.SocketMode = "0666";
+      };
+      systemd.services.tribuchet-sandboxd = {
+        serviceConfig = {
+          Type = "notify";
+          ExecStart = "${lib.getExe' worker.package "tribuchet-sandboxd"} --worker-user tribuchet";
+          Environment = "RUST_LOG=info";
+          Restart = "on-failure";
+          NoNewPrivileges = true;
+          PrivateTmp = true;
+          ProtectHome = true;
+          ProtectSystem = "strict";
+          # build cgroups it delegates, and the socket when started standalone
+          ReadWritePaths = [
+            "/sys/fs/cgroup"
+            "/run"
+          ];
+          SystemCallArchitectures = "native";
+          SystemCallFilter = [ "@system-service" ];
+          SystemCallErrorNumber = "EPERM";
+        };
+      };
+
       systemd.services.tribuchet-worker = {
         wantedBy = [ "multi-user.target" ];
+        # sandboxd may be socket-activated or run standalone; either way
+        # the socket must exist before the worker starts
+        wants = [ "tribuchet-sandboxd.socket" ];
+        after = [ "tribuchet-sandboxd.socket" ];
         # only ExecReload carries the package store path, so a new
         # package reloads instead of restarting; settings changes also
         # arrive via reload (the fresh worker generation re-reads the
@@ -272,6 +335,8 @@ in
         restartTriggers = [ workerToml ];
         serviceConfig = {
           Type = "notify";
+          User = "tribuchet";
+          Group = "tribuchet";
           # READY/watchdog come from the worker child; the main pid
           # is the build reaper it was exec'd by.
           NotifyAccess = "all";
@@ -291,6 +356,13 @@ in
           # Builders inherit this; match nix-daemon so they are not stuck at
           # the systemd default soft limit of 1024 and fail with EMFILE.
           LimitNOFILE = 1048576;
+          # builds write only the state dir (writable under strict);
+          # store writes go through the nix-daemon socket
+          NoNewPrivileges = true;
+          PrivateTmp = true;
+          ProtectHome = true;
+          ProtectSystem = "strict";
+          RestrictSUIDSGID = true;
           Restart = "on-failure";
         };
       };

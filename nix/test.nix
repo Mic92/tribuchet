@@ -36,6 +36,9 @@ in
         networking.firewall.allowedTCPPorts = [
           7437
           8765
+          # listener for the fod-policy subtest; the worker's
+          # fod-network rule denies it inside the sandbox
+          8766
         ];
         virtualisation.writableStore = true;
         # container eval and closure streaming need room
@@ -43,6 +46,7 @@ in
         virtualisation.diskSize = 4096;
         virtualisation.additionalPaths = [
           pkgs.bash
+          pkgs.coreutils
           pkgs.stdenvNoCC
           nspawn.toplevel
         ];
@@ -82,9 +86,19 @@ in
         environment.etc."tt/uidrange.nix".text = ''
           import ${./tests/uidrange.nix} { bash = "${pkgs.bash}"; }
         '';
+        environment.etc."tt/singleuid.nix".text = ''
+          import ${./tests/singleuid.nix} { bash = "${pkgs.bash}"; }
+        '';
         environment.etc."tt/fod.nix".text = ''
           import ${./tests/fod.nix} {
             bash = "${pkgs.bash}";
+            hubIp = "${nodes.hub.networking.primaryIPAddress}";
+          }
+        '';
+        environment.etc."tt/fod-policy.nix".text = ''
+          import ${./tests/fod-policy.nix} {
+            bash = "${pkgs.bash}";
+            coreutils = "${pkgs.coreutils}";
             hubIp = "${nodes.hub.networking.primaryIPAddress}";
           }
         '';
@@ -111,6 +125,9 @@ in
         '';
         environment.etc."tt/cancel.nix".text = ''
           import ${./tests/cancel.nix} { bash = "${pkgs.bash}"; }
+        '';
+        environment.etc."tt/stop.nix".text = ''
+          import ${./tests/stop.nix} { bash = "${pkgs.bash}"; }
         '';
         environment.etc."tt/slowlog.nix".text = ''
           import ${./tests/slowlog.nix} { bash = "${pkgs.bash}"; }
@@ -169,7 +186,7 @@ in
           tribuchet
           pkgs.python3
         ];
-        # Resolver for the FOD-via-DNS subtest; pasta forwards the
+        # Resolver for the FOD-via-DNS subtest; presto-pasta forwards the
         # sandbox's queries here. The record is dropped into addn-hosts
         # at test time, once the hub IP is known.
         services.dnsmasq = {
@@ -203,6 +220,14 @@ in
             max-jobs = 2;
             max-log-size = 1048576;
             recursive-nix = true;
+            # exercised by the fod-policy subtest
+            fod-network.rules = [
+              {
+                action = "deny";
+                proto = "tcp";
+                ports = [ "8766" ];
+              }
+            ];
             emulate.aarch64-linux = "${pkgs.pkgsStatic.qemu-user}/bin/qemu-aarch64";
           };
         };
@@ -226,6 +251,7 @@ in
         for f in ["worker.crt", "worker.key", "ca.crt"]:
             pem = hub.succeed(f"cat /root/ca/{f}")
             worker.succeed(f"cat > /var/lib/tribuchet/tls/{f} << 'PEMEOF'\n{pem}PEMEOF")
+        worker.succeed("chown -R tribuchet:tribuchet /var/lib/tribuchet")
 
     with subtest("worker registers at hub over mTLS"):
         hub.succeed("systemctl start tribuchet-hub.socket")

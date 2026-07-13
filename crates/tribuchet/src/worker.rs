@@ -19,6 +19,8 @@ mod logtail;
 pub mod reaper;
 mod resume;
 pub mod sandbox;
+#[cfg(target_os = "linux")]
+mod sandboxd;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -61,7 +63,6 @@ struct WorkerCtx {
     /// Where the reaper records exit codes, one file per pid.
     status_dir: PathBuf,
     sandbox_bin_sh: Option<PathBuf>,
-    cgroup_base: Option<PathBuf>,
     build_memory_max: Option<u64>,
     /// Files a build must never read even where DAC would allow it
     /// (macOS Seatbelt deny rules; Linux relies on the mount namespace).
@@ -73,17 +74,19 @@ struct WorkerCtx {
     resumable: Mutex<HashMap<String, ResumableBuild>>,
     /// system -> static emulator binary, from the emulate setting.
     emulators: HashMap<String, PathBuf>,
-    /// pasta binary for fixed-output network isolation.
-    pasta: Option<PathBuf>,
+    /// Fixed-output builds get a private netns with the presto-pasta
+    /// user-mode NAT (Linux workers with /dev/net/tun).
+    fod_isolation: bool,
+    /// Flow policy for that network, from the fod-network setting.
+    fod_network: crate::netpolicy::NetPolicy,
     max_silent_time: Duration,
     max_log_size: u64,
     /// Builder gets the host nix-daemon socket bind-mounted in; the
     /// worker advertises the `recursive-nix` feature.
     pub(super) recursive_nix: bool,
-    /// Slot i maps the uid block [uid_base + i*65536, 65536); disjoint
-    /// blocks keep concurrent uid-range builds apart.
-    uid_base: u32,
-    uid_slots: Mutex<Vec<bool>>,
+    /// tribuchet-sandboxd socket; every Linux build leases its user
+    /// namespace and cgroup from it. None on macOS.
+    sandboxd: Option<PathBuf>,
     /// Dedupe keys of builds the hub cancelled; the supervising loops
     /// abort them. Keyed like the registry, since a resumed build's
     /// build_id changes while it runs.
@@ -249,21 +252,35 @@ fn request_job() -> WorkerMessage {
     msg(worker_message::Msg::RequestJob(RequestJob {}))
 }
 
+/// Linux workers depend on tribuchet-sandboxd for every build's uid
+/// mapping and cgroup, so a missing socket is a startup error rather
+/// than a degraded mode.
+#[cfg(target_os = "linux")]
+fn sandboxd_socket() -> Result<Option<PathBuf>> {
+    let socket = Path::new(sandboxd::SOCKET_PATH);
+    anyhow::ensure!(
+        socket.exists(),
+        "tribuchet-sandboxd is not available at {}",
+        socket.display()
+    );
+    Ok(Some(socket.to_path_buf()))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sandboxd_socket() -> Result<Option<PathBuf>> {
+    Ok(None)
+}
+
 pub fn run(opts: WorkerConfig) -> Result<()> {
     // ensure() either becomes the reaper (never returns) or, in the
     // worker generation it exec'd, hands back the spawner. It runs
     // before tokio because the reaper must stay single-threaded.
     let spawner = reaper::ensure(&opts.state_dir.join("exited"))?;
-    let cgroup_base = std::env::var(reaper::CGROUP_ENV).ok().map(PathBuf::from);
     let rt = crate::rt::runtime("trib-worker")?;
-    rt.block_on(run_async(opts, spawner, cgroup_base))
+    rt.block_on(run_async(opts, spawner))
 }
 
-async fn run_async(
-    opts: WorkerConfig,
-    spawner: reaper::Spawner,
-    cgroup_base: Option<PathBuf>,
-) -> Result<()> {
+async fn run_async(opts: WorkerConfig, spawner: reaper::Spawner) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let builds_dir = opts.state_dir.join("builds");
     fs::create_dir_all(&builds_dir)?;
@@ -277,13 +294,6 @@ async fn run_async(
     if opts.systems.is_empty() {
         opts.systems.push(host_system());
     }
-    // "none" disables pasta even when a default path was baked in at
-    // build time.
-    opts.pasta = match opts.pasta.take() {
-        Some(p) if p.as_os_str() == "none" => None,
-        Some(p) => Some(p),
-        None => option_env!("TRIBUCHET_PASTA").map(PathBuf::from),
-    };
     // "none" disables the baked-in /bin/sh; else fall back to it so
     // builds using system(3)/#!/bin/sh work without extra config.
     opts.sandbox_bin_sh = match opts.sandbox_bin_sh.take() {
@@ -291,9 +301,10 @@ async fn run_async(
         Some(p) => Some(p),
         None => option_env!("TRIBUCHET_BIN_SH").map(PathBuf::from),
     };
-    // main logs the config before this baked-in default applies, so it
-    // always shows pasta: None; log the effective value.
-    tracing::info!(pasta = ?opts.pasta, bin_sh = ?opts.sandbox_bin_sh, "resolved sandbox defaults");
+    let fod_isolation = cfg!(target_os = "linux") && Path::new("/dev/net/tun").exists();
+    // main logs the config before the baked-in bin_sh default applies;
+    // log the effective values.
+    tracing::info!(fod_isolation, bin_sh = ?opts.sandbox_bin_sh, "resolved sandbox defaults");
     let mut emulators = HashMap::new();
     for (system, path) in &opts.emulate {
         if !cfg!(target_os = "linux") {
@@ -310,33 +321,24 @@ async fn run_async(
         }
         emulators.insert(system.clone(), path.clone());
     }
-    if let Some(p) = &opts.pasta {
-        if !cfg!(target_os = "linux") {
-            anyhow::bail!("pasta requires Linux (network namespaces)");
-        }
-        if !p.is_file() {
-            anyhow::bail!("pasta: {} not found", p.display());
-        }
-    }
     let opts = opts;
     let ctx = Arc::new(WorkerCtx {
         state_dir: opts.state_dir.clone(),
         spawner,
         status_dir: opts.state_dir.join("exited"),
         sandbox_bin_sh: opts.sandbox_bin_sh.clone(),
-        cgroup_base,
         build_memory_max: opts.build_memory_max_bytes,
         secret_paths: vec![opts.key.clone(), opts.state_dir.join("signing.key")],
         running: atomic::AtomicU32::new(0),
         cancelled: Mutex::new(HashSet::new()),
         resumable: Mutex::new(HashMap::new()),
         emulators,
-        pasta: opts.pasta.clone(),
+        fod_isolation,
+        fod_network: opts.fod_network.clone(),
         max_silent_time: Duration::from_secs(opts.max_silent_time_secs),
         max_log_size: opts.max_log_size,
         recursive_nix: opts.recursive_nix,
-        uid_base: opts.auto_allocate_uids_base,
-        uid_slots: Mutex::new(vec![false; opts.max_jobs.max(1) as usize]),
+        sandboxd: sandboxd_socket()?,
     });
 
     // Ready once local setup is done, not once the hub answers: the

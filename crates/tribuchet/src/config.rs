@@ -157,20 +157,15 @@ pub struct WorkerConfig {
     /// Concurrent build slots.
     #[serde(default = "default_max_jobs")]
     pub max_jobs: u32,
-    /// First uid of the per-slot 65536-uid ranges for builds that
-    /// require the uid-range feature (Nix's auto-allocate-uids
-    /// start-id; needs a root worker).
-    #[serde(default = "default_uid_base")]
-    pub auto_allocate_uids_base: u32,
     /// Emulated systems: system -> path of a static emulator binary
     /// (Linux, kernel 6.7+).
     #[serde(default)]
     pub emulate: BTreeMap<String, PathBuf>,
-    /// pasta binary; fixed-output builds then get a private network
-    /// namespace with user-mode NAT (Linux). Defaults to the path
-    /// baked in at build time, if any; "none" disables it.
+    /// Flow policy for the fixed-output build network: ordered
+    /// allow/deny rules on destination address, protocol and port,
+    /// evaluated when a build opens an outbound connection.
     #[serde(default)]
-    pub pasta: Option<PathBuf>,
+    pub fod_network: crate::netpolicy::NetPolicy,
     /// Advertise the `recursive-nix` system feature so the hub routes
     /// derivations using it here. Requires the patched Nix on the
     /// client side (see `nix/patches/`).
@@ -199,10 +194,6 @@ fn default_max_jobs() -> u32 {
         .and_then(|n| u32::try_from(n.get()).ok())
         .unwrap_or(1)
 }
-fn default_uid_base() -> u32 {
-    872_415_232
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

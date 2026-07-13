@@ -1,4 +1,4 @@
-# Fetches from the hub's TCP server through pasta and asserts the
+# Fetches from the hub's TCP server through presto-pasta and asserts the
 # worker's loopback service is unreachable from the sandbox.
 { bash, hubIp }:
 derivation {
