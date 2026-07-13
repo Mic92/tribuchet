@@ -43,35 +43,74 @@ enum BuildOwner {
     #[cfg(target_os = "linux")]
     Leased {
         lease: super::sandboxd::SandboxLease,
-        /// Number of uids in the lease (1 or 65536).
-        uid_count: u32,
     },
 }
 
+/// Pre-spawn half of a lease: the user namespace exists (so its path
+/// can go into the spec) but sandboxd has not been contacted yet.
+struct OwnerPrep {
+    #[cfg(target_os = "linux")]
+    ns: super::sandboxd::SandboxPrep,
+    #[cfg(target_os = "linux")]
+    uid_count: u32,
+}
+
 impl BuildOwner {
-    fn for_build(ctx: &Arc<WorkerCtx>, a: &BuildAssignment) -> Result<Self> {
+    fn prepare(a: &BuildAssignment) -> Result<OwnerPrep> {
         #[cfg(target_os = "linux")]
-        {
-            let uid_count = if requires_uid_range(&a.env) { 65536 } else { 1 };
-            let socket = ctx
-                .sandboxd
-                .as_deref()
-                .context("tribuchet-sandboxd socket unavailable")?;
-            let lease = super::sandboxd::allocate(socket, &a.build_id, uid_count)?;
-            tracing::info!(
-                build_id = a.build_id,
-                pool_base = lease.pool_base,
-                uid_count,
-                "leased sandbox"
-            );
-            Ok(Self::Leased { lease, uid_count })
-        }
+        return Ok(OwnerPrep {
+            ns: super::sandboxd::SandboxPrep::new()?,
+            uid_count: if requires_uid_range(&a.env) { 65536 } else { 1 },
+        });
         #[cfg(not(target_os = "linux"))]
         {
             if requires_uid_range(&a.env) {
                 bail!("the uid-range feature is only supported on Linux workers");
             }
-            let _ = ctx;
+            Ok(OwnerPrep {})
+        }
+    }
+
+    /// Lease the sandbox now that the setup stage exists, so sandboxd
+    /// can place it in the build cgroup. Fills in `spec.cgroup`.
+    fn lease(
+        ctx: &WorkerCtx,
+        build_id: &str,
+        prep: OwnerPrep,
+        stage: i32,
+        spec: &mut sandbox::SandboxSpec,
+    ) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            let socket = ctx
+                .sandboxd
+                .as_deref()
+                .context("tribuchet-sandboxd socket unavailable")?;
+            let OwnerPrep { ns, uid_count } = prep;
+            let lease = ns.allocate(
+                socket,
+                build_id,
+                uid_count,
+                nix::unistd::Pid::from_raw(stage),
+            )?;
+            tracing::info!(
+                build_id,
+                pool_base = lease.pool_base,
+                uid_count,
+                "leased sandbox"
+            );
+            // memory.max is group-writable for the worker.
+            if let Some(bytes) = ctx.build_memory_max
+                && let Err(e) = fs::write(lease.cgroup().join("memory.max"), bytes.to_string())
+            {
+                tracing::warn!("setting memory.max on the leased cgroup: {e}");
+            }
+            spec.cgroup = Some(lease.cgroup().to_path_buf());
+            Ok(Self::Leased { lease })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (ctx, build_id, prep, stage, spec);
             Ok(Self::Worker)
         }
     }
@@ -81,7 +120,7 @@ impl BuildOwner {
     fn cleanup_disk(&self, spec: &sandbox::SandboxSpec) {
         #[cfg(target_os = "linux")]
         {
-            let Self::Leased { lease, .. } = self;
+            let Self::Leased { lease } = self;
             let paths = [spec.root.join("nix/store"), spec.build_dir.clone()];
             if let Err(e) = sandbox::cleanup_leased(&lease.ns_path(), &paths) {
                 tracing::warn!("cleaning up leased build files: {e:#}");
@@ -377,20 +416,17 @@ impl ActiveBuild {
         Ok(false)
     }
 
-    fn build_spec(&self, owner: &BuildOwner) -> Result<sandbox::SandboxSpec> {
+    fn build_spec(&self, prep: &OwnerPrep) -> Result<sandbox::SandboxSpec> {
         let a = &self.assignment;
         // The spec fields stay Option: the macOS spec has no lease.
         #[cfg(target_os = "linux")]
-        let (leased_userns, leased_uid_count) = {
-            let BuildOwner::Leased { lease, uid_count } = owner;
-            (Some(lease.ns_path()), Some(*uid_count))
-        };
+        let (leased_userns, leased_uid_count) = (Some(prep.ns.ns_path()), Some(prep.uid_count));
         #[cfg(not(target_os = "linux"))]
         let (leased_userns, leased_uid_count) = {
-            let BuildOwner::Worker = owner;
+            let _ = prep;
             (None, None)
         };
-        let mut spec = sandbox::prepare(
+        let spec = sandbox::prepare(
             a,
             &self.dir,
             &self.inputs,
@@ -413,19 +449,6 @@ impl ActiveBuild {
             net_isolation = spec.net_isolation,
             "sandbox network decision"
         );
-        #[cfg(target_os = "linux")]
-        {
-            let BuildOwner::Leased { lease, .. } = owner;
-            // sandboxd created and delegated this cgroup; memory.max is
-            // group-writable for the worker.
-            let cg = lease.cgroup().to_path_buf();
-            if let Some(bytes) = self.ctx.build_memory_max
-                && let Err(e) = fs::write(cg.join("memory.max"), bytes.to_string())
-            {
-                tracing::warn!("setting memory.max on the leased cgroup: {e}");
-            }
-            spec.cgroup = Some(cg);
-        }
         Ok(spec)
     }
 
@@ -440,10 +463,11 @@ impl ActiveBuild {
         timeout: Duration,
     ) -> Result<FinishedBuild> {
         let a = &self.assignment;
-        // The lease keeps concurrent uid blocks disjoint; released
-        // when the owner drops after the build finishes.
-        let owner = BuildOwner::for_build(&self.ctx, a)?;
-        let spec = self.build_spec(&owner)?;
+        // Spawn first, lease after: sandboxd needs the stage's pidfd to
+        // move it into the build cgroup. The stage blocks on stdin
+        // until the spec is sent below, so nothing runs before leasing.
+        let prep = BuildOwner::prepare(a)?;
+        let mut spec = self.build_spec(&prep)?;
         let deadline = Instant::now() + timeout;
         // Logs go through a file in the build dir, not pipes: capture
         // is decoupled from this process's lifetime, so a later worker
@@ -455,6 +479,7 @@ impl ActiveBuild {
             .ctx
             .spawner
             .spawn(&mut req, &log_file, child_stdin.as_ref())?;
+        let owner = BuildOwner::lease(&self.ctx, &a.build_id, prep, pid, &mut spec)?;
         if let Some(w) = spec_w {
             sandbox::send_spec_to(&spec, w)?;
         }

@@ -251,14 +251,8 @@ pub fn setup_stage() -> ! {
 const CLOSE_RANGE_CLOEXEC: libc::c_uint = 4;
 
 fn enter_and_exec(spec: &SandboxSpec) -> io::Result<std::convert::Infallible> {
-    // Enter the build cgroup first, with the worker's full
-    // credentials and before any namespace changes.
-    if let Some(cg) = &spec.cgroup {
-        // A leased cgroup is owned by the sandbox's namespace root;
-        // its cgroup.procs is group-writable for the worker.
-        fs::write(cg.join("cgroup.procs"), "0")
-            .map_err(|e| io::Error::other(format!("entering build cgroup: {e}")))?;
-    }
+    // sandboxd placed this process in the build cgroup before the spec
+    // arrived on stdin; CLONE_NEWCGROUP below roots the namespace there.
     let binfmt_line = match &spec.emulator {
         Some(_) => Some(binfmt::register_line(&spec.system).ok_or_else(|| {
             io::Error::other(format!("no binfmt magic known for system {}", spec.system))

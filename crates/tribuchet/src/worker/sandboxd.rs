@@ -32,12 +32,7 @@ impl SandboxLease {
     /// Path under which other processes of this user (the reaper-spawned
     /// sandbox setup stage) can open and setns() into the namespace.
     pub fn ns_path(&self) -> PathBuf {
-        format!(
-            "/proc/{}/fd/{}",
-            std::process::id(),
-            self.userns.as_raw_fd()
-        )
-        .into()
+        ns_path(&self.userns)
     }
 
     /// The delegated per-build cgroup directory.
@@ -46,36 +41,69 @@ impl SandboxLease {
     }
 }
 
-/// Lease a sandbox with `uid_count` uids (1 or 65536) mapped at in-ns 0.
-pub fn allocate(socket: &Path, build_id: &str, uid_count: u32) -> Result<SandboxLease> {
-    // The holder process must stay alive until the daemon has verified
-    // the pidfd/userns pair and written the maps through /proc/<pid>;
-    // afterwards the fd alone pins the namespace.
-    let (holder, userns) = UsernsHolder::new().context("creating an unmapped user namespace")?;
-    let conn = UnixStream::connect(socket)
-        .with_context(|| format!("connecting to sandboxd at {}", socket.display()))?;
-    sandbox_proto::send_call(
-        &conn,
-        METHOD_ALLOCATE,
-        &AllocateRequest {
-            build_id: build_id.to_owned(),
-            uid_count,
-        },
-        &[userns.as_raw_fd(), holder.pidfd.as_raw_fd()],
-    )?;
-    let (reply, fds): (AllocateReply, Vec<OwnedFd>) =
-        sandbox_proto::recv_reply(&conn).context("leasing a sandbox from tribuchet-sandboxd")?;
-    let [cgroup_fd] = <[OwnedFd; 1]>::try_from(fds)
-        .map_err(|fds| anyhow::anyhow!("expected 1 fd in the lease reply, got {}", fds.len()))?;
-    let cgroup = fs::read_link(format!("/proc/self/fd/{}", cgroup_fd.as_raw_fd()))
-        .context("resolving the leased cgroup path")?;
-    drop(holder);
-    Ok(SandboxLease {
-        _conn: conn,
-        userns,
-        cgroup,
-        pool_base: reply.pool_base,
-    })
+/// A worker-created, still-unmapped user namespace. Lets the caller
+/// spawn the setup stage (which needs [`ns_path`](Self::ns_path))
+/// before [`allocate`](Self::allocate) so sandboxd can place it in the
+/// build cgroup as part of the one Allocate call.
+pub struct SandboxPrep {
+    holder: UsernsHolder,
+    userns: OwnedFd,
+}
+
+impl SandboxPrep {
+    pub fn new() -> Result<Self> {
+        let (holder, userns) =
+            UsernsHolder::new().context("creating an unmapped user namespace")?;
+        Ok(Self { holder, userns })
+    }
+
+    /// Stays valid across the move into [`SandboxLease`] (same fd).
+    pub fn ns_path(&self) -> PathBuf {
+        ns_path(&self.userns)
+    }
+
+    /// Lease a sandbox with `uid_count` uids (1 or 65536) at in-ns 0
+    /// and have sandboxd place `stage` in the build cgroup.
+    pub fn allocate(
+        self,
+        socket: &Path,
+        build_id: &str,
+        uid_count: u32,
+        stage: nix::unistd::Pid,
+    ) -> Result<SandboxLease> {
+        let stage_fd = pidfd_open(stage).context("opening a pidfd of the setup stage")?;
+        let conn = UnixStream::connect(socket)
+            .with_context(|| format!("connecting to sandboxd at {}", socket.display()))?;
+        // The holder must survive until sandboxd has verified the
+        // pidfd/userns pair and written maps through /proc/<pid>;
+        // afterwards the fd alone pins the namespace.
+        sandbox_proto::send_call(
+            &conn,
+            METHOD_ALLOCATE,
+            &AllocateRequest {
+                build_id: build_id.to_owned(),
+                uid_count,
+            },
+            &[
+                self.userns.as_raw_fd(),
+                self.holder.pidfd.as_raw_fd(),
+                stage_fd.as_raw_fd(),
+            ],
+        )?;
+        let (reply, fds): (AllocateReply, Vec<OwnedFd>) = sandbox_proto::recv_reply(&conn)
+            .context("leasing a sandbox from tribuchet-sandboxd")?;
+        let [cgroup_fd] = <[OwnedFd; 1]>::try_from(fds).map_err(|fds| {
+            anyhow::anyhow!("expected 1 fd in the lease reply, got {}", fds.len())
+        })?;
+        let cgroup = fs::read_link(format!("/proc/self/fd/{}", cgroup_fd.as_raw_fd()))
+            .context("resolving the leased cgroup path")?;
+        Ok(SandboxLease {
+            _conn: conn,
+            userns: self.userns,
+            cgroup,
+            pool_base: reply.pool_base,
+        })
+    }
 }
 
 /// A forked child that unshared an unmapped user namespace and blocks;
@@ -133,6 +161,10 @@ impl Drop for UsernsHolder {
     }
 }
 
+fn ns_path(userns: &OwnedFd) -> PathBuf {
+    format!("/proc/{}/fd/{}", std::process::id(), userns.as_raw_fd()).into()
+}
+
 /// pidfd_open(2); no nix wrapper yet.
 fn pidfd_open(pid: nix::unistd::Pid) -> Result<OwnedFd> {
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid.as_raw(), 0) };
@@ -155,7 +187,7 @@ mod tests {
                 sandbox_proto::recv_call(&conn).unwrap();
             assert_eq!(method, METHOD_ALLOCATE);
             assert_eq!(request.uid_count, 65536);
-            assert_eq!(fds.len(), 2, "userns and pidfd expected");
+            assert_eq!(fds.len(), 3, "userns, holder and stage pidfds expected");
             let cgroup = std::fs::File::open("/tmp").unwrap();
             sandbox_proto::send_reply(
                 &conn,
@@ -176,7 +208,11 @@ mod tests {
         let path = dir.path().join("socket");
         let server = mock_server(UnixListener::bind(&path).unwrap());
 
-        let lease = allocate(&path, "b1", 65536).unwrap();
+        let prep = SandboxPrep::new().unwrap();
+        assert!(prep.ns_path().exists());
+        let lease = prep
+            .allocate(&path, "b1", 65536, nix::unistd::Pid::this())
+            .unwrap();
         assert_eq!(lease.pool_base, 3_000_000);
         assert_eq!(lease.cgroup(), Path::new("/tmp"));
         assert!(lease.ns_path().exists());
@@ -194,12 +230,19 @@ mod tests {
             let _ = sandbox_proto::recv_call::<AllocateRequest>(&conn).unwrap();
             sandbox_proto::send_error(&conn, "com.tribuchet.Sandbox.PoolExhausted").unwrap();
         });
-        let err = allocate(&path, "b1", 65536).unwrap_err();
+        let err = SandboxPrep::new()
+            .unwrap()
+            .allocate(&path, "b1", 65536, nix::unistd::Pid::this())
+            .unwrap_err();
         assert!(format!("{err:#}").contains("PoolExhausted"), "{err:#}");
     }
 
     #[test]
     fn missing_socket_fails() {
-        assert!(allocate(Path::new("/nonexistent/socket"), "b1", 1).is_err());
+        let prep = SandboxPrep::new().unwrap();
+        assert!(
+            prep.allocate(Path::new("/nonexistent"), "b1", 1, nix::unistd::Pid::this())
+                .is_err()
+        );
     }
 }

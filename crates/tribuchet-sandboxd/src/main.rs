@@ -110,6 +110,7 @@ fn handle(daemon: &Daemon, conn: &UnixStream) -> Result<()> {
     let mut fds = fds.into_iter();
     let userns = fds.next().context("missing userns fd")?;
     let pidfd = fds.next().context("missing pidfd")?;
+    let stage_fd = fds.next().context("missing setup-stage pidfd")?;
 
     let holder = lease::pidfd_pid(pidfd.as_fd())?;
     lease::verify_userns(holder, userns.as_fd())?;
@@ -130,6 +131,7 @@ fn handle(daemon: &Daemon, conn: &UnixStream) -> Result<()> {
             base,
             daemon.worker.gid.as_raw(),
         )?;
+        lease::enter_cgroup(&cgroup, stage_fd.as_fd(), daemon.worker.uid)?;
         sandbox_proto::send_reply(
             conn,
             &AllocateReply { pool_base: base },

@@ -57,11 +57,9 @@ pub struct BuildCgroup {
     pub dir: OwnedFd,
 }
 
-/// Create the build cgroup inside the worker's delegated subtree
-/// (derived from the requesting process). Owned by the pool base uid so
-/// the in-ns-root payload can manage subgroups; cgroup.procs,
-/// cgroup.kill and memory.max are group-writable so the worker can
-/// place the setup stage, kill the build and set its memory limit.
+/// Create the build cgroup under the worker's own cgroup. Owned by the
+/// pool base uid so the in-ns-root payload can manage subgroups;
+/// memory.max is group-writable so the worker can set the limit.
 pub fn create_cgroup(
     peer_pid: Pid,
     build_id: &str,
@@ -109,6 +107,25 @@ pub fn create_cgroup(
         )?;
     }
     Ok(BuildCgroup { parent, name, dir })
+}
+
+/// Move the process behind `pidfd` into the build cgroup. Done as root
+/// because cgroup v2 migration needs write on the common ancestor's
+/// `cgroup.procs`, which the worker lacks outside a `Delegate=yes`
+/// unit. Refuses a process not owned by the worker: pidfd_open has no
+/// credential check, so otherwise the worker could have sandboxd move
+/// (and later `cgroup.kill`) any process.
+pub fn enter_cgroup(cg: &BuildCgroup, pidfd: BorrowedFd, worker_uid: Uid) -> Result<()> {
+    let pid = pidfd_pid(pidfd)?;
+    let uid = fs::metadata(format!("/proc/{pid}"))?.uid();
+    ensure!(
+        uid == worker_uid.as_raw(),
+        "setup stage {pid} is uid {uid}, not the worker"
+    );
+    // The pidfd staying live across the uid read rules out pid reuse.
+    ensure!(pidfd_pid(pidfd)? == pid, "setup stage exited");
+    write_at(&cg.dir, "cgroup.procs", &pid.to_string())
+        .with_context(|| format!("moving pid {pid} into cgroup {}", cg.name))
 }
 
 /// Block until the lease is over: the build cgroup was populated and

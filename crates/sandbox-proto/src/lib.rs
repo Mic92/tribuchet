@@ -18,7 +18,11 @@ pub const SOCKET_PATH: &str = "/run/tribuchet-sandboxd.sock";
 pub const METHOD_ALLOCATE: &str = "com.tribuchet.Sandbox.Allocate";
 
 /// Lease a per-build sandbox. Attached fds: the worker-created user
-/// namespace (index 0) and a pidfd of the process holding it (index 1).
+/// namespace (0), a pidfd of the process holding it (1), and a pidfd of
+/// the sandbox setup stage (2). sandboxd maps the namespace, creates
+/// the build cgroup, and moves the setup stage into it -- as root, so
+/// the worker needs no write on any ancestor `cgroup.procs` and thus no
+/// delegated subtree.
 ///
 /// The reply carries [`AllocateReply`] with the delegated build cgroup
 /// directory as fd 0. The lease ends when the build cgroup drains after
