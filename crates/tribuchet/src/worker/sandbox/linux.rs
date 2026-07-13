@@ -218,53 +218,19 @@ fn create_mount_points(spec: &SandboxSpec) -> Result<()> {
     Ok(())
 }
 
-/// A build whose sandbox uid 0 maps to host root (emulated builds on a
-/// root worker) could chmod/chown a bind-mounted host device node, so a
-/// worker with CAP_MKNOD creates its own nodes instead. Without the
-/// capability (rootless worker) it binds the host nodes; there the
-/// sandbox never maps to a uid owning them.
+/// Like Nix: bind-mount the host device nodes instead of mknod'ing
+/// copies (impossible in a leased user namespace anyway). The mounts
+/// are read-only, so a sandbox mapping a host uid that owns a node
+/// cannot chmod/chown it; device I/O is unaffected by MS_RDONLY.
 fn populate_dev(root: &Path, binds_dev: &mut Vec<(PathBuf, PathBuf)>) -> Result<()> {
     let mut devices = vec!["null", "zero", "full", "random", "urandom", "tty"];
     // Nix's `kvm` system feature (VM builds, NixOS tests).
     if Path::new("/dev/kvm").exists() {
         devices.push("kvm");
     }
-    let mut can_mknod = true;
     for dev in devices {
         let host = PathBuf::from("/dev").join(dev);
-        let target = root.join("dev").join(dev);
-        if can_mknod {
-            let rdev = stat::stat(&host)
-                .with_context(|| format!("stat {}", host.display()))?
-                .st_rdev;
-            match stat::mknod(
-                &target,
-                stat::SFlag::S_IFCHR,
-                stat::Mode::from_bits_truncate(0o666),
-                rdev,
-            ) {
-                Ok(()) => {
-                    // umask clips mknod's mode; sandbox uids need 0666.
-                    fs::set_permissions(
-                        &target,
-                        std::os::unix::fs::PermissionsExt::from_mode(0o666),
-                    )
-                    .with_context(|| format!("chmod {}", target.display()))?;
-                    continue;
-                }
-                // Bind-mounting host nodes is only safe when the sandbox
-                // cannot map to a host uid owning them; a root worker
-                // stripped of CAP_MKNOD must not fall back silently.
-                Err(Errno::EPERM) if !unistd::geteuid().is_root() => can_mknod = false,
-                Err(Errno::EPERM) => {
-                    anyhow::bail!("worker runs as root but lacks CAP_MKNOD to create device nodes")
-                }
-                Err(e) => {
-                    return Err(e).with_context(|| format!("mknod {}", target.display()));
-                }
-            }
-        }
-        fs::File::create(&target)?;
+        fs::File::create(root.join("dev").join(dev))?;
         binds_dev.push((host.clone(), host));
     }
     Ok(())
@@ -906,16 +872,16 @@ fn mount_filesystems(p: &SetupParams) -> io::Result<()> {
             .map_err(|e| io::Error::other(format!("remounting {}: {e}", src.display())))?;
         Ok(())
     };
-    // Request-derived binds are always read-only; only the sandbox's
-    // own device nodes stay writable. Keying writability on a path
-    // prefix of a client-influenced destination would let a request
-    // bind host devices read-write.
+    // Every bind is read-only: request-derived ones because the request
+    // must not expose writable host files, device binds because the
+    // sandbox must not chmod/chown the host nodes (writing *to* a char
+    // device works regardless of MS_RDONLY).
     let nosuid_nodev = MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
     for (src, dst) in p.binds {
         bind_one(src, dst, true, nosuid_nodev)?;
     }
     for (src, dst) in p.binds_dev {
-        bind_one(src, dst, false, MsFlags::MS_NOSUID)?;
+        bind_one(src, dst, true, MsFlags::MS_NOSUID)?;
     }
     bind_one(p.build_dir, Path::new(p.cwd), false, nosuid_nodev)?;
 
