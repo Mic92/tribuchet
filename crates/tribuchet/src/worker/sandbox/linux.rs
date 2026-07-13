@@ -474,12 +474,13 @@ struct NetHelper {
     sock: OwnedFd,
 }
 
-/// Fork a helper that stays in the host namespaces and runs the
+/// Fork a helper that stays outside the sandbox and runs the
 /// presto-pasta datapath on the tap fd the sandbox side sends over
-/// once its netns exists (see [`NetHelper::attach`]). FOD builds drop
-/// the helper to the unprivileged backing uid before any traffic is
-/// processed. The helper exits when the build process (its parent)
-/// dies, watched via a pidfd.
+/// once its netns exists (see [`NetHelper::attach`]). Before any
+/// traffic is processed the helper drops to the FOD backing uid on a
+/// root worker, or into its own single-uid user namespace otherwise.
+/// The helper exits when the build process (its parent) dies, watched
+/// via a pidfd.
 fn fork_net_helper(policy: NetPolicy, runas: Option<(u32, u32)>) -> io::Result<NetHelper> {
     let target = unistd::getpid();
     let (ours, theirs) = socketpair(
@@ -537,6 +538,19 @@ fn net_helper(
             && unistd::setgid(unistd::Gid::from_raw(gid)).is_ok()
             && unistd::setuid(unistd::Uid::from_raw(uid)).is_ok();
         if !dropped {
+            return 1;
+        }
+    } else {
+        // Rootless worker: confine the helper to its own self-mapped
+        // user namespace; it only needs the tap fd and outbound
+        // sockets.
+        let uid = unistd::getuid().as_raw();
+        let gid = unistd::getgid().as_raw();
+        let confined = unshare(CloneFlags::CLONE_NEWUSER).is_ok()
+            && fs::write("/proc/self/setgroups", "deny").is_ok()
+            && fs::write("/proc/self/uid_map", format!("{uid} {uid} 1")).is_ok()
+            && fs::write("/proc/self/gid_map", format!("{gid} {gid} 1")).is_ok();
+        if !confined {
             return 1;
         }
     }

@@ -76,7 +76,7 @@ struct WorkerCtx {
     /// system -> static emulator binary, from the emulate setting.
     emulators: HashMap<String, PathBuf>,
     /// Fixed-output builds get a private netns with the presto-pasta
-    /// user-mode NAT (Linux root workers with /dev/net/tun).
+    /// user-mode NAT (Linux workers with /dev/net/tun).
     fod_isolation: bool,
     /// Flow policy for that network, from the fod-network setting.
     fod_network: crate::netpolicy::NetPolicy,
