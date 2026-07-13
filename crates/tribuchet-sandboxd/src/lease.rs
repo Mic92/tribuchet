@@ -1,12 +1,14 @@
 //! One sandbox lease: userns maps and the delegated build cgroup.
 
 use std::fs;
-use std::os::fd::{AsRawFd, BorrowedFd};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
-use nix::unistd::{Gid, Pid, Uid, chown};
+use nix::fcntl::{AtFlags, OFlag, openat};
+use nix::sys::stat::{FchmodatFlags, Mode, fchmodat, fstatat, mkdirat};
+use nix::unistd::{Gid, Pid, Uid, UnlinkatFlags, fchown, fchownat, unlinkat};
 
 /// Pid behind a pidfd, or an error if the process already exited.
 pub fn pidfd_pid(pidfd: BorrowedFd) -> Result<Pid> {
@@ -46,11 +48,26 @@ pub fn write_maps(pid: Pid, base: u32, count: u32) -> Result<()> {
     Ok(())
 }
 
+/// The build's cgroup, held via directory fds so later operations do
+/// not depend on re-resolving worker-influenced paths.
+#[derive(Debug)]
+pub struct BuildCgroup {
+    parent: OwnedFd,
+    name: String,
+    pub dir: OwnedFd,
+}
+
 /// Create the build cgroup inside the worker's delegated subtree
 /// (derived from the requesting process). Owned by the pool base uid so
-/// the in-ns-root payload can manage subgroups; cgroup.procs and
-/// cgroup.kill are group-writable for the worker.
-pub fn create_cgroup(peer_pid: Pid, build_id: &str, base: u32, worker_gid: u32) -> Result<PathBuf> {
+/// the in-ns-root payload can manage subgroups; cgroup.procs,
+/// cgroup.kill and memory.max are group-writable so the worker can
+/// place the setup stage, kill the build and set its memory limit.
+pub fn create_cgroup(
+    peer_pid: Pid,
+    build_id: &str,
+    base: u32,
+    worker_gid: u32,
+) -> Result<BuildCgroup> {
     ensure!(
         !build_id.is_empty()
             && build_id.len() <= 64
@@ -64,50 +81,87 @@ pub fn create_cgroup(peer_pid: Pid, build_id: &str, base: u32, worker_gid: u32) 
         .trim()
         .strip_prefix("0::/")
         .context("requester not on cgroup v2")?;
-    let dir = Path::new("/sys/fs/cgroup")
-        .join(rel)
-        .join(format!("build-{build_id}"));
-    fs::create_dir(&dir).with_context(|| format!("creating cgroup {}", dir.display()))?;
+    let parent_path = Path::new("/sys/fs/cgroup").join(rel);
+    let parent = nix::fcntl::open(&parent_path, DIR_FLAGS, Mode::empty())
+        .with_context(|| format!("opening cgroup {}", parent_path.display()))?;
+    let name = format!("build-{build_id}");
+    mkdirat(&parent, name.as_str(), Mode::from_bits_truncate(0o755))
+        .with_context(|| format!("creating cgroup {}/{name}", parent_path.display()))?;
+    let dir = openat(&parent, name.as_str(), DIR_FLAGS, Mode::empty())
+        .context("opening the build cgroup")?;
     let uid = Some(Uid::from_raw(base));
     let gid = Some(Gid::from_raw(worker_gid));
-    chown(&dir, uid, gid)?;
-    for f in [
-        "cgroup.procs",
-        "cgroup.subtree_control",
-        "cgroup.threads",
-        "cgroup.kill",
-    ] {
-        let _ = chown(&dir.join(f), uid, gid);
+    fchown(&dir, uid, gid)?;
+    for f in ["cgroup.subtree_control", "cgroup.threads"] {
+        let _ = fchownat(&dir, f, uid, gid, AtFlags::AT_SYMLINK_NOFOLLOW);
     }
-    for f in ["cgroup.procs", "cgroup.kill"] {
-        fs::set_permissions(dir.join(f), fs::Permissions::from_mode(0o664))?;
+    // memory.max only exists when the parent enables the controller
+    for f in ["cgroup.procs", "cgroup.kill", "memory.max"] {
+        if fstatat(&dir, f, AtFlags::AT_SYMLINK_NOFOLLOW).is_err() {
+            continue;
+        }
+        fchownat(&dir, f, uid, gid, AtFlags::AT_SYMLINK_NOFOLLOW)?;
+        fchmodat(
+            &dir,
+            f,
+            Mode::from_bits_truncate(0o664),
+            FchmodatFlags::NoFollowSymlink,
+        )?;
     }
-    Ok(dir)
+    Ok(BuildCgroup { parent, name, dir })
 }
 
 /// Kill everything in the build cgroup, wait for it to drain, remove it.
 /// Must complete before the uid block is reused.
-pub fn destroy_cgroup(dir: &Path) -> Result<()> {
-    fs::write(dir.join("cgroup.kill"), "1").context("writing cgroup.kill")?;
+pub fn destroy_cgroup(cg: &BuildCgroup) -> Result<()> {
+    write_at(&cg.dir, "cgroup.kill", "1").context("writing cgroup.kill")?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
-    while fs::read_to_string(dir.join("cgroup.events"))
-        .is_ok_and(|events| !events.contains("populated 0"))
-    {
+    while !read_at(&cg.dir, "cgroup.events").is_ok_and(|events| events.contains("populated 0")) {
         ensure!(std::time::Instant::now() < deadline, "cgroup did not drain");
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    remove_cgroup_tree(dir)
+    remove_cgroup_tree(&cg.dir).context("removing build subgroups")?;
+    unlinkat(&cg.parent, cg.name.as_str(), UnlinkatFlags::RemoveDir)
+        .with_context(|| format!("removing cgroup {}", cg.name))
+}
+
+const DIR_FLAGS: OFlag = OFlag::O_DIRECTORY
+    .union(OFlag::O_NOFOLLOW)
+    .union(OFlag::O_RDONLY)
+    .union(OFlag::O_CLOEXEC);
+
+fn write_at(dir: &OwnedFd, name: &str, data: &str) -> Result<()> {
+    let fd = openat(dir, name, OFlag::O_WRONLY | OFlag::O_CLOEXEC, Mode::empty())?;
+    nix::unistd::write(&fd, data.as_bytes())?;
+    Ok(())
+}
+
+fn read_at(dir: &OwnedFd, name: &str) -> Result<String> {
+    let fd = openat(dir, name, OFlag::O_RDONLY | OFlag::O_CLOEXEC, Mode::empty())?;
+    let mut out = String::new();
+    std::io::Read::read_to_string(&mut fs::File::from(fd), &mut out)?;
+    Ok(out)
 }
 
 /// Cgroup dirs cannot be unlinked, only rmdir'd bottom-up.
-fn remove_cgroup_tree(dir: &Path) -> Result<()> {
-    for entry in fs::read_dir(dir)? {
+fn remove_cgroup_tree(dir: &OwnedFd) -> Result<()> {
+    let mut entries = Vec::new();
+    let mut d = nix::dir::Dir::from_fd(dir.try_clone()?)?;
+    for entry in d.iter() {
         let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            remove_cgroup_tree(&entry.path())?;
+        if entry.file_type() == Some(nix::dir::Type::Directory) {
+            let name = entry.file_name().to_owned();
+            if name.to_bytes() != b"." && name.to_bytes() != b".." {
+                entries.push(name);
+            }
         }
     }
-    fs::remove_dir(dir).with_context(|| format!("removing cgroup {}", dir.display()))
+    for name in entries {
+        let sub = openat(dir, name.as_c_str(), DIR_FLAGS, Mode::empty())?;
+        remove_cgroup_tree(&sub)?;
+        unlinkat(dir, name.as_c_str(), UnlinkatFlags::RemoveDir)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -143,5 +197,14 @@ mod tests {
     fn create_cgroup_rejects_bad_build_id() {
         let err = create_cgroup(Pid::this(), "../escape", 3_000_000, 0).unwrap_err();
         assert!(err.to_string().contains("invalid build id"), "{err}");
+    }
+
+    #[test]
+    fn read_write_at() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("f"), "").unwrap();
+        let fd = nix::fcntl::open(dir.path(), DIR_FLAGS, Mode::empty()).unwrap();
+        write_at(&fd, "f", "populated 0\n").unwrap();
+        assert_eq!(read_at(&fd, "f").unwrap(), "populated 0\n");
     }
 }

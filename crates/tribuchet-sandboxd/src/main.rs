@@ -120,17 +120,16 @@ fn handle(daemon: &Daemon, conn: &UnixStream) -> Result<()> {
     let mut leaked = false;
     let result = (|| {
         lease::write_maps(holder, base, request.uid_count)?;
-        let cgroup_dir = lease::create_cgroup(
+        let cgroup = lease::create_cgroup(
             Pid::from_raw(peer.pid()),
             &request.build_id,
             base,
             daemon.worker.gid.as_raw(),
         )?;
-        let cgroup = std::fs::File::open(&cgroup_dir)?;
         sandbox_proto::send_reply(
             conn,
             &AllocateReply { pool_base: base },
-            &[cgroup.as_raw_fd()],
+            &[cgroup.dir.as_raw_fd()],
         )?;
         tracing::info!(
             build = request.build_id,
@@ -146,7 +145,7 @@ fn handle(daemon: &Daemon, conn: &UnixStream) -> Result<()> {
         };
 
         // never reuse the block while build processes may still run
-        if let Err(e) = lease::destroy_cgroup(&cgroup_dir) {
+        if let Err(e) = lease::destroy_cgroup(&cgroup) {
             tracing::error!(build = request.build_id, "leaking uid block {base}: {e:#}");
             leaked = true;
         }

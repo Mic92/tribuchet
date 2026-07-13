@@ -16,9 +16,9 @@ pub(super) fn requires_uid_range(env: &HashMap<String, String>) -> bool {
 /// System features this worker can honor, advertised to the hub for
 /// scheduling. Mirrors Nix's defaults. Emulated systems get only the
 /// baseline: kvm is an x86 device to an emulated guest, and uid-range
-/// and recursive-nix under emulation are untested. `nsresourced`:
-/// leased ranges make uid-range work without a root worker.
-fn local_features(native: bool, opts: &WorkerConfig, nsresourced: bool) -> Vec<String> {
+/// and recursive-nix under emulation are untested. `sandboxd`: leased
+/// ranges make uid-range work without a root worker.
+fn local_features(native: bool, opts: &WorkerConfig, sandboxd: bool) -> Vec<String> {
     let mut features = vec![
         "nixos-test".to_owned(),
         "benchmark".to_owned(),
@@ -28,7 +28,7 @@ fn local_features(native: bool, opts: &WorkerConfig, nsresourced: bool) -> Vec<S
         if std::path::Path::new("/dev/kvm").exists() {
             features.push("kvm".to_owned());
         }
-        if nsresourced || can_map_uid_range(opts.auto_allocate_uids_base) {
+        if sandboxd || can_map_uid_range(opts.auto_allocate_uids_base) {
             features.push("uid-range".to_owned());
         }
     }
@@ -41,7 +41,7 @@ fn local_features(native: bool, opts: &WorkerConfig, nsresourced: bool) -> Vec<S
 /// Per-system capability list for Register; native systems get the
 /// probed feature set, emulated ones only the baseline.
 pub(super) fn system_caps(opts: &WorkerConfig, ctx: &WorkerCtx) -> Vec<crate::proto::SystemCaps> {
-    let native = local_features(true, opts, ctx.nsresourced.is_some());
+    let native = local_features(true, opts, ctx.sandboxd.is_some());
     let emulated = local_features(false, opts, false);
     opts.systems
         .iter()

@@ -345,18 +345,10 @@ fn enter_and_exec(spec: &SandboxSpec) -> io::Result<std::convert::Infallible> {
     // Enter the build cgroup first, with the worker's full
     // credentials and before any namespace changes.
     if let Some(cg) = &spec.cgroup {
+        // A leased cgroup is owned by the sandbox's namespace root;
+        // its cgroup.procs is group-writable for the worker.
         fs::write(cg.join("cgroup.procs"), "0")
             .map_err(|e| io::Error::other(format!("entering build cgroup: {e}")))?;
-        // Hand the just-entered cgroup to the leased namespace's root
-        // (nspawn inside the sandbox manages it).
-        if let Some(ns) = &spec.leased_userns {
-            crate::worker::nsresourced::add_cgroup_to_userns(
-                Path::new(crate::worker::nsresourced::SOCKET_PATH),
-                ns,
-                cg,
-            )
-            .map_err(|e| io::Error::other(format!("delegating build cgroup: {e:#}")))?;
-        }
     }
     let binfmt_line = match &spec.emulator {
         Some(_) => Some(binfmt::register_line(&spec.system).ok_or_else(|| {
@@ -367,18 +359,18 @@ fn enter_and_exec(spec: &SandboxSpec) -> io::Result<std::convert::Infallible> {
     // Single uid 1000 (Nix default) or, for uid-range builds,
     // in-namespace root over a 65536-uid block. Emulated builds map
     // uid 0 for the binfmt registration, dropped to 1000 in setup().
-    // Leased namespaces already carry their maps; host uids are unused
-    // and the sandbox uid is whatever nsresourced mapped.
+    // Leased namespaces already carry their maps (in-ns 0..count);
+    // host uids are unused and setup becomes in-ns root after joining.
     let backing_uid = spec.fod_uid.unwrap_or_else(|| getuid().as_raw());
     let backing_gid = spec.fod_uid.unwrap_or_else(|| getgid().as_raw());
-    let (sandbox_uid, host_uid, uid_count) = match (spec.leased_uids, spec.uid_range) {
-        (Some((uid, count)), _) => (uid, 0, count),
+    let (sandbox_uid, host_uid, uid_count) = match (spec.leased_uid_count, spec.uid_range) {
+        (Some(count), _) => (0, 0, count),
         (None, Some(base)) => (0, base, 65536u32),
         (None, None) if binfmt_line.is_some() => (0, backing_uid, 1),
         (None, None) => (1000, backing_uid, 1),
     };
-    let (sandbox_gid, host_gid) = match (spec.leased_uids, spec.uid_range) {
-        (Some((gid, _)), _) => (gid, 0),
+    let (sandbox_gid, host_gid) = match (spec.leased_uid_count, spec.uid_range) {
+        (Some(_), _) => (0, 0),
         (None, Some(base)) => (0, base),
         (None, None) if binfmt_line.is_some() => (0, backing_gid),
         (None, None) => (100, backing_gid),
@@ -772,13 +764,18 @@ fn setup(p: &SetupParams) -> io::Result<()> {
     // AppArmor on Ubuntu), which would reject the setgroups write
     // below. Only an unprivileged worker self-maps its own uid.
     if let Some(userns) = p.leased_userns {
-        // Rootless uid-range: nsresourced already wrote the maps of the
-        // leased namespace; join it (allowed: this uid owns it) and
-        // unshare the rest inside.
+        // Rootless: sandboxd already wrote the maps of the leased
+        // namespace; join it (allowed: this uid owns it) and unshare
+        // the rest inside. Then become in-ns root (backed by the pool
+        // base uid): the worker uid is not mapped here, so the file
+        // creation and mounts below need mapped credentials.
         let ns = fs::File::open(userns)
             .map_err(|e| io::Error::other(format!("opening leased userns: {e}")))?;
         nix::sched::setns(ns, CloneFlags::CLONE_NEWUSER).map_err(ioerr("joining leased userns"))?;
         unshare(flags & !CloneFlags::CLONE_NEWUSER).map_err(ioerr("unshare"))?;
+        unistd::setgroups(&[]).map_err(ioerr("setgroups"))?;
+        unistd::setgid(unistd::Gid::from_raw(0)).map_err(ioerr("setgid"))?;
+        unistd::setuid(unistd::Uid::from_raw(0)).map_err(ioerr("setuid"))?;
     } else if p.uid_count == 1 && p.fod_uid.is_none() {
         unshare(flags).map_err(ioerr("unshare"))?;
         fs::write("/proc/self/setgroups", "deny").map_err(werr("setgroups"))?;
@@ -837,21 +834,23 @@ fn setup(p: &SetupParams) -> io::Result<()> {
     apply_process_limits(p.system)?;
 
     // Helper-mapped builds run as the still-root worker, unmapped but
-    // holding all caps in the new userns (a leased namespace likewise
-    // maps neither root nor the worker uid); drop to the in-namespace
-    // uid the map promised. A self-mapped worker already runs as it.
-    if p.uid_count > 1 || p.fod_uid.is_some() || p.leased_userns.is_some() {
-        unistd::setgroups(&[]).map_err(ioerr("setgroups"))?;
-        unistd::setgid(unistd::Gid::from_raw(p.sandbox_gid)).map_err(ioerr("setgid"))?;
-        unistd::setuid(unistd::Uid::from_raw(p.sandbox_uid)).map_err(ioerr("setuid"))?;
-        if p.leased_userns.is_some() && p.binfmt_line.is_some() {
-            // Leased emulated build: registration needed uid 0; remap
-            // to Nix's uid 1000 via a nested userns.
+    // holding all caps in the new userns; drop to the in-namespace uid
+    // the map promised. A self-mapped worker already runs as it.
+    // Leased builds became in-ns root when joining the namespace;
+    // single-uid ones must not run the builder with sandbox root's
+    // capabilities, so remap to Nix's uid 1000 via a nested userns
+    // (any binfmt registration above already ran as root).
+    if p.leased_userns.is_some() {
+        if p.uid_count == 1 {
             unshare(CloneFlags::CLONE_NEWUSER).map_err(ioerr("nested unshare"))?;
             fs::write("/proc/self/setgroups", "deny").map_err(werr("nested setgroups"))?;
             fs::write("/proc/self/uid_map", "1000 0 1").map_err(werr("nested uid_map"))?;
             fs::write("/proc/self/gid_map", "100 0 1").map_err(werr("nested gid_map"))?;
         }
+    } else if p.uid_count > 1 || p.fod_uid.is_some() {
+        unistd::setgroups(&[]).map_err(ioerr("setgroups"))?;
+        unistd::setgid(unistd::Gid::from_raw(p.sandbox_gid)).map_err(ioerr("setgid"))?;
+        unistd::setuid(unistd::Uid::from_raw(p.sandbox_uid)).map_err(ioerr("setuid"))?;
     } else if p.binfmt_line.is_some() {
         // binfmt registration needed in-namespace root; remap to
         // Nix's uid 1000 via a nested userns. Exec lookup falls back
@@ -979,30 +978,18 @@ fn mount_filesystems(p: &SetupParams) -> io::Result<()> {
 
 /// A leased build cannot own the worker-created on-disk skeleton (the
 /// worker uid is unmapped here); recreate it on a tmpfs owned by this
-/// namespace so the build can chmod and chown it like under a root
-/// worker. Only the scratch store stays on disk: outputs must survive
-/// the namespace.
+/// namespace (setup runs as in-ns root) so the build can chmod and
+/// chown it like under a root worker. Only the scratch store stays on
+/// disk: outputs must survive the namespace.
 fn tmpfs_root(p: &SetupParams) -> io::Result<()> {
     let root = p.root;
     let none: Option<&str> = None;
     let store = open_tree(&root.join("nix/store")).map_err(ioerr("detaching scratch store"))?;
-    // Creating inodes on the ns-owned tmpfs needs a mapped fsuid (the
-    // worker uid is not); the mapped ids also make the build own the
-    // skeleton. fsuid/fsgid are per-thread and the setup stage is
-    // single-threaded; restored afterwards because the on-disk paths
-    // bound later are only reachable as the worker uid.
-    let saved_user = unistd::setfsuid(unistd::Uid::from_raw(p.sandbox_uid));
-    let saved_group = unistd::setfsgid(unistd::Gid::from_raw(p.sandbox_gid));
-    let populated = (|| {
-        mount(Some("tmpfs"), root, Some("tmpfs"), MsFlags::empty(), none)
-            .map_err(ioerr("mounting tmpfs root"))?;
-        write_skeleton(p.spec)
-            .and_then(|()| create_mount_points(p.spec))
-            .map_err(|e| io::Error::other(format!("populating tmpfs root: {e:#}")))
-    })();
-    unistd::setfsuid(saved_user);
-    unistd::setfsgid(saved_group);
-    populated?;
+    mount(Some("tmpfs"), root, Some("tmpfs"), MsFlags::empty(), none)
+        .map_err(ioerr("mounting tmpfs root"))?;
+    write_skeleton(p.spec)
+        .and_then(|()| create_mount_points(p.spec))
+        .map_err(|e| io::Error::other(format!("populating tmpfs root: {e:#}")))?;
     move_mount(store.as_fd(), &root.join("nix/store")).map_err(ioerr("attaching scratch store"))
 }
 
@@ -1111,14 +1098,13 @@ pub const CLEANUP_STAGE_ARG: &str = "__lease_cleanup";
 
 /// Files a leased build wrote to disk (scratch store, /build) belong to
 /// leased uids the worker cannot delete. Re-exec this binary into the
-/// leased namespace as the mapped uid and remove them from there, while
-/// the lease still pins the namespace.
-pub fn cleanup_leased(userns: &Path, sandbox_uid: u32, paths: &[PathBuf]) -> Result<()> {
+/// leased namespace as its root and remove them from there, while the
+/// lease still pins the namespace.
+pub fn cleanup_leased(userns: &Path, paths: &[PathBuf]) -> Result<()> {
     let exe = std::env::current_exe().context("resolving worker binary path")?;
     let status = Command::new(exe)
         .arg(CLEANUP_STAGE_ARG)
         .arg(userns)
-        .arg(sandbox_uid.to_string())
         .args(paths)
         .status()
         .context("spawning lease cleanup stage")?;
@@ -1127,8 +1113,8 @@ pub fn cleanup_leased(userns: &Path, sandbox_uid: u32, paths: &[PathBuf]) -> Res
 }
 
 /// Entry point of the re-exec'd cleanup stage:
-/// `__lease_cleanup <userns> <uid> <path>...` removes the contents of
-/// each path.
+/// `__lease_cleanup <userns> <path>...` removes the contents of each
+/// path.
 pub fn cleanup_stage() -> ! {
     let code = match cleanup_stage_impl() {
         Ok(()) => 0,
@@ -1143,19 +1129,20 @@ pub fn cleanup_stage() -> ! {
 fn cleanup_stage_impl() -> Result<()> {
     let mut args = std::env::args_os().skip(2);
     let ns = args.next().context("missing userns path")?;
-    let uid: u32 = args
-        .next()
-        .context("missing uid")?
-        .to_string_lossy()
-        .parse()
-        .context("parsing uid")?;
     let ns = fs::File::open(Path::new(&ns)).context("opening leased userns")?;
     nix::sched::setns(ns, CloneFlags::CLONE_NEWUSER).context("joining leased userns")?;
-    // Become the mapped uid: the on-disk files to delete are owned by
-    // its backing host uid.
-    let (uid, gid) = (unistd::Uid::from_raw(uid), unistd::Gid::from_raw(uid));
+    // Become in-ns root: it owns the leased uids' files and, unlike the
+    // unmapped worker uid, may delete them despite the sticky bit.
+    let (uid, gid) = (unistd::Uid::from_raw(0), unistd::Gid::from_raw(0));
     unistd::setresgid(gid, gid, gid).context("setresgid")?;
     unistd::setresuid(uid, uid, uid).context("setresuid")?;
+    // Entries the worker created (input mount points, output dirs)
+    // appear as the overflow uid here; leave them for the worker's own
+    // remove_dir_all.
+    let overflow_uid: u32 = fs::read_to_string("/proc/sys/kernel/overflowuid")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(65534);
     for dir in args {
         let dir = PathBuf::from(dir);
         // O_NOFOLLOW + fd-based descent below: the build controlled
@@ -1168,10 +1155,8 @@ fn cleanup_stage_impl() -> Result<()> {
         )
         .with_context(|| format!("opening {}", dir.display()))?;
         for name in dir_entry_names(&fd)? {
-            // Worker-created entries (e.g. input bind mount points)
-            // stay: the worker deletes them with the build dir.
             let st = stat::fstatat(&fd, name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW)?;
-            if st.st_uid != unistd::geteuid().as_raw() {
+            if st.st_uid == overflow_uid {
                 continue;
             }
             remove_at(&fd, &name).with_context(|| format!("under {}", dir.display()))?;

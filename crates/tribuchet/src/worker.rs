@@ -16,11 +16,11 @@ mod caps;
 mod cgroup;
 mod imports;
 mod logtail;
-#[cfg(target_os = "linux")]
-mod nsresourced;
 pub mod reaper;
 mod resume;
 pub mod sandbox;
+#[cfg(target_os = "linux")]
+mod sandboxd;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -85,9 +85,9 @@ struct WorkerCtx {
     /// Builder gets the host nix-daemon socket bind-mounted in; the
     /// worker advertises the `recursive-nix` feature.
     pub(super) recursive_nix: bool,
-    /// systemd-nsresourced socket, if it delegates uid ranges to this
-    /// user; lets a rootless worker run uid-range builds.
-    nsresourced: Option<PathBuf>,
+    /// tribuchet-sandboxd socket; a rootless worker leases per-build
+    /// user namespaces and cgroups from it. None on root workers.
+    sandboxd: Option<PathBuf>,
     /// Slot i maps the uid block [uid_base + i*65536, 65536); disjoint
     /// blocks keep concurrent uid-range builds apart.
     uid_base: u32,
@@ -257,17 +257,26 @@ fn request_job() -> WorkerMessage {
     msg(worker_message::Msg::RequestJob(RequestJob {}))
 }
 
+/// Non-root Linux workers depend on tribuchet-sandboxd for every
+/// build's uid mapping and cgroup, so a missing socket is a startup
+/// error rather than a degraded mode.
 #[cfg(target_os = "linux")]
-fn nsresourced_socket() -> Option<PathBuf> {
-    let socket = Path::new(nsresourced::SOCKET_PATH);
-    let available = nsresourced::available(socket);
-    tracing::info!(available, "systemd-nsresourced uid range delegation");
-    available.then(|| socket.to_path_buf())
+fn sandboxd_socket() -> Result<Option<PathBuf>> {
+    if nix::unistd::geteuid().is_root() {
+        return Ok(None);
+    }
+    let socket = Path::new(sandboxd::SOCKET_PATH);
+    anyhow::ensure!(
+        socket.exists(),
+        "worker runs unprivileged but tribuchet-sandboxd is not available at {}",
+        socket.display()
+    );
+    Ok(Some(socket.to_path_buf()))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn nsresourced_socket() -> Option<PathBuf> {
-    None
+fn sandboxd_socket() -> Result<Option<PathBuf>> {
+    Ok(None)
 }
 
 pub fn run(opts: WorkerConfig) -> Result<()> {
@@ -343,7 +352,7 @@ async fn run_async(
         max_silent_time: Duration::from_secs(opts.max_silent_time_secs),
         max_log_size: opts.max_log_size,
         recursive_nix: opts.recursive_nix,
-        nsresourced: nsresourced_socket(),
+        sandboxd: sandboxd_socket()?,
         uid_base: opts.auto_allocate_uids_base,
         uid_slots: Mutex::new(vec![false; opts.max_jobs.max(1) as usize]),
     });

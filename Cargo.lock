@@ -2478,6 +2478,7 @@ dependencies = [
  "prost",
  "rand",
  "rcgen",
+ "sandbox-proto",
  "sd-notify 0.5.0",
  "serde",
  "serde_json",
@@ -2509,6 +2510,7 @@ dependencies = [
  "sandbox-proto",
  "sd-notify 0.4.5",
  "serde_json",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]

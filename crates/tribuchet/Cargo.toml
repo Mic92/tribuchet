@@ -28,6 +28,7 @@ time.workspace = true
 zstd.workspace = true
 nix.workspace = true
 libc.workspace = true
+sandbox-proto = { path = "../sandbox-proto" }
 futures-util.workspace = true
 async-compression.workspace = true
 tokio-util.workspace = true
