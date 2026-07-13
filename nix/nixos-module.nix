@@ -304,6 +304,18 @@ in
           ExecStart = "${lib.getExe' worker.package "tribuchet-sandboxd"} --worker-user tribuchet";
           Environment = "RUST_LOG=info";
           Restart = "on-failure";
+          NoNewPrivileges = true;
+          PrivateTmp = true;
+          ProtectHome = true;
+          ProtectSystem = "strict";
+          # build cgroups it delegates, and the socket when started standalone
+          ReadWritePaths = [
+            "/sys/fs/cgroup"
+            "/run"
+          ];
+          SystemCallArchitectures = "native";
+          SystemCallFilter = [ "@system-service" ];
+          SystemCallErrorNumber = "EPERM";
         };
       };
 
@@ -344,6 +356,13 @@ in
           # Builders inherit this; match nix-daemon so they are not stuck at
           # the systemd default soft limit of 1024 and fail with EMFILE.
           LimitNOFILE = 1048576;
+          # builds write only the state dir (writable under strict);
+          # store writes go through the nix-daemon socket
+          NoNewPrivileges = true;
+          PrivateTmp = true;
+          ProtectHome = true;
+          ProtectSystem = "strict";
+          RestrictSUIDSGID = true;
           Restart = "on-failure";
         };
       };

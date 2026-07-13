@@ -248,6 +248,8 @@ pub fn setup_stage() -> ! {
     std::process::exit(121);
 }
 
+const CLOSE_RANGE_CLOEXEC: libc::c_uint = 4;
+
 fn enter_and_exec(spec: &SandboxSpec) -> io::Result<std::convert::Infallible> {
     // Enter the build cgroup first, with the worker's full
     // credentials and before any namespace changes.
@@ -302,6 +304,16 @@ fn enter_and_exec(spec: &SandboxSpec) -> io::Result<std::convert::Infallible> {
         .map(|(k, v)| CString::new(format!("{k}={v}")))
         .collect::<Result<_, _>>()
         .map_err(|_| io::Error::other("NUL in builder environment"))?;
+    // Fds the setup stage still holds (error file, leased namespace)
+    // must not leak into the builder.
+    unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            3,
+            libc::c_uint::MAX,
+            CLOSE_RANGE_CLOEXEC,
+        );
+    }
     unistd::execve(&prog, &args, &env).map_err(ioerr("exec builder"))
 }
 
