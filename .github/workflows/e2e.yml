@@ -174,4 +174,4 @@ jobs:
       - run: python3 .github/scripts/e2e/run.py worker --hub-ip "$HUB_TS_IP"
 
       - if: always()
-        run: cat worker.log || true
+        run: cat worker.log sandboxd.log 2>/dev/null || true
