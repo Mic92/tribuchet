@@ -111,10 +111,54 @@ pub fn create_cgroup(
     Ok(BuildCgroup { parent, name, dir })
 }
 
+/// Block until the lease is over: the build cgroup was populated and
+/// drained again, or the worker closed the connection without ever
+/// spawning into it.
+pub fn wait_for_build_end(conn: &std::os::unix::net::UnixStream, cg: &BuildCgroup) -> Result<()> {
+    conn.set_nonblocking(true)?;
+    let mut reader = conn;
+    let mut was_populated = false;
+    loop {
+        // systemd removes the cgroup when it stops the worker unit;
+        // gone means drained
+        let events = match read_at(&cg.dir, "cgroup.events") {
+            Err(e) if is_enoent(&e) => return Ok(()),
+            other => other?,
+        };
+        let populated = !events.contains("populated 0");
+        was_populated |= populated;
+        if was_populated && !populated {
+            return Ok(());
+        }
+        match std::io::Read::read(&mut reader, &mut [0u8; 8]) {
+            // eof: the worker dropped the lease
+            Ok(0) if !was_populated => return Ok(()),
+            Ok(0) => {}
+            Ok(_) => anyhow::bail!("unexpected data on the lease connection"),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e).context("lease connection"),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+fn is_enoent(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<nix::errno::Errno>() == Some(&nix::errno::Errno::ENOENT)
+        || e.downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+}
+
 /// Kill everything in the build cgroup, wait for it to drain, remove it.
-/// Must complete before the uid block is reused.
+/// Must complete before the uid block is reused. A cgroup systemd
+/// already removed (worker unit stopped) counts as destroyed.
 pub fn destroy_cgroup(cg: &BuildCgroup) -> Result<()> {
-    write_at(&cg.dir, "cgroup.kill", "1").context("writing cgroup.kill")?;
+    match write_at(&cg.dir, "cgroup.kill", "1") {
+        Err(e) if is_enoent(&e) => {
+            let _ = unlinkat(&cg.parent, cg.name.as_str(), UnlinkatFlags::RemoveDir);
+            return Ok(());
+        }
+        other => other.context("writing cgroup.kill")?,
+    }
     let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
     while !read_at(&cg.dir, "cgroup.events").is_ok_and(|events| events.contains("populated 0")) {
         ensure!(std::time::Instant::now() < deadline, "cgroup did not drain");
@@ -197,6 +241,45 @@ mod tests {
     fn create_cgroup_rejects_bad_build_id() {
         let err = create_cgroup(Pid::this(), "../escape", 3_000_000, 0).unwrap_err();
         assert!(err.to_string().contains("invalid build id"), "{err}");
+    }
+
+    /// Fake build cgroup: a plain dir with a writable cgroup.events.
+    fn fake_cgroup(dir: &Path) -> BuildCgroup {
+        fs::write(dir.join("cgroup.events"), "populated 0\n").unwrap();
+        let parent = nix::fcntl::open(dir, DIR_FLAGS, Mode::empty()).unwrap();
+        let dir = nix::fcntl::open(dir, DIR_FLAGS, Mode::empty()).unwrap();
+        BuildCgroup {
+            parent,
+            name: "fake".into(),
+            dir,
+        }
+    }
+
+    #[test]
+    fn lease_ends_when_the_worker_never_spawned() {
+        let dir = tempfile::tempdir().unwrap();
+        let cg = fake_cgroup(dir.path());
+        let (ours, worker) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(worker);
+        wait_for_build_end(&ours, &cg).unwrap();
+    }
+
+    #[test]
+    fn lease_outlives_the_connection_until_the_cgroup_drains() {
+        let dir = tempfile::tempdir().unwrap();
+        let cg = fake_cgroup(dir.path());
+        let events = dir.path().join("cgroup.events");
+        fs::write(&events, "populated 1\n").unwrap();
+        let (ours, worker) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(worker);
+        let drainer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            fs::write(&events, "populated 0\n").unwrap();
+        });
+        let started = std::time::Instant::now();
+        wait_for_build_end(&ours, &cg).unwrap();
+        assert!(started.elapsed() >= std::time::Duration::from_millis(400));
+        drainer.join().unwrap();
     }
 
     #[test]

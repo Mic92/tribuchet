@@ -2,8 +2,10 @@
 //!
 //! The daemon writes uid/gid maps into a worker-created user namespace
 //! (in-ns 0..count backed by a pool block, the worker uid never mapped)
-//! and hands back a delegated build cgroup. Dropping the lease closes
-//! the connection: the daemon kills the cgroup and reclaims the block.
+//! and hands back a delegated build cgroup. The daemon reclaims the
+//! block once the build cgroup has drained, or when the connection
+//! closes before the build ever started; the connection alone ending
+//! never kills a running build (they survive worker restarts).
 
 use std::fs;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};

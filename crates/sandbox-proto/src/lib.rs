@@ -21,8 +21,10 @@ pub const METHOD_ALLOCATE: &str = "com.tribuchet.Sandbox.Allocate";
 /// namespace (index 0) and a pidfd of the process holding it (index 1).
 ///
 /// The reply carries [`AllocateReply`] with the delegated build cgroup
-/// directory as fd 0. The lease lasts until the connection closes; the
-/// daemon then kills the cgroup and returns the uid range.
+/// directory as fd 0. The lease ends when the build cgroup drains after
+/// having been populated -- so builds survive worker restarts -- or when
+/// the connection closes before anything ran in it; the daemon then
+/// removes the cgroup and returns the uid range.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AllocateRequest {
     pub build_id: String,

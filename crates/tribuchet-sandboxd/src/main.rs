@@ -15,7 +15,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use nix::sys::socket::{UnixCredentials, getsockopt, sockopt::PeerCredentials};
 use nix::unistd::{Pid, User};
@@ -29,11 +29,14 @@ struct Args {
     /// User the worker runs as; only this uid may request leases.
     #[arg(long, default_value = "tribuchet")]
     worker_user: String,
-    /// First uid of the pool handed to builds.
-    #[arg(long, default_value_t = 3_000_000)]
+    /// First uid of the pool handed to builds; the default starts
+    /// right after nix-daemon's auto-allocate-uids range so the two
+    /// never hand out the same uids on one host.
+    #[arg(long, default_value_t = 1_325_400_064)]
     pool_start: u32,
-    /// Number of 65536-uid blocks in the pool (max concurrent leases).
-    #[arg(long, default_value_t = 16)]
+    /// Number of 65536-uid blocks in the pool (max concurrent leases);
+    /// the default matches nix-daemon's id-count.
+    #[arg(long, default_value_t = 6912)]
     pool_blocks: u32,
 }
 
@@ -87,7 +90,8 @@ fn listener(path: &std::path::Path) -> Result<UnixListener> {
     Ok(listener)
 }
 
-/// One lease: allocate on request, tear down when the connection closes.
+/// One lease: allocate on request, tear down when the build's cgroup
+/// has drained (or the worker gave up before spawning into it).
 fn handle(daemon: &Daemon, conn: &UnixStream) -> Result<()> {
     let peer: UnixCredentials = getsockopt(conn, PeerCredentials)?;
     ensure!(
@@ -138,16 +142,16 @@ fn handle(daemon: &Daemon, conn: &UnixStream) -> Result<()> {
             "leased"
         );
 
-        // the lease lives as long as the connection
-        let held = match sandbox_proto::recv_call::<serde_json::Value>(conn) {
-            Err(_) => Ok(()),
-            Ok(_) => bail!("unexpected second call on lease connection"),
-        };
+        // The build must survive worker restarts, so the connection
+        // alone does not end the lease; the emptied cgroup does.
+        let held = lease::wait_for_build_end(conn, &cgroup);
 
         // never reuse the block while build processes may still run
         if let Err(e) = lease::destroy_cgroup(&cgroup) {
             tracing::error!(build = request.build_id, "leaking uid block {base}: {e:#}");
             leaked = true;
+        } else {
+            tracing::info!(build = request.build_id, base, "released");
         }
         held
     })();

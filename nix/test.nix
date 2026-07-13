@@ -123,6 +123,9 @@ in
         environment.etc."tt/cancel.nix".text = ''
           import ${./tests/cancel.nix} { bash = "${pkgs.bash}"; }
         '';
+        environment.etc."tt/stop.nix".text = ''
+          import ${./tests/stop.nix} { bash = "${pkgs.bash}"; }
+        '';
         environment.etc."tt/slowlog.nix".text = ''
           import ${./tests/slowlog.nix} { bash = "${pkgs.bash}"; }
         '';

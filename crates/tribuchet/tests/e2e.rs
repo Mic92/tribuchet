@@ -758,8 +758,32 @@ fn lifecycle() {
         "builds did not overlap: {elapsed}s (serial would be >=30s)"
     );
 
+    // --- finished builds leave no leased cgroup behind ---------------------
+    let no_build_cgroups = "[ -z \"$(find /sys/fs/cgroup/system.slice/tribuchet-worker.service \
+         -name 'build-*' 2>/dev/null)\" ]";
+    wait_until_succeeds(Node::Worker, no_build_cgroups, 60);
+
+    // --- stopping the worker mid-build kills the build and its lease ------
+    succeed(
+        Node::Hub,
+        "systemd-run --unit=stopbuild bash -lc 'nix-build /etc/tt/stop.nix --no-out-link'",
+    );
+    wait_until_succeeds(Node::Worker, "pgrep -f 'stop-marker-runnin[g]'", 60);
+    let released = count(Node::Worker, "tribuchet-sandboxd", "released");
+
     // --- no worker: build is declined and falls back to a local build -----
     succeed(Node::Worker, "systemctl stop tribuchet-worker");
+    // systemd kills the unit's cgroup subtree; sandboxd reaps the lease
+    wait_until_succeeds(Node::Worker, "! pgrep -f 'stop-marker-runnin[g]'", 60);
+    wait_until_succeeds(Node::Worker, no_build_cgroups, 60);
+    // sandboxd reaped the lease of the killed build and returned its block
+    wait_until_succeeds(
+        Node::Worker,
+        &format!("[ $(journalctl -u tribuchet-sandboxd | grep -c released) -gt {released} ]"),
+        60,
+    );
+    // stop the client before its declined build falls back to a local run
+    run(Node::Hub, "systemctl kill --signal=SIGKILL stopbuild");
     // Let the hub observe the session tear down so it no longer counts capable.
     succeed(Node::Hub, "sleep 3");
     write_echo_deriv(
