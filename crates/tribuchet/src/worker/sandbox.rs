@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 use std::process::{Child, Stdio};
 
 use anyhow::{Context, Result};
@@ -63,14 +64,9 @@ pub struct SandboxSpec {
     /// memory limit covers the whole build, including the setup phase.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub cgroup: Option<PathBuf>,
-    /// uid-range feature: host base of a 65536-uid block mapped into
-    /// the user namespace, builder as in-namespace root. None = single
-    /// uid mapped to 1000, like Nix without auto-allocate-uids.
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
-    pub uid_range: Option<u32>,
-    /// Rootless worker: path to a user namespace mapped by
-    /// tribuchet-sandboxd; the setup stage joins it instead of writing
-    /// uid maps itself.
+    /// Path to the user namespace mapped by tribuchet-sandboxd; the
+    /// setup stage joins it instead of writing uid maps itself.
+    /// Unused on macOS (Seatbelt sandbox).
     #[serde(default)]
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub leased_userns: Option<PathBuf>,
@@ -78,10 +74,6 @@ pub struct SandboxSpec {
     #[serde(default)]
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub leased_uid_count: Option<u32>,
-    /// Root workers: unprivileged host uid backing fixed-output builds,
-    /// so a network-facing build never runs as host root.
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
-    pub fod_uid: Option<u32>,
     /// Fixed-output build: private netns with the presto-pasta
     /// user-mode NAT; host abstract sockets and loopback services
     /// stay unreachable.
@@ -126,8 +118,7 @@ pub fn output_host_path(spec: &SandboxSpec, scratch: &str) -> PathBuf {
 pub struct PrepareOpts<'a> {
     pub bin_sh: Option<&'a Path>,
     pub secrets: &'a [PathBuf],
-    pub uid_range: Option<u32>,
-    /// User namespace leased from tribuchet-sandboxd (rootless worker).
+    /// User namespace leased from tribuchet-sandboxd.
     pub leased_userns: Option<PathBuf>,
     /// Uids mapped in the leased namespace (1 or 65536).
     pub leased_uid_count: Option<u32>,
@@ -136,7 +127,6 @@ pub struct PrepareOpts<'a> {
     pub net_isolation: bool,
     /// Flow policy applied to that network.
     pub net_policy: NetPolicy,
-    pub fod_uid: Option<u32>,
     /// Bind-mount the host nix-daemon socket into the sandbox so the
     /// builder can register inner-build outputs.
     pub recursive_nix: bool,
@@ -177,10 +167,8 @@ pub fn prepare(
         outputs: a.outputs.values().cloned().collect(),
         store_inputs: inputs.to_vec(),
         cgroup: None,
-        uid_range: opts.uid_range,
         leased_userns: opts.leased_userns.clone(),
         leased_uid_count: opts.leased_uid_count,
-        fod_uid: opts.fod_uid.filter(|_| a.fixed_output),
         net_isolation: opts.net_isolation && a.fixed_output,
         net_policy: opts.net_policy.clone(),
         emulator: opts.emulator.map(Path::to_path_buf),
@@ -269,9 +257,9 @@ pub fn send_spec_to(spec: &SandboxSpec, w: std::os::fd::OwnedFd) -> Result<()> {
     serde_json::to_writer(fs::File::from(w), spec).context("sending sandbox spec")
 }
 
-/// Spawn the builder directly (unit tests only; real builds go
+/// Spawn the builder directly (macOS unit tests only; real builds go
 /// through the reaper) with stdout/stderr on `log`.
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub fn spawn(spec: &SandboxSpec, log: fs::File) -> Result<Child> {
     let mut cmd = platform::command(spec)?;
     // Own process group, so orphaned builder children can be killed
@@ -393,31 +381,6 @@ mod tests {
         Ok(())
     }
 
-    /// Not a test: re-exec target for `sandbox_runs_builder`. There
-    /// `/proc/self/exe` is the libtest binary, which treats the stage
-    /// argument as a name filter selecting exactly this function.
-    /// No-op in normal test runs.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn __sandbox_setup() {
-        if std::env::args().any(|a| a == SETUP_STAGE_ARG) {
-            // CLONE_NEWUSER requires a single-threaded process and
-            // libtest has already spawned threads; a forked child is
-            // single-threaded again.
-            match unsafe { nix::unistd::fork() }.expect("fork") {
-                nix::unistd::ForkResult::Child => setup_stage(),
-                nix::unistd::ForkResult::Parent { child } => {
-                    use nix::sys::wait::{WaitStatus, waitpid};
-                    let code = match waitpid(child, None) {
-                        Ok(WaitStatus::Exited(_, code)) => code,
-                        other => panic!("setup stage: {other:?}"),
-                    };
-                    std::process::exit(code);
-                }
-            }
-        }
-    }
-
     /// Common fields for a /bin/sh test build rooted in `dir`;
     /// tests override what they exercise via struct update syntax.
     fn test_spec(dir: &Path) -> SandboxSpec {
@@ -451,55 +414,6 @@ mod tests {
         fs::create_dir_all(&spec.build_dir)?;
         let (req, _r, _w) = spawn_request(&spec)?;
         assert!(req.env.is_empty(), "setup stage env: {:?}", req.env);
-        Ok(())
-    }
-
-    /// End-to-end smoke test of the Linux sandbox: namespaces, mounts,
-    /// pivot_root, /proc, loopback, and exit-code plumbing through the
-    /// PID-namespace shim. Requires unprivileged user namespaces.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn sandbox_runs_builder() -> Result<()> {
-        if nix::sched::unshare(nix::sched::CloneFlags::empty()).is_err() {
-            return Ok(()); // no namespace support in this environment
-        }
-        let dir = tempfile::tempdir()?;
-        let mut spec = SandboxSpec {
-            args: vec![
-                "-c".into(),
-                // sleep keeps the builder alive so the timing assertion
-                // below is meaningful; environments without a sleep
-                // binary (Nix's busybox /bin/sh) just exit fast.
-                // $FOO asserts the derivation env reaches the builder
-                // even though the setup stage runs with a clean env.
-                "test -w /build && test -d /proc/self && test -d /dev/shm || exit 1; \
-                 test \"$FOO\" = bar || exit 2; \
-                 sleep 1 2>/dev/null; exit 7"
-                    .into(),
-            ],
-            env: HashMap::from([("FOO".into(), "bar".into())]),
-            binds_ro: ["/bin", "/usr", "/lib", "/lib64", "/nix/store"]
-                .iter()
-                .filter(|p| Path::new(p).exists())
-                .map(|p| (PathBuf::from(p), PathBuf::from(p)))
-                .collect(),
-            ..test_spec(dir.path())
-        };
-        fs::create_dir_all(&spec.build_dir)?;
-        platform::prepare(&mut spec)?;
-        let log_path = dir.path().join("build.log");
-        let started = std::time::Instant::now();
-        let mut child = spawn(&spec, fs::File::create(&log_path)?)?;
-        // spawn must return as soon as the builder execs; if the PID-ns
-        // shim kept std's status pipe open, spawn would block for the
-        // whole build and deadlock against the unread pipe.
-        assert!(
-            started.elapsed() < std::time::Duration::from_millis(900),
-            "spawn blocked until builder exit"
-        );
-        let status = child.wait()?;
-        let stderr = fs::read_to_string(&log_path)?;
-        assert_eq!(status.code(), Some(7), "{status:?} log: {stderr}");
         Ok(())
     }
 

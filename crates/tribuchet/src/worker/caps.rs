@@ -16,9 +16,9 @@ pub(super) fn requires_uid_range(env: &HashMap<String, String>) -> bool {
 /// System features this worker can honor, advertised to the hub for
 /// scheduling. Mirrors Nix's defaults. Emulated systems get only the
 /// baseline: kvm is an x86 device to an emulated guest, and uid-range
-/// and recursive-nix under emulation are untested. `sandboxd`: leased
-/// ranges make uid-range work without a root worker.
-fn local_features(native: bool, opts: &WorkerConfig, sandboxd: bool) -> Vec<String> {
+/// and recursive-nix under emulation are untested. uid-range comes
+/// from the sandboxd lease, which every Linux worker has.
+fn local_features(native: bool, opts: &WorkerConfig) -> Vec<String> {
     let mut features = vec![
         "nixos-test".to_owned(),
         "benchmark".to_owned(),
@@ -28,9 +28,7 @@ fn local_features(native: bool, opts: &WorkerConfig, sandboxd: bool) -> Vec<Stri
         if std::path::Path::new("/dev/kvm").exists() {
             features.push("kvm".to_owned());
         }
-        if sandboxd || can_map_uid_range(opts.auto_allocate_uids_base) {
-            features.push("uid-range".to_owned());
-        }
+        features.push("uid-range".to_owned());
     }
     if native && opts.recursive_nix {
         features.push("recursive-nix".to_owned());
@@ -39,10 +37,10 @@ fn local_features(native: bool, opts: &WorkerConfig, sandboxd: bool) -> Vec<Stri
 }
 
 /// Per-system capability list for Register; native systems get the
-/// probed feature set, emulated ones only the baseline.
+/// full feature set, emulated ones only the baseline.
 pub(super) fn system_caps(opts: &WorkerConfig, ctx: &WorkerCtx) -> Vec<crate::proto::SystemCaps> {
-    let native = local_features(true, opts, ctx.sandboxd.is_some());
-    let emulated = local_features(false, opts, false);
+    let native = local_features(true, opts);
+    let emulated = local_features(false, opts);
     opts.systems
         .iter()
         .map(|s| crate::proto::SystemCaps {
@@ -54,52 +52,6 @@ pub(super) fn system_caps(opts: &WorkerConfig, ctx: &WorkerCtx) -> Vec<crate::pr
             },
         })
         .collect()
-}
-
-/// Probe whether a 65536-uid mapping actually works (root alone is not
-/// enough: user namespaces may be disabled). The child unshares and the
-/// parent writes the map: after CLONE_NEWUSER the child has no caps in
-/// the parent namespace, so it could not map a range itself. Forks
-/// because unshare(CLONE_NEWUSER) fails with EINVAL in a multithreaded
-/// process; the child runs only async-signal-safe syscalls.
-#[cfg(target_os = "linux")]
-fn can_map_uid_range(base: u32) -> bool {
-    use nix::unistd::{self, ForkResult};
-    let Ok((sync_r, sync_w)) = unistd::pipe() else {
-        return false;
-    };
-    let Ok((hold_r, hold_w)) = unistd::pipe() else {
-        return false;
-    };
-    match unsafe { unistd::fork() } {
-        Ok(ForkResult::Child) => {
-            if nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWUSER).is_err() {
-                unsafe { libc::_exit(1) }
-            }
-            let _ = unistd::write(&sync_w, b"u");
-            drop(sync_w);
-            // block until the parent has tried the map write
-            drop(hold_w);
-            let _ = unistd::read(&hold_r, &mut [0u8; 1]);
-            unsafe { libc::_exit(0) }
-        }
-        Ok(ForkResult::Parent { child }) => {
-            drop(sync_w);
-            let unshared = unistd::read(&sync_r, &mut [0u8; 1]) == Ok(1);
-            let mapped = unshared
-                && std::fs::write(format!("/proc/{child}/uid_map"), format!("0 {base} 65536"))
-                    .is_ok();
-            drop(hold_w);
-            let _ = nix::sys::wait::waitpid(child, None);
-            mapped
-        }
-        Err(_) => false,
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn can_map_uid_range(_base: u32) -> bool {
-    false
 }
 
 pub fn host_system() -> String {
@@ -141,12 +93,12 @@ mod tests {
         let toml =
             |body: &str| toml::from_str::<WorkerConfig>(&format!("hub = \"x\"\n{body}")).unwrap();
         let off = toml("");
-        assert!(!local_features(true, &off, false).contains(&"recursive-nix".to_owned()));
-        assert!(!local_features(false, &off, false).contains(&"recursive-nix".to_owned()));
+        assert!(!local_features(true, &off).contains(&"recursive-nix".to_owned()));
+        assert!(!local_features(false, &off).contains(&"recursive-nix".to_owned()));
 
         let on = toml("recursive-nix = true");
-        assert!(local_features(true, &on, false).contains(&"recursive-nix".to_owned()));
+        assert!(local_features(true, &on).contains(&"recursive-nix".to_owned()));
         // emulated systems must not inherit the host's recursive-nix
-        assert!(!local_features(false, &on, false).contains(&"recursive-nix".to_owned()));
+        assert!(!local_features(false, &on).contains(&"recursive-nix".to_owned()));
     }
 }

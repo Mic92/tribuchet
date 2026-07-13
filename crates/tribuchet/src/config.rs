@@ -157,11 +157,6 @@ pub struct WorkerConfig {
     /// Concurrent build slots.
     #[serde(default = "default_max_jobs")]
     pub max_jobs: u32,
-    /// First uid of the per-slot 65536-uid ranges for builds that
-    /// require the uid-range feature (Nix's auto-allocate-uids
-    /// start-id; needs a root worker).
-    #[serde(default = "default_uid_base")]
-    pub auto_allocate_uids_base: u32,
     /// Emulated systems: system -> path of a static emulator binary
     /// (Linux, kernel 6.7+).
     #[serde(default)]
@@ -199,10 +194,6 @@ fn default_max_jobs() -> u32 {
         .and_then(|n| u32::try_from(n.get()).ok())
         .unwrap_or(1)
 }
-fn default_uid_base() -> u32 {
-    872_415_232
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

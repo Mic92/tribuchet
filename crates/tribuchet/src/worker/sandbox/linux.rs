@@ -1,14 +1,5 @@
 //! Linux sandbox implementation: namespaces, bind mounts, pivot_root.
 
-use std::ffi::{CStr, CString};
-use std::fs;
-use std::io;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
-use std::path::{Path, PathBuf};
-use std::process::Command;
-#[cfg(test)]
-use std::process::{Child, Stdio};
-
 use anyhow::{Context, Result};
 use nix::errno::Errno;
 use nix::fcntl::{self, AtFlags, OFlag};
@@ -21,7 +12,13 @@ use nix::sys::socket::{
     recvmsg, sendmsg, socketpair,
 };
 use nix::sys::{prctl, stat, wait};
-use nix::unistd::{self, getgid, getuid, pivot_root, sethostname};
+use nix::unistd::{self, pivot_root, sethostname};
+use std::ffi::{CStr, CString};
+use std::fs;
+use std::io;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use super::{SandboxSpec, binfmt};
 use crate::netpolicy::NetPolicy;
@@ -56,41 +53,11 @@ pub fn prepare(spec: &mut SandboxSpec) -> Result<()> {
             spec.binds_ro.push((real, ca.to_path_buf()));
         }
     }
-    if let Some(uid) = spec.fod_uid {
-        // The dropped-uid process performs every mount itself, so it
-        // must own the whole per-build dir; 0700 keeps other FOD
-        // uids out.
-        if let Some(build_root) = root.parent() {
-            chown_recursive(build_root, uid)?;
-            fs::set_permissions(
-                build_root,
-                std::os::unix::fs::PermissionsExt::from_mode(0o700),
-            )?;
-        }
-    }
-    if let Some(base) = spec.uid_range {
-        // The builder is root inside the namespace but uid `base`
-        // on the host; writable trees must be owned by the range
-        // (Nix's chownToBuilder). The sandbox root itself too:
-        // container payloads mkdir top-level dirs like /run.
-        std::os::unix::fs::lchown(root, Some(base), Some(base))?;
-        for dir in [
-            root.join("nix/store"),
-            root.join("etc"),
-            root.join("tmp"),
-            spec.build_dir
-                .parent()
-                .unwrap_or(&spec.build_dir)
-                .to_path_buf(),
-        ] {
-            chown_recursive(&dir, base)?;
-        }
-    } else if spec.leased_userns.is_some() {
-        // A rootless worker cannot chown to the leased range: the
-        // sandbox root is recreated on an in-namespace tmpfs instead
-        // (mount_filesystems); the on-disk trees the build still
-        // writes are opened up. The 0700 per-build parent (see
-        // BuildOwner) keeps other local users out.
+    // The worker cannot chown to the leased range: the sandbox root is
+    // recreated on an in-namespace tmpfs instead (mount_filesystems);
+    // the on-disk trees the build still writes are opened up. The 0700
+    // per-build parent (see BuildOwner) keeps other local users out.
+    {
         use std::os::unix::fs::PermissionsExt;
         for dir in [
             root.join("nix/store"),
@@ -236,17 +203,6 @@ fn populate_dev(root: &Path, binds_dev: &mut Vec<(PathBuf, PathBuf)>) -> Result<
     Ok(())
 }
 
-fn chown_recursive(path: &Path, uid: u32) -> Result<()> {
-    use std::os::unix::fs::lchown;
-    lchown(path, Some(uid), Some(uid)).with_context(|| format!("chowning {}", path.display()))?;
-    if path.is_dir() && !path.is_symlink() {
-        for entry in fs::read_dir(path)? {
-            chown_recursive(&entry?.path(), uid)?;
-        }
-    }
-    Ok(())
-}
-
 pub fn command(spec: &SandboxSpec) -> Result<Command> {
     create_mount_points(spec)?;
 
@@ -263,24 +219,10 @@ pub fn command(spec: &SandboxSpec) -> Result<Command> {
     Ok(cmd)
 }
 
-// Underscore form so that, in unit tests, libtest interprets it as
-// a filter selecting the dispatch test below.
 pub const SETUP_STAGE_ARG: &str = "__sandbox_setup";
 
 /// The spec travels via the setup stage's stdin.
 pub const SPEC_VIA_STDIN: bool = true;
-
-#[cfg(test)]
-pub fn stdin_mode() -> Stdio {
-    Stdio::piped() // carries the serialized spec
-}
-
-#[cfg(test)]
-pub fn send_spec(child: &mut Child, spec: &SandboxSpec) -> Result<()> {
-    let stdin = child.stdin.take().context("setup stage stdin missing")?;
-    serde_json::to_writer(stdin, spec).context("sending sandbox spec")?;
-    Ok(())
-}
 
 pub fn setup_stage() -> ! {
     use std::io::{Read, Write};
@@ -306,7 +248,6 @@ pub fn setup_stage() -> ! {
     std::process::exit(121);
 }
 
-#[expect(clippy::similar_names, reason = "uid/gid pairs are conventional")]
 fn enter_and_exec(spec: &SandboxSpec) -> io::Result<std::convert::Infallible> {
     // Enter the build cgroup first, with the worker's full
     // credentials and before any namespace changes.
@@ -322,25 +263,15 @@ fn enter_and_exec(spec: &SandboxSpec) -> io::Result<std::convert::Infallible> {
         })?),
         None => None,
     };
-    // Single uid 1000 (Nix default) or, for uid-range builds,
-    // in-namespace root over a 65536-uid block. Emulated builds map
-    // uid 0 for the binfmt registration, dropped to 1000 in setup().
-    // Leased namespaces already carry their maps (in-ns 0..count);
-    // host uids are unused and setup becomes in-ns root after joining.
-    let backing_uid = spec.fod_uid.unwrap_or_else(|| getuid().as_raw());
-    let backing_gid = spec.fod_uid.unwrap_or_else(|| getgid().as_raw());
-    let (sandbox_uid, host_uid, uid_count) = match (spec.leased_uid_count, spec.uid_range) {
-        (Some(count), _) => (0, 0, count),
-        (None, Some(base)) => (0, base, 65536u32),
-        (None, None) if binfmt_line.is_some() => (0, backing_uid, 1),
-        (None, None) => (1000, backing_uid, 1),
-    };
-    let (sandbox_gid, host_gid) = match (spec.leased_uid_count, spec.uid_range) {
-        (Some(_), _) => (0, 0),
-        (None, Some(base)) => (0, base),
-        (None, None) if binfmt_line.is_some() => (0, backing_gid),
-        (None, None) => (100, backing_gid),
-    };
+    // The leased namespace already carries its maps (in-ns 0..count,
+    // written by sandboxd); setup becomes in-ns root after joining.
+    let uid_count = spec
+        .leased_uid_count
+        .ok_or_else(|| io::Error::other("sandbox spec lacks a leased uid count"))?;
+    let leased_userns = spec
+        .leased_userns
+        .as_deref()
+        .ok_or_else(|| io::Error::other("sandbox spec lacks a leased user namespace"))?;
     setup(&SetupParams {
         spec,
         root: &spec.root,
@@ -348,18 +279,13 @@ fn enter_and_exec(spec: &SandboxSpec) -> io::Result<std::convert::Infallible> {
         binfmt_line: binfmt_line.as_deref(),
         net_isolation: spec.net_isolation,
         net_policy: &spec.net_policy,
-        fod_uid: spec.fod_uid,
-        leased_userns: spec.leased_userns.as_deref(),
+        leased_userns,
         build_dir: &spec.build_dir,
         binds: &spec.binds_ro,
         binds_dev: &spec.binds_dev,
         cwd: &spec.cwd,
         network: spec.network,
         has_cgroup: spec.cgroup.is_some(),
-        sandbox_uid,
-        host_uid,
-        sandbox_gid,
-        host_gid,
         uid_count,
     })?;
     let prog =
@@ -417,59 +343,6 @@ fn werr(step: &'static str) -> impl Fn(io::Error) -> io::Error {
     move |e| io::Error::other(format!("{step}: {e}"))
 }
 
-/// Unshare and have a forked helper, still in the parent user
-/// namespace, write this process's uid/gid maps: multi-uid ranges
-/// need CAP_SETUID *there*, which the unshared process no longer
-/// has (hence uid-range requires a root worker).
-#[expect(clippy::similar_names, reason = "uid/gid pairs are conventional")]
-fn map_uid_range_via_helper(
-    flags: CloneFlags,
-    sandbox_uid: u32,
-    host_uid: u32,
-    sandbox_gid: u32,
-    host_gid: u32,
-    uid_count: u32,
-) -> io::Result<()> {
-    use nix::unistd::{read, write};
-    let target = unistd::getpid();
-    let (req_r, req_w) = unistd::pipe().map_err(ioerr("pipe"))?;
-    let (ack_r, ack_w) = unistd::pipe().map_err(ioerr("pipe"))?;
-    match unsafe { unistd::fork() }.map_err(ioerr("fork mapper"))? {
-        unistd::ForkResult::Child => {
-            // Mapper: wait until the target has unshared, then map.
-            let mut buf = [0u8; 1];
-            let ok = read(&req_r, &mut buf).is_ok_and(|n| n == 1)
-                && fs::write(
-                    format!("/proc/{target}/uid_map"),
-                    format!("{sandbox_uid} {host_uid} {uid_count}"),
-                )
-                .is_ok()
-                && fs::write(
-                    format!("/proc/{target}/gid_map"),
-                    format!("{sandbox_gid} {host_gid} {uid_count}"),
-                )
-                .is_ok();
-            let _ = write(&ack_w, if ok { b"K" } else { b"E" });
-            unsafe { libc::_exit(0) }
-        }
-        unistd::ForkResult::Parent { child } => {
-            drop(req_r);
-            drop(ack_w);
-            unshare(flags).map_err(ioerr("unshare"))?;
-            write(&req_w, b"x").map_err(ioerr("signaling uid mapper"))?;
-            let mut buf = [0u8; 1];
-            let n = read(&ack_r, &mut buf).map_err(ioerr("reading uid mapper ack"))?;
-            let _ = wait::waitpid(child, None);
-            if n != 1 || buf[0] != b'K' {
-                return Err(io::Error::other(
-                    "uid-range mapping failed (is the worker root?)",
-                ));
-            }
-            Ok(())
-        }
-    }
-}
-
 struct NetHelper {
     sock: OwnedFd,
 }
@@ -477,11 +350,10 @@ struct NetHelper {
 /// Fork a helper that stays outside the sandbox and runs the
 /// presto-pasta datapath on the tap fd the sandbox side sends over
 /// once its netns exists (see [`NetHelper::attach`]). Before any
-/// traffic is processed the helper drops to the FOD backing uid on a
-/// root worker, or into its own single-uid user namespace otherwise.
-/// The helper exits when the build process (its parent) dies, watched
-/// via a pidfd.
-fn fork_net_helper(policy: NetPolicy, runas: Option<(u32, u32)>) -> io::Result<NetHelper> {
+/// traffic is processed the helper confines itself to its own
+/// single-uid user namespace. The helper exits when the build process
+/// (its parent) dies, watched via a pidfd.
+fn fork_net_helper(policy: NetPolicy) -> io::Result<NetHelper> {
     let target = unistd::getpid();
     let (ours, theirs) = socketpair(
         AddressFamily::Unix,
@@ -493,7 +365,7 @@ fn fork_net_helper(policy: NetPolicy, runas: Option<(u32, u32)>) -> io::Result<N
     match unsafe { unistd::fork() }.map_err(ioerr("fork net helper"))? {
         unistd::ForkResult::Child => {
             drop(ours);
-            let code = net_helper(&theirs, target, policy, runas);
+            let code = net_helper(&theirs, target, policy);
             unsafe { libc::_exit(code) }
         }
         unistd::ForkResult::Parent { .. } => {
@@ -506,12 +378,7 @@ fn fork_net_helper(policy: NetPolicy, runas: Option<(u32, u32)>) -> io::Result<N
 /// Helper body: receive the tap fd, drop privileges, start the
 /// datapath, acknowledge readiness, then wait for the build process
 /// to die.
-fn net_helper(
-    sock: &OwnedFd,
-    build_pid: unistd::Pid,
-    policy: NetPolicy,
-    runas: Option<(u32, u32)>,
-) -> i32 {
+fn net_helper(sock: &OwnedFd, build_pid: unistd::Pid, policy: NetPolicy) -> i32 {
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, build_pid.as_raw(), 0) };
     if pidfd < 0 {
         return 1;
@@ -533,26 +400,16 @@ fn net_helper(
         return 1;
     };
     let tap = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-    if let Some((uid, gid)) = runas {
-        let dropped = unistd::setgroups(&[]).is_ok()
-            && unistd::setgid(unistd::Gid::from_raw(gid)).is_ok()
-            && unistd::setuid(unistd::Uid::from_raw(uid)).is_ok();
-        if !dropped {
-            return 1;
-        }
-    } else {
-        // Rootless worker: confine the helper to its own self-mapped
-        // user namespace; it only needs the tap fd and outbound
-        // sockets.
-        let uid = unistd::getuid().as_raw();
-        let gid = unistd::getgid().as_raw();
-        let confined = unshare(CloneFlags::CLONE_NEWUSER).is_ok()
-            && fs::write("/proc/self/setgroups", "deny").is_ok()
-            && fs::write("/proc/self/uid_map", format!("{uid} {uid} 1")).is_ok()
-            && fs::write("/proc/self/gid_map", format!("{gid} {gid} 1")).is_ok();
-        if !confined {
-            return 1;
-        }
+    // Confine the helper to its own self-mapped user namespace; it
+    // only needs the tap fd and outbound sockets.
+    let uid = unistd::getuid().as_raw();
+    let gid = unistd::getgid().as_raw();
+    let confined = unshare(CloneFlags::CLONE_NEWUSER).is_ok()
+        && fs::write("/proc/self/setgroups", "deny").is_ok()
+        && fs::write("/proc/self/uid_map", format!("{uid} {uid} 1")).is_ok()
+        && fs::write("/proc/self/gid_map", format!("{gid} {gid} 1")).is_ok();
+    if !confined {
+        return 1;
     }
     let net = presto_pasta::Config {
         allow_flow: Some(std::sync::Arc::new(move |d: &presto_pasta::FlowDst| {
@@ -693,19 +550,15 @@ struct SetupParams<'a> {
     binfmt_line: Option<&'a str>,
     net_isolation: bool,
     net_policy: &'a NetPolicy,
-    fod_uid: Option<u32>,
-    /// Leased user namespace to join (rootless uid-range).
-    leased_userns: Option<&'a Path>,
+    /// Leased user namespace to join, mapped by tribuchet-sandboxd.
+    leased_userns: &'a Path,
     build_dir: &'a Path,
     binds: &'a [(PathBuf, PathBuf)],
     binds_dev: &'a [(PathBuf, PathBuf)],
     cwd: &'a str,
     network: bool,
     has_cgroup: bool,
-    sandbox_uid: u32,
-    host_uid: u32,
-    sandbox_gid: u32,
-    host_gid: u32,
+    /// Uids mapped in the lease (1 or 65536).
     uid_count: u32,
 }
 
@@ -721,13 +574,10 @@ fn setup(p: &SetupParams) -> io::Result<()> {
     if private_net {
         flags |= CloneFlags::CLONE_NEWNET;
     }
-    // The helper stays in the host namespaces, so it drops to the
-    // host-side backing uid of the FOD build.
+    // Forked before the leased userns is joined, so the helper stays
+    // outside the sandbox as the worker uid.
     let net_helper = if p.net_isolation && p.network {
-        Some(fork_net_helper(
-            p.net_policy.clone(),
-            p.fod_uid.map(|u| (u, u)),
-        )?)
+        Some(fork_net_helper(p.net_policy.clone())?)
     } else {
         None
     };
@@ -737,48 +587,18 @@ fn setup(p: &SetupParams) -> io::Result<()> {
         // delegated subtree (usable by nspawn inside the sandbox).
         flags |= CloneFlags::CLONE_NEWCGROUP;
     }
-    // Mapping onto a host uid other than the worker's own (uid-range,
-    // or a FOD's backing uid) needs a still-privileged helper in the
-    // parent userns to write the map. Unsharing while root also avoids
-    // the unprivileged-userns restriction some kernels enforce (e.g.
-    // AppArmor on Ubuntu), which would reject the setgroups write
-    // below. Only an unprivileged worker self-maps its own uid.
-    if let Some(userns) = p.leased_userns {
-        // Rootless: sandboxd already wrote the maps of the leased
-        // namespace; join it (allowed: this uid owns it) and unshare
-        // the rest inside. Then become in-ns root (backed by the pool
-        // base uid): the worker uid is not mapped here, so the file
-        // creation and mounts below need mapped credentials.
-        let ns = fs::File::open(userns)
-            .map_err(|e| io::Error::other(format!("opening leased userns: {e}")))?;
-        nix::sched::setns(ns, CloneFlags::CLONE_NEWUSER).map_err(ioerr("joining leased userns"))?;
-        unshare(flags & !CloneFlags::CLONE_NEWUSER).map_err(ioerr("unshare"))?;
-        unistd::setgroups(&[]).map_err(ioerr("setgroups"))?;
-        unistd::setgid(unistd::Gid::from_raw(0)).map_err(ioerr("setgid"))?;
-        unistd::setuid(unistd::Uid::from_raw(0)).map_err(ioerr("setuid"))?;
-    } else if p.uid_count == 1 && p.fod_uid.is_none() {
-        unshare(flags).map_err(ioerr("unshare"))?;
-        fs::write("/proc/self/setgroups", "deny").map_err(werr("setgroups"))?;
-        fs::write(
-            "/proc/self/uid_map",
-            format!("{} {} {}", p.sandbox_uid, p.host_uid, p.uid_count),
-        )
-        .map_err(werr("uid_map"))?;
-        fs::write(
-            "/proc/self/gid_map",
-            format!("{} {} {}", p.sandbox_gid, p.host_gid, p.uid_count),
-        )
-        .map_err(werr("gid_map"))?;
-    } else {
-        map_uid_range_via_helper(
-            flags,
-            p.sandbox_uid,
-            p.host_uid,
-            p.sandbox_gid,
-            p.host_gid,
-            p.uid_count,
-        )?;
-    }
+    // sandboxd already wrote the maps of the leased namespace; join it
+    // (allowed: this uid owns it) and unshare the rest inside. Then
+    // become in-ns root (backed by the pool base uid): the worker uid
+    // is not mapped here, so the file creation and mounts below need
+    // mapped credentials.
+    let ns = fs::File::open(p.leased_userns)
+        .map_err(|e| io::Error::other(format!("opening leased userns: {e}")))?;
+    nix::sched::setns(ns, CloneFlags::CLONE_NEWUSER).map_err(ioerr("joining leased userns"))?;
+    unshare(flags & !CloneFlags::CLONE_NEWUSER).map_err(ioerr("unshare"))?;
+    unistd::setgroups(&[]).map_err(ioerr("setgroups"))?;
+    unistd::setgid(unistd::Gid::from_raw(0)).map_err(ioerr("setgid"))?;
+    unistd::setuid(unistd::Uid::from_raw(0)).map_err(ioerr("setuid"))?;
     sethostname("localhost").map_err(ioerr("sethostname"))?;
     // "(none)" is the kernel default; fixed like Nix for determinism
     if unsafe { libc::setdomainname(c"(none)".as_ptr(), 6) } == -1 {
@@ -813,28 +633,12 @@ fn setup(p: &SetupParams) -> io::Result<()> {
     }
     apply_process_limits(p.system)?;
 
-    // Helper-mapped builds run as the still-root worker, unmapped but
-    // holding all caps in the new userns; drop to the in-namespace uid
-    // the map promised. A self-mapped worker already runs as it.
-    // Leased builds became in-ns root when joining the namespace;
-    // single-uid ones must not run the builder with sandbox root's
+    // The build became in-ns root when joining the namespace;
+    // single-uid builds must not run the builder with sandbox root's
     // capabilities, so remap to Nix's uid 1000 via a nested userns
-    // (any binfmt registration above already ran as root).
-    if p.leased_userns.is_some() {
-        if p.uid_count == 1 {
-            unshare(CloneFlags::CLONE_NEWUSER).map_err(ioerr("nested unshare"))?;
-            fs::write("/proc/self/setgroups", "deny").map_err(werr("nested setgroups"))?;
-            fs::write("/proc/self/uid_map", "1000 0 1").map_err(werr("nested uid_map"))?;
-            fs::write("/proc/self/gid_map", "100 0 1").map_err(werr("nested gid_map"))?;
-        }
-    } else if p.uid_count > 1 || p.fod_uid.is_some() {
-        unistd::setgroups(&[]).map_err(ioerr("setgroups"))?;
-        unistd::setgid(unistd::Gid::from_raw(p.sandbox_gid)).map_err(ioerr("setgid"))?;
-        unistd::setuid(unistd::Uid::from_raw(p.sandbox_uid)).map_err(ioerr("setuid"))?;
-    } else if p.binfmt_line.is_some() {
-        // binfmt registration needed in-namespace root; remap to
-        // Nix's uid 1000 via a nested userns. Exec lookup falls back
-        // to the ancestor namespace's binfmt instance.
+    // (any binfmt registration above already ran as root). uid-range
+    // builds keep in-ns root: container payloads need it.
+    if p.uid_count == 1 {
         unshare(CloneFlags::CLONE_NEWUSER).map_err(ioerr("nested unshare"))?;
         fs::write("/proc/self/setgroups", "deny").map_err(werr("nested setgroups"))?;
         fs::write("/proc/self/uid_map", "1000 0 1").map_err(werr("nested uid_map"))?;
@@ -851,18 +655,7 @@ fn mount_filesystems(p: &SetupParams) -> io::Result<()> {
     let none: Option<&str> = None;
     mount(none, "/", none, MsFlags::MS_REC | MsFlags::MS_PRIVATE, none)
         .map_err(ioerr("making / private"))?;
-    if p.leased_userns.is_some() {
-        tmpfs_root(p)?;
-    } else {
-        mount(
-            Some(root),
-            root,
-            none,
-            MsFlags::MS_BIND | MsFlags::MS_REC,
-            none,
-        )
-        .map_err(ioerr("binding root"))?;
-    }
+    tmpfs_root(p)?;
 
     let bind_one = |src: &Path, dst: &Path, ro: bool, extra: MsFlags| -> io::Result<()> {
         let target = root.join(dst.strip_prefix("/").unwrap_or(dst));

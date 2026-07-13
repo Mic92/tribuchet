@@ -779,11 +779,6 @@ fn lifecycle() {
 
     // --- build really ran on the worker -----------------------------------
     assert_journal(Node::Worker, "tribuchet-worker", "builder finished");
-    assert_journal(
-        Node::Worker,
-        "tribuchet-worker",
-        "per-build cgroup scoping enabled",
-    );
     assert_journal(Node::Hub, "tribuchet-hub", "dispatching build");
     // Inputs are imported through the worker's nix-daemon and registered as
     // valid paths in its Nix database.

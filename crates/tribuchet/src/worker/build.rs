@@ -23,56 +23,23 @@ use super::caps::requires_uid_range;
 use super::imports::{Claim, ImportGuard, ImportWait, SessionImports};
 use super::logtail::tail_log;
 use super::resume::{FinishedBuild, PackedExtra, PackedOutput, ResumeState};
-use super::{DaemonConn, WorkerCtx, cgroup, reaper, sandbox, unix_now};
+use super::{DaemonConn, WorkerCtx, reaper, sandbox, unix_now};
 use crate::chunkio::ChannelReader;
 use crate::nar;
 use crate::proto::{BuildAssignment, NarTransfer, PathInfoMsg, WorkerMessage, nar_transfer};
 use crate::store::{STORE_DIR, parse_path_info, valid_store_path};
 
-impl WorkerCtx {
-    fn alloc_uid_slot(self: &Arc<Self>) -> Option<UidSlot> {
-        let mut slots = self.uid_slots.lock().unwrap();
-        let idx = slots.iter().position(|used| !used)?;
-        slots[idx] = true;
-        Some(UidSlot {
-            ctx: self.clone(),
-            base: self.uid_base + u32::try_from(idx).expect("slot index fits u32") * 65536,
-            idx,
-        })
-    }
-}
-
-/// A leased 65536-uid range; returned to the pool on drop.
-struct UidSlot {
-    ctx: Arc<WorkerCtx>,
-    base: u32,
-    idx: usize,
-}
-
-impl Drop for UidSlot {
-    fn drop(&mut self) {
-        self.ctx.uid_slots.lock().unwrap()[self.idx] = false;
-    }
-}
-
-/// Host credentials backing one build's sandbox.
+/// Credentials backing one build's sandbox.
 ///
-/// Root workers lease a uid slot for two cases: uid-range builds (the
-/// builder is namespace root over a 65536-uid block) and isolated FOD
-/// builds (the network-facing build drops to a single unprivileged
-/// uid, which the presto-pasta datapath helper also runs as). A leased uid runs the whole sandbox setup itself
-/// after the drop, which is why sandbox::prepare hands it the per-build
-/// tree (chown + 0700) and the worker state dirs are traverse-only
-/// (0711). Everything else runs as the worker's own uid.
-/// Rootless workers lease every build's sandbox from
-/// tribuchet-sandboxd: a mapped user namespace (65536 uids for
-/// uid-range builds, one otherwise) plus a delegated cgroup, so no
-/// build runs as the worker's own uid. The sandbox setup stage joins
-/// the pre-mapped namespace and no host file is chowned.
+/// Linux workers lease every build's sandbox from tribuchet-sandboxd:
+/// a mapped user namespace (65536 uids for uid-range builds, one
+/// otherwise) plus a delegated cgroup, so no build runs as the
+/// worker's own uid. The sandbox setup stage joins the pre-mapped
+/// namespace and no host file is chowned. macOS builds run as the
+/// worker under the Seatbelt profile.
 enum BuildOwner {
+    #[cfg(not(target_os = "linux"))]
     Worker,
-    UidRange(UidSlot),
-    Fod(UidSlot),
     #[cfg(target_os = "linux")]
     Leased {
         lease: super::sandboxd::SandboxLease,
@@ -83,74 +50,29 @@ enum BuildOwner {
 
 impl BuildOwner {
     fn for_build(ctx: &Arc<WorkerCtx>, a: &BuildAssignment) -> Result<Self> {
-        let is_root = nix::unistd::geteuid().is_root();
-        if requires_uid_range(&a.env) {
-            if !cfg!(target_os = "linux") {
+        #[cfg(target_os = "linux")]
+        {
+            let uid_count = if requires_uid_range(&a.env) { 65536 } else { 1 };
+            let socket = ctx
+                .sandboxd
+                .as_deref()
+                .context("tribuchet-sandboxd socket unavailable")?;
+            let lease = super::sandboxd::allocate(socket, &a.build_id, uid_count)?;
+            tracing::info!(
+                build_id = a.build_id,
+                pool_base = lease.pool_base,
+                uid_count,
+                "leased sandbox"
+            );
+            Ok(Self::Leased { lease, uid_count })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            if requires_uid_range(&a.env) {
                 bail!("the uid-range feature is only supported on Linux workers");
             }
-            #[cfg(target_os = "linux")]
-            if !is_root {
-                return Self::lease(ctx, a, 65536);
-            }
-            let slot = ctx.alloc_uid_slot().context("no free uid range slot")?;
-            return Ok(Self::UidRange(slot));
-        }
-        #[cfg(target_os = "linux")]
-        if !is_root {
-            return Self::lease(ctx, a, 1);
-        }
-        if a.fixed_output && ctx.fod_isolation && cfg!(target_os = "linux") && is_root {
-            let slot = ctx.alloc_uid_slot().context("no free uid slot")?;
-            return Ok(Self::Fod(slot));
-        }
-        Ok(Self::Worker)
-    }
-
-    #[cfg(target_os = "linux")]
-    fn lease(ctx: &Arc<WorkerCtx>, a: &BuildAssignment, uid_count: u32) -> Result<Self> {
-        let socket = ctx
-            .sandboxd
-            .as_deref()
-            .context("leasing a sandbox needs a root worker or tribuchet-sandboxd")?;
-        let lease = super::sandboxd::allocate(socket, &a.build_id, uid_count)?;
-        tracing::info!(
-            build_id = a.build_id,
-            pool_base = lease.pool_base,
-            uid_count,
-            "leased sandbox"
-        );
-        Ok(Self::Leased { lease, uid_count })
-    }
-
-    pub(super) fn uid_range(&self) -> Option<u32> {
-        match self {
-            Self::UidRange(slot) => Some(slot.base),
-            _ => None,
-        }
-    }
-
-    pub(super) fn fod_uid(&self) -> Option<u32> {
-        match self {
-            Self::Fod(slot) => Some(slot.base),
-            _ => None,
-        }
-    }
-
-    /// Sandboxd-leased user namespace for the sandbox spec.
-    fn leased_userns(&self) -> Option<std::path::PathBuf> {
-        match self {
-            #[cfg(target_os = "linux")]
-            Self::Leased { lease, .. } => Some(lease.ns_path()),
-            _ => None,
-        }
-    }
-
-    /// Number of uids mapped in the leased namespace.
-    fn leased_uid_count(&self) -> Option<u32> {
-        match self {
-            #[cfg(target_os = "linux")]
-            Self::Leased { uid_count, .. } => Some(*uid_count),
-            _ => None,
+            let _ = ctx;
+            Ok(Self::Worker)
         }
     }
 
@@ -158,7 +80,8 @@ impl BuildOwner {
     /// the lease is still held (see `sandbox::cleanup_leased`).
     fn cleanup_disk(&self, spec: &sandbox::SandboxSpec) {
         #[cfg(target_os = "linux")]
-        if let Self::Leased { lease, .. } = self {
+        {
+            let Self::Leased { lease, .. } = self;
             let paths = [spec.root.join("nix/store"), spec.build_dir.clone()];
             if let Err(e) = sandbox::cleanup_leased(&lease.ns_path(), &paths) {
                 tracing::warn!("cleaning up leased build files: {e:#}");
@@ -166,15 +89,6 @@ impl BuildOwner {
         }
         #[cfg(not(target_os = "linux"))]
         let _ = spec;
-    }
-
-    /// Slot index for resume state: a re-adopting worker must mark it
-    /// used again so new builds get disjoint uid ranges.
-    fn slot_idx(&self) -> Option<usize> {
-        match self {
-            Self::UidRange(slot) | Self::Fod(slot) => Some(slot.idx),
-            _ => None,
-        }
     }
 }
 
@@ -465,6 +379,17 @@ impl ActiveBuild {
 
     fn build_spec(&self, owner: &BuildOwner) -> Result<sandbox::SandboxSpec> {
         let a = &self.assignment;
+        // The spec fields stay Option: the macOS spec has no lease.
+        #[cfg(target_os = "linux")]
+        let (leased_userns, leased_uid_count) = {
+            let BuildOwner::Leased { lease, uid_count } = owner;
+            (Some(lease.ns_path()), Some(*uid_count))
+        };
+        #[cfg(not(target_os = "linux"))]
+        let (leased_userns, leased_uid_count) = {
+            let BuildOwner::Worker = owner;
+            (None, None)
+        };
         let mut spec = sandbox::prepare(
             a,
             &self.dir,
@@ -472,13 +397,11 @@ impl ActiveBuild {
             &sandbox::PrepareOpts {
                 bin_sh: self.ctx.sandbox_bin_sh.as_deref(),
                 secrets: &self.ctx.secret_paths,
-                uid_range: owner.uid_range(),
-                leased_userns: owner.leased_userns(),
-                leased_uid_count: owner.leased_uid_count(),
+                leased_userns,
+                leased_uid_count,
                 emulator: self.ctx.emulators.get(&a.system).map(PathBuf::as_path),
                 net_isolation: self.ctx.fod_isolation,
                 net_policy: self.ctx.fod_network.clone(),
-                fod_uid: owner.fod_uid(),
                 recursive_nix: self.ctx.recursive_nix,
                 nix_daemon_socket: None,
             },
@@ -491,7 +414,8 @@ impl ActiveBuild {
             "sandbox network decision"
         );
         #[cfg(target_os = "linux")]
-        if let BuildOwner::Leased { lease, .. } = owner {
+        {
+            let BuildOwner::Leased { lease, .. } = owner;
             // sandboxd created and delegated this cgroup; memory.max is
             // group-writable for the worker.
             let cg = lease.cgroup().to_path_buf();
@@ -501,17 +425,6 @@ impl ActiveBuild {
                 tracing::warn!("setting memory.max on the leased cgroup: {e}");
             }
             spec.cgroup = Some(cg);
-            return Ok(spec);
-        }
-        spec.cgroup = self
-            .ctx
-            .cgroup_base
-            .as_deref()
-            .and_then(|base| cgroup::create(base, &a.build_id, self.ctx.build_memory_max));
-        if let (Some(base), Some(cg)) = (owner.uid_range(), &spec.cgroup) {
-            // the build manages its own delegated cgroup (Nix's
-            // `cgroups` setting); needed by nspawn inside the sandbox
-            cgroup::chown_to_builder(cg, base);
         }
         Ok(spec)
     }
@@ -527,8 +440,8 @@ impl ActiveBuild {
         timeout: Duration,
     ) -> Result<FinishedBuild> {
         let a = &self.assignment;
-        // The slot lease keeps concurrent uids disjoint; returned on
-        // drop when the build finishes.
+        // The lease keeps concurrent uid blocks disjoint; released
+        // when the owner drops after the build finishes.
         let owner = BuildOwner::for_build(&self.ctx, a)?;
         let spec = self.build_spec(&owner)?;
         let deadline = Instant::now() + timeout;
@@ -556,7 +469,6 @@ impl ActiveBuild {
             spec: spec.clone(),
             outputs: a.outputs.clone(),
             deadline_unix: unix_now() + timeout.as_secs(),
-            uid_slot: owner.slot_idx(),
         };
         fs::write(self.dir.join("resume.json"), serde_json::to_vec(&resume)?)?;
 
@@ -643,13 +555,10 @@ impl ActiveBuild {
         })
     }
 
-    /// Tear down sandbox and cgroup, keeping the build dir: it holds
-    /// the packed output NARs until they are delivered to a hub.
+    /// Tear down the sandbox, keeping the build dir: it holds the
+    /// packed output NARs until they are delivered to a hub. sandboxd
+    /// removes the build cgroup when the dropped lease drains.
     pub(super) fn teardown(&self) {
-        if let Some(base) = self.ctx.cgroup_base.as_deref() {
-            // cgroup.kill reaches setsid'd survivors that escaped killpg.
-            cgroup::kill_and_remove(base, &self.assignment.build_id);
-        }
         sandbox::cleanup(&self.assignment, &self.dir);
     }
 

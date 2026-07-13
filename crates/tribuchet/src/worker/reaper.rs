@@ -114,8 +114,6 @@ pub fn take_status(status_dir: &Path, token: &str) -> Option<i32> {
 
 /// Spawner socket fd, handed to exec'd worker children.
 pub const FD_ENV: &str = "TRIBUCHET_REAPER_FD";
-/// Delegated cgroup base, entered by the reaper before any child.
-pub const CGROUP_ENV: &str = "TRIBUCHET_CGROUP_BASE";
 /// Identifies the reaper generation: persisted build state is only
 /// adoptable while the reaper that spawned those pids is still our
 /// parent, otherwise pids and statuses are meaningless.
@@ -145,15 +143,12 @@ pub fn ensure(status_dir: &Path) -> Result<Spawner> {
             let _ = fs::remove_file(entry.path());
         }
     }
-    // Enter the delegated-cgroup leaf before spawning anything: every
-    // process must leave the unit's root cgroup, or enabling
-    // subtree_control there fails (no-internal-processes rule).
-    // SAFETY: reaper init runs during single-threaded startup, before any
-    // worker threads exist, so mutating the environment races nothing.
+    // Vacate the unit's root cgroup so subtree_control can be enabled
+    // there (no-internal-processes rule); done before spawning so every
+    // descendant lands in the leaf.
     #[cfg(target_os = "linux")]
-    if let Some(base) = super::cgroup::init() {
-        unsafe { env::set_var(CGROUP_ENV, &base) };
-    }
+    super::cgroup::init();
+    // SAFETY: single-threaded startup, before any worker threads exist.
     unsafe {
         env::set_var(
             ID_ENV,

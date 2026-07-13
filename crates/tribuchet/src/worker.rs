@@ -63,7 +63,6 @@ struct WorkerCtx {
     /// Where the reaper records exit codes, one file per pid.
     status_dir: PathBuf,
     sandbox_bin_sh: Option<PathBuf>,
-    cgroup_base: Option<PathBuf>,
     build_memory_max: Option<u64>,
     /// Files a build must never read even where DAC would allow it
     /// (macOS Seatbelt deny rules; Linux relies on the mount namespace).
@@ -85,13 +84,9 @@ struct WorkerCtx {
     /// Builder gets the host nix-daemon socket bind-mounted in; the
     /// worker advertises the `recursive-nix` feature.
     pub(super) recursive_nix: bool,
-    /// tribuchet-sandboxd socket; a rootless worker leases per-build
-    /// user namespaces and cgroups from it. None on root workers.
+    /// tribuchet-sandboxd socket; every Linux build leases its user
+    /// namespace and cgroup from it. None on macOS.
     sandboxd: Option<PathBuf>,
-    /// Slot i maps the uid block [uid_base + i*65536, 65536); disjoint
-    /// blocks keep concurrent uid-range builds apart.
-    uid_base: u32,
-    uid_slots: Mutex<Vec<bool>>,
     /// Dedupe keys of builds the hub cancelled; the supervising loops
     /// abort them. Keyed like the registry, since a resumed build's
     /// build_id changes while it runs.
@@ -257,18 +252,15 @@ fn request_job() -> WorkerMessage {
     msg(worker_message::Msg::RequestJob(RequestJob {}))
 }
 
-/// Non-root Linux workers depend on tribuchet-sandboxd for every
-/// build's uid mapping and cgroup, so a missing socket is a startup
-/// error rather than a degraded mode.
+/// Linux workers depend on tribuchet-sandboxd for every build's uid
+/// mapping and cgroup, so a missing socket is a startup error rather
+/// than a degraded mode.
 #[cfg(target_os = "linux")]
 fn sandboxd_socket() -> Result<Option<PathBuf>> {
-    if nix::unistd::geteuid().is_root() {
-        return Ok(None);
-    }
     let socket = Path::new(sandboxd::SOCKET_PATH);
     anyhow::ensure!(
         socket.exists(),
-        "worker runs unprivileged but tribuchet-sandboxd is not available at {}",
+        "tribuchet-sandboxd is not available at {}",
         socket.display()
     );
     Ok(Some(socket.to_path_buf()))
@@ -284,16 +276,11 @@ pub fn run(opts: WorkerConfig) -> Result<()> {
     // worker generation it exec'd, hands back the spawner. It runs
     // before tokio because the reaper must stay single-threaded.
     let spawner = reaper::ensure(&opts.state_dir.join("exited"))?;
-    let cgroup_base = std::env::var(reaper::CGROUP_ENV).ok().map(PathBuf::from);
     let rt = crate::rt::runtime("trib-worker")?;
-    rt.block_on(run_async(opts, spawner, cgroup_base))
+    rt.block_on(run_async(opts, spawner))
 }
 
-async fn run_async(
-    opts: WorkerConfig,
-    spawner: reaper::Spawner,
-    cgroup_base: Option<PathBuf>,
-) -> Result<()> {
+async fn run_async(opts: WorkerConfig, spawner: reaper::Spawner) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let builds_dir = opts.state_dir.join("builds");
     fs::create_dir_all(&builds_dir)?;
@@ -340,7 +327,6 @@ async fn run_async(
         spawner,
         status_dir: opts.state_dir.join("exited"),
         sandbox_bin_sh: opts.sandbox_bin_sh.clone(),
-        cgroup_base,
         build_memory_max: opts.build_memory_max_bytes,
         secret_paths: vec![opts.key.clone(), opts.state_dir.join("signing.key")],
         running: atomic::AtomicU32::new(0),
@@ -353,8 +339,6 @@ async fn run_async(
         max_log_size: opts.max_log_size,
         recursive_nix: opts.recursive_nix,
         sandboxd: sandboxd_socket()?,
-        uid_base: opts.auto_allocate_uids_base,
-        uid_slots: Mutex::new(vec![false; opts.max_jobs.max(1) as usize]),
     });
 
     // Ready once local setup is done, not once the hub answers: the

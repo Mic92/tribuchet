@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 
 use super::build::{ActiveBuild, pack_outputs};
 use super::logtail::LogTail;
-use super::{DaemonConn, WorkerCtx, cgroup, msg, reaper, sandbox, unix_now};
+use super::{DaemonConn, WorkerCtx, msg, reaper, sandbox, unix_now};
 use crate::chunkio::CHUNK_SIZE;
 use crate::fsutil::remove_path_all;
 use crate::proto::{
@@ -73,7 +73,6 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>, signing_key: &Arc<SecretK
                 continue;
             }
         };
-        set_uid_slot(ctx, st.uid_slot, true);
         tracing::info!(id = st.build_id, pid = st.pid, "adopted running build");
         // The temp roots taken at negotiation died with the previous
         // generation's daemon connection; without new ones a GC could
@@ -173,17 +172,12 @@ fn supervise_adopted(
         std::thread::sleep(Duration::from_millis(200));
     };
     let _ = signal::killpg(pgrp, signal::Signal::SIGKILL);
-    // Tear down cgroup and sandbox like teardown() would.
-    if let Some(base) = ctx.cgroup_base.as_deref() {
-        cgroup::kill_and_remove(base, &st.build_id);
-    }
     let synth = BuildAssignment {
         build_id: st.build_id.clone(),
         outputs: st.outputs.clone(),
         ..Default::default()
     };
     sandbox::cleanup(&synth, &dir);
-    set_uid_slot(ctx, st.uid_slot, false);
     let (exit_code, error, outputs) = if let Some(reason) = aborted {
         (1, reason, vec![])
     } else if code != 0 {
@@ -336,7 +330,6 @@ pub(super) struct ResumeState {
     /// Assignment outputs (name -> scratch path), for cleanup.
     pub(super) outputs: HashMap<String, String>,
     pub(super) deadline_unix: u64,
-    pub(super) uid_slot: Option<usize>,
 }
 
 /// On-disk form of a finished-but-undelivered result; the packed NARs
@@ -371,16 +364,6 @@ pub(super) fn record_finished(ctx: &Arc<WorkerCtx>, key: &str, fin: FinishedBuil
     // (under the registry lock), so no new flag can appear afterwards.
     ctx.cancelled.lock().unwrap().remove(key);
     try_deliver(ctx, key);
-}
-
-/// Mark or release a leased uid slot by index (re-adopted builds,
-/// where no BuildOwner exists to do it on drop).
-fn set_uid_slot(ctx: &WorkerCtx, idx: Option<usize>, used: bool) {
-    if let Some(idx) = idx
-        && let Some(s) = ctx.uid_slots.lock().unwrap().get_mut(idx)
-    {
-        *s = used;
-    }
 }
 
 /// Persist a finished result so a replacement worker can redeliver
