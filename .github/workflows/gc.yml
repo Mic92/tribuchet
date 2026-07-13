@@ -29,7 +29,7 @@ jobs:
       actions: write
       contents: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: NixOS/nix-installer-action@6b8548fe06acfb0155a50ab5d561accb215764cc
       # Installs the released hestia binary and captures the cache API
       # tokens GC needs (HESTIA_BIN points at the binary).
