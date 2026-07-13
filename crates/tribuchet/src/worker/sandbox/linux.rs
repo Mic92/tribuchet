@@ -599,6 +599,11 @@ fn setup(p: &SetupParams) -> io::Result<()> {
     unistd::setgroups(&[]).map_err(ioerr("setgroups"))?;
     unistd::setgid(unistd::Gid::from_raw(0)).map_err(ioerr("setgid"))?;
     unistd::setuid(unistd::Uid::from_raw(0)).map_err(ioerr("setuid"))?;
+    // The setuid from the unmapped worker uid cleared the dumpable
+    // flag, which makes /proc/self inodes root-owned and would reject
+    // the nested userns map writes below; the userns still confines
+    // ptrace, so restore it.
+    nix::sys::prctl::set_dumpable(true).map_err(ioerr("set dumpable"))?;
     sethostname("localhost").map_err(ioerr("sethostname"))?;
     // "(none)" is the kernel default; fixed like Nix for determinism
     if unsafe { libc::setdomainname(c"(none)".as_ptr(), 6) } == -1 {
