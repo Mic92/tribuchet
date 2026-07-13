@@ -101,7 +101,10 @@ syntax as `trusted-public-keys`).
 ### 3. Workers
 
 Workers need a running nix-daemon of their own (inputs are imported
-through it and protected from garbage collection by temp roots).
+through it and protected from garbage collection by temp roots). On
+Linux the worker runs unprivileged and leases each build's user
+namespace, uid range and cgroup from the small `tribuchet-sandboxd`
+root daemon (set up by the NixOS module).
 
 `/etc/tribuchet/worker.toml`:
 
@@ -160,7 +163,7 @@ keeping builds alive across upgrades.
 
 ## Fixed-output network policy
 
-On root Linux workers with `/dev/net/tun`, fixed-output builds run in
+On Linux workers with `/dev/net/tun`, fixed-output builds run in
 a private network namespace and get outbound connectivity through the
 embedded [presto-pasta] user-mode NAT. The worker's loopback services
 and abstract sockets are never reachable from there. On top of that,

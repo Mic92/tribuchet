@@ -86,6 +86,9 @@ in
         environment.etc."tt/uidrange.nix".text = ''
           import ${./tests/uidrange.nix} { bash = "${pkgs.bash}"; }
         '';
+        environment.etc."tt/singleuid.nix".text = ''
+          import ${./tests/singleuid.nix} { bash = "${pkgs.bash}"; }
+        '';
         environment.etc."tt/fod.nix".text = ''
           import ${./tests/fod.nix} {
             bash = "${pkgs.bash}";
@@ -248,6 +251,7 @@ in
         for f in ["worker.crt", "worker.key", "ca.crt"]:
             pem = hub.succeed(f"cat /root/ca/{f}")
             worker.succeed(f"cat > /var/lib/tribuchet/tls/{f} << 'PEMEOF'\n{pem}PEMEOF")
+        worker.succeed("chown -R tribuchet:tribuchet /var/lib/tribuchet")
 
     with subtest("worker registers at hub over mTLS"):
         hub.succeed("systemctl start tribuchet-hub.socket")

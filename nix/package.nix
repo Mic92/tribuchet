@@ -57,10 +57,6 @@ craneLib.buildPackage (
   commonArgs
   // {
     inherit cargoArtifacts;
-    # sandbox_runs_builder needs CAP_SYS_ADMIN that the outer
-    # Nix builder sandbox does not grant; `nix develop -c
-    # cargo test` runs it.
-    cargoTestExtraArgs = "-- --skip=worker::sandbox::tests::sandbox_runs_builder";
     passthru = { inherit cargoArtifacts e2eTests; };
   }
   // lib.optionalAttrs stdenv.isLinux {

@@ -1,8 +1,8 @@
-# Regular build on a rootless worker: a single uid leased from
-# nsresourced, so the builder never runs as the worker's own uid.
+# Regular build: a single leased uid, so the builder never runs as
+# the worker's own uid or as sandbox root.
 { bash }:
 derivation {
-  name = "tt-single-uid-rootless";
+  name = "tt-single-uid";
   system = "x86_64-linux";
   builder = builtins.storePath bash + "/bin/bash";
   args = [
@@ -14,8 +14,8 @@ derivation {
       [ -w /sys/fs/cgroup/cgroup.procs ] || exit 1
       # skeleton lives on an in-namespace tmpfs owned by the build
       [ -O / ] && [ -O /etc ] || exit 1
-      # the test script checks the backing uid is not the worker's
-      echo "single-uid-rootless-ok $outer" > $out
+      # the e2e test checks the backing uid is not the worker's
+      echo "single-uid-ok $outer" > $out
     ''
   ];
 }

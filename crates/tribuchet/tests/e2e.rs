@@ -454,6 +454,17 @@ fn build_uidrange() {
 }
 
 #[test]
+fn build_singleuid() {
+    let out = succeed(Node::Hub, "nix-build /etc/tt/singleuid.nix --no-out-link");
+    let out = succeed(Node::Hub, &format!("cat {}", out.trim()));
+    let backing_uid = out.split_whitespace().last().unwrap_or_default();
+    assert!(out.contains("single-uid-ok"), "{out}");
+    // the builder ran on a leased uid, not as the worker user
+    let worker_uid = succeed(Node::Worker, "id -u tribuchet");
+    assert_ne!(backing_uid, worker_uid.trim(), "{out}");
+}
+
+#[test]
 fn build_refgraph() {
     build_grep("/etc/tt/refgraph.nix", "refgraph-ok");
 }

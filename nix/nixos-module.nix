@@ -277,8 +277,42 @@ in
 
     (lib.mkIf worker.enable {
       environment.etc."tribuchet/worker.toml".source = workerToml;
+
+      users.users.tribuchet = {
+        isSystemUser = true;
+        group = "tribuchet";
+        # /dev/kvm for kvm-requiring builds
+        extraGroups = [ "kvm" ];
+      };
+      users.groups.tribuchet = { };
+      # the worker imports build inputs through the nix-daemon without
+      # signatures, which only trusted users may do
+      nix.settings.trusted-users = [ "tribuchet" ];
+
+      # Root daemon leasing per-build user namespaces, uid ranges and
+      # delegated cgroups to the unprivileged worker. Socket-activated,
+      # but the daemon binds the socket itself when started directly.
+      systemd.sockets.tribuchet-sandboxd = {
+        wantedBy = [ "sockets.target" ];
+        listenStreams = [ "/run/tribuchet-sandboxd.sock" ];
+        # access control is sandboxd's SO_PEERCRED check
+        socketConfig.SocketMode = "0666";
+      };
+      systemd.services.tribuchet-sandboxd = {
+        serviceConfig = {
+          Type = "notify";
+          ExecStart = "${lib.getExe' worker.package "tribuchet-sandboxd"} --worker-user tribuchet";
+          Environment = "RUST_LOG=info";
+          Restart = "on-failure";
+        };
+      };
+
       systemd.services.tribuchet-worker = {
         wantedBy = [ "multi-user.target" ];
+        # sandboxd may be socket-activated or run standalone; either way
+        # the socket must exist before the worker starts
+        wants = [ "tribuchet-sandboxd.socket" ];
+        after = [ "tribuchet-sandboxd.socket" ];
         # only ExecReload carries the package store path, so a new
         # package reloads instead of restarting; settings changes also
         # arrive via reload (the fresh worker generation re-reads the
@@ -289,6 +323,8 @@ in
         restartTriggers = [ workerToml ];
         serviceConfig = {
           Type = "notify";
+          User = "tribuchet";
+          Group = "tribuchet";
           # READY/watchdog come from the worker child; the main pid
           # is the build reaper it was exec'd by.
           NotifyAccess = "all";
