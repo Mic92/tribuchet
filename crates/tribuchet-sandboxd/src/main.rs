@@ -138,12 +138,19 @@ fn handle(daemon: &Daemon, conn: &UnixStream) -> Result<()> {
             base,
             daemon.worker.gid.as_raw(),
         )?;
-        lease::enter_cgroup(&cgroup, stage_fd.as_fd(), daemon.worker.uid)?;
-        sandbox_proto::send_reply(
-            conn,
-            &AllocateReply { pool_base: base },
-            &[cgroup.dir.as_raw_fd()],
-        )?;
+        // From here the cgroup exists on disk; remove it on any early exit.
+        let setup = (|| {
+            lease::enter_cgroup(&cgroup, stage_fd.as_fd(), daemon.worker.uid)?;
+            sandbox_proto::send_reply(
+                conn,
+                &AllocateReply { pool_base: base },
+                &[cgroup.dir.as_raw_fd()],
+            )
+        })();
+        if let Err(e) = setup {
+            let _ = lease::destroy_cgroup(&cgroup);
+            return Err(e);
+        }
         tracing::info!(
             build = request.build_id,
             base,
