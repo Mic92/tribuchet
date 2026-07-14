@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use harmonia_utils_signature::{PublicKey, Signature};
 use nix::{dir, fcntl};
 use sha2::{Digest, Sha256};
@@ -429,7 +429,7 @@ async fn stream_tmp_dir(
         let mut tar = tar::Builder::new(enc);
         // Walk the directory through the fd validated at submission
         // time, not by re-resolving the client-controlled path.
-        append_dir_fd(&mut tar, &top_tmp_dir, Path::new(""))?;
+        append_dir_fd(&mut tar, &top_tmp_dir, Path::new(""), 0)?;
         tar.into_inner()?.finish()?.flush()?;
         Ok(())
     });
@@ -466,7 +466,11 @@ fn append_dir_fd<W: io::Write>(
     tar: &mut tar::Builder<W>,
     dir: &fs::File,
     prefix: &Path,
+    depth: u32,
 ) -> Result<()> {
+    // Bound recursion so a client-crafted deep tree cannot overflow
+    // the spawn_blocking stack and abort the hub.
+    ensure!(depth < 128, "topTmpDir nesting too deep");
     use std::os::fd::AsFd;
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::MetadataExt;
@@ -529,7 +533,7 @@ fn append_dir_fd<W: io::Write>(
             h.set_entry_type(tar::EntryType::Directory);
             h.set_size(0);
             tar.append_data(&mut h, &in_tar, io::empty())?;
-            append_dir_fd(tar, &fd, &in_tar)?;
+            append_dir_fd(tar, &fd, &in_tar, depth + 1)?;
         } else if meta.is_file() {
             h.set_entry_type(tar::EntryType::Regular);
             h.set_size(meta.len());
