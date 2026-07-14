@@ -221,7 +221,7 @@ pub fn destroy_cgroup(cg: &BuildCgroup) -> Result<()> {
         ensure!(std::time::Instant::now() < deadline, "cgroup did not drain");
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    remove_cgroup_tree(&cg.dir).context("removing build subgroups")?;
+    remove_cgroup_tree(&cg.dir, 0).context("removing build subgroups")?;
     unlinkat(&cg.parent, cg.name.as_str(), UnlinkatFlags::RemoveDir)
         .with_context(|| format!("removing cgroup {}", cg.name))
 }
@@ -244,8 +244,10 @@ fn read_at(dir: &OwnedFd, name: &str) -> Result<String> {
     Ok(out)
 }
 
-/// Cgroup dirs cannot be unlinked, only rmdir'd bottom-up.
-fn remove_cgroup_tree(dir: &OwnedFd) -> Result<()> {
+/// Cgroup dirs cannot be unlinked, only rmdir'd bottom-up. Depth-capped:
+/// the build owns this subtree and could nest it to overflow the stack.
+fn remove_cgroup_tree(dir: &OwnedFd, depth: u32) -> Result<()> {
+    ensure!(depth < 64, "cgroup subtree too deep");
     let mut entries = Vec::new();
     let mut d = nix::dir::Dir::from_fd(dir.try_clone()?)?;
     for entry in d.iter() {
@@ -259,7 +261,7 @@ fn remove_cgroup_tree(dir: &OwnedFd) -> Result<()> {
     }
     for name in entries {
         let sub = openat(dir, name.as_c_str(), DIR_FLAGS, Mode::empty())?;
-        remove_cgroup_tree(&sub)?;
+        remove_cgroup_tree(&sub, depth + 1)?;
         unlinkat(dir, name.as_c_str(), UnlinkatFlags::RemoveDir)?;
     }
     Ok(())
