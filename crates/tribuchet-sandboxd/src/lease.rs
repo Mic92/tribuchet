@@ -210,7 +210,14 @@ pub fn destroy_cgroup(cg: &BuildCgroup) -> Result<()> {
         other => other.context("writing cgroup.kill")?,
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
-    while !read_at(&cg.dir, "cgroup.events").is_ok_and(|events| events.contains("populated 0")) {
+    loop {
+        match read_at(&cg.dir, "cgroup.events") {
+            Ok(events) if events.contains("populated 0") => break,
+            // gone mid-drain (worker unit stopped) counts as drained
+            Err(e) if is_enoent(&e) => return Ok(()),
+            Ok(_) => {}
+            Err(e) => return Err(e).context("reading cgroup.events"),
+        }
         ensure!(std::time::Instant::now() < deadline, "cgroup did not drain");
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
