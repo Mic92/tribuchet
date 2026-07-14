@@ -532,7 +532,7 @@ impl ActiveBuild {
                 .then(|| format!("build timed out after {}s", timeout.as_secs()));
             abort = self.ctx.abort_reason(&a.dedupe_key, &log_path, timed_out);
             if abort.is_some() {
-                let _ = signal::killpg(pgrp, signal::Signal::SIGKILL);
+                kill_build(pgrp, spec.cgroup.as_deref());
                 // The reaper collects the kill within its sweep interval.
                 break loop {
                     if let Some(code) = reaper::take_status(&self.ctx.status_dir, &req.token) {
@@ -544,9 +544,9 @@ impl ActiveBuild {
             std::thread::sleep(Duration::from_millis(200));
         };
         // The builder is PID 1 of its PID namespace, so its death took
-        // every descendant with it; the killpg also covers the brief
-        // pre-exec window and macOS, where there is no PID namespace.
-        let _ = signal::killpg(pgrp, signal::Signal::SIGKILL);
+        // every descendant with it; this also covers the pre-exec window
+        // and macOS, where there is no PID namespace.
+        kill_build(pgrp, spec.cgroup.as_deref());
         log_done.store(true, Ordering::Relaxed);
         let _ = tailer.join();
         if let Some(reason) = abort {
@@ -620,6 +620,17 @@ impl ActiveBuild {
         if let Err(e) = fs::remove_dir_all(&self.dir) {
             tracing::warn!("cleaning up {}: {e}", self.dir.display());
         }
+    }
+}
+
+/// Kill a build's processes. killpg alone misses a builder that
+/// setsid()'d out of the group; the shim is outside the pidns, so its
+/// death does not tear it down. cgroup.kill (group-writable via
+/// sandboxd) reaches everything.
+pub(super) fn kill_build(pgrp: nix::unistd::Pid, cgroup: Option<&Path>) {
+    let _ = signal::killpg(pgrp, signal::Signal::SIGKILL);
+    if let Some(cg) = cgroup {
+        let _ = fs::write(cg.join("cgroup.kill"), "1");
     }
 }
 

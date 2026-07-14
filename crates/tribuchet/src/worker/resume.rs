@@ -15,7 +15,7 @@ use harmonia_utils_signature::SecretKey;
 use nix::sys::signal;
 use tokio::sync::mpsc;
 
-use super::build::{ActiveBuild, pack_outputs};
+use super::build::{ActiveBuild, kill_build, pack_outputs};
 use super::logtail::LogTail;
 use super::{DaemonConn, WorkerCtx, msg, reaper, sandbox, unix_now};
 use crate::chunkio::CHUNK_SIZE;
@@ -166,12 +166,12 @@ fn supervise_adopted(
             let timed_out = (unix_now() >= st.deadline_unix).then(|| "build timed out".to_string());
             aborted = ctx.abort_reason(&st.dedupe_key, &log_path, timed_out);
             if aborted.is_some() {
-                let _ = signal::killpg(pgrp, signal::Signal::SIGKILL);
+                kill_build(pgrp, st.spec.cgroup.as_deref());
             }
         }
         std::thread::sleep(Duration::from_millis(200));
     };
-    let _ = signal::killpg(pgrp, signal::Signal::SIGKILL);
+    kill_build(pgrp, st.spec.cgroup.as_deref());
     let synth = BuildAssignment {
         build_id: st.build_id.clone(),
         outputs: st.outputs.clone(),
