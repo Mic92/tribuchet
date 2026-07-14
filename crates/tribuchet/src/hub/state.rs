@@ -310,7 +310,13 @@ impl HubState {
     /// platform it served waits for it to reconnect rather than
     /// declining at once.
     pub(super) fn record_departed(&self, caps: WorkerCaps) {
-        self.departed.lock().unwrap().push((caps, Instant::now()));
+        let now = Instant::now();
+        let mut departed = self.departed.lock().unwrap();
+        // Prune here: expected_deadline() only runs for unservable
+        // submissions, so a healthy fleet would otherwise accumulate
+        // an entry per worker reconnect indefinitely.
+        departed.retain(|(_, at)| now < *at + self.worker_grace);
+        departed.push((caps, now));
     }
 
     /// If this platform is not servable right now but we expect a
