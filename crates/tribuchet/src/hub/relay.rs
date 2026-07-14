@@ -731,8 +731,11 @@ async fn relay_extra_chunk(
     if let Some(nar_transfer::Payload::ZstdNarChunk(chunk)) = n.payload
         && extra.tx.send(chunk.into()).await.is_err()
     {
+        // rx closed does not imply failure: the import reads via
+        // take(nar_size) and drops rx once done.
         let extra = extras.remove(&n.store_path).unwrap();
-        return Err(extra.task.await?.unwrap_err());
+        extra.task.await??;
+        bail!("excess extra chunks for {}", n.store_path);
     }
     if n.eof {
         let extra = extras.remove(&n.store_path).unwrap();
