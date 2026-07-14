@@ -5,7 +5,6 @@ use nix::errno::Errno;
 use nix::fcntl::{self, AtFlags, OFlag};
 use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use nix::sched::{CloneFlags, unshare};
-use nix::sys::personality::{self, Persona};
 use nix::sys::resource::{Resource, getrlimit, setrlimit};
 use nix::sys::socket::{
     AddressFamily, ControlMessage, ControlMessageOwned, MsgFlags, SockFlag, SockType, recv,
@@ -844,22 +843,19 @@ fn apply_process_limits(system: &str) -> io::Result<()> {
     let (_, hard) = getrlimit(Resource::RLIMIT_CORE).map_err(ioerr("getrlimit CORE"))?;
     setrlimit(Resource::RLIMIT_CORE, 0, hard).map_err(ioerr("setting RLIMIT_CORE"))?;
     stat::umask(stat::Mode::from_bits_truncate(0o022));
-    if matches!(
+    // PER_LINUX32 is a base persona, not a flag bit; nix's Persona
+    // bitflags truncate it, so do the read/modify/write via raw libc.
+    let base: libc::c_ulong = if matches!(
         system,
         "i686-linux" | "armv7l-linux" | "armv6l-linux" | "armv5tel-linux"
     ) {
-        // PER_LINUX32 is a base persona, not a flag bit, so the nix
-        // crate's Persona bitflags cannot express it.
-        if unsafe {
-            libc::personality(0x0008 /* PER_LINUX32 */)
-        } == -1
-        {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    if let Ok(persona) = personality::get() {
-        let _ = personality::set(persona | Persona::ADDR_NO_RANDOMIZE);
-    }
+        0x0008 // PER_LINUX32
+    } else {
+        unsafe { libc::personality(0xFFFF_FFFF) as libc::c_ulong }
+    };
+    unsafe {
+        libc::personality(base | 0x0004_0000 /* ADDR_NO_RANDOMIZE */)
+    };
     prctl::set_no_new_privs().map_err(ioerr("PR_SET_NO_NEW_PRIVS"))
 }
 
