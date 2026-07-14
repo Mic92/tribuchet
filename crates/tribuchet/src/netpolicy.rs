@@ -102,6 +102,8 @@ pub enum Dst {
 
 impl Dst {
     fn matches(self, ip: IpAddr) -> bool {
+        // ::ffff:a.b.c.d is a.b.c.d for `private` and IPv4 CIDRs.
+        let ip = ip.to_canonical();
         match self {
             Self::Any => true,
             Self::Private => !is_public(ip),
@@ -319,6 +321,10 @@ mod tests {
         assert!(!p.allows(6, "10.1.2.3".parse().unwrap(), 80));
         assert!(!p.allows(6, "127.0.0.1".parse().unwrap(), 80));
         assert!(!p.allows(6, "fd00::1".parse().unwrap(), 80));
+        // IPv4-mapped IPv6 addresses classify by their embedded IPv4.
+        assert!(!p.allows(6, "::ffff:10.1.2.3".parse().unwrap(), 80));
+        assert!(!p.allows(6, "::ffff:127.0.0.1".parse().unwrap(), 80));
+        assert!(p.allows(6, "::ffff:93.184.216.34".parse().unwrap(), 80));
         assert!(!p.allows(6, "2001:db8::5".parse().unwrap(), 25));
         assert!(p.allows(6, "2001:db8::5".parse().unwrap(), 443));
         assert!(p.allows(6, "93.184.216.34".parse().unwrap(), 80));
