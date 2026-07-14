@@ -109,8 +109,11 @@ pub fn create_cgroup(
         .trim()
         .strip_prefix("0::/")
         .context("requester not on cgroup v2")?;
-    let parent_path = Path::new("/sys/fs/cgroup").join(rel);
-    let parent = nix::fcntl::open(&parent_path, DIR_FLAGS, Mode::empty())
+    // The worker sits in a `main` leaf; build cgroups go next to it,
+    // not under it (leaf holds processes, so no controller subtree).
+    let worker_cg = Path::new("/sys/fs/cgroup").join(rel);
+    let parent_path = worker_cg.parent().unwrap_or(&worker_cg);
+    let parent = nix::fcntl::open(parent_path, DIR_FLAGS, Mode::empty())
         .with_context(|| format!("opening cgroup {}", parent_path.display()))?;
     let name = format!("build-{build_id}");
     mkdirat(&parent, name.as_str(), Mode::from_bits_truncate(0o755))
