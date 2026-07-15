@@ -86,11 +86,13 @@ impl BuildOwner {
                 .as_deref()
                 .context("tribuchet-sandboxd socket unavailable")?;
             let OwnerPrep { ns, uid_count } = prep;
+            let tmp_dir = spec.build_dir.parent().unwrap_or(&spec.build_dir);
             let lease = ns.allocate(
                 socket,
                 build_id,
                 uid_count,
                 nix::unistd::Pid::from_raw(stage),
+                tmp_dir,
             )?;
             tracing::info!(
                 build_id,
@@ -120,7 +122,13 @@ impl BuildOwner {
         #[cfg(target_os = "linux")]
         {
             let Self::Leased { lease } = self;
-            let paths = [spec.root.join("nix/store"), spec.build_dir.clone()];
+            // The whole top/ tree is leased-uid-owned (see lease()).
+            let top = spec
+                .build_dir
+                .parent()
+                .unwrap_or(&spec.build_dir)
+                .to_path_buf();
+            let paths = [spec.root.join("nix/store"), top];
             if let Err(e) = sandbox::cleanup_leased(&lease.ns_path(), &paths) {
                 tracing::warn!("cleaning up leased build files: {e:#}");
             }

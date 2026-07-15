@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use nix::sys::socket::{UnixCredentials, getsockopt, sockopt::PeerCredentials};
-use nix::unistd::{Pid, User};
+use nix::unistd::{Gid, Pid, Uid, User};
 use sandbox_proto::{AllocateReply, AllocateRequest, METHOD_ALLOCATE};
 
 #[derive(Parser)]
@@ -111,6 +111,7 @@ fn handle(daemon: &Daemon, conn: &UnixStream) -> Result<()> {
     let userns = fds.next().context("missing userns fd")?;
     let pidfd = fds.next().context("missing pidfd")?;
     let stage_fd = fds.next().context("missing setup-stage pidfd")?;
+    let tmp_dir = fds.next().context("missing tmp dir fd")?;
 
     let holder = lease::pidfd_pid(pidfd.as_fd())?;
     lease::verify_userns(holder, userns.as_fd())?;
@@ -125,6 +126,12 @@ fn handle(daemon: &Daemon, conn: &UnixStream) -> Result<()> {
     let mut leaked = false;
     let result = (|| {
         lease::write_maps(holder, base, request.uid_count)?;
+        lease::chown_tree(
+            &tmp_dir,
+            (Uid::from_raw(base), Gid::from_raw(base)),
+            daemon.worker.uid,
+        )
+        .context("chowning the tmp dir")?;
         let cgroup = lease::create_cgroup(
             Pid::from_raw(peer.pid()),
             &request.build_id,
