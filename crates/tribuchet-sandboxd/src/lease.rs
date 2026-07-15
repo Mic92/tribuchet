@@ -48,6 +48,36 @@ pub fn write_maps(pid: Pid, base: u32, count: u32) -> Result<()> {
     Ok(())
 }
 
+/// Chown the build tmp dir tree to the leased base uid so files the
+/// worker unpacked are mapped (and thus deletable) inside the build's
+/// user namespace. Only inodes owned by the worker are touched: the
+/// worker must not be able to re-own foreign files it can merely open.
+pub fn chown_tree(dir: &OwnedFd, owner: (Uid, Gid), worker_uid: Uid) -> Result<()> {
+    let uid = Some(owner.0);
+    let gid = Some(owner.1);
+    let stat = nix::sys::stat::fstat(dir)?;
+    if stat.st_uid == worker_uid.as_raw() {
+        fchown(dir, uid, gid)?;
+    }
+    let mut d = nix::dir::Dir::from_fd(dir.try_clone()?)?;
+    for entry in d.iter() {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        let stat = fstatat(dir, name, AtFlags::AT_SYMLINK_NOFOLLOW)?;
+        if stat.st_uid == worker_uid.as_raw() {
+            fchownat(dir, name, uid, gid, AtFlags::AT_SYMLINK_NOFOLLOW)?;
+        }
+        if entry.file_type() == Some(nix::dir::Type::Directory) {
+            let sub = openat(dir, name, DIR_FLAGS, Mode::empty())?;
+            chown_tree(&sub, owner, worker_uid)?;
+        }
+    }
+    Ok(())
+}
+
 /// The build's cgroup, held via directory fds so later operations do
 /// not depend on re-resolving worker-influenced paths.
 #[derive(Debug)]
@@ -297,6 +327,19 @@ mod tests {
         wait_for_build_end(&ours, &cg).unwrap();
         assert!(started.elapsed() >= std::time::Duration::from_millis(400));
         drainer.join().unwrap();
+    }
+
+    #[test]
+    fn chown_tree_walks_and_skips_symlink_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub/file"), "x").unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", dir.path().join("link")).unwrap();
+        let fd = nix::fcntl::open(dir.path(), DIR_FLAGS, Mode::empty()).unwrap();
+        // chown to our own uid: must not follow the symlink
+        // (chowning /etc/passwd would fail)
+        let me = nix::unistd::getuid();
+        chown_tree(&fd, (me, nix::unistd::getgid()), me).unwrap();
     }
 
     #[test]

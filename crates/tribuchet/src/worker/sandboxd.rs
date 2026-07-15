@@ -63,15 +63,26 @@ impl SandboxPrep {
     }
 
     /// Lease a sandbox with `uid_count` uids (1 or 65536) at in-ns 0
-    /// and have sandboxd place `stage` in the build cgroup.
+    /// and have sandboxd place `stage` in the build cgroup and chown
+    /// `tmp_dir` to the leased base uid.
     pub fn allocate(
         self,
         socket: &Path,
         build_id: &str,
         uid_count: u32,
         stage: nix::unistd::Pid,
+        tmp_dir: &Path,
     ) -> Result<SandboxLease> {
         let stage_fd = pidfd_open(stage).context("opening a pidfd of the setup stage")?;
+        let tmp_dir_fd = nix::fcntl::open(
+            tmp_dir,
+            nix::fcntl::OFlag::O_DIRECTORY
+                | nix::fcntl::OFlag::O_NOFOLLOW
+                | nix::fcntl::OFlag::O_RDONLY
+                | nix::fcntl::OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::empty(),
+        )
+        .with_context(|| format!("opening tmp dir {}", tmp_dir.display()))?;
         let conn = UnixStream::connect(socket)
             .with_context(|| format!("connecting to sandboxd at {}", socket.display()))?;
         // The holder must survive until sandboxd has verified the
@@ -88,6 +99,7 @@ impl SandboxPrep {
                 self.userns.as_raw_fd(),
                 self.holder.pidfd.as_raw_fd(),
                 stage_fd.as_raw_fd(),
+                tmp_dir_fd.as_raw_fd(),
             ],
         )?;
         let (reply, fds): (AllocateReply, Vec<OwnedFd>) = sandbox_proto::recv_reply(&conn)
@@ -187,7 +199,11 @@ mod tests {
                 sandbox_proto::recv_call(&conn).unwrap();
             assert_eq!(method, METHOD_ALLOCATE);
             assert_eq!(request.uid_count, 65536);
-            assert_eq!(fds.len(), 3, "userns, holder and stage pidfds expected");
+            assert_eq!(
+                fds.len(),
+                4,
+                "userns, holder and stage pidfds plus tmp dir expected"
+            );
             let cgroup = std::fs::File::open("/tmp").unwrap();
             sandbox_proto::send_reply(
                 &conn,
@@ -211,7 +227,13 @@ mod tests {
         let prep = SandboxPrep::new().unwrap();
         assert!(prep.ns_path().exists());
         let lease = prep
-            .allocate(&path, "b1", 65536, nix::unistd::Pid::this())
+            .allocate(
+                &path,
+                "b1",
+                65536,
+                nix::unistd::Pid::this(),
+                Path::new("/tmp"),
+            )
             .unwrap();
         assert_eq!(lease.pool_base, 3_000_000);
         assert_eq!(lease.cgroup(), Path::new("/tmp"));
@@ -232,7 +254,13 @@ mod tests {
         });
         let err = SandboxPrep::new()
             .unwrap()
-            .allocate(&path, "b1", 65536, nix::unistd::Pid::this())
+            .allocate(
+                &path,
+                "b1",
+                65536,
+                nix::unistd::Pid::this(),
+                Path::new("/tmp"),
+            )
             .unwrap_err();
         assert!(format!("{err:#}").contains("PoolExhausted"), "{err:#}");
     }
@@ -241,8 +269,14 @@ mod tests {
     fn missing_socket_fails() {
         let prep = SandboxPrep::new().unwrap();
         assert!(
-            prep.allocate(Path::new("/nonexistent"), "b1", 1, nix::unistd::Pid::this())
-                .is_err()
+            prep.allocate(
+                Path::new("/nonexistent"),
+                "b1",
+                1,
+                nix::unistd::Pid::this(),
+                Path::new("/tmp"),
+            )
+            .is_err()
         );
     }
 }
