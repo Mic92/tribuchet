@@ -89,6 +89,12 @@ in
         environment.etc."tt/singleuid.nix".text = ''
           import ${./tests/singleuid.nix} { bash = "${pkgs.bash}"; }
         '';
+        environment.etc."tt/passasfile.nix".text = ''
+          import ${./tests/passasfile.nix} {
+            bash = "${pkgs.bash}";
+            coreutils = "${pkgs.coreutils}";
+          }
+        '';
         environment.etc."tt/fod.nix".text = ''
           import ${./tests/fod.nix} {
             bash = "${pkgs.bash}";
