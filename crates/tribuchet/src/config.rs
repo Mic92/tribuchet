@@ -173,6 +173,23 @@ pub struct WorkerConfig {
     pub recursive_nix: bool,
 }
 
+impl WorkerConfig {
+    /// Override the TLS paths from `TRIBUCHET_CA_CERT`, `TRIBUCHET_CERT`
+    /// and `TRIBUCHET_KEY`, e.g. for keys delivered by systemd
+    /// `LoadCredential`.
+    pub fn apply_env_overrides(&mut self) {
+        for (var, field) in [
+            ("TRIBUCHET_CA_CERT", &mut self.ca_cert),
+            ("TRIBUCHET_CERT", &mut self.cert),
+            ("TRIBUCHET_KEY", &mut self.key),
+        ] {
+            if let Some(v) = std::env::var_os(var) {
+                *field = PathBuf::from(v);
+            }
+        }
+    }
+}
+
 fn default_state_dir() -> PathBuf {
     "/var/lib/tribuchet".into()
 }
@@ -197,6 +214,17 @@ fn default_max_jobs() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_overrides_tls_paths() {
+        let mut cfg: WorkerConfig = toml::from_str("hub = \"https://hub:7437\"").unwrap();
+        // SAFETY: test-only; no other thread reads the environment here.
+        unsafe { std::env::set_var("TRIBUCHET_KEY", "/run/credentials/w/worker-key") };
+        cfg.apply_env_overrides();
+        unsafe { std::env::remove_var("TRIBUCHET_KEY") };
+        assert_eq!(cfg.key, PathBuf::from("/run/credentials/w/worker-key"));
+        assert_eq!(cfg.cert, default_cert());
+    }
 
     #[test]
     fn worker_defaults_and_emulate_map() {

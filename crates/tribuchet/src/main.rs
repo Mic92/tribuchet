@@ -79,7 +79,8 @@ fn main() -> anyhow::Result<()> {
             hub::run(cfg)
         }
         Command::Worker { config } => {
-            let cfg: config::WorkerConfig = config::load(&config)?;
+            let mut cfg: config::WorkerConfig = config::load(&config)?;
+            cfg.apply_env_overrides();
             tracing::info!(?cfg, "worker configuration");
             worker::run(cfg)
         }

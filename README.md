@@ -124,6 +124,11 @@ $ tribuchet worker --config /etc/tribuchet/worker.toml
 The full set of options for both files is documented in
 [`crates/tribuchet/src/config.rs`](crates/tribuchet/src/config.rs).
 
+The worker's TLS paths can be overridden with the `TRIBUCHET_CA_CERT`,
+`TRIBUCHET_CERT` and `TRIBUCHET_KEY` environment variables, e.g. to
+point at a key delivered by systemd `LoadCredential` (the NixOS
+module's `services.tribuchet-worker.keyFile` does this).
+
 ### NixOS
 
 Import `tribuchet.nixosModules.default` (flake input
