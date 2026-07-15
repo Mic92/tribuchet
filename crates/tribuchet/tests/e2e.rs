@@ -411,6 +411,11 @@ in [ (mk "a") (mk "b") (mk "c") ]
 }
 
 #[test]
+fn build_passasfile() {
+    build_grep("/etc/tt/passasfile.nix", "pass-as-file-ok");
+}
+
+#[test]
 fn build_symlink_input() {
     // A store object that is itself a symlink must stay a symlink
     // inside the sandbox.
