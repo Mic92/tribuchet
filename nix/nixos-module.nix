@@ -157,6 +157,16 @@ in
       defaultText = lib.literalExpression "tribuchet";
       description = "Package providing bin/tribuchet.";
     };
+    keyFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      description = ''
+        TLS client key for the hub connection, loaded through systemd
+        LoadCredential so it may stay root-owned (e.g. a sops secret).
+        Passed to the worker via TRIBUCHET_KEY; leave `settings.key`
+        unset when using this.
+      '';
+    };
     settings = lib.mkOption {
       type = format.type;
       example = lib.literalExpression ''
@@ -335,6 +345,7 @@ in
         restartTriggers = [ workerToml ];
         serviceConfig = {
           Type = "notify";
+          LoadCredential = lib.optional (worker.keyFile != null) "worker-key:${worker.keyFile}";
           User = "tribuchet";
           Group = "tribuchet";
           # READY/watchdog come from the worker child; the main pid
@@ -349,7 +360,10 @@ in
           ExecStart = "${workerExec} worker --config /etc/tribuchet/worker.toml";
           RuntimeDirectory = "tribuchet-worker";
           StateDirectory = "tribuchet";
-          Environment = "RUST_LOG=info";
+          Environment = [
+            "RUST_LOG=info"
+          ]
+          ++ lib.optional (worker.keyFile != null) "TRIBUCHET_KEY=%d/worker-key";
           # delegate the cgroup subtree so the worker can apply
           # per-build pids/memory limits and cgroup.kill teardown
           Delegate = true;
