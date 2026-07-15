@@ -259,10 +259,15 @@ async fn handle_output_chunk(
         let task = tokio::spawn(async move { nar::unpack_zstd_chunks(rx, &tmp).await });
         (tx, task)
     });
-    if !out.zstd_nar_chunk.is_empty() {
-        tx.send(out.zstd_nar_chunk)
-            .await
-            .map_err(|_| anyhow::anyhow!("output unpacker died"))?;
+    if !out.zstd_nar_chunk.is_empty() && tx.send(out.zstd_nar_chunk).await.is_err() {
+        // The unpacker only stops early on error; report that error.
+        let (_, task) = unpackers.remove(&out.store_path).unwrap();
+        let err = task
+            .await?
+            .err()
+            .unwrap_or_else(|| anyhow::anyhow!("unpacker exited before eof"));
+        remove_tree(&unpack_temp_path(&out.store_path));
+        return Err(err.context(format!("unpacking output {}", out.store_path)));
     }
     if out.eof {
         let (tx, task) = unpackers.remove(&out.store_path).unwrap();

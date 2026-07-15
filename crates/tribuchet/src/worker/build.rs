@@ -365,10 +365,14 @@ impl ActiveBuild {
             });
             (tx, task)
         });
-        if !t.zstd_tar_chunk.is_empty() {
-            tx.send(t.zstd_tar_chunk)
-                .await
-                .map_err(|_| anyhow::anyhow!("tmp dir unpacker died"))?;
+        if !t.zstd_tar_chunk.is_empty() && tx.send(t.zstd_tar_chunk).await.is_err() {
+            // The unpacker only stops early on error; report that error.
+            let (_, task) = self.tmp_unpacker.take().unwrap();
+            let err = task
+                .await?
+                .err()
+                .unwrap_or_else(|| anyhow::anyhow!("tmp dir unpacker exited early"));
+            return Err(err);
         }
         if t.eof {
             let (tx, task) = self.tmp_unpacker.take().unwrap();
