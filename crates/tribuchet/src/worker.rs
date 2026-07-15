@@ -14,7 +14,6 @@ pub mod binfmt;
 mod build;
 mod caps;
 mod cgroup;
-mod imports;
 mod logtail;
 pub mod reaper;
 mod resume;
@@ -469,16 +468,12 @@ async fn session(
     }
 
     let mut active: HashMap<String, ActiveBuild> = HashMap::new();
-    // Deduplicates concurrent input imports across this session's
-    // builds; dropped with the session so a reconnect starts clean.
-    let imports = imports::SessionImports::new();
     let result = session_loop(
         &mut inbound,
         &mut active,
         &out_tx,
         signing_key,
         ctx,
-        &imports,
         Duration::from_secs(opts.build_timeout_secs),
     )
     .await;
@@ -496,7 +491,6 @@ async fn session_loop(
     out_tx: &mpsc::Sender<WorkerMessage>,
     signing_key: &Arc<SecretKey>,
     ctx: &Arc<WorkerCtx>,
-    imports: &imports::SessionImports,
     build_timeout: Duration,
 ) -> Result<()> {
     while let Some(m) = inbound.message().await? {
@@ -537,7 +531,7 @@ async fn session_loop(
                 let Some(build) = active.get_mut(&offer.build_id) else {
                     continue;
                 };
-                match build.negotiate(&offer.store_paths, imports).await {
+                match build.negotiate(&offer.store_paths).await {
                     Ok(missing) => {
                         out_tx
                             .send(msg(worker_message::Msg::MissingPaths(MissingPaths {
@@ -566,7 +560,7 @@ async fn session_loop(
                         Ok(false) => {}
                         Ok(true) => {
                             let build = active.remove(&id).unwrap();
-                            launch_when_staged(ctx, build, out_tx, signing_key, build_timeout);
+                            launch_build(ctx, build, out_tx, signing_key, build_timeout);
                         }
                     }
                 }
@@ -644,44 +638,6 @@ fn launch_build(
         ctx.running.fetch_sub(1, atomic::Ordering::Relaxed);
         record_finished(&ctx, &key, fin);
         let _ = out_tx.blocking_send(request_job());
-    });
-}
-
-/// A fully-staged build launches at once, unless some of its inputs are
-/// imported by sibling builds: then wait for those off the session loop
-/// (which must keep feeding the sibling imports) before launching.
-fn launch_when_staged(
-    ctx: &Arc<WorkerCtx>,
-    mut build: ActiveBuild,
-    out_tx: &mpsc::Sender<WorkerMessage>,
-    signing_key: &Arc<SecretKey>,
-    build_timeout: Duration,
-) {
-    let awaited = build.take_awaited();
-    if awaited.is_empty() {
-        launch_build(ctx, build, out_tx, signing_key, build_timeout);
-        return;
-    }
-    let ctx = ctx.clone();
-    let out_tx = out_tx.clone();
-    let signing_key = signing_key.clone();
-    let build_id = build.assignment.build_id.clone();
-    tokio::spawn(async move {
-        let mut ok = true;
-        for wait in awaited {
-            ok &= wait.wait().await;
-        }
-        if ok {
-            launch_build(&ctx, build, &out_tx, &signing_key, build_timeout);
-        } else {
-            build.abort().await;
-            let _ = fail_build(
-                &out_tx,
-                &build_id,
-                &anyhow::anyhow!("a shared input import failed on another build"),
-            )
-            .await;
-        }
     });
 }
 

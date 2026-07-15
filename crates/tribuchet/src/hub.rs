@@ -36,7 +36,7 @@ mod state;
 mod submit;
 
 use metrics::Metrics;
-use relay::{run_job, send};
+use relay::{WorkerStaging, run_job, send};
 use state::{HubState, WorkerCaps};
 use submit::AttachSvc;
 
@@ -300,7 +300,7 @@ async fn worker_loop(
     // each closure in isolation (references before referrers, no
     // shared-path lock contention) and a later build sees earlier shared
     // inputs as valid, so it fetches only its delta.
-    let staging = Arc::new(tokio::sync::Semaphore::new(1));
+    let staging = Arc::new(WorkerStaging::new());
 
     let mut credits: usize = 0;
     'outer: loop {
