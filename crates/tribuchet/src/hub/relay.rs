@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -26,6 +26,31 @@ use crate::proto::{
 /// before the hub cancels it on the worker.
 const CANCEL_GRACE: Duration = Duration::from_secs(10);
 
+/// Per-worker-session staging state: one build's inputs stream at a
+/// time, and paths already streamed this session are not re-sent.
+pub(super) struct WorkerStaging {
+    permits: tokio::sync::Semaphore,
+    streamed: Mutex<HashSet<String>>,
+}
+
+impl WorkerStaging {
+    pub(super) fn new() -> Self {
+        Self {
+            permits: tokio::sync::Semaphore::new(1),
+            streamed: Mutex::default(),
+        }
+    }
+
+    /// Forget paths a build streamed but may not have imported (it
+    /// failed or the session errored), so a later build re-streams them.
+    fn unstage(&self, paths: &[String]) {
+        let mut set = self.streamed.lock().unwrap();
+        for p in paths {
+            set.remove(p);
+        }
+    }
+}
+
 pub(super) async fn send(
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
     msg: hub_message::Msg,
@@ -42,7 +67,7 @@ pub(super) async fn run_job(
     vkey: &PublicKey,
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
     mut in_rx: mpsc::Receiver<worker_message::Msg>,
-    staging: std::sync::Arc<tokio::sync::Semaphore>,
+    staging: Arc<WorkerStaging>,
 ) -> Result<()> {
     let req = &job.req;
     send(
@@ -76,7 +101,9 @@ pub(super) async fn run_job(
             // restart); skip staging, its result arrives like any other.
             worker_message::Msg::Resumed(_) => {
                 tracing::info!(id = job.id, "worker resumed an in-flight build");
-                return relay_build(state, job, vkey, out_tx, &mut in_rx).await;
+                return relay_build(state, job, vkey, out_tx, &mut in_rx)
+                    .await
+                    .map(|_| ());
             }
             // A resumed build's log tail can race ahead of its Resumed
             // reply (separate task, same stream); pass the chunk on.
@@ -121,32 +148,75 @@ pub(super) async fn run_job(
         "input path negotiation done"
     );
 
-    // Serialize only the import: negotiation above is read-only on the
-    // worker store, so it runs in parallel (bounded by RequestJob
-    // credits) instead of gating throughput on its round-trip.
-    let permit = staging
-        .acquire_owned()
+    let new_paths = stage_inputs(state, job, out_tx, &staging, &missing).await?;
+    let res = relay_build(state, job, vkey, out_tx, &mut in_rx).await;
+    if !matches!(res, Ok(true)) {
+        staging.unstage(&new_paths);
+    }
+    res.map(|_| ())
+}
+
+/// Stream this build's missing inputs and tmp dir under the session's
+/// staging permit; returns the paths newly streamed. Paths an earlier
+/// build already streamed are skipped: staging phases are serialized
+/// and the worker imports NARs in stream order, so those imports are
+/// committed before this build's inputs arrive. The worker re-checks
+/// skipped paths when its staging completes.
+async fn stage_inputs(
+    state: &HubState,
+    job: &Job,
+    out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
+    staging: &WorkerStaging,
+    missing: &[String],
+) -> Result<Vec<String>> {
+    // Serialize only the import: negotiation before this is read-only
+    // on the worker store, so it runs in parallel (bounded by
+    // RequestJob credits) instead of gating throughput on its
+    // round-trip.
+    let _permit = staging
+        .permits
+        .acquire()
         .await
         .expect("staging semaphore closed");
-
-    // The worker imports missing inputs through its Nix daemon, which
-    // needs the full ValidPathInfo; ask the local nix-daemon for it.
-    // AddToStoreNar also needs a path's references valid first, and
-    // Nix's order is not topological, so reorder references before
-    // referrers.
-    let infos = order_by_references(query_path_infos(&state.daemon_pool, &missing).await?);
-    for mut info in infos {
-        let path = info.store_path.clone();
-        info.build_id = job.id.clone();
-        send(out_tx, hub_message::Msg::PathInfo(info)).await?;
-        stream_store_path(&job.id, &path, out_tx).await?;
+    let new_paths = select_unstreamed(&staging.streamed, missing);
+    if new_paths.len() < missing.len() {
+        tracing::info!(
+            id = job.id,
+            skipped = missing.len() - new_paths.len(),
+            "inputs already streamed earlier in this worker session"
+        );
     }
-    stream_tmp_dir(&job.id, job.tmp_dir.clone(), out_tx).await?;
+    let res = async {
+        // The worker imports missing inputs through its Nix daemon, which
+        // needs the full ValidPathInfo; ask the local nix-daemon for it.
+        // AddToStoreNar also needs a path's references valid first, and
+        // Nix's order is not topological, so reorder references before
+        // referrers.
+        let infos = order_by_references(query_path_infos(&state.daemon_pool, &new_paths).await?);
+        for mut info in infos {
+            let path = info.store_path.clone();
+            info.build_id = job.id.clone();
+            send(out_tx, hub_message::Msg::PathInfo(info)).await?;
+            stream_store_path(&job.id, &path, out_tx).await?;
+        }
+        stream_tmp_dir(&job.id, job.tmp_dir.clone(), out_tx).await
+    }
+    .await;
+    if res.is_err() {
+        staging.unstage(&new_paths);
+    }
+    res.map(|()| new_paths)
+}
 
-    // Inputs delivered and (being in-order on the stream) committed;
-    // let the next build's import proceed while this one executes.
-    drop(permit);
-    relay_build(state, job, vkey, out_tx, &mut in_rx).await
+/// Record `missing` in the session's streamed set; return the paths
+/// not streamed before.
+fn select_unstreamed(staged: &Mutex<HashSet<String>>, missing: &[String]) -> Vec<String> {
+    let mut set = staged.lock().unwrap();
+    missing
+        .iter()
+        .filter(|p| set.insert((*p).clone()))
+        .cloned()
+        .collect()
 }
 
 /// Log/error-safe name of a worker message variant. The messages embed
@@ -725,13 +795,15 @@ async fn ack_result(out_tx: &mpsc::Sender<Result<HubMessage, Status>>, job: &Job
     .await;
 }
 
+/// Relay logs, the result and output NARs for one dispatched build.
+/// Returns the build verdict; a failed build is not an `Err`.
 async fn relay_build(
     state: &HubState,
     job: &Job,
     vkey: &PublicKey,
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
     in_rx: &mut mpsc::Receiver<worker_message::Msg>,
-) -> Result<()> {
+) -> Result<bool> {
     let mut pending: HashMap<String, OutputVerify> = HashMap::new();
     let mut extras: HashMap<String, ExtraImport> = HashMap::new();
     let mut awaiting_outputs = false;
@@ -779,14 +851,14 @@ async fn relay_build(
                 }
                 if res.exit_code != 0 {
                     publish_worker_failure(state, out_tx, job, &res).await?;
-                    return Ok(());
+                    return Ok(false);
                 }
                 pending = verify_set(res.outputs, &job.req.outputs)?;
                 extras = start_extras(state, vkey, res.extras)?;
                 awaiting_outputs = true;
                 if pending.is_empty() && extras.is_empty() {
                     finish_relay(state, out_tx, &job.replay, job).await;
-                    return Ok(());
+                    return Ok(true);
                 }
             }
             worker_message::Msg::Nar(n) if awaiting_outputs => {
@@ -799,7 +871,7 @@ async fn relay_build(
                 }
                 if pending.is_empty() && extras.is_empty() {
                     finish_relay(state, out_tx, &job.replay, job).await;
-                    return Ok(());
+                    return Ok(true);
                 }
             }
             other => bail!("unexpected worker message: {}", msg_name(&other)),
@@ -834,6 +906,25 @@ mod tests {
         let ordered = order_by_references(vec![info(lib, &[dep, lib]), info(dep, &[])]);
         let seq: Vec<&str> = ordered.iter().map(|i| i.store_path.as_str()).collect();
         assert_eq!(seq, vec![dep, lib]);
+    }
+
+    #[test]
+    fn already_streamed_paths_are_skipped_and_reset_on_failure() {
+        let staged = Mutex::new(HashSet::new());
+        let a = "/nix/store/aaa".to_string();
+        let b = "/nix/store/bbb".to_string();
+        assert_eq!(
+            select_unstreamed(&staged, &[a.clone(), b.clone()]),
+            vec![a.clone(), b.clone()]
+        );
+        // A later build sharing an input streams only its delta.
+        assert_eq!(
+            select_unstreamed(&staged, &[a.clone(), b.clone()]),
+            Vec::<String>::new()
+        );
+        // A failed build's paths are removed and get streamed again.
+        staged.lock().unwrap().remove(&a);
+        assert_eq!(select_unstreamed(&staged, &[a.clone(), b]), vec![a]);
     }
 
     #[test]

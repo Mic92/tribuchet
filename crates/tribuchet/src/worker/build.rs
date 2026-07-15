@@ -20,7 +20,6 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use super::caps::requires_uid_range;
-use super::imports::{Claim, ImportGuard, ImportWait, SessionImports};
 use super::logtail::tail_log;
 use super::resume::{FinishedBuild, PackedExtra, PackedOutput, ResumeState};
 use super::{DaemonConn, WorkerCtx, reaper, sandbox, unix_now};
@@ -195,12 +194,6 @@ pub(super) struct ActiveBuild {
     daemon: Option<DaemonConn>,
     importer: Option<Importer>,
     tmp_unpacker: Option<Unpacker>,
-    /// Missing paths this build owns the import of (deduped across the
-    /// session); the guard wakes sibling builds awaiting the same path.
-    owned: HashMap<String, ImportGuard>,
-    /// Missing paths a sibling build imports; this build waits for them
-    /// to settle before it may launch (they are bind-mount sources).
-    awaited: Vec<ImportWait>,
 }
 
 fn store_base(store_path: &str) -> &str {
@@ -246,21 +239,10 @@ impl ActiveBuild {
             daemon: None,
             importer: None,
             tmp_unpacker: None,
-            owned: HashMap::new(),
-            awaited: Vec::new(),
         })
     }
 
-    /// Sibling-import waits to satisfy before this build may launch.
-    pub(super) fn take_awaited(&mut self) -> Vec<ImportWait> {
-        std::mem::take(&mut self.awaited)
-    }
-
-    pub(super) async fn negotiate(
-        &mut self,
-        offered: &[String],
-        imports: &SessionImports,
-    ) -> Result<Vec<String>> {
+    pub(super) async fn negotiate(&mut self, offered: &[String]) -> Result<Vec<String>> {
         let store_dir = StoreDir::default();
         let mut daemon = DaemonClient::builder()
             .connect_daemon()
@@ -294,20 +276,9 @@ impl ActiveBuild {
         for (p, sp) in parsed {
             if valid.contains(&sp) {
                 self.inputs.push(p.clone());
-                continue;
-            }
-            // One owner per missing path imports it; siblings await it.
-            match imports.claim(p) {
-                Claim::Owner(guard) => {
-                    self.owned.insert(p.clone(), guard);
-                    self.pending.insert(p.clone(), None);
-                    missing.push(p.clone());
-                }
-                Claim::Awaiter(wait) => {
-                    // Imported by a sibling; valid as an input by launch.
-                    self.inputs.push(p.clone());
-                    self.awaited.push(wait);
-                }
+            } else {
+                self.pending.insert(p.clone(), None);
+                missing.push(p.clone());
             }
         }
         self.daemon = Some(daemon);
@@ -377,11 +348,6 @@ impl ActiveBuild {
             if send_failed {
                 bail!("input import ended early for {}", n.store_path);
             }
-            // Committed: wake siblings awaiting this path. A guard left
-            // in `owned` (build aborts first) signals failure on drop.
-            if let Some(guard) = self.owned.remove(&n.store_path) {
-                guard.complete(true);
-            }
             self.inputs.push(n.store_path);
         }
         Ok(())
@@ -408,12 +374,49 @@ impl ActiveBuild {
             let (tx, task) = self.tmp_unpacker.take().unwrap();
             drop(tx);
             task.await??;
-            if !self.pending.is_empty() || self.importer.is_some() {
-                bail!("tmp dir transfer finished before all input paths arrived");
+            if self.importer.is_some() {
+                bail!("tmp dir transfer finished during an input NAR transfer");
             }
+            self.finish_staging().await?;
             return Ok(true);
         }
         Ok(false)
+    }
+
+    /// Inputs the hub skipped (streamed for an earlier build in this
+    /// session) never got a NAR here; verify they are valid in the
+    /// local store before treating them as bind-mount sources.
+    async fn finish_staging(&mut self) -> Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let store_dir = StoreDir::default();
+        let mut set = StorePathSet::new();
+        let mut skipped = Vec::new();
+        for (p, info) in std::mem::take(&mut self.pending) {
+            if info.is_some() {
+                bail!("hub sent path info but no NAR for {p}");
+            }
+            set.insert(store_dir.parse(&p)?);
+            skipped.push(p);
+        }
+        let daemon = self
+            .daemon
+            .as_mut()
+            .context("daemon connection missing (no negotiation?)")?;
+        let valid = daemon
+            .query_valid_paths(&set, false)
+            .await
+            .context("re-checking inputs staged for earlier builds")?;
+        for p in skipped {
+            if !valid.contains(&store_dir.parse(&p)?) {
+                bail!(
+                    "input {p} was staged for an earlier build but is not valid in the local store"
+                );
+            }
+            self.inputs.push(p);
+        }
+        Ok(())
     }
 
     fn build_spec(&self, prep: &OwnerPrep) -> Result<sandbox::SandboxSpec> {
