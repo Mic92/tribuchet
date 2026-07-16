@@ -171,12 +171,6 @@ fn supervise_adopted(
         std::thread::sleep(Duration::from_millis(200));
     };
     kill_build(pgrp, st.spec.cgroup.as_deref());
-    let synth = BuildAssignment {
-        build_id: st.build_id.clone(),
-        outputs: st.outputs.clone(),
-        ..Default::default()
-    };
-    sandbox::cleanup(&synth, &dir);
     let (exit_code, error, outputs) = if let Some(reason) = aborted {
         (1, reason, vec![])
     } else if code != 0 {
@@ -207,6 +201,13 @@ fn supervise_adopted(
             Err(e) => (1, format!("{e:#}"), vec![]),
         }
     };
+    // After packing: on macOS cleanup removes the very output paths.
+    let synth = BuildAssignment {
+        build_id: st.build_id.clone(),
+        outputs: st.outputs.clone(),
+        ..Default::default()
+    };
+    sandbox::cleanup(&synth, &dir);
     FinishedBuild {
         exit_code,
         error,
