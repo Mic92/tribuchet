@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use harmonia_store_path::{StoreDir, StorePath, StorePathSet};
-use harmonia_store_path_info::ValidPathInfo;
+use harmonia_store_path_info::{UnkeyedValidPathInfo, ValidPathInfo};
 use harmonia_store_remote::{DaemonClient, DaemonStore};
 use harmonia_utils_signature::SecretKey;
 use nix::fcntl;
@@ -744,15 +744,13 @@ async fn pack_extras(
         .map(String::as_str)
         .chain(spec_outputs.iter().map(String::as_str))
         .collect();
-    let mut extras_set = BTreeSet::new();
-    for o in outputs {
-        for r in &o.references {
-            if !known.contains(r.as_str()) {
-                extras_set.insert(r.clone());
-            }
-        }
-    }
-    if extras_set.is_empty() {
+    let mut queue: Vec<String> = outputs
+        .iter()
+        .flat_map(|o| o.references.iter())
+        .filter(|r| !known.contains(r.as_str()))
+        .cloned()
+        .collect();
+    if queue.is_empty() {
         return Ok(Vec::new());
     }
     let store_dir = StoreDir::default();
@@ -760,8 +758,13 @@ async fn pack_extras(
         .connect_daemon()
         .await
         .context("connecting to the local nix-daemon")?;
-    let mut out = Vec::new();
-    for path in extras_set {
+    // Transitive closure: the hub daemon rejects an import whose
+    // references are not already valid.
+    let mut infos: HashMap<String, UnkeyedValidPathInfo> = HashMap::new();
+    while let Some(path) = queue.pop() {
+        if infos.contains_key(&path) {
+            continue;
+        }
         let sp = StorePath::from_base_path(store_base(&path))
             .with_context(|| format!("parsing extra path {path}"))?;
         // Hold a temp root so the daemon does not GC the path while
@@ -775,17 +778,30 @@ async fn pack_extras(
             .await
             .with_context(|| format!("queryPathInfo {path}"))?
             .ok_or_else(|| anyhow::anyhow!("extra {path} vanished from store"))?;
-        // Re-scan the extra's NAR against its declared references so
-        // the hub-side import keeps the transitive closure intact.
+        for r in &info.references {
+            let r = r
+                .to_absolute_path(&store_dir)
+                .to_string_lossy()
+                .into_owned();
+            if !known.contains(r.as_str()) {
+                queue.push(r);
+            }
+        }
+        infos.insert(path, info);
+    }
+    // Referenced-before-referrer, matching hub-side sequential import.
+    let mut out = Vec::with_capacity(infos.len());
+    for path in order_extras(&infos, &store_dir) {
+        let info = infos.remove(&path).unwrap();
+        let sp = StorePath::from_base_path(store_base(&path))?;
         let mut candidates: BTreeSet<StorePath> = info.references.iter().cloned().collect();
-        let self_sp = sp.clone();
-        candidates.insert(self_sp.clone());
+        candidates.insert(sp.clone());
         let nar_file = dir.join(format!("extra-{}.nar.zst", store_base(&path)));
         let res = pack_one_nar(
             Path::new(&path),
             &nar_file,
             &candidates,
-            Some(&self_sp),
+            Some(&sp),
             deadline,
         )
         .await
@@ -827,6 +843,33 @@ async fn pack_extras(
         });
     }
     Ok(out)
+}
+
+/// DFS post-order over the extras' inter-references.
+fn order_extras(
+    infos: &HashMap<String, UnkeyedValidPathInfo>,
+    store_dir: &StoreDir,
+) -> Vec<String> {
+    let mut order = Vec::with_capacity(infos.len());
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut stack: Vec<(String, bool)> = infos.keys().map(|p| (p.clone(), false)).collect();
+    while let Some((path, emit)) = stack.pop() {
+        if emit {
+            order.push(path);
+            continue;
+        }
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        stack.push((path.clone(), true));
+        for r in &infos[&path].references {
+            let r = r.to_absolute_path(store_dir).to_string_lossy().into_owned();
+            if infos.contains_key(&r) {
+                stack.push((r, false));
+            }
+        }
+    }
+    order
 }
 
 struct NarPackResult {
