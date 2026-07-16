@@ -68,6 +68,9 @@ struct WorkerCtx {
     secret_paths: Vec<PathBuf>,
     /// Builds currently executing, reported in heartbeats.
     running: atomic::AtomicU32,
+    /// Live hub session's out channel; builds return their RequestJob
+    /// credit here, not to the session that spawned them.
+    session_tx: Mutex<Option<mpsc::Sender<WorkerMessage>>>,
     /// dedupe_key -> build past staging; survives session loss so a
     /// replacement hub can resume instead of rebuilding.
     resumable: Mutex<HashMap<String, ResumableBuild>>,
@@ -131,6 +134,18 @@ impl WorkerCtx {
             ));
         }
         None
+    }
+
+    /// Free a build slot and fund the current session's next job.
+    fn release_job_slot(&self) {
+        let tx = {
+            let tx = self.session_tx.lock().unwrap();
+            self.running.fetch_sub(1, atomic::Ordering::Relaxed);
+            tx.clone()
+        };
+        if let Some(tx) = tx {
+            let _ = tx.blocking_send(request_job());
+        }
     }
 
     fn resumable_keys(&self) -> Vec<String> {
@@ -329,6 +344,7 @@ async fn run_async(opts: WorkerConfig, spawner: reaper::Spawner) -> Result<()> {
         build_memory_max: opts.build_memory_max_bytes,
         secret_paths: vec![opts.key.clone(), opts.state_dir.join("signing.key")],
         running: atomic::AtomicU32::new(0),
+        session_tx: Mutex::new(None),
         cancelled: Mutex::new(HashSet::new()),
         resumable: Mutex::new(HashMap::new()),
         emulators,
@@ -461,8 +477,13 @@ async fn session(
     // (adopted or running across a reconnect) are re-dispatched
     // credit-free and must not be funded again. Sent only now that
     // session() drains the channel: priming past its capacity first
-    // would deadlock the handshake.
-    let occupied = u64::from(ctx.running.load(atomic::Ordering::Relaxed));
+    // would deadlock the handshake. Set-and-load under one lock: a
+    // finishing build either counts as free here or funds itself.
+    let occupied = {
+        let mut tx = ctx.session_tx.lock().unwrap();
+        *tx = Some(out_tx.clone());
+        u64::from(ctx.running.load(atomic::Ordering::Relaxed))
+    };
     for _ in 0..u64::from(opts.max_jobs.max(1)).saturating_sub(occupied) {
         out_tx.send(request_job()).await?;
     }
@@ -635,9 +656,8 @@ fn launch_build(
         let fin = execute_to_finished(&build, &out_tx, &signing_key, build_timeout);
         build.teardown();
         drop(build);
-        ctx.running.fetch_sub(1, atomic::Ordering::Relaxed);
+        ctx.release_job_slot();
         record_finished(&ctx, &key, fin);
-        let _ = out_tx.blocking_send(request_job());
     });
 }
 

@@ -98,7 +98,7 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>, signing_key: &Arc<SecretK
             let fin = supervise_adopted(&ctx, &st, dir, &signing_key);
             // Roots live until the outputs are packed.
             drop(gc_roots);
-            ctx.running.fetch_sub(1, atomic::Ordering::Relaxed);
+            ctx.release_job_slot();
             record_finished(&ctx, &key, fin);
         });
     }
