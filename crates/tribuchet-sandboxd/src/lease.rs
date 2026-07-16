@@ -244,6 +244,34 @@ fn read_at(dir: &OwnedFd, name: &str) -> Result<String> {
     Ok(out)
 }
 
+/// Remove everything under `dir` via O_NOFOLLOW openat descent. Root
+/// bypasses DAC, so leased-uid 0555 output dirs are no obstacle.
+pub fn purge_tree(dir: &OwnedFd, depth: u32) -> Result<()> {
+    ensure!(depth < 128, "purge tree too deep");
+    let mut d = nix::dir::Dir::from_fd(dir.try_clone()?)?;
+    let entries: Vec<_> = d
+        .iter()
+        .filter_map(|e| e.ok().map(|e| (e.file_name().to_owned(), e.file_type())))
+        .filter(|(n, _)| n.as_bytes() != b"." && n.as_bytes() != b"..")
+        .collect();
+    for (name, ftype) in entries {
+        let is_dir = match ftype {
+            Some(nix::dir::Type::Directory) => true,
+            None => fstatat(dir, name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW)
+                .is_ok_and(|s| s.st_mode & libc::S_IFMT == libc::S_IFDIR),
+            _ => false,
+        };
+        if is_dir {
+            let sub = openat(dir, name.as_c_str(), DIR_FLAGS, Mode::empty())?;
+            purge_tree(&sub, depth + 1)?;
+            unlinkat(dir, name.as_c_str(), UnlinkatFlags::RemoveDir)?;
+        } else {
+            unlinkat(dir, name.as_c_str(), UnlinkatFlags::NoRemoveDir)?;
+        }
+    }
+    Ok(())
+}
+
 /// Cgroup dirs cannot be unlinked, only rmdir'd bottom-up. Depth-capped:
 /// the build owns this subtree and could nest it to overflow the stack.
 fn remove_cgroup_tree(dir: &OwnedFd, depth: u32) -> Result<()> {

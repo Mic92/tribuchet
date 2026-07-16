@@ -13,9 +13,27 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use sandbox_proto::{AllocateReply, AllocateRequest, METHOD_ALLOCATE};
+use sandbox_proto::{AllocateReply, AllocateRequest, METHOD_ALLOCATE, METHOD_PURGE, PurgeRequest};
 
 pub use sandbox_proto::SOCKET_PATH;
+
+/// Ask sandboxd (root) to empty a worker-owned dir of leased-uid files.
+pub fn purge(socket: &Path, dir: &Path) -> Result<()> {
+    let fd = nix::fcntl::open(
+        dir,
+        nix::fcntl::OFlag::O_DIRECTORY
+            | nix::fcntl::OFlag::O_NOFOLLOW
+            | nix::fcntl::OFlag::O_RDONLY
+            | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )
+    .with_context(|| format!("opening {}", dir.display()))?;
+    let conn = UnixStream::connect(socket)
+        .with_context(|| format!("connecting to sandboxd at {}", socket.display()))?;
+    sandbox_proto::send_call(&conn, METHOD_PURGE, &PurgeRequest {}, &[fd.as_raw_fd()])?;
+    let (_, _): (serde_json::Value, _) = sandbox_proto::recv_reply(&conn)?;
+    Ok(())
+}
 
 /// One leased sandbox: a mapped user namespace and its build cgroup.
 #[derive(Debug)]

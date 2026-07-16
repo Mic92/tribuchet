@@ -148,6 +148,23 @@ impl WorkerCtx {
         }
     }
 
+    /// Remove a build dir that may hold leased-uid files (adopted or
+    /// stale builds have no lease/userns to `cleanup_leased` through).
+    pub(super) fn remove_build_dir(&self, dir: &Path) {
+        if fs::remove_dir_all(dir).is_ok() {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(sock) = &self.sandboxd
+            && let Err(e) = sandboxd::purge(sock, dir)
+        {
+            tracing::warn!("sandboxd purge {}: {e:#}", dir.display());
+        }
+        if let Err(e) = fs::remove_dir_all(dir) {
+            tracing::warn!("cleaning up {}: {e}", dir.display());
+        }
+    }
+
     fn resumable_keys(&self) -> Vec<String> {
         self.resumable.lock().unwrap().keys().cloned().collect()
     }

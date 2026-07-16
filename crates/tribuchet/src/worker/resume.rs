@@ -19,7 +19,6 @@ use super::build::{ActiveBuild, kill_build, pack_outputs};
 use super::logtail::LogTail;
 use super::{DaemonConn, WorkerCtx, msg, reaper, sandbox, unix_now};
 use crate::chunkio::CHUNK_SIZE;
-use crate::fsutil::remove_path_all;
 use crate::proto::{
     BuildAssignment, BuildResult, ExtraPath, NarTransfer, OutputSignature, PathInfoMsg,
     WorkerMessage, nar_transfer, worker_message,
@@ -37,7 +36,7 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>, signing_key: &Arc<SecretK
         let dir = entry.path();
         if let Ok(s) = fs::read_to_string(dir.join("finished.json")) {
             let Ok(f) = serde_json::from_str::<FinishedState>(&s) else {
-                remove_path_all(&dir);
+                ctx.remove_build_dir(&dir);
                 continue;
             };
             tracing::info!(id = f.build_id, "adopted finished build awaiting delivery");
@@ -69,7 +68,7 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>, signing_key: &Arc<SecretK
             // Different reaper: the pid is meaningless and the build
             // died with the old unit; the client will resubmit.
             _ => {
-                remove_path_all(&dir);
+                ctx.remove_build_dir(&dir);
                 continue;
             }
         };
@@ -238,7 +237,7 @@ pub(super) fn spawn_resumable_reaper(ctx: Arc<WorkerCtx>) {
                 });
             }
             for (key, dir) in expired {
-                let _ = fs::remove_dir_all(&dir);
+                ctx.remove_build_dir(&dir);
                 tracing::warn!(
                     key,
                     "dropping undelivered build result (no resume within TTL)"
@@ -501,9 +500,7 @@ pub(super) fn ack_delivery(ctx: &Arc<WorkerCtx>, key: &str, build_id: &str) {
         }
     };
     if let Some(e) = removed {
-        if let Err(err) = fs::remove_dir_all(&e.dir) {
-            tracing::warn!("cleaning up {}: {err}", e.dir.display());
-        }
+        ctx.remove_build_dir(&e.dir);
         tracing::info!(id = build_id, "build result acknowledged");
     }
 }

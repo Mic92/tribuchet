@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 pub const SOCKET_PATH: &str = "/run/tribuchet-sandboxd.sock";
 
 pub const METHOD_ALLOCATE: &str = "com.tribuchet.Sandbox.Allocate";
+pub const METHOD_PURGE: &str = "com.tribuchet.Sandbox.Purge";
 
 /// Lease a per-build sandbox. Attached fds: the worker-created user
 /// namespace (0), a pidfd of the process holding it (1), a pidfd of
@@ -39,6 +40,11 @@ pub struct AllocateRequest {
     /// single-uid builds, 65536 for uid-range builds.
     pub uid_count: u32,
 }
+
+/// Empty a worker-owned directory (fd 0) of leased-uid files after the
+/// lease is gone. Reply is `{}`.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PurgeRequest {}
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AllocateReply {
