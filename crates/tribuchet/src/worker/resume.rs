@@ -116,13 +116,12 @@ async fn re_root_inputs(spec: &sandbox::SandboxSpec) -> Option<DaemonConn> {
             return None;
         }
     };
-    for (src, _) in &spec.binds_ro {
-        // non-store binds (e.g. the static /bin/sh) need no root
-        let Some(sp) = src.to_str().and_then(|p| store_dir.parse(p).ok()) else {
+    for path in &spec.store_inputs {
+        let Ok(sp) = store_dir.parse(path) else {
             continue;
         };
         if let Err(e) = daemon.add_temp_root(&sp).await {
-            tracing::warn!(path = %src.display(), "re-adding GC root: {e:#}");
+            tracing::warn!(path, "re-adding GC root: {e:#}");
         }
     }
     Some(daemon)
