@@ -1,6 +1,5 @@
 //! Resumable builds: adoption across worker generations, result persistence and delivery.
 
-use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -11,16 +10,15 @@ use anyhow::Result;
 use harmonia_store_path::StoreDir;
 use harmonia_store_remote::{DaemonClient, DaemonStore};
 use harmonia_utils_signature::SecretKey;
-use nix::sys::signal;
 use tokio::sync::mpsc;
 
-use super::build::{ActiveBuild, kill_build, pack_outputs};
+use super::build::{ActiveBuild, supervise};
 use super::logtail::LogTail;
-use super::{DaemonConn, WorkerCtx, msg, reaper, sandbox, unix_now};
+use super::{DaemonConn, WorkerCtx, msg, reaper, sandbox};
 use crate::chunkio::CHUNK_SIZE;
 use crate::proto::{
-    BuildAssignment, BuildResult, ExtraPath, NarTransfer, OutputSignature, PathInfoMsg,
-    WorkerMessage, nar_transfer, worker_message,
+    BuildResult, ExtraPath, NarTransfer, OutputSignature, PathInfoMsg, WorkerMessage, nar_transfer,
+    worker_message,
 };
 
 /// Pick up builds a previous worker generation left behind: still
@@ -93,7 +91,7 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>, signing_key: &Arc<SecretK
         tokio::task::spawn_blocking(move || {
             let ctx = task_ctx;
             let key = st.dedupe_key.clone();
-            let fin = supervise_adopted(&ctx, &st, dir, &signing_key);
+            let fin = supervise(&ctx, &st, dir, &signing_key);
             // Roots live until the outputs are packed.
             drop(gc_roots);
             drop(permit);
@@ -123,97 +121,6 @@ async fn re_root_inputs(spec: &sandbox::SandboxSpec) -> Option<DaemonConn> {
         }
     }
     Some(daemon)
-}
-
-/// Wait out a re-adopted build and pack its outputs, mirroring the
-/// tail end of execute(). Logs are streamed by the tailer that
-/// adopt_assignment starts once a session re-dispatches the build.
-fn supervise_adopted(
-    ctx: &Arc<WorkerCtx>,
-    st: &ResumeState,
-    dir: PathBuf,
-    signing_key: &SecretKey,
-) -> FinishedBuild {
-    let pgrp = nix::unistd::Pid::from_raw(st.pid);
-    let mut aborted: Option<String> = None;
-    let log_path = dir.join("build.log");
-    // Set when the build process is gone but no status file appears: a
-    // previous generation may have consumed the status (take_status
-    // deletes it on read) and died before recording the result. Waiting
-    // forever would leak the slot and the supervising thread.
-    let mut gone_since: Option<Instant> = None;
-    let code = loop {
-        if let Some(code) = reaper::take_status(&ctx.status_dir, &st.status_token) {
-            break code;
-        }
-        if signal::kill(pgrp, None).is_err() {
-            let since = gone_since.get_or_insert_with(Instant::now);
-            // a couple of reaper sweeps of grace for a status file
-            // that is still on its way
-            if since.elapsed() > Duration::from_secs(5) {
-                aborted.get_or_insert_with(|| {
-                    "build exit status was lost during a worker handover".into()
-                });
-                break 1;
-            }
-        } else {
-            gone_since = None;
-        }
-        if aborted.is_none() {
-            let timed_out = (unix_now() >= st.deadline_unix).then(|| "build timed out".to_string());
-            aborted = ctx.abort_reason(&st.dedupe_key, &log_path, timed_out);
-            if aborted.is_some() {
-                kill_build(pgrp, st.spec.cgroup.as_deref());
-            }
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    };
-    kill_build(pgrp, st.spec.cgroup.as_deref());
-    let (exit_code, error, outputs) = if let Some(reason) = aborted {
-        (1, reason, vec![])
-    } else if code != 0 {
-        (
-            code,
-            sandbox::setup_error_detail(&st.spec).unwrap_or_default(),
-            vec![],
-        )
-    } else {
-        // Fresh deadline: the build's own one bounded execution; this
-        // one only stops packing a pathological (e.g. sparse-file)
-        // output from running away.
-        let deadline = Instant::now() + Duration::from_mins(10);
-        // Resume path: skip the recursive-nix candidate widening.
-        // The daemon was queried on the original execute(); a
-        // worker-handover replay re-scans against inputs+outputs only,
-        // accepting that closure-delta extras from a resumed build
-        // miss any cross-references between added paths.
-        let extra_candidates = std::collections::BTreeSet::new();
-        match tokio::runtime::Handle::current().block_on(pack_outputs(
-            &dir,
-            &st.spec,
-            &extra_candidates,
-            deadline,
-            signing_key,
-        )) {
-            Ok(outputs) => (0, String::new(), outputs),
-            Err(e) => (1, format!("{e:#}"), vec![]),
-        }
-    };
-    // After packing: on macOS cleanup removes the very output paths.
-    let synth = BuildAssignment {
-        build_id: st.build_id.clone(),
-        outputs: st.outputs.clone(),
-        ..Default::default()
-    };
-    sandbox::cleanup(&synth, &dir);
-    FinishedBuild {
-        exit_code,
-        error,
-        outputs,
-        extras: Vec::new(),
-        dir,
-        finished_at: Instant::now(),
-    }
 }
 
 /// Forget finished builds nobody resumed. Without a client
@@ -325,8 +232,6 @@ pub(super) struct ResumeState {
     /// Status-file name the reaper records the exit code under.
     pub(super) status_token: String,
     pub(super) spec: sandbox::SandboxSpec,
-    /// Assignment outputs (name -> scratch path), for cleanup.
-    pub(super) outputs: HashMap<String, String>,
     pub(super) deadline_unix: u64,
 }
 

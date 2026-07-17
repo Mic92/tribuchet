@@ -10,7 +10,6 @@ use std::process::{Child, Stdio};
 use anyhow::{Context, Result};
 
 use super::SandboxSpec;
-use crate::proto::BuildAssignment;
 
 pub fn prepare(spec: &mut SandboxSpec) -> Result<()> {
     // No bind mounts on Darwin: inputs already live at their real
@@ -139,10 +138,10 @@ pub fn send_spec(_child: &mut Child, _spec: &SandboxSpec) -> Result<()> {
     Ok(())
 }
 
-pub fn cleanup(a: &BuildAssignment, _dir: &Path) {
+pub fn cleanup(outputs: &[String], _dir: &Path) {
     // Outputs were written straight into /nix/store; drop them after
     // upload.
-    for scratch in a.outputs.values() {
+    for scratch in outputs {
         let p = Path::new(scratch);
         let _ = fs::remove_dir_all(p);
         let _ = fs::remove_file(p);

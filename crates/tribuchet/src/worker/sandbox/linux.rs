@@ -20,7 +20,6 @@ use std::process::Command;
 
 use super::{SandboxSpec, binfmt};
 use crate::netpolicy::NetPolicy;
-use crate::proto::BuildAssignment;
 
 // Interface name for the presto-pasta tap inside the build netns.
 // Addressing (link-local guest/gateway, DNS forwarded on the gateway
@@ -868,7 +867,7 @@ pub fn setup_error_detail_impl(spec: &SandboxSpec) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-pub fn cleanup(_a: &BuildAssignment, _dir: &Path) {
+pub fn cleanup(_outputs: &[String], _dir: &Path) {
     // Mounts lived in the child's namespace and died with it; the
     // build dir itself is removed by the caller.
 }

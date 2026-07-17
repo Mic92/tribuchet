@@ -301,8 +301,8 @@ pub fn setup_stage() -> ! {
 #[cfg(target_os = "linux")]
 pub use platform::SETUP_STAGE_ARG;
 
-pub fn cleanup(a: &BuildAssignment, dir: &Path) {
-    platform::cleanup(a, dir);
+pub fn cleanup(outputs: &[String], dir: &Path) {
+    platform::cleanup(outputs, dir);
 }
 
 #[cfg(target_os = "linux")]

@@ -647,7 +647,6 @@ fn launch_build(
     );
     tokio::task::spawn_blocking(move || {
         let fin = execute_to_finished(&build, &out_tx, &signing_key, build_timeout);
-        build.teardown();
         drop(build);
         record_finished(&ctx, &key, fin);
     });

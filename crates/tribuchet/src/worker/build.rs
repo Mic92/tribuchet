@@ -465,12 +465,10 @@ impl ActiveBuild {
         // until the spec is sent below, so nothing runs before leasing.
         let prep = BuildOwner::prepare(a)?;
         let mut spec = self.build_spec(&prep)?;
-        let deadline = Instant::now() + timeout;
         // Logs go through a file in the build dir, not pipes: capture
         // is decoupled from this process's lifetime, so a later worker
         // generation can resume tailing where we stopped.
-        let log_path = self.dir.join("build.log");
-        let log_file = fs::File::create(&log_path)?;
+        let log_file = fs::File::create(self.dir.join("build.log"))?;
         let (mut req, child_stdin, spec_w) = sandbox::spawn_request(&spec)?;
         let pid = self
             .ctx
@@ -488,8 +486,7 @@ impl ActiveBuild {
             build_id: a.build_id.clone(),
             pid,
             status_token: req.token.clone(),
-            spec: spec.clone(),
-            outputs: a.outputs.clone(),
+            spec,
             deadline_unix: unix_now() + timeout.as_secs(),
         };
         fs::write(self.dir.join("resume.json"), serde_json::to_vec(&resume)?)?;
@@ -504,81 +501,10 @@ impl ActiveBuild {
                 tail_log(&dir, &build_id, &tx, || log_done.load(Ordering::Relaxed));
             })
         };
-        let pgrp = nix::unistd::Pid::from_raw(pid);
-        let mut abort: Option<String> = None;
-        let status = loop {
-            if let Some(code) = reaper::take_status(&self.ctx.status_dir, &req.token) {
-                break code;
-            }
-            let timed_out = (Instant::now() >= deadline)
-                .then(|| format!("build timed out after {}s", timeout.as_secs()));
-            abort = self.ctx.abort_reason(&a.dedupe_key, &log_path, timed_out);
-            if abort.is_some() {
-                kill_build(pgrp, spec.cgroup.as_deref());
-                // The reaper collects the kill within its sweep interval.
-                break loop {
-                    if let Some(code) = reaper::take_status(&self.ctx.status_dir, &req.token) {
-                        break code;
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
-                };
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        };
-        // The builder is PID 1 of its PID namespace, so its death took
-        // every descendant with it; this also covers the pre-exec window
-        // and macOS, where there is no PID namespace.
-        kill_build(pgrp, spec.cgroup.as_deref());
+        let fin = supervise(&self.ctx, &resume, self.dir.clone(), signing_key);
         log_done.store(true, Ordering::Relaxed);
         let _ = tailer.join();
-        if let Some(reason) = abort {
-            bail!("{reason}");
-        }
-        // The reaper already folded signal deaths into 128 + signo
-        // (matching shell conventions), so an OOM SIGKILL (137) is
-        // distinguishable from a SIGSEGV (139).
-        let exit_code = status;
-        tracing::info!(id = a.build_id, exit_code, "builder finished");
-
-        if exit_code != 0 {
-            // present on Linux when the sandbox setup stage failed
-            let error = sandbox::setup_error_detail(&spec).unwrap_or_default();
-            if !error.is_empty() {
-                tracing::warn!(id = a.build_id, error, "sandbox setup failed");
-            }
-            return Ok(FinishedBuild {
-                exit_code,
-                error,
-                outputs: Vec::new(),
-                extras: Vec::new(),
-                dir: self.dir.clone(),
-                finished_at: Instant::now(),
-            });
-        }
-
-        let packed = tokio::runtime::Handle::current().block_on(pack_outputs_and_extras(
-            &self.dir,
-            &spec,
-            deadline,
-            signing_key,
-            &a.build_id,
-        ));
-        let (packed, extras) = packed?;
-        Ok(FinishedBuild {
-            exit_code: 0,
-            error: String::new(),
-            outputs: packed,
-            extras,
-            dir: self.dir.clone(),
-            finished_at: Instant::now(),
-        })
-    }
-
-    /// Tear down the sandbox, keeping the build dir: it holds the
-    /// packed output NARs until they are delivered to a hub. sandboxd
-    /// removes the build cgroup when the dropped lease drains.
-    pub(super) fn teardown(&self) {
-        sandbox::cleanup(&self.assignment, &self.dir);
+        Ok(fin)
     }
 
     /// Tear down a build abandoned before execution: stop the import
@@ -602,11 +528,91 @@ impl ActiveBuild {
     }
 }
 
+/// Wait out a running build (fresh or re-adopted), pack its outputs,
+/// and tear the sandbox down. Driven off the persisted `ResumeState`
+/// so both entry points share one wait/kill/pack path.
+pub(super) fn supervise(
+    ctx: &WorkerCtx,
+    st: &ResumeState,
+    dir: PathBuf,
+    signing_key: &SecretKey,
+) -> FinishedBuild {
+    let pgrp = nix::unistd::Pid::from_raw(st.pid);
+    let log_path = dir.join("build.log");
+    let mut aborted: Option<String> = None;
+    // Process gone but no status file: an earlier worker generation may
+    // have consumed it. Bounded grace, then treat as failed.
+    let mut gone_since: Option<Instant> = None;
+    let code = loop {
+        if let Some(code) = reaper::take_status(&ctx.status_dir, &st.status_token) {
+            break code;
+        }
+        // EPERM means the process exists (leased uid); only ESRCH is gone.
+        if signal::kill(pgrp, None) == Err(nix::errno::Errno::ESRCH) {
+            let since = gone_since.get_or_insert_with(Instant::now);
+            if since.elapsed() > Duration::from_secs(5) {
+                aborted.get_or_insert_with(|| {
+                    "build exit status was lost during a worker handover".into()
+                });
+                break 1;
+            }
+        } else {
+            gone_since = None;
+        }
+        if aborted.is_none() {
+            let timed_out = (unix_now() >= st.deadline_unix).then(|| "build timed out".to_string());
+            if let Some(r) = ctx.abort_reason(&st.dedupe_key, &log_path, timed_out) {
+                aborted = Some(r);
+                kill_build(pgrp, st.spec.cgroup.as_deref());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    // Builder is PID 1 of its PID namespace, so its death took every
+    // descendant with it; also covers macOS (no pidns) and the pre-exec
+    // window.
+    kill_build(pgrp, st.spec.cgroup.as_deref());
+    tracing::info!(id = st.build_id, exit_code = code, aborted = ?aborted, "builder finished");
+    let (exit_code, error, outputs, extras) = if let Some(reason) = aborted {
+        (1, reason, vec![], vec![])
+    } else if code != 0 {
+        (
+            code,
+            sandbox::setup_error_detail(&st.spec).unwrap_or_default(),
+            vec![],
+            vec![],
+        )
+    } else {
+        // At least a few minutes to pack even if the build ate its budget.
+        let remaining = Duration::from_secs(st.deadline_unix.saturating_sub(unix_now()));
+        let deadline = Instant::now() + remaining.max(Duration::from_mins(10));
+        match tokio::runtime::Handle::current().block_on(pack_outputs_and_extras(
+            &dir,
+            &st.spec,
+            deadline,
+            signing_key,
+            &st.build_id,
+        )) {
+            Ok((o, e)) => (0, String::new(), o, e),
+            Err(e) => (1, format!("{e:#}"), vec![], vec![]),
+        }
+    };
+    sandbox::cleanup(&st.spec.outputs, &dir);
+    FinishedBuild {
+        exit_code,
+        error,
+        outputs,
+        extras,
+        dir,
+        finished_at: Instant::now(),
+    }
+}
+
 /// Kill a build's processes. killpg alone misses a builder that
 /// setsid()'d out of the group; the shim is outside the pidns, so its
 /// death does not tear it down. cgroup.kill (group-writable via
 /// sandboxd) reaches everything.
-pub(super) fn kill_build(pgrp: nix::unistd::Pid, cgroup: Option<&Path>) {
+fn kill_build(pgrp: nix::unistd::Pid, cgroup: Option<&Path>) {
     let _ = signal::killpg(pgrp, signal::Signal::SIGKILL);
     if let Some(cg) = cgroup {
         let _ = fs::write(cg.join("cgroup.kill"), "1");
@@ -667,7 +673,7 @@ async fn query_all_valid_paths() -> Result<BTreeSet<harmonia_store_path::StorePa
 
 /// Pack, hash and sign every output before announcing the result,
 /// because signatures travel in BuildResult ahead of the NAR data.
-pub(super) async fn pack_outputs(
+async fn pack_outputs(
     dir: &Path,
     spec: &sandbox::SandboxSpec,
     extra_candidates: &BTreeSet<harmonia_store_path::StorePath>,
