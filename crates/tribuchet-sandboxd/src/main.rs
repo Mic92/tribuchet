@@ -200,6 +200,6 @@ fn handle_purge(daemon: &Daemon, conn: &UnixStream, fds: Vec<std::os::fd::OwnedF
         st.st_mode & libc::S_IFMT == libc::S_IFDIR && st.st_uid == daemon.worker.uid.as_raw(),
         "purge target must be a worker-owned directory"
     );
-    lease::purge_tree(&dir, 0)?;
+    lease::purge_tree(&dir)?;
     sandbox_proto::send_reply(conn, &serde_json::json!({}), &[])
 }
