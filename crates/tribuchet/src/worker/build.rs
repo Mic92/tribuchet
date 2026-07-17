@@ -41,7 +41,7 @@ enum BuildOwner {
     Worker,
     #[cfg(target_os = "linux")]
     Leased {
-        lease: super::sandboxd::SandboxLease,
+        _lease: super::sandboxd::SandboxLease,
     },
 }
 
@@ -107,34 +107,13 @@ impl BuildOwner {
                 tracing::warn!("setting memory.max on the leased cgroup: {e}");
             }
             spec.cgroup = Some(lease.cgroup().to_path_buf());
-            Ok(Self::Leased { lease })
+            Ok(Self::Leased { _lease: lease })
         }
         #[cfg(not(target_os = "linux"))]
         {
             let _ = (ctx, build_id, prep, stage, spec);
             Ok(Self::Worker)
         }
-    }
-
-    /// Remove the leased-uid-owned files a build left on disk while
-    /// the lease is still held (see `sandbox::cleanup_leased`).
-    fn cleanup_disk(&self, spec: &sandbox::SandboxSpec) {
-        #[cfg(target_os = "linux")]
-        {
-            let Self::Leased { lease } = self;
-            // The whole top/ tree is leased-uid-owned (see lease()).
-            let top = spec
-                .build_dir
-                .parent()
-                .unwrap_or(&spec.build_dir)
-                .to_path_buf();
-            let paths = [spec.root.join("nix/store"), top];
-            if let Err(e) = sandbox::cleanup_leased(&lease.ns_path(), &paths) {
-                tracing::warn!("cleaning up leased build files: {e:#}");
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        let _ = spec;
     }
 }
 
@@ -494,7 +473,7 @@ impl ActiveBuild {
             .ctx
             .spawner
             .spawn(&mut req, &log_file, child_stdin.as_ref())?;
-        let owner = BuildOwner::lease(&self.ctx, &a.build_id, prep, pid, &mut spec)?;
+        let _owner = BuildOwner::lease(&self.ctx, &a.build_id, prep, pid, &mut spec)?;
         if let Some(w) = spec_w {
             sandbox::send_spec_to(&spec, w)?;
         }
@@ -559,7 +538,6 @@ impl ActiveBuild {
         tracing::info!(id = a.build_id, exit_code, "builder finished");
 
         if exit_code != 0 {
-            owner.cleanup_disk(&spec);
             // present on Linux when the sandbox setup stage failed
             let error = sandbox::setup_error_detail(&spec).unwrap_or_default();
             if !error.is_empty() {
@@ -582,8 +560,6 @@ impl ActiveBuild {
             signing_key,
             &a.build_id,
         ));
-        // packing reads the scratch store, so clean up only afterwards
-        owner.cleanup_disk(&spec);
         let (packed, extras) = packed?;
         Ok(FinishedBuild {
             exit_code: 0,

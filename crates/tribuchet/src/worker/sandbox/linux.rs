@@ -2,7 +2,6 @@
 
 use anyhow::{Context, Result};
 use nix::errno::Errno;
-use nix::fcntl::{self, AtFlags, OFlag};
 use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use nix::sched::{CloneFlags, unshare};
 use nix::sys::resource::{Resource, getrlimit, setrlimit};
@@ -12,7 +11,7 @@ use nix::sys::socket::{
 };
 use nix::sys::{prctl, stat, wait};
 use nix::unistd::{self, pivot_root, sethostname};
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::fs;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
@@ -872,115 +871,4 @@ pub fn setup_error_detail_impl(spec: &SandboxSpec) -> Option<String> {
 pub fn cleanup(_a: &BuildAssignment, _dir: &Path) {
     // Mounts lived in the child's namespace and died with it; the
     // build dir itself is removed by the caller.
-}
-
-pub const CLEANUP_STAGE_ARG: &str = "__lease_cleanup";
-
-/// Files a leased build wrote to disk (scratch store, /build) belong to
-/// leased uids the worker cannot delete. Re-exec this binary into the
-/// leased namespace as its root and remove them from there, while the
-/// lease still pins the namespace.
-pub fn cleanup_leased(userns: &Path, paths: &[PathBuf]) -> Result<()> {
-    let exe = std::env::current_exe().context("resolving worker binary path")?;
-    let status = Command::new(exe)
-        .arg(CLEANUP_STAGE_ARG)
-        .arg(userns)
-        .args(paths)
-        .status()
-        .context("spawning lease cleanup stage")?;
-    anyhow::ensure!(status.success(), "lease cleanup stage failed: {status}");
-    Ok(())
-}
-
-/// Entry point of the re-exec'd cleanup stage:
-/// `__lease_cleanup <userns> <path>...` removes the contents of each
-/// path.
-pub fn cleanup_stage() -> ! {
-    let code = match cleanup_stage_impl() {
-        Ok(()) => 0,
-        Err(e) => {
-            eprintln!("lease cleanup: {e:#}");
-            1
-        }
-    };
-    std::process::exit(code);
-}
-
-fn cleanup_stage_impl() -> Result<()> {
-    let mut args = std::env::args_os().skip(2);
-    let ns = args.next().context("missing userns path")?;
-    let ns = fs::File::open(Path::new(&ns)).context("opening leased userns")?;
-    nix::sched::setns(ns, CloneFlags::CLONE_NEWUSER).context("joining leased userns")?;
-    // Become in-ns root: it owns the leased uids' files and, unlike the
-    // unmapped worker uid, may delete them despite the sticky bit.
-    let (uid, gid) = (unistd::Uid::from_raw(0), unistd::Gid::from_raw(0));
-    unistd::setresgid(gid, gid, gid).context("setresgid")?;
-    unistd::setresuid(uid, uid, uid).context("setresuid")?;
-    // Entries the worker created (input mount points, output dirs)
-    // appear as the overflow uid here; leave them for the worker's own
-    // remove_dir_all.
-    let overflow_uid: u32 = fs::read_to_string("/proc/sys/kernel/overflowuid")
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(65534);
-    for dir in args {
-        let dir = PathBuf::from(dir);
-        // O_NOFOLLOW + fd-based descent below: the build controlled
-        // these trees, symlinks it planted must not redirect the
-        // deletion (or the chmod) outside them.
-        let fd = fcntl::open(
-            &dir,
-            OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_RDONLY | OFlag::O_CLOEXEC,
-            stat::Mode::empty(),
-        )
-        .with_context(|| format!("opening {}", dir.display()))?;
-        for name in dir_entry_names(&fd)? {
-            let st = stat::fstatat(&fd, name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW)?;
-            if st.st_uid == overflow_uid {
-                continue;
-            }
-            remove_at(&fd, &name).with_context(|| format!("under {}", dir.display()))?;
-        }
-    }
-    Ok(())
-}
-
-/// Directory entry names via an fd, collected before deletion mutates
-/// the directory.
-fn dir_entry_names(dirfd: &OwnedFd) -> Result<Vec<CString>> {
-    let mut names = Vec::new();
-    let mut dir = nix::dir::Dir::from_fd(dirfd.try_clone()?)?;
-    for entry in dir.iter() {
-        let name = entry?.file_name().to_owned();
-        if name.as_bytes() != b"." && name.as_bytes() != b".." {
-            names.push(name);
-        }
-    }
-    Ok(names)
-}
-
-/// unlinkat-based remove_dir_all that also handles read-only
-/// directories (store outputs are typically 0555) and never follows
-/// symlinks.
-fn remove_at(dirfd: &OwnedFd, name: &CStr) -> Result<()> {
-    match unistd::unlinkat(dirfd, name, unistd::UnlinkatFlags::NoRemoveDir) {
-        Ok(()) => return Ok(()),
-        Err(Errno::EISDIR) => {}
-        Err(e) => return Err(e).with_context(|| format!("removing {name:?}")),
-    }
-    let sub = fcntl::openat(
-        dirfd,
-        name,
-        OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_RDONLY | OFlag::O_CLOEXEC,
-        stat::Mode::empty(),
-    )
-    .with_context(|| format!("opening {name:?}"))?;
-    stat::fchmod(&sub, stat::Mode::from_bits_truncate(0o700))
-        .with_context(|| format!("unlocking {name:?}"))?;
-    for child in dir_entry_names(&sub)? {
-        remove_at(&sub, &child).with_context(|| format!("under {name:?}"))?;
-    }
-    unistd::unlinkat(dirfd, name, unistd::UnlinkatFlags::RemoveDir)
-        .with_context(|| format!("removing {name:?}"))?;
-    Ok(())
 }

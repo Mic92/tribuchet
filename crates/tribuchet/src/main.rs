@@ -60,10 +60,8 @@ fn main() -> anyhow::Result<()> {
     // Builds re-exec this binary as the sandbox setup stage; divert
     // before clap and tracing touch anything.
     #[cfg(target_os = "linux")]
-    match std::env::args().nth(1).as_deref() {
-        Some(worker::sandbox::SETUP_STAGE_ARG) => worker::sandbox::setup_stage(),
-        Some(worker::sandbox::CLEANUP_STAGE_ARG) => worker::sandbox::cleanup_stage(),
-        _ => {}
+    if std::env::args().nth(1).as_deref() == Some(worker::sandbox::SETUP_STAGE_ARG) {
+        worker::sandbox::setup_stage();
     }
     tracing_subscriber::fmt()
         .with_env_filter(

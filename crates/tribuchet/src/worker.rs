@@ -148,8 +148,8 @@ impl WorkerCtx {
         }
     }
 
-    /// Remove a build dir that may hold leased-uid files (adopted or
-    /// stale builds have no lease/userns to `cleanup_leased` through).
+    /// Remove a build dir. Leased-uid files (from any Linux build,
+    /// fresh or adopted) are handled via a sandboxd Purge.
     pub(super) fn remove_build_dir(&self, dir: &Path) {
         if fs::remove_dir_all(dir).is_ok() {
             return;
