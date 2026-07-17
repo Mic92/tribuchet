@@ -5,7 +5,6 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -88,7 +87,7 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>, signing_key: &Arc<SecretK
                 log_tail: None,
             },
         );
-        ctx.running.fetch_add(1, atomic::Ordering::Relaxed);
+        let permit = ctx.slots.clone().try_acquire_owned().ok();
         let task_ctx = ctx.clone();
         let signing_key = signing_key.clone();
         tokio::task::spawn_blocking(move || {
@@ -97,7 +96,7 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>, signing_key: &Arc<SecretK
             let fin = supervise_adopted(&ctx, &st, dir, &signing_key);
             // Roots live until the outputs are packed.
             drop(gc_roots);
-            ctx.release_job_slot();
+            drop(permit);
             record_finished(&ctx, &key, fin);
         });
     }

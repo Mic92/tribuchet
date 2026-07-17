@@ -171,6 +171,8 @@ pub(super) struct ActiveBuild {
     pub(super) assignment: BuildAssignment,
     pub(super) dir: PathBuf, // state_dir/builds/<id>
     pub(super) ctx: Arc<WorkerCtx>,
+    /// Job slot; drops back to `WorkerCtx::slots` with the build.
+    pub(super) permit: Option<tokio::sync::OwnedSemaphorePermit>,
     /// Input store paths available in /nix/store (bind-mount sources).
     inputs: Vec<String>,
     /// Paths reported missing, waiting for PathInfo + NAR. The value
@@ -221,6 +223,7 @@ impl ActiveBuild {
             assignment,
             dir,
             ctx,
+            permit: None,
             inputs: Vec::new(),
             pending: HashMap::new(),
             daemon: None,
