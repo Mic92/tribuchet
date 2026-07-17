@@ -52,6 +52,35 @@ pub fn parse_path_info(
     })
 }
 
+/// Iterative DFS post-order over `roots`: references before referrers.
+/// `refs_of` returns only edges within the node set. Cycle-safe.
+pub fn topo_order<K, I, F>(roots: I, mut refs_of: F) -> Vec<K>
+where
+    K: Eq + std::hash::Hash + Clone,
+    I: IntoIterator<Item = K>,
+    F: FnMut(&K) -> Vec<K>,
+{
+    let mut order = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut stack: Vec<(K, bool)> = Vec::new();
+    for root in roots {
+        stack.push((root, false));
+        while let Some((k, emit)) = stack.pop() {
+            if emit {
+                order.push(k);
+            } else if seen.insert(k.clone()) {
+                stack.push((k.clone(), true));
+                for r in refs_of(&k) {
+                    if !seen.contains(&r) {
+                        stack.push((r, false));
+                    }
+                }
+            }
+        }
+    }
+    order
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

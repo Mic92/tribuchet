@@ -253,41 +253,24 @@ pub(super) async fn recv(
 /// case for build requests -- would be invisible and concurrent
 /// checkpoints could yield torn reads. The daemon answers from its
 /// own consistent view.
-/// Topologically order path infos (references before referrers) via DFS
-/// post-order. Tolerates self-references and cycles.
+/// References before referrers; tolerates self-refs and cycles.
 fn order_by_references(infos: Vec<PathInfoMsg>) -> Vec<PathInfoMsg> {
-    use std::collections::HashMap;
     let roots: Vec<String> = infos.iter().map(|i| i.store_path.clone()).collect();
     let mut nodes: HashMap<String, PathInfoMsg> = infos
         .into_iter()
         .map(|i| (i.store_path.clone(), i))
         .collect();
-    let mut order = Vec::with_capacity(roots.len());
-    let mut visited: HashSet<String> = HashSet::new();
-    for root in &roots {
-        let mut stack = vec![(root.clone(), false)];
-        while let Some((path, emit)) = stack.pop() {
-            if emit {
-                order.push(path);
-                continue;
-            }
-            if !visited.insert(path.clone()) {
-                continue;
-            }
-            stack.push((path.clone(), true));
-            if let Some(info) = nodes.get(&path) {
-                for r in &info.references {
-                    if !visited.contains(r) && nodes.contains_key(r) {
-                        stack.push((r.clone(), false));
-                    }
-                }
-            }
-        }
-    }
-    order
-        .into_iter()
-        .map(|p| nodes.remove(&p).unwrap())
-        .collect()
+    crate::store::topo_order(roots, |p| {
+        nodes[p]
+            .references
+            .iter()
+            .filter(|r| nodes.contains_key(*r))
+            .cloned()
+            .collect()
+    })
+    .into_iter()
+    .map(|p| nodes.remove(&p).unwrap())
+    .collect()
 }
 
 /// Per-path query info from one daemon connection, for a slice of paths.

@@ -26,7 +26,7 @@ use super::{DaemonConn, WorkerCtx, reaper, sandbox, unix_now};
 use crate::chunkio::ChannelReader;
 use crate::nar;
 use crate::proto::{BuildAssignment, NarTransfer, PathInfoMsg, WorkerMessage, nar_transfer};
-use crate::store::{STORE_DIR, parse_path_info, valid_store_path};
+use crate::store::{STORE_DIR, parse_path_info, topo_order, valid_store_path};
 
 /// Credentials backing one build's sandbox.
 ///
@@ -790,8 +790,20 @@ async fn pack_extras(
         infos.insert(path, info);
     }
     // Referenced-before-referrer, matching hub-side sequential import.
+    let ordered = topo_order(infos.keys().cloned(), |p| {
+        infos[p]
+            .references
+            .iter()
+            .map(|r| {
+                r.to_absolute_path(&store_dir)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|r| infos.contains_key(r))
+            .collect()
+    });
     let mut out = Vec::with_capacity(infos.len());
-    for path in order_extras(&infos, &store_dir) {
+    for path in ordered {
         let info = infos.remove(&path).unwrap();
         let sp = StorePath::from_base_path(store_base(&path))?;
         let mut candidates: BTreeSet<StorePath> = info.references.iter().cloned().collect();
@@ -843,33 +855,6 @@ async fn pack_extras(
         });
     }
     Ok(out)
-}
-
-/// DFS post-order over the extras' inter-references.
-fn order_extras(
-    infos: &HashMap<String, UnkeyedValidPathInfo>,
-    store_dir: &StoreDir,
-) -> Vec<String> {
-    let mut order = Vec::with_capacity(infos.len());
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-    let mut stack: Vec<(String, bool)> = infos.keys().map(|p| (p.clone(), false)).collect();
-    while let Some((path, emit)) = stack.pop() {
-        if emit {
-            order.push(path);
-            continue;
-        }
-        if !seen.insert(path.clone()) {
-            continue;
-        }
-        stack.push((path.clone(), true));
-        for r in &infos[&path].references {
-            let r = r.to_absolute_path(store_dir).to_string_lossy().into_owned();
-            if infos.contains_key(&r) {
-                stack.push((r, false));
-            }
-        }
-    }
-    order
 }
 
 struct NarPackResult {
