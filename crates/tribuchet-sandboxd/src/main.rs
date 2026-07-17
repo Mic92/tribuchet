@@ -19,7 +19,7 @@ use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use nix::sys::socket::{UnixCredentials, getsockopt, sockopt::PeerCredentials};
 use nix::unistd::{Gid, Pid, Uid, User};
-use sandbox_proto::{AllocateReply, AllocateRequest, METHOD_ALLOCATE};
+use sandbox_proto::{AllocateReply, AllocateRequest, METHOD_ALLOCATE, METHOD_PURGE};
 
 #[derive(Parser)]
 struct Args {
@@ -101,8 +101,23 @@ fn handle(daemon: &Daemon, conn: &UnixStream) -> Result<()> {
         daemon.worker.uid
     );
 
-    let (method, request, fds): (_, AllocateRequest, _) = sandbox_proto::recv_call(conn)?;
-    ensure!(method == METHOD_ALLOCATE, "unknown method {method}");
+    let (method, params, fds): (_, serde_json::Value, _) = sandbox_proto::recv_call(conn)?;
+    match method.as_str() {
+        METHOD_ALLOCATE => {
+            handle_allocate(daemon, conn, peer, serde_json::from_value(params)?, fds)
+        }
+        METHOD_PURGE => handle_purge(daemon, conn, fds),
+        m => anyhow::bail!("unknown method {m}"),
+    }
+}
+
+fn handle_allocate(
+    daemon: &Daemon,
+    conn: &UnixStream,
+    peer: UnixCredentials,
+    request: AllocateRequest,
+    fds: Vec<std::os::fd::OwnedFd>,
+) -> Result<()> {
     ensure!(
         matches!(request.uid_count, 1 | 65536),
         "uid_count must be 1 or 65536"
@@ -138,12 +153,19 @@ fn handle(daemon: &Daemon, conn: &UnixStream) -> Result<()> {
             base,
             daemon.worker.gid.as_raw(),
         )?;
-        lease::enter_cgroup(&cgroup, stage_fd.as_fd(), daemon.worker.uid)?;
-        sandbox_proto::send_reply(
-            conn,
-            &AllocateReply { pool_base: base },
-            &[cgroup.dir.as_raw_fd()],
-        )?;
+        // From here the cgroup exists on disk; remove it on any early exit.
+        let setup = (|| {
+            lease::enter_cgroup(&cgroup, stage_fd.as_fd(), daemon.worker.uid)?;
+            sandbox_proto::send_reply(
+                conn,
+                &AllocateReply { pool_base: base },
+                &[cgroup.dir.as_raw_fd()],
+            )
+        })();
+        if let Err(e) = setup {
+            let _ = lease::destroy_cgroup(&cgroup);
+            return Err(e);
+        }
         tracing::info!(
             build = request.build_id,
             base,
@@ -168,4 +190,16 @@ fn handle(daemon: &Daemon, conn: &UnixStream) -> Result<()> {
         daemon.pool.lock().unwrap().release(base);
     }
     result
+}
+
+fn handle_purge(daemon: &Daemon, conn: &UnixStream, fds: Vec<std::os::fd::OwnedFd>) -> Result<()> {
+    let mut fds = fds.into_iter();
+    let dir = fds.next().context("missing directory fd")?;
+    let st = nix::sys::stat::fstat(&dir)?;
+    ensure!(
+        st.st_mode & libc::S_IFMT == libc::S_IFDIR && st.st_uid == daemon.worker.uid.as_raw(),
+        "purge target must be a worker-owned directory"
+    );
+    lease::purge_tree(&dir)?;
+    sandbox_proto::send_reply(conn, &serde_json::json!({}), &[])
 }

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use harmonia_utils_signature::{PublicKey, Signature};
 use nix::{dir, fcntl};
 use sha2::{Digest, Sha256};
@@ -253,41 +253,24 @@ pub(super) async fn recv(
 /// case for build requests -- would be invisible and concurrent
 /// checkpoints could yield torn reads. The daemon answers from its
 /// own consistent view.
-/// Topologically order path infos (references before referrers) via DFS
-/// post-order. Tolerates self-references and cycles.
+/// References before referrers; tolerates self-refs and cycles.
 fn order_by_references(infos: Vec<PathInfoMsg>) -> Vec<PathInfoMsg> {
-    use std::collections::HashMap;
     let roots: Vec<String> = infos.iter().map(|i| i.store_path.clone()).collect();
     let mut nodes: HashMap<String, PathInfoMsg> = infos
         .into_iter()
         .map(|i| (i.store_path.clone(), i))
         .collect();
-    let mut order = Vec::with_capacity(roots.len());
-    let mut visited: HashSet<String> = HashSet::new();
-    for root in &roots {
-        let mut stack = vec![(root.clone(), false)];
-        while let Some((path, emit)) = stack.pop() {
-            if emit {
-                order.push(path);
-                continue;
-            }
-            if !visited.insert(path.clone()) {
-                continue;
-            }
-            stack.push((path.clone(), true));
-            if let Some(info) = nodes.get(&path) {
-                for r in &info.references {
-                    if !visited.contains(r) && nodes.contains_key(r) {
-                        stack.push((r.clone(), false));
-                    }
-                }
-            }
-        }
-    }
-    order
-        .into_iter()
-        .map(|p| nodes.remove(&p).unwrap())
-        .collect()
+    crate::store::topo_order(roots, |p| {
+        nodes[p]
+            .references
+            .iter()
+            .filter(|r| nodes.contains_key(*r))
+            .cloned()
+            .collect()
+    })
+    .into_iter()
+    .map(|p| nodes.remove(&p).unwrap())
+    .collect()
 }
 
 /// Per-path query info from one daemon connection, for a slice of paths.
@@ -429,7 +412,7 @@ async fn stream_tmp_dir(
         let mut tar = tar::Builder::new(enc);
         // Walk the directory through the fd validated at submission
         // time, not by re-resolving the client-controlled path.
-        append_dir_fd(&mut tar, &top_tmp_dir, Path::new(""))?;
+        append_dir_fd(&mut tar, &top_tmp_dir, Path::new(""), 0)?;
         tar.into_inner()?.finish()?.flush()?;
         Ok(())
     });
@@ -466,7 +449,11 @@ fn append_dir_fd<W: io::Write>(
     tar: &mut tar::Builder<W>,
     dir: &fs::File,
     prefix: &Path,
+    depth: u32,
 ) -> Result<()> {
+    // Bound recursion so a client-crafted deep tree cannot overflow
+    // the spawn_blocking stack and abort the hub.
+    ensure!(depth < 128, "topTmpDir nesting too deep");
     use std::os::fd::AsFd;
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::MetadataExt;
@@ -529,7 +516,7 @@ fn append_dir_fd<W: io::Write>(
             h.set_entry_type(tar::EntryType::Directory);
             h.set_size(0);
             tar.append_data(&mut h, &in_tar, io::empty())?;
-            append_dir_fd(tar, &fd, &in_tar)?;
+            append_dir_fd(tar, &fd, &in_tar, depth + 1)?;
         } else if meta.is_file() {
             h.set_entry_type(tar::EntryType::Regular);
             h.set_size(meta.len());
@@ -727,8 +714,11 @@ async fn relay_extra_chunk(
     if let Some(nar_transfer::Payload::ZstdNarChunk(chunk)) = n.payload
         && extra.tx.send(chunk.into()).await.is_err()
     {
+        // rx closed does not imply failure: the import reads via
+        // take(nar_size) and drops rx once done.
         let extra = extras.remove(&n.store_path).unwrap();
-        return Err(extra.task.await?.unwrap_err());
+        extra.task.await??;
+        bail!("excess extra chunks for {}", n.store_path);
     }
     if n.eof {
         let extra = extras.remove(&n.store_path).unwrap();

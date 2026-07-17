@@ -13,28 +13,41 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use sandbox_proto::{AllocateReply, AllocateRequest, METHOD_ALLOCATE};
+use sandbox_proto::{AllocateReply, AllocateRequest, METHOD_ALLOCATE, METHOD_PURGE, PurgeRequest};
 
 pub use sandbox_proto::SOCKET_PATH;
+
+/// Ask sandboxd (root) to empty a worker-owned dir of leased-uid files.
+pub fn purge(socket: &Path, dir: &Path) -> Result<()> {
+    let fd = nix::fcntl::open(
+        dir,
+        nix::fcntl::OFlag::O_DIRECTORY
+            | nix::fcntl::OFlag::O_NOFOLLOW
+            | nix::fcntl::OFlag::O_RDONLY
+            | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )
+    .with_context(|| format!("opening {}", dir.display()))?;
+    let conn = UnixStream::connect(socket)
+        .with_context(|| format!("connecting to sandboxd at {}", socket.display()))?;
+    sandbox_proto::send_call(&conn, METHOD_PURGE, &PurgeRequest {}, &[fd.as_raw_fd()])?;
+    let (_, _): (serde_json::Value, _) = sandbox_proto::recv_reply(&conn)?;
+    Ok(())
+}
 
 /// One leased sandbox: a mapped user namespace and its build cgroup.
 #[derive(Debug)]
 pub struct SandboxLease {
     /// Held open for the lease lifetime.
     _conn: UnixStream,
-    userns: OwnedFd,
+    /// Keeps /proc/self/fd/N valid until the setup stage has setns()'d.
+    _userns: OwnedFd,
     cgroup: PathBuf,
     /// First host uid of the leased block (backs in-ns uid 0).
     pub pool_base: u32,
 }
 
 impl SandboxLease {
-    /// Path under which other processes of this user (the reaper-spawned
-    /// sandbox setup stage) can open and setns() into the namespace.
-    pub fn ns_path(&self) -> PathBuf {
-        ns_path(&self.userns)
-    }
-
     /// The delegated per-build cgroup directory.
     pub fn cgroup(&self) -> &Path {
         &self.cgroup
@@ -111,7 +124,7 @@ impl SandboxPrep {
             .context("resolving the leased cgroup path")?;
         Ok(SandboxLease {
             _conn: conn,
-            userns: self.userns,
+            _userns: self.userns,
             cgroup,
             pool_base: reply.pool_base,
         })
@@ -237,7 +250,6 @@ mod tests {
             .unwrap();
         assert_eq!(lease.pool_base, 3_000_000);
         assert_eq!(lease.cgroup(), Path::new("/tmp"));
-        assert!(lease.ns_path().exists());
         drop(lease);
         server.join().unwrap();
     }

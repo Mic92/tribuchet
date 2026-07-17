@@ -24,14 +24,13 @@ mod sandboxd;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use harmonia_store_remote::DaemonClient;
 use harmonia_utils_signature::SecretKey;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
@@ -66,8 +65,9 @@ struct WorkerCtx {
     /// Files a build must never read even where DAC would allow it
     /// (macOS Seatbelt deny rules; Linux relies on the mount namespace).
     secret_paths: Vec<PathBuf>,
-    /// Builds currently executing, reported in heartbeats.
-    running: atomic::AtomicU32,
+    /// One permit per concurrent build; the session loop turns free
+    /// permits into RequestJob credits.
+    slots: Arc<Semaphore>,
     /// dedupe_key -> build past staging; survives session loss so a
     /// replacement hub can resume instead of rebuilding.
     resumable: Mutex<HashMap<String, ResumableBuild>>,
@@ -133,6 +133,23 @@ impl WorkerCtx {
         None
     }
 
+    /// Remove a build dir. Leased-uid files (from any Linux build,
+    /// fresh or adopted) are handled via a sandboxd Purge.
+    pub(super) fn remove_build_dir(&self, dir: &Path) {
+        if fs::remove_dir_all(dir).is_ok() {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(sock) = &self.sandboxd
+            && let Err(e) = sandboxd::purge(sock, dir)
+        {
+            tracing::warn!("sandboxd purge {}: {e:#}", dir.display());
+        }
+        if let Err(e) = fs::remove_dir_all(dir) {
+            tracing::warn!("cleaning up {}: {e}", dir.display());
+        }
+    }
+
     fn resumable_keys(&self) -> Vec<String> {
         self.resumable.lock().unwrap().keys().cloned().collect()
     }
@@ -155,7 +172,7 @@ impl WorkerCtx {
                     // An earlier resume's tailer feeds a dead session.
                     // Only flag it (no join): it may be waiting on the
                     // registry lock held right here.
-                    t.done.store(true, atomic::Ordering::Relaxed);
+                    t.done.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 e.log_tail = Some(spawn_log_tail(
                     self.clone(),
@@ -328,7 +345,7 @@ async fn run_async(opts: WorkerConfig, spawner: reaper::Spawner) -> Result<()> {
         sandbox_bin_sh: opts.sandbox_bin_sh.clone(),
         build_memory_max: opts.build_memory_max_bytes,
         secret_paths: vec![opts.key.clone(), opts.state_dir.join("signing.key")],
-        running: atomic::AtomicU32::new(0),
+        slots: Arc::new(Semaphore::new(opts.max_jobs.max(1) as usize)),
         cancelled: Mutex::new(HashSet::new()),
         resumable: Mutex::new(HashMap::new()),
         emulators,
@@ -432,40 +449,11 @@ async fn session(
         })))
         .await?;
 
-    let heartbeat_tx = out_tx.clone();
-    let heartbeat_ctx = ctx.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
-        loop {
-            interval.tick().await;
-            if heartbeat_tx
-                .send(msg(worker_message::Msg::Heartbeat(Heartbeat {
-                    running_jobs: heartbeat_ctx.running.load(atomic::Ordering::Relaxed),
-                    load1: loadavg1(),
-                })))
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
-    });
-
     let mut inbound = client
         .session(ReceiverStream::new(out_rx))
         .await?
         .into_inner();
     tracing::info!(hub = opts.hub, systems = ?opts.systems, "connected to hub");
-
-    // One outstanding RequestJob per *free* slot; occupied slots
-    // (adopted or running across a reconnect) are re-dispatched
-    // credit-free and must not be funded again. Sent only now that
-    // session() drains the channel: priming past its capacity first
-    // would deadlock the handshake.
-    let occupied = u64::from(ctx.running.load(atomic::Ordering::Relaxed));
-    for _ in 0..u64::from(opts.max_jobs.max(1)).saturating_sub(occupied) {
-        out_tx.send(request_job()).await?;
-    }
 
     let mut active: HashMap<String, ActiveBuild> = HashMap::new();
     let result = session_loop(
@@ -475,6 +463,7 @@ async fn session(
         signing_key,
         ctx,
         Duration::from_secs(opts.build_timeout_secs),
+        opts.max_jobs.max(1),
     )
     .await;
     // Builds still staging when the session dies must not keep their
@@ -492,8 +481,31 @@ async fn session_loop(
     signing_key: &Arc<SecretKey>,
     ctx: &Arc<WorkerCtx>,
     build_timeout: Duration,
+    max_jobs: u32,
 ) -> Result<()> {
-    while let Some(m) = inbound.message().await? {
+    // Permits already funded to the hub but not yet assigned back.
+    let mut pending = Vec::new();
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+    loop {
+        let m = tokio::select! {
+            permit = ctx.slots.clone().acquire_owned() => {
+                pending.push(permit.expect("slots never closed"));
+                out_tx.send(request_job()).await?;
+                continue;
+            }
+            _ = heartbeat.tick() => {
+                let occupied = max_jobs as usize - ctx.slots.available_permits();
+                let running = occupied.saturating_sub(pending.len() + active.len());
+                out_tx.send(msg(worker_message::Msg::Heartbeat(Heartbeat {
+                    running_jobs: running as u32,
+                    load1: loadavg1(),
+                }))).await?;
+                continue;
+            }
+            m = inbound.message() => {
+                m?.ok_or_else(|| anyhow::anyhow!("hub closed the session"))?
+            }
+        };
         let Some(m) = m.msg else { continue };
         match m {
             hub_message::Msg::Assignment(a) => {
@@ -513,6 +525,9 @@ async fn session_loop(
                     tokio::task::spawn_blocking(move || try_deliver(&ctx, &a.dedupe_key));
                     continue;
                 }
+                // Resumed assignments are credit-free on the hub, so
+                // never funded a permit into `pending`.
+                let permit = pending.pop();
                 tracing::info!(id = a.build_id, "build assigned");
                 // build ids are never reused; a duplicate is a confused hub
                 if let Some(old) = active.remove(&a.build_id) {
@@ -521,7 +536,8 @@ async fn session_loop(
                 }
                 let build_id = a.build_id.clone();
                 match validate_assignment(&a).and_then(|()| ActiveBuild::new(a, ctx.clone())) {
-                    Ok(b) => {
+                    Ok(mut b) => {
+                        b.permit = permit;
                         active.insert(build_id, b);
                     }
                     Err(e) => fail_build(out_tx, &build_id, &e).await?,
@@ -601,7 +617,6 @@ async fn session_loop(
             }
         }
     }
-    bail!("hub closed the session");
 }
 
 /// Register a fully-staged build as resumable and run it on a blocking
@@ -630,14 +645,10 @@ fn launch_build(
             log_tail: None,
         },
     );
-    ctx.running.fetch_add(1, atomic::Ordering::Relaxed);
     tokio::task::spawn_blocking(move || {
         let fin = execute_to_finished(&build, &out_tx, &signing_key, build_timeout);
-        build.teardown();
         drop(build);
-        ctx.running.fetch_sub(1, atomic::Ordering::Relaxed);
         record_finished(&ctx, &key, fin);
-        let _ = out_tx.blocking_send(request_job());
     });
 }
 
@@ -669,10 +680,6 @@ async fn fail_build(
             extras: vec![],
             error: format!("{err:#}"),
         })))
-        .await
-        .map_err(|_| anyhow::anyhow!("hub connection lost"))?;
-    out_tx
-        .send(request_job())
         .await
         .map_err(|_| anyhow::anyhow!("hub connection lost"))
 }

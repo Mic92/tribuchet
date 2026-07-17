@@ -1,28 +1,24 @@
 //! Resumable builds: adoption across worker generations, result persistence and delivery.
 
-use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use harmonia_store_path::StoreDir;
 use harmonia_store_remote::{DaemonClient, DaemonStore};
 use harmonia_utils_signature::SecretKey;
-use nix::sys::signal;
 use tokio::sync::mpsc;
 
-use super::build::{ActiveBuild, pack_outputs};
+use super::build::{ActiveBuild, supervise};
 use super::logtail::LogTail;
-use super::{DaemonConn, WorkerCtx, msg, reaper, sandbox, unix_now};
+use super::{DaemonConn, WorkerCtx, msg, reaper, sandbox};
 use crate::chunkio::CHUNK_SIZE;
-use crate::fsutil::remove_path_all;
 use crate::proto::{
-    BuildAssignment, BuildResult, ExtraPath, NarTransfer, OutputSignature, PathInfoMsg,
-    WorkerMessage, nar_transfer, worker_message,
+    BuildResult, ExtraPath, NarTransfer, OutputSignature, PathInfoMsg, WorkerMessage, nar_transfer,
+    worker_message,
 };
 
 /// Pick up builds a previous worker generation left behind: still
@@ -37,7 +33,7 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>, signing_key: &Arc<SecretK
         let dir = entry.path();
         if let Ok(s) = fs::read_to_string(dir.join("finished.json")) {
             let Ok(f) = serde_json::from_str::<FinishedState>(&s) else {
-                remove_path_all(&dir);
+                ctx.remove_build_dir(&dir);
                 continue;
             };
             tracing::info!(id = f.build_id, "adopted finished build awaiting delivery");
@@ -69,7 +65,7 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>, signing_key: &Arc<SecretK
             // Different reaper: the pid is meaningless and the build
             // died with the old unit; the client will resubmit.
             _ => {
-                remove_path_all(&dir);
+                ctx.remove_build_dir(&dir);
                 continue;
             }
         };
@@ -89,16 +85,16 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>, signing_key: &Arc<SecretK
                 log_tail: None,
             },
         );
-        ctx.running.fetch_add(1, atomic::Ordering::Relaxed);
+        let permit = ctx.slots.clone().try_acquire_owned().ok();
         let task_ctx = ctx.clone();
         let signing_key = signing_key.clone();
         tokio::task::spawn_blocking(move || {
             let ctx = task_ctx;
             let key = st.dedupe_key.clone();
-            let fin = supervise_adopted(&ctx, &st, dir, &signing_key);
+            let fin = supervise(&ctx, &st, dir, &signing_key);
             // Roots live until the outputs are packed.
             drop(gc_roots);
-            ctx.running.fetch_sub(1, atomic::Ordering::Relaxed);
+            drop(permit);
             record_finished(&ctx, &key, fin);
         });
     }
@@ -116,106 +112,15 @@ async fn re_root_inputs(spec: &sandbox::SandboxSpec) -> Option<DaemonConn> {
             return None;
         }
     };
-    for (src, _) in &spec.binds_ro {
-        // non-store binds (e.g. the static /bin/sh) need no root
-        let Some(sp) = src.to_str().and_then(|p| store_dir.parse(p).ok()) else {
+    for path in &spec.store_inputs {
+        let Ok(sp) = store_dir.parse(path) else {
             continue;
         };
         if let Err(e) = daemon.add_temp_root(&sp).await {
-            tracing::warn!(path = %src.display(), "re-adding GC root: {e:#}");
+            tracing::warn!(path, "re-adding GC root: {e:#}");
         }
     }
     Some(daemon)
-}
-
-/// Wait out a re-adopted build and pack its outputs, mirroring the
-/// tail end of execute(). Logs are streamed by the tailer that
-/// adopt_assignment starts once a session re-dispatches the build.
-fn supervise_adopted(
-    ctx: &Arc<WorkerCtx>,
-    st: &ResumeState,
-    dir: PathBuf,
-    signing_key: &SecretKey,
-) -> FinishedBuild {
-    let pgrp = nix::unistd::Pid::from_raw(st.pid);
-    let mut aborted: Option<String> = None;
-    let log_path = dir.join("build.log");
-    // Set when the build process is gone but no status file appears: a
-    // previous generation may have consumed the status (take_status
-    // deletes it on read) and died before recording the result. Waiting
-    // forever would leak the slot and the supervising thread.
-    let mut gone_since: Option<Instant> = None;
-    let code = loop {
-        if let Some(code) = reaper::take_status(&ctx.status_dir, &st.status_token) {
-            break code;
-        }
-        if signal::kill(pgrp, None).is_err() {
-            let since = gone_since.get_or_insert_with(Instant::now);
-            // a couple of reaper sweeps of grace for a status file
-            // that is still on its way
-            if since.elapsed() > Duration::from_secs(5) {
-                aborted.get_or_insert_with(|| {
-                    "build exit status was lost during a worker handover".into()
-                });
-                break 1;
-            }
-        } else {
-            gone_since = None;
-        }
-        if aborted.is_none() {
-            let timed_out = (unix_now() >= st.deadline_unix).then(|| "build timed out".to_string());
-            aborted = ctx.abort_reason(&st.dedupe_key, &log_path, timed_out);
-            if aborted.is_some() {
-                let _ = signal::killpg(pgrp, signal::Signal::SIGKILL);
-            }
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    };
-    let _ = signal::killpg(pgrp, signal::Signal::SIGKILL);
-    let synth = BuildAssignment {
-        build_id: st.build_id.clone(),
-        outputs: st.outputs.clone(),
-        ..Default::default()
-    };
-    sandbox::cleanup(&synth, &dir);
-    let (exit_code, error, outputs) = if let Some(reason) = aborted {
-        (1, reason, vec![])
-    } else if code != 0 {
-        (
-            code,
-            sandbox::setup_error_detail(&st.spec).unwrap_or_default(),
-            vec![],
-        )
-    } else {
-        // Fresh deadline: the build's own one bounded execution; this
-        // one only stops packing a pathological (e.g. sparse-file)
-        // output from running away.
-        let deadline = Instant::now() + Duration::from_mins(10);
-        // Resume path: skip the recursive-nix candidate widening.
-        // The daemon was queried on the original execute(); a
-        // worker-handover replay re-scans against inputs+outputs only,
-        // accepting that closure-delta extras from a resumed build
-        // miss any cross-references between added paths.
-        let extra_candidates = std::collections::BTreeSet::new();
-        match tokio::runtime::Handle::current().block_on(pack_outputs(
-            &dir,
-            &st.spec,
-            &extra_candidates,
-            deadline,
-            signing_key,
-        )) {
-            Ok(outputs) => (0, String::new(), outputs),
-            Err(e) => (1, format!("{e:#}"), vec![]),
-        }
-    };
-    FinishedBuild {
-        exit_code,
-        error,
-        outputs,
-        extras: Vec::new(),
-        dir,
-        finished_at: Instant::now(),
-    }
 }
 
 /// Forget finished builds nobody resumed. Without a client
@@ -238,7 +143,7 @@ pub(super) fn spawn_resumable_reaper(ctx: Arc<WorkerCtx>) {
                 });
             }
             for (key, dir) in expired {
-                let _ = fs::remove_dir_all(&dir);
+                ctx.remove_build_dir(&dir);
                 tracing::warn!(
                     key,
                     "dropping undelivered build result (no resume within TTL)"
@@ -327,8 +232,6 @@ pub(super) struct ResumeState {
     /// Status-file name the reaper records the exit code under.
     pub(super) status_token: String,
     pub(super) spec: sandbox::SandboxSpec,
-    /// Assignment outputs (name -> scratch path), for cleanup.
-    pub(super) outputs: HashMap<String, String>,
     pub(super) deadline_unix: u64,
 }
 
@@ -501,9 +404,7 @@ pub(super) fn ack_delivery(ctx: &Arc<WorkerCtx>, key: &str, build_id: &str) {
         }
     };
     if let Some(e) = removed {
-        if let Err(err) = fs::remove_dir_all(&e.dir) {
-            tracing::warn!("cleaning up {}: {err}", e.dir.display());
-        }
+        ctx.remove_build_dir(&e.dir);
         tracing::info!(id = build_id, "build result acknowledged");
     }
 }

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use harmonia_store_path::{StoreDir, StorePath, StorePathSet};
-use harmonia_store_path_info::ValidPathInfo;
+use harmonia_store_path_info::{UnkeyedValidPathInfo, ValidPathInfo};
 use harmonia_store_remote::{DaemonClient, DaemonStore};
 use harmonia_utils_signature::SecretKey;
 use nix::fcntl;
@@ -26,7 +26,7 @@ use super::{DaemonConn, WorkerCtx, reaper, sandbox, unix_now};
 use crate::chunkio::ChannelReader;
 use crate::nar;
 use crate::proto::{BuildAssignment, NarTransfer, PathInfoMsg, WorkerMessage, nar_transfer};
-use crate::store::{STORE_DIR, parse_path_info, valid_store_path};
+use crate::store::{STORE_DIR, parse_path_info, topo_order, valid_store_path};
 
 /// Credentials backing one build's sandbox.
 ///
@@ -41,7 +41,7 @@ enum BuildOwner {
     Worker,
     #[cfg(target_os = "linux")]
     Leased {
-        lease: super::sandboxd::SandboxLease,
+        _lease: super::sandboxd::SandboxLease,
     },
 }
 
@@ -107,34 +107,13 @@ impl BuildOwner {
                 tracing::warn!("setting memory.max on the leased cgroup: {e}");
             }
             spec.cgroup = Some(lease.cgroup().to_path_buf());
-            Ok(Self::Leased { lease })
+            Ok(Self::Leased { _lease: lease })
         }
         #[cfg(not(target_os = "linux"))]
         {
             let _ = (ctx, build_id, prep, stage, spec);
             Ok(Self::Worker)
         }
-    }
-
-    /// Remove the leased-uid-owned files a build left on disk while
-    /// the lease is still held (see `sandbox::cleanup_leased`).
-    fn cleanup_disk(&self, spec: &sandbox::SandboxSpec) {
-        #[cfg(target_os = "linux")]
-        {
-            let Self::Leased { lease } = self;
-            // The whole top/ tree is leased-uid-owned (see lease()).
-            let top = spec
-                .build_dir
-                .parent()
-                .unwrap_or(&spec.build_dir)
-                .to_path_buf();
-            let paths = [spec.root.join("nix/store"), top];
-            if let Err(e) = sandbox::cleanup_leased(&lease.ns_path(), &paths) {
-                tracing::warn!("cleaning up leased build files: {e:#}");
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        let _ = spec;
     }
 }
 
@@ -192,6 +171,8 @@ pub(super) struct ActiveBuild {
     pub(super) assignment: BuildAssignment,
     pub(super) dir: PathBuf, // state_dir/builds/<id>
     pub(super) ctx: Arc<WorkerCtx>,
+    /// Job slot; drops back to `WorkerCtx::slots` with the build.
+    pub(super) permit: Option<tokio::sync::OwnedSemaphorePermit>,
     /// Input store paths available in /nix/store (bind-mount sources).
     inputs: Vec<String>,
     /// Paths reported missing, waiting for PathInfo + NAR. The value
@@ -242,6 +223,7 @@ impl ActiveBuild {
             assignment,
             dir,
             ctx,
+            permit: None,
             inputs: Vec::new(),
             pending: HashMap::new(),
             daemon: None,
@@ -483,18 +465,16 @@ impl ActiveBuild {
         // until the spec is sent below, so nothing runs before leasing.
         let prep = BuildOwner::prepare(a)?;
         let mut spec = self.build_spec(&prep)?;
-        let deadline = Instant::now() + timeout;
         // Logs go through a file in the build dir, not pipes: capture
         // is decoupled from this process's lifetime, so a later worker
         // generation can resume tailing where we stopped.
-        let log_path = self.dir.join("build.log");
-        let log_file = fs::File::create(&log_path)?;
+        let log_file = fs::File::create(self.dir.join("build.log"))?;
         let (mut req, child_stdin, spec_w) = sandbox::spawn_request(&spec)?;
         let pid = self
             .ctx
             .spawner
             .spawn(&mut req, &log_file, child_stdin.as_ref())?;
-        let owner = BuildOwner::lease(&self.ctx, &a.build_id, prep, pid, &mut spec)?;
+        let _owner = BuildOwner::lease(&self.ctx, &a.build_id, prep, pid, &mut spec)?;
         if let Some(w) = spec_w {
             sandbox::send_spec_to(&spec, w)?;
         }
@@ -506,8 +486,7 @@ impl ActiveBuild {
             build_id: a.build_id.clone(),
             pid,
             status_token: req.token.clone(),
-            spec: spec.clone(),
-            outputs: a.outputs.clone(),
+            spec,
             deadline_unix: unix_now() + timeout.as_secs(),
         };
         fs::write(self.dir.join("resume.json"), serde_json::to_vec(&resume)?)?;
@@ -522,84 +501,10 @@ impl ActiveBuild {
                 tail_log(&dir, &build_id, &tx, || log_done.load(Ordering::Relaxed));
             })
         };
-        let pgrp = nix::unistd::Pid::from_raw(pid);
-        let mut abort: Option<String> = None;
-        let status = loop {
-            if let Some(code) = reaper::take_status(&self.ctx.status_dir, &req.token) {
-                break code;
-            }
-            let timed_out = (Instant::now() >= deadline)
-                .then(|| format!("build timed out after {}s", timeout.as_secs()));
-            abort = self.ctx.abort_reason(&a.dedupe_key, &log_path, timed_out);
-            if abort.is_some() {
-                let _ = signal::killpg(pgrp, signal::Signal::SIGKILL);
-                // The reaper collects the kill within its sweep interval.
-                break loop {
-                    if let Some(code) = reaper::take_status(&self.ctx.status_dir, &req.token) {
-                        break code;
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
-                };
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        };
-        // The builder is PID 1 of its PID namespace, so its death took
-        // every descendant with it; the killpg also covers the brief
-        // pre-exec window and macOS, where there is no PID namespace.
-        let _ = signal::killpg(pgrp, signal::Signal::SIGKILL);
+        let fin = supervise(&self.ctx, &resume, self.dir.clone(), signing_key);
         log_done.store(true, Ordering::Relaxed);
         let _ = tailer.join();
-        if let Some(reason) = abort {
-            bail!("{reason}");
-        }
-        // The reaper already folded signal deaths into 128 + signo
-        // (matching shell conventions), so an OOM SIGKILL (137) is
-        // distinguishable from a SIGSEGV (139).
-        let exit_code = status;
-        tracing::info!(id = a.build_id, exit_code, "builder finished");
-
-        if exit_code != 0 {
-            owner.cleanup_disk(&spec);
-            // present on Linux when the sandbox setup stage failed
-            let error = sandbox::setup_error_detail(&spec).unwrap_or_default();
-            if !error.is_empty() {
-                tracing::warn!(id = a.build_id, error, "sandbox setup failed");
-            }
-            return Ok(FinishedBuild {
-                exit_code,
-                error,
-                outputs: Vec::new(),
-                extras: Vec::new(),
-                dir: self.dir.clone(),
-                finished_at: Instant::now(),
-            });
-        }
-
-        let packed = tokio::runtime::Handle::current().block_on(pack_outputs_and_extras(
-            &self.dir,
-            &spec,
-            deadline,
-            signing_key,
-            &a.build_id,
-        ));
-        // packing reads the scratch store, so clean up only afterwards
-        owner.cleanup_disk(&spec);
-        let (packed, extras) = packed?;
-        Ok(FinishedBuild {
-            exit_code: 0,
-            error: String::new(),
-            outputs: packed,
-            extras,
-            dir: self.dir.clone(),
-            finished_at: Instant::now(),
-        })
-    }
-
-    /// Tear down the sandbox, keeping the build dir: it holds the
-    /// packed output NARs until they are delivered to a hub. sandboxd
-    /// removes the build cgroup when the dropped lease drains.
-    pub(super) fn teardown(&self) {
-        sandbox::cleanup(&self.assignment, &self.dir);
+        Ok(fin)
     }
 
     /// Tear down a build abandoned before execution: stop the import
@@ -620,6 +525,97 @@ impl ActiveBuild {
         if let Err(e) = fs::remove_dir_all(&self.dir) {
             tracing::warn!("cleaning up {}: {e}", self.dir.display());
         }
+    }
+}
+
+/// Wait out a running build (fresh or re-adopted), pack its outputs,
+/// and tear the sandbox down. Driven off the persisted `ResumeState`
+/// so both entry points share one wait/kill/pack path.
+pub(super) fn supervise(
+    ctx: &WorkerCtx,
+    st: &ResumeState,
+    dir: PathBuf,
+    signing_key: &SecretKey,
+) -> FinishedBuild {
+    let pgrp = nix::unistd::Pid::from_raw(st.pid);
+    let log_path = dir.join("build.log");
+    let mut aborted: Option<String> = None;
+    // Process gone but no status file: an earlier worker generation may
+    // have consumed it. Bounded grace, then treat as failed.
+    let mut gone_since: Option<Instant> = None;
+    let code = loop {
+        if let Some(code) = reaper::take_status(&ctx.status_dir, &st.status_token) {
+            break code;
+        }
+        // EPERM means the process exists (leased uid); only ESRCH is gone.
+        if signal::kill(pgrp, None) == Err(nix::errno::Errno::ESRCH) {
+            let since = gone_since.get_or_insert_with(Instant::now);
+            if since.elapsed() > Duration::from_secs(5) {
+                aborted.get_or_insert_with(|| {
+                    "build exit status was lost during a worker handover".into()
+                });
+                break 1;
+            }
+        } else {
+            gone_since = None;
+        }
+        if aborted.is_none() {
+            let timed_out = (unix_now() >= st.deadline_unix).then(|| "build timed out".to_string());
+            if let Some(r) = ctx.abort_reason(&st.dedupe_key, &log_path, timed_out) {
+                aborted = Some(r);
+                kill_build(pgrp, st.spec.cgroup.as_deref());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    // Builder is PID 1 of its PID namespace, so its death took every
+    // descendant with it; also covers macOS (no pidns) and the pre-exec
+    // window.
+    kill_build(pgrp, st.spec.cgroup.as_deref());
+    tracing::info!(id = st.build_id, exit_code = code, aborted = ?aborted, "builder finished");
+    let (exit_code, error, outputs, extras) = if let Some(reason) = aborted {
+        (1, reason, vec![], vec![])
+    } else if code != 0 {
+        (
+            code,
+            sandbox::setup_error_detail(&st.spec).unwrap_or_default(),
+            vec![],
+            vec![],
+        )
+    } else {
+        // At least a few minutes to pack even if the build ate its budget.
+        let remaining = Duration::from_secs(st.deadline_unix.saturating_sub(unix_now()));
+        let deadline = Instant::now() + remaining.max(Duration::from_mins(10));
+        match tokio::runtime::Handle::current().block_on(pack_outputs_and_extras(
+            &dir,
+            &st.spec,
+            deadline,
+            signing_key,
+            &st.build_id,
+        )) {
+            Ok((o, e)) => (0, String::new(), o, e),
+            Err(e) => (1, format!("{e:#}"), vec![], vec![]),
+        }
+    };
+    sandbox::cleanup(&st.spec.outputs, &dir);
+    FinishedBuild {
+        exit_code,
+        error,
+        outputs,
+        extras,
+        dir,
+        finished_at: Instant::now(),
+    }
+}
+
+/// Kill a build's processes. killpg alone misses a builder that
+/// setsid()'d out of the group; the shim is outside the pidns, so its
+/// death does not tear it down. cgroup.kill (group-writable via
+/// sandboxd) reaches everything.
+fn kill_build(pgrp: nix::unistd::Pid, cgroup: Option<&Path>) {
+    let _ = signal::killpg(pgrp, signal::Signal::SIGKILL);
+    if let Some(cg) = cgroup {
+        let _ = fs::write(cg.join("cgroup.kill"), "1");
     }
 }
 
@@ -677,7 +673,7 @@ async fn query_all_valid_paths() -> Result<BTreeSet<harmonia_store_path::StorePa
 
 /// Pack, hash and sign every output before announcing the result,
 /// because signatures travel in BuildResult ahead of the NAR data.
-pub(super) async fn pack_outputs(
+async fn pack_outputs(
     dir: &Path,
     spec: &sandbox::SandboxSpec,
     extra_candidates: &BTreeSet<harmonia_store_path::StorePath>,
@@ -733,15 +729,13 @@ async fn pack_extras(
         .map(String::as_str)
         .chain(spec_outputs.iter().map(String::as_str))
         .collect();
-    let mut extras_set = BTreeSet::new();
-    for o in outputs {
-        for r in &o.references {
-            if !known.contains(r.as_str()) {
-                extras_set.insert(r.clone());
-            }
-        }
-    }
-    if extras_set.is_empty() {
+    let mut queue: Vec<String> = outputs
+        .iter()
+        .flat_map(|o| o.references.iter())
+        .filter(|r| !known.contains(r.as_str()))
+        .cloned()
+        .collect();
+    if queue.is_empty() {
         return Ok(Vec::new());
     }
     let store_dir = StoreDir::default();
@@ -749,8 +743,13 @@ async fn pack_extras(
         .connect_daemon()
         .await
         .context("connecting to the local nix-daemon")?;
-    let mut out = Vec::new();
-    for path in extras_set {
+    // Transitive closure: the hub daemon rejects an import whose
+    // references are not already valid.
+    let mut infos: HashMap<String, UnkeyedValidPathInfo> = HashMap::new();
+    while let Some(path) = queue.pop() {
+        if infos.contains_key(&path) {
+            continue;
+        }
         let sp = StorePath::from_base_path(store_base(&path))
             .with_context(|| format!("parsing extra path {path}"))?;
         // Hold a temp root so the daemon does not GC the path while
@@ -764,17 +763,42 @@ async fn pack_extras(
             .await
             .with_context(|| format!("queryPathInfo {path}"))?
             .ok_or_else(|| anyhow::anyhow!("extra {path} vanished from store"))?;
-        // Re-scan the extra's NAR against its declared references so
-        // the hub-side import keeps the transitive closure intact.
+        for r in &info.references {
+            let r = r
+                .to_absolute_path(&store_dir)
+                .to_string_lossy()
+                .into_owned();
+            if !known.contains(r.as_str()) {
+                queue.push(r);
+            }
+        }
+        infos.insert(path, info);
+    }
+    // Referenced-before-referrer, matching hub-side sequential import.
+    let ordered = topo_order(infos.keys().cloned(), |p| {
+        infos[p]
+            .references
+            .iter()
+            .map(|r| {
+                r.to_absolute_path(&store_dir)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|r| infos.contains_key(r))
+            .collect()
+    });
+    let mut out = Vec::with_capacity(infos.len());
+    for path in ordered {
+        let info = infos.remove(&path).unwrap();
+        let sp = StorePath::from_base_path(store_base(&path))?;
         let mut candidates: BTreeSet<StorePath> = info.references.iter().cloned().collect();
-        let self_sp = sp.clone();
-        candidates.insert(self_sp.clone());
+        candidates.insert(sp.clone());
         let nar_file = dir.join(format!("extra-{}.nar.zst", store_base(&path)));
         let res = pack_one_nar(
             Path::new(&path),
             &nar_file,
             &candidates,
-            Some(&self_sp),
+            Some(&sp),
             deadline,
         )
         .await

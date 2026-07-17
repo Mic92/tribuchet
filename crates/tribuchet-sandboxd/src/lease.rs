@@ -1,5 +1,6 @@
 //! One sandbox lease: userns maps and the delegated build cgroup.
 
+use std::ffi::CStr;
 use std::fs;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
@@ -48,34 +49,55 @@ pub fn write_maps(pid: Pid, base: u32, count: u32) -> Result<()> {
     Ok(())
 }
 
+/// Depth-limited O_NOFOLLOW post-order descent. Entries are collected
+/// before `f` runs so unlinking during the walk is well-defined.
+fn walk_entries(
+    dir: &OwnedFd,
+    depth: u32,
+    f: &mut impl FnMut(&OwnedFd, &CStr, bool) -> Result<()>,
+) -> Result<()> {
+    ensure!(depth < 128, "tree too deep");
+    let mut entries = Vec::new();
+    let mut d = nix::dir::Dir::from_fd(dir.try_clone()?)?;
+    for e in d.iter() {
+        let e = e?;
+        let name = e.file_name();
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            entries.push((name.to_owned(), e.file_type()));
+        }
+    }
+    for (name, ftype) in entries {
+        let name = name.as_c_str();
+        let is_dir = match ftype {
+            Some(nix::dir::Type::Directory) => true,
+            Some(_) => false,
+            None => fstatat(dir, name, AtFlags::AT_SYMLINK_NOFOLLOW)
+                .is_ok_and(|s| s.st_mode & libc::S_IFMT == libc::S_IFDIR),
+        };
+        if is_dir {
+            let sub = openat(dir, name, DIR_FLAGS, Mode::empty())?;
+            walk_entries(&sub, depth + 1, f)?;
+        }
+        f(dir, name, is_dir)?;
+    }
+    Ok(())
+}
+
 /// Chown the build tmp dir tree to the leased base uid so files the
 /// worker unpacked are mapped (and thus deletable) inside the build's
 /// user namespace. Only inodes owned by the worker are touched: the
 /// worker must not be able to re-own foreign files it can merely open.
 pub fn chown_tree(dir: &OwnedFd, owner: (Uid, Gid), worker_uid: Uid) -> Result<()> {
-    let uid = Some(owner.0);
-    let gid = Some(owner.1);
-    let stat = nix::sys::stat::fstat(dir)?;
-    if stat.st_uid == worker_uid.as_raw() {
+    let (uid, gid) = (Some(owner.0), Some(owner.1));
+    if nix::sys::stat::fstat(dir)?.st_uid == worker_uid.as_raw() {
         fchown(dir, uid, gid)?;
     }
-    let mut d = nix::dir::Dir::from_fd(dir.try_clone()?)?;
-    for entry in d.iter() {
-        let entry = entry?;
-        let name = entry.file_name();
-        if name.to_bytes() == b"." || name.to_bytes() == b".." {
-            continue;
+    walk_entries(dir, 0, &mut |d, name, _| {
+        if fstatat(d, name, AtFlags::AT_SYMLINK_NOFOLLOW)?.st_uid == worker_uid.as_raw() {
+            fchownat(d, name, uid, gid, AtFlags::AT_SYMLINK_NOFOLLOW)?;
         }
-        let stat = fstatat(dir, name, AtFlags::AT_SYMLINK_NOFOLLOW)?;
-        if stat.st_uid == worker_uid.as_raw() {
-            fchownat(dir, name, uid, gid, AtFlags::AT_SYMLINK_NOFOLLOW)?;
-        }
-        if entry.file_type() == Some(nix::dir::Type::Directory) {
-            let sub = openat(dir, name, DIR_FLAGS, Mode::empty())?;
-            chown_tree(&sub, owner, worker_uid)?;
-        }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// The build's cgroup, held via directory fds so later operations do
@@ -109,8 +131,11 @@ pub fn create_cgroup(
         .trim()
         .strip_prefix("0::/")
         .context("requester not on cgroup v2")?;
-    let parent_path = Path::new("/sys/fs/cgroup").join(rel);
-    let parent = nix::fcntl::open(&parent_path, DIR_FLAGS, Mode::empty())
+    // The worker sits in a `main` leaf; build cgroups go next to it,
+    // not under it (leaf holds processes, so no controller subtree).
+    let worker_cg = Path::new("/sys/fs/cgroup").join(rel);
+    let parent_path = worker_cg.parent().unwrap_or(&worker_cg);
+    let parent = nix::fcntl::open(parent_path, DIR_FLAGS, Mode::empty())
         .with_context(|| format!("opening cgroup {}", parent_path.display()))?;
     let name = format!("build-{build_id}");
     mkdirat(&parent, name.as_str(), Mode::from_bits_truncate(0o755))
@@ -207,7 +232,14 @@ pub fn destroy_cgroup(cg: &BuildCgroup) -> Result<()> {
         other => other.context("writing cgroup.kill")?,
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
-    while !read_at(&cg.dir, "cgroup.events").is_ok_and(|events| events.contains("populated 0")) {
+    loop {
+        match read_at(&cg.dir, "cgroup.events") {
+            Ok(events) if events.contains("populated 0") => break,
+            // gone mid-drain (worker unit stopped) counts as drained
+            Err(e) if is_enoent(&e) => return Ok(()),
+            Ok(_) => {}
+            Err(e) => return Err(e).context("reading cgroup.events"),
+        }
         ensure!(std::time::Instant::now() < deadline, "cgroup did not drain");
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
@@ -234,25 +266,27 @@ fn read_at(dir: &OwnedFd, name: &str) -> Result<String> {
     Ok(out)
 }
 
+/// Remove everything under `dir`. Root bypasses DAC, so leased-uid
+/// 0555 output dirs are no obstacle.
+pub fn purge_tree(dir: &OwnedFd) -> Result<()> {
+    walk_entries(dir, 0, &mut |d, name, is_dir| {
+        let flag = if is_dir {
+            UnlinkatFlags::RemoveDir
+        } else {
+            UnlinkatFlags::NoRemoveDir
+        };
+        Ok(unlinkat(d, name, flag)?)
+    })
+}
+
 /// Cgroup dirs cannot be unlinked, only rmdir'd bottom-up.
 fn remove_cgroup_tree(dir: &OwnedFd) -> Result<()> {
-    let mut entries = Vec::new();
-    let mut d = nix::dir::Dir::from_fd(dir.try_clone()?)?;
-    for entry in d.iter() {
-        let entry = entry?;
-        if entry.file_type() == Some(nix::dir::Type::Directory) {
-            let name = entry.file_name().to_owned();
-            if name.to_bytes() != b"." && name.to_bytes() != b".." {
-                entries.push(name);
-            }
+    walk_entries(dir, 0, &mut |d, name, is_dir| {
+        if is_dir {
+            unlinkat(d, name, UnlinkatFlags::RemoveDir)?;
         }
-    }
-    for name in entries {
-        let sub = openat(dir, name.as_c_str(), DIR_FLAGS, Mode::empty())?;
-        remove_cgroup_tree(&sub)?;
-        unlinkat(dir, name.as_c_str(), UnlinkatFlags::RemoveDir)?;
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 #[cfg(test)]

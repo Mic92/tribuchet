@@ -218,15 +218,13 @@ fn render_nix_config(caps: &HashMap<u64, WorkerCaps>, cfg: &NixConfig) -> String
         .values()
         .flat_map(|c| c.systems.keys().map(String::as_str))
         .collect();
-    let systems_json = systems
-        .iter()
-        .map(|s| format!("{s:?}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let mut out = format!(
-        "external-builders = [{{\"systems\":[{systems_json}],\"program\":\"{}\",\"args\":[]}}]\n",
-        cfg.attach_program.display(),
-    );
+    // System names are peer-supplied; Rust Debug is not valid JSON.
+    let builders = serde_json::json!([{
+        "systems": systems,
+        "program": cfg.attach_program.to_string_lossy(),
+        "args": [],
+    }]);
+    let mut out = format!("external-builders = {builders}\n");
     let capacity: u64 = caps.values().map(|c| u64::from(c.max_jobs)).sum();
     if capacity > 0 {
         let scaled = capacity * u64::from(cfg.oversubscribe_percent) / 100;
@@ -312,7 +310,13 @@ impl HubState {
     /// platform it served waits for it to reconnect rather than
     /// declining at once.
     pub(super) fn record_departed(&self, caps: WorkerCaps) {
-        self.departed.lock().unwrap().push((caps, Instant::now()));
+        let now = Instant::now();
+        let mut departed = self.departed.lock().unwrap();
+        // Prune here: expected_deadline() only runs for unservable
+        // submissions, so a healthy fleet would otherwise accumulate
+        // an entry per worker reconnect indefinitely.
+        departed.retain(|(_, at)| now < *at + self.worker_grace);
+        departed.push((caps, now));
     }
 
     /// If this platform is not servable right now but we expect a
@@ -533,6 +537,28 @@ mod tests {
         assert!(out.contains(r#""program":"/nix/store/attach""#), "{out}");
         // (100 + 50) * 2 = 300, clamped to the cap.
         assert!(out.contains("max-jobs = 256\n"), "{out}");
+    }
+
+    #[test]
+    fn nix_config_json_escapes_peer_supplied_systems() {
+        let cfg = NixConfig {
+            path: "/run/x".into(),
+            attach_program: r"/nix/store/at\tach".into(),
+            oversubscribe_percent: 100,
+            max_jobs_cap: 1,
+        };
+        let mut workers = HashMap::new();
+        workers.insert(1, caps("x86_64-linux\u{2028}\"", &[]));
+        let out = render_nix_config(&workers, &cfg);
+        let json = out
+            .strip_prefix("external-builders = ")
+            .and_then(|s| s.lines().next())
+            .unwrap();
+        // Nix parses this as JSON; must be valid regardless of what a
+        // worker registered or how the attach path is spelled.
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(v[0]["systems"][0], "x86_64-linux\u{2028}\"");
+        assert_eq!(v[0]["program"], r"/nix/store/at\tach");
     }
 
     #[test]

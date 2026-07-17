@@ -30,9 +30,15 @@ impl Metrics {
 }
 
 /// Escape a label value per the Prometheus text format; worker names
-/// are peer-supplied, so a stray quote or newline must not break a line.
+/// and systems are peer-supplied, so a stray quote or newline must not
+/// break a line, and an oversized value must not bloat every scrape.
 fn label(value: &str) -> String {
-    value
+    const MAX: usize = 128;
+    let mut end = value.len().min(MAX);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end]
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', "\\n")
@@ -153,7 +159,8 @@ fn render_workers(out: &mut String, state: &HubState) {
     for (system, count) in &per_system {
         let _ = writeln!(
             out,
-            "tribuchet_workers_for_system{{system=\"{system}\"}} {count}"
+            "tribuchet_workers_for_system{{system=\"{}\"}} {count}",
+            label(system)
         );
     }
 }
@@ -189,5 +196,23 @@ pub(super) async fn serve(state: Arc<HubState>, addr: String) -> Result<()> {
             let _ = sock.write_all(resp.as_bytes()).await;
             let _ = sock.shutdown().await;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn label_escapes_and_truncates() {
+        assert_eq!(label("x86_64-linux"), "x86_64-linux");
+        assert_eq!(label("a\"\n\\b"), "a\\\"\\n\\\\b");
+        // Peer-supplied values are capped so one worker cannot bloat
+        // every scrape; truncation stays on a char boundary.
+        assert_eq!(label(&"x".repeat(300)).len(), 128);
+        let long = "é".repeat(300);
+        let out = label(&long);
+        assert!(out.len() <= 128);
+        assert!(long.starts_with(&out));
     }
 }
