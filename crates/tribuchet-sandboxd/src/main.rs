@@ -61,7 +61,7 @@ fn main() -> Result<()> {
     });
 
     let listener = listener(&args.socket)?;
-    let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
+    let _ = sd_notify::notify(&[sd_notify::NotifyState::Ready]);
     tracing::info!(socket = %args.socket.display(), "listening");
 
     for conn in listener.incoming() {
