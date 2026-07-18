@@ -154,7 +154,7 @@ pub fn spawn_watchdog() {
         .and_then(|v| v.parse::<u64>().ok())
         .map(std::time::Duration::from_micros)
         .filter(|_| {
-            std::env::var("WATCHDOG_PID").map_or(true, |p| {
+            std::env::var("WATCHDOG_PID").ok().is_none_or(|p| {
                 p == std::process::id().to_string()
                     || p == nix::unistd::getppid().as_raw().to_string()
             })
