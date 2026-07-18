@@ -33,7 +33,7 @@ jobs:
       - uses: NixOS/nix-installer-action@6b8548fe06acfb0155a50ab5d561accb215764cc
       # Installs the released hestia binary and captures the cache API
       # tokens GC needs (HESTIA_BIN points at the binary).
-      - uses: Mic92/hestia-beta@v2.0.0-beta.1
+      - uses: Mic92/hestia@v2.0.0
         with:
           version: v2.0.0-beta.1
       - run: "$HESTIA_BIN gc ${{ inputs.dry-run && '--dry-run' || '' }}"

@@ -81,10 +81,7 @@ jobs:
           extra-conf: ${{ env.NIX_EXTRA_CONF }}
 
       # GHA-cache layer over cache.thalheim.io.
-      - uses: Mic92/hestia-beta@v2.0.0-beta.1
-        with:
-          version: v2.0.0-beta.1
-
+      - uses: Mic92/hestia@v2.0.0
       - uses: tailscale/github-action@v4
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
@@ -147,10 +144,7 @@ jobs:
           extra-conf: ${{ env.NIX_EXTRA_CONF }}
 
       # GHA-cache layer over cache.thalheim.io.
-      - uses: Mic92/hestia-beta@v2.0.0-beta.1
-        with:
-          version: v2.0.0-beta.1
-
+      - uses: Mic92/hestia@v2.0.0
       - uses: tailscale/github-action@v4
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
