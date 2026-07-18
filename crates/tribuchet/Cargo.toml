@@ -44,7 +44,7 @@ tempfile.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # User-mode NAT datapath for fixed-output build network isolation.
-presto-pasta = "0.0.5"
+presto-pasta = "0.0.6"
 
 [features]
 # Gates the NixOS e2e harness (tests/e2e.rs). It drives VMs over the test
