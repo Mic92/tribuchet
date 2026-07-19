@@ -173,16 +173,16 @@ dedupe key routes it back to the worker holding the build, which
 resumes (or just re-delivers the finished result) instead of building
 again.
 
-Worker redeploys go through reload (SIGHUP to the unit): builds are
-children of a small reaper process the worker is exec'd by, with
-resume state and logs persisted in their build dirs, so the reaper
-just execs a fresh worker that re-adopts them — running builds are
-supervised to completion, finished ones redelivered. The hub covers
-the session gap by requeueing instead of failing jobs whose worker
+Worker redeploys are plain unit restarts: builds run in their own
+process groups and sandboxd-leased cgroups, the worker unit uses
+KillMode=process, and resume state, logs and the exit status (written
+by the in-sandbox PID-1 shim) are persisted in the build dirs. The
+replacement worker re-adopts running builds, supervises them to
+completion and redelivers finished results. The hub covers the
+session gap by requeueing instead of failing jobs whose worker
 session died; the attached client sees a pause, not an error. A full
-stop (SIGTERM) does not drain: the unit teardown takes the reaper and
-the build processes with it, and the requeued jobs fail once no
-capable worker is left (or get rebuilt by another one).
+stop behaves the same way: builds keep running, and their results
+wait on disk until a worker starts again (or expire undelivered).
 
 ## Known limitations (MVP)
 
@@ -193,9 +193,9 @@ capable worker is left (or get rebuilt by another one).
   trusts that nothing rewrites the finished build's output tree while
   it is being packed (builds run under disjoint uids, so only root or
   the same build could).
-* Reload upgrades the worker but never the reaper itself; picking up
-  a new reaper still needs a full restart (which kills running
-  builds). The reaper is deliberately small so this rarely matters.
+* Stopping the worker does not stop its running builds (KillMode=
+  process); an operator who wants them gone must kill the build
+  cgroups too.
 * Results are kept until the hub acknowledges them, but log replay
   offsets advance when a chunk is handed to the session, so a few log
   lines in flight when a session dies are skipped on resume.
@@ -219,14 +219,11 @@ one-shot `attach` and `ca` commands take their parameters on the
 command line. `nixosModules.default` ships hub and worker services
 (`services.tribuchet-hub`, `services.tribuchet-worker`): the hub is
 socket-activated, the worker unit delegates its cgroup subtree for
-per-build limits and execs the worker through a stable /run symlink
-with `reloadIfChanged`, so package bumps and settings changes reload
-instead of restarting (the fresh worker generation re-reads the
-config file).
+per-build limits and restarts on package bumps and settings changes
+while running builds keep going (KillMode=process plus re-adoption).
 The e2e test consumes the same module. macOS hosts use the
 `darwinModules.default` nix-darwin module, which ships both services:
 the hub adopts its listeners from launchd (`launch_activate_socket`,
 the analogue of the socket-activated NixOS unit), and the worker's
-launchd daemon execs a stable symlink that activation flips and
-SIGHUPs the reaper, again reloading on package bumps and settings
-changes.
+launchd daemon execs a stable symlink that activation flips before
+restarting the daemon.

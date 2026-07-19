@@ -15,7 +15,6 @@ mod build;
 mod caps;
 mod cgroup;
 mod logtail;
-pub mod reaper;
 mod resume;
 pub mod sandbox;
 #[cfg(target_os = "linux")]
@@ -55,11 +54,6 @@ type DaemonConn = DaemonClient<tokio::net::unix::OwnedReadHalf, tokio::net::unix
 /// Per-process context threaded through builds.
 struct WorkerCtx {
     state_dir: PathBuf,
-    /// Handle to the reaper (the pre-fork parent half), which spawns
-    /// and reaps builder processes so they are not our children.
-    spawner: reaper::Spawner,
-    /// Where the reaper records exit codes, one file per pid.
-    status_dir: PathBuf,
     sandbox_bin_sh: Option<PathBuf>,
     build_memory_max: Option<u64>,
     /// Files a build must never read even where DAC would allow it
@@ -288,15 +282,16 @@ fn sandboxd_socket() -> Result<Option<PathBuf>> {
 }
 
 pub fn run(opts: WorkerConfig) -> Result<()> {
-    // ensure() either becomes the reaper (never returns) or, in the
-    // worker generation it exec'd, hands back the spawner. It runs
-    // before tokio because the reaper must stay single-threaded.
-    let spawner = reaper::ensure(&opts.state_dir.join("exited"))?;
+    // Vacate the unit's root cgroup so subtree_control can be enabled
+    // there (no-internal-processes rule). Must happen before any build
+    // cgroup is created next to the worker's leaf.
+    #[cfg(target_os = "linux")]
+    cgroup::init();
     let rt = crate::rt::runtime("trib-worker")?;
-    rt.block_on(run_async(opts, spawner))
+    rt.block_on(run_async(opts))
 }
 
-async fn run_async(opts: WorkerConfig, spawner: reaper::Spawner) -> Result<()> {
+async fn run_async(opts: WorkerConfig) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let builds_dir = opts.state_dir.join("builds");
     fs::create_dir_all(&builds_dir)?;
@@ -340,8 +335,6 @@ async fn run_async(opts: WorkerConfig, spawner: reaper::Spawner) -> Result<()> {
     let opts = opts;
     let ctx = Arc::new(WorkerCtx {
         state_dir: opts.state_dir.clone(),
-        spawner,
-        status_dir: opts.state_dir.join("exited"),
         sandbox_bin_sh: opts.sandbox_bin_sh.clone(),
         build_memory_max: opts.build_memory_max_bytes,
         secret_paths: vec![opts.key.clone(), opts.state_dir.join("signing.key")],
@@ -383,22 +376,13 @@ async fn run_async(opts: WorkerConfig, spawner: reaper::Spawner) -> Result<()> {
     }
 }
 
-/// SIGUSR1 (reload: a new generation is about to be exec'd) or
-/// SIGTERM (unit stop): exit immediately either way. All resumable
-/// state is already on disk; on reload the replacement worker
-/// re-adopts the running builds, on stop the unit teardown ends them
-/// and the hub requeues their jobs.
+/// SIGTERM (unit stop or restart): exit immediately. All resumable
+/// state is already on disk and builds run in their own process
+/// groups/cgroups (KillMode=process), so a replacement worker
+/// re-adopts them.
 fn spawn_handover() {
     tokio::spawn(async {
-        let Ok(mut usr1) =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
-        else {
-            return;
-        };
-        tokio::select! {
-            _ = usr1.recv() => {}
-            () = crate::sd::stop_requested() => {}
-        }
+        crate::sd::stop_requested().await;
         tracing::info!("handover requested; exiting");
         std::process::exit(0);
     });

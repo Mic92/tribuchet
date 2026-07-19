@@ -14,18 +14,18 @@ use tokio::sync::mpsc;
 
 use super::build::{ActiveBuild, supervise};
 use super::logtail::LogTail;
-use super::{DaemonConn, WorkerCtx, msg, reaper, sandbox};
+use super::{DaemonConn, WorkerCtx, msg, sandbox};
 use crate::chunkio::CHUNK_SIZE;
 use crate::proto::{
     BuildResult, ExtraPath, NarTransfer, OutputSignature, PathInfoMsg, WorkerMessage, nar_transfer,
     worker_message,
 };
 
-/// Pick up builds a previous worker generation left behind: still
-/// running (same reaper, so their pids and exit statuses are valid)
-/// or finished but undelivered. Anything stale is swept.
+/// Pick up builds a previous worker instance left behind: still
+/// running (their sandbox outlives the worker and the exit status
+/// lands in the persisted exit-status file) or finished but
+/// undelivered. Anything stale is swept.
 pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>, signing_key: &Arc<SecretKey>) {
-    let reaper_id = std::env::var(reaper::ID_ENV).unwrap_or_default();
     let Ok(entries) = fs::read_dir(ctx.state_dir.join("builds")) else {
         return;
     };
@@ -60,15 +60,18 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>, signing_key: &Arc<SecretK
         let Ok(s) = fs::read_to_string(dir.join("resume.json")) else {
             continue; // already swept by sweep_state_dir
         };
-        let st = match serde_json::from_str::<ResumeState>(&s) {
-            Ok(st) if st.reaper_id == reaper_id => st,
-            // Different reaper: the pid is meaningless and the build
-            // died with the old unit; the client will resubmit.
-            _ => {
-                ctx.remove_build_dir(&dir);
-                continue;
-            }
+        let Ok(st) = serde_json::from_str::<ResumeState>(&s) else {
+            ctx.remove_build_dir(&dir);
+            continue;
         };
+        // Without a leased cgroup there is nothing that ties the
+        // persisted pid to this build (macOS until the agent track
+        // lands): a recycled pid must not be supervised as a build.
+        if st.spec.cgroup.is_none() && sandbox::exit_status(&st.spec).is_none() {
+            tracing::warn!(id = st.build_id, "dropping unadoptable running build");
+            ctx.remove_build_dir(&dir);
+            continue;
+        }
         tracing::info!(id = st.build_id, pid = st.pid, "adopted running build");
         // The temp roots taken at negotiation died with the previous
         // generation's daemon connection; without new ones a GC could
@@ -91,7 +94,7 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>, signing_key: &Arc<SecretK
         tokio::task::spawn_blocking(move || {
             let ctx = task_ctx;
             let key = st.dedupe_key.clone();
-            let fin = supervise(&ctx, &st, dir, &signing_key);
+            let fin = supervise(&ctx, &st, dir, &signing_key, None);
             // Roots live until the outputs are packed.
             drop(gc_roots);
             drop(permit);
@@ -220,17 +223,17 @@ pub(super) struct PackedOutput {
 }
 
 /// On-disk state for re-adopting a running build after a worker
-/// handover. Only valid within one reaper generation: a different
-/// reaper never spawned these pids, so their statuses cannot come.
+/// restart. The build's identity across restarts is its leased cgroup
+/// (spec.cgroup). The exit code comes from the exit-status file the
+/// PID-1 shim persists.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(super) struct ResumeState {
-    pub(super) reaper_id: String,
     pub(super) dedupe_key: String,
     /// Original assignment id: names the cgroup and the log file.
     pub(super) build_id: String,
+    /// The spawned shim. Used for process-group kills and, without a
+    /// cgroup, as a liveness probe.
     pub(super) pid: i32,
-    /// Status-file name the reaper records the exit code under.
-    pub(super) status_token: String,
     pub(super) spec: sandbox::SandboxSpec,
     pub(super) deadline_unix: u64,
 }

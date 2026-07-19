@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 use super::caps::requires_uid_range;
 use super::logtail::tail_log;
 use super::resume::{FinishedBuild, PackedExtra, PackedOutput, ResumeState};
-use super::{DaemonConn, WorkerCtx, reaper, sandbox, unix_now};
+use super::{DaemonConn, WorkerCtx, sandbox, unix_now};
 use crate::chunkio::ChannelReader;
 use crate::nar;
 use crate::proto::{BuildAssignment, NarTransfer, PathInfoMsg, WorkerMessage, nar_transfer};
@@ -466,26 +466,22 @@ impl ActiveBuild {
         let prep = BuildOwner::prepare(a)?;
         let mut spec = self.build_spec(&prep)?;
         // Logs go through a file in the build dir, not pipes: capture
-        // is decoupled from this process's lifetime, so a later worker
-        // generation can resume tailing where we stopped.
+        // is decoupled from this process's lifetime, so a restarted
+        // worker can resume tailing where we stopped.
         let log_file = fs::File::create(self.dir.join("build.log"))?;
-        let (mut req, child_stdin, spec_w) = sandbox::spawn_request(&spec)?;
-        let pid = self
-            .ctx
-            .spawner
-            .spawn(&mut req, &log_file, child_stdin.as_ref())?;
+        let (child, spec_w) = sandbox::spawn(&spec, &log_file)?;
+        let pid = child.id().cast_signed();
         let _owner = BuildOwner::lease(&self.ctx, &a.build_id, prep, pid, &mut spec)?;
         if let Some(w) = spec_w {
             sandbox::send_spec_to(&spec, w)?;
         }
-        // From here the build can be re-adopted by a replacement
-        // worker generation under the same reaper.
+        // From here the build can be re-adopted by a restarted worker.
+        // The exit status lands in the exit-status file, not only in
+        // this process's wait().
         let resume = ResumeState {
-            reaper_id: std::env::var(reaper::ID_ENV).unwrap_or_default(),
             dedupe_key: a.dedupe_key.clone(),
             build_id: a.build_id.clone(),
             pid,
-            status_token: req.token.clone(),
             spec,
             deadline_unix: unix_now() + timeout.as_secs(),
         };
@@ -501,7 +497,13 @@ impl ActiveBuild {
                 tail_log(&dir, &build_id, &tx, || log_done.load(Ordering::Relaxed));
             })
         };
-        let fin = supervise(&self.ctx, &resume, self.dir.clone(), signing_key);
+        let fin = supervise(
+            &self.ctx,
+            &resume,
+            self.dir.clone(),
+            signing_key,
+            Some(child),
+        );
         log_done.store(true, Ordering::Relaxed);
         let _ = tailer.join();
         Ok(fin)
@@ -528,36 +530,67 @@ impl ActiveBuild {
     }
 }
 
+/// True while the build's processes are still around: cgroup still
+/// populated (Linux lease) or, without a cgroup, the shim/builder pid
+/// still exists. The pid check alone would be fooled by pid reuse for
+/// adopted builds, so the cgroup wins when there is one.
+fn build_alive(st: &ResumeState) -> bool {
+    if let Some(cg) = &st.spec.cgroup {
+        return match fs::read_to_string(cg.join("cgroup.events")) {
+            Ok(events) => !events.contains("populated 0"),
+            Err(_) => false, // cgroup gone: lease over, build dead
+        };
+    }
+    // EPERM means the process exists (leased uid). Only ESRCH is gone.
+    signal::kill(nix::unistd::Pid::from_raw(st.pid), None) != Err(nix::errno::Errno::ESRCH)
+}
+
 /// Wait out a running build (fresh or re-adopted), pack its outputs,
 /// and tear the sandbox down. Driven off the persisted `ResumeState`
-/// so both entry points share one wait/kill/pack path.
+/// so both entry points share one wait/kill/pack path. `child` is the
+/// spawned shim for a fresh build, reaped here. An adopted build has
+/// no child, its exit code comes from the persisted exit-status file.
 pub(super) fn supervise(
     ctx: &WorkerCtx,
     st: &ResumeState,
     dir: PathBuf,
     signing_key: &SecretKey,
+    mut child: Option<std::process::Child>,
 ) -> FinishedBuild {
+    // POSIX-shell style exit code of a reaped child.
+    fn exit_code(status: std::process::ExitStatus) -> i32 {
+        use std::os::unix::process::ExitStatusExt;
+        status
+            .code()
+            .unwrap_or_else(|| 128 + status.signal().unwrap_or(1))
+    }
     let pgrp = nix::unistd::Pid::from_raw(st.pid);
     let log_path = dir.join("build.log");
     let mut aborted: Option<String> = None;
-    // Process gone but no status file: an earlier worker generation may
-    // have consumed it. Bounded grace, then treat as failed.
+    // Exit code of the reaped child. The exit-status file wins when it
+    // exists (setup failures exit before the shim can write it).
+    let mut child_code: Option<i32> = None;
+    // Build gone but no exit status anywhere: bounded grace, then
+    // treat as failed.
     let mut gone_since: Option<Instant> = None;
     let code = loop {
-        if let Some(code) = reaper::take_status(&ctx.status_dir, &st.status_token) {
+        if child_code.is_none()
+            && let Some(c) = child.as_mut()
+            && let Ok(Some(status)) = c.try_wait()
+        {
+            child_code = Some(exit_code(status));
+        }
+        if let Some(code) = sandbox::exit_status(&st.spec).or(child_code) {
             break code;
         }
-        // EPERM means the process exists (leased uid); only ESRCH is gone.
-        if signal::kill(pgrp, None) == Err(nix::errno::Errno::ESRCH) {
+        if build_alive(st) {
+            gone_since = None;
+        } else {
             let since = gone_since.get_or_insert_with(Instant::now);
             if since.elapsed() > Duration::from_secs(5) {
-                aborted.get_or_insert_with(|| {
-                    "build exit status was lost during a worker handover".into()
-                });
+                aborted.get_or_insert_with(|| "build exit status was lost".into());
                 break 1;
             }
-        } else {
-            gone_since = None;
         }
         if aborted.is_none() {
             let timed_out = (unix_now() >= st.deadline_unix).then(|| "build timed out".to_string());
@@ -568,6 +601,12 @@ pub(super) fn supervise(
         }
         std::thread::sleep(Duration::from_millis(200));
     };
+    // Reap the shim if we spawned it and have not reaped it yet.
+    if child_code.is_none()
+        && let Some(mut c) = child
+    {
+        let _ = c.wait();
+    }
     // Builder is PID 1 of its PID namespace, so its death took every
     // descendant with it; also covers macOS (no pidns) and the pre-exec
     // window.

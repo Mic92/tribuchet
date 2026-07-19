@@ -660,7 +660,7 @@ fn lifecycle() {
         &format!("grep -q 'lifecycle-payload built-remotely' {}", out.trim()),
     );
 
-    // --- restart hub + reload worker mid-build cancels nothing ------------
+    // --- restart hub + restart worker mid-build cancels nothing -----------
     let assigned = count(Node::Worker, "tribuchet-worker", "build assigned");
     succeed(
         Node::Hub,
@@ -672,7 +672,7 @@ fn lifecycle() {
         &format!("[ $(journalctl -u tribuchet-worker | grep -c 'build assigned') -gt {assigned} ]"),
         60,
     );
-    succeed(Node::Worker, "systemctl reload tribuchet-worker");
+    succeed(Node::Worker, "systemctl restart tribuchet-worker");
     succeed(Node::Hub, "systemctl restart --no-block tribuchet-hub");
     wait_until_succeeds(Node::Hub, "test -f /tmp/drain.ok", 120);
     let out = succeed(Node::Hub, "cat /tmp/drain.out");
@@ -690,7 +690,7 @@ fn lifecycle() {
         120,
     );
 
-    // --- max-log-size applies to a build adopted across a reload ----------
+    // --- max-log-size applies to a build adopted across a restart ---------
     let assigned = count(Node::Worker, "tribuchet-worker", "build assigned");
     succeed(
         Node::Hub,
@@ -703,14 +703,14 @@ fn lifecycle() {
         &format!("[ $(journalctl -u tribuchet-worker | grep -c 'build assigned') -gt {assigned} ]"),
         60,
     );
-    succeed(Node::Worker, "systemctl reload tribuchet-worker");
+    succeed(Node::Worker, "systemctl restart tribuchet-worker");
     wait_until_succeeds(
         Node::Hub,
         "grep -q 'exceeded the limit' /tmp/slowlog.out",
         120,
     );
 
-    // --- worker reload mid-build re-adopts the running build ---------------
+    // --- worker restart mid-build re-adopts the running build --------------
     let assigned = count(Node::Worker, "tribuchet-worker", "build assigned");
     let adopted = count(Node::Worker, "tribuchet-worker", "adopted running build");
     succeed(
@@ -723,13 +723,13 @@ fn lifecycle() {
         &format!("[ $(journalctl -u tribuchet-worker | grep -c 'build assigned') -gt {assigned} ]"),
         60,
     );
-    // Settings changes also arrive via reload: bump max-jobs in the config.
+    // Settings changes also arrive via restart: bump max-jobs in the config.
     succeed(
         Node::Worker,
         "cp --remove-destination $(readlink -f /etc/tribuchet/worker.toml) /etc/tribuchet/worker.toml \
          && sed -i 's/max-jobs = 2/max-jobs = 3/' /etc/tribuchet/worker.toml",
     );
-    succeed(Node::Worker, "systemctl reload tribuchet-worker");
+    succeed(Node::Worker, "systemctl restart tribuchet-worker");
     wait_until_succeeds(Node::Hub, "test -f /tmp/reload.ok", 120);
     let out = succeed(Node::Hub, "cat /tmp/reload.out");
     succeed(
@@ -739,12 +739,13 @@ fn lifecycle() {
     let adopted_now = count(Node::Worker, "tribuchet-worker", "adopted running build");
     assert!(
         adopted_now > adopted,
-        "reload did not adopt the running build"
+        "restart did not adopt the running build"
     );
-    // The marker is only printed after the reload; seeing it in the client's
-    // log means the adopted build streamed live logs through the new generation.
+    // The marker is only printed after the restart. Seeing it in the
+    // client's log means the adopted build streamed live logs through
+    // the new worker instance.
     assert_journal(Node::Hub, "reloadbuild", "log-after-reload");
-    // The new generation logs its configuration: the max-jobs bump survived.
+    // The new instance logs its configuration: the max-jobs bump survived.
     assert_journal(Node::Worker, "tribuchet-worker", "max_jobs: 3");
 
     // --- killing the client cancels the build on the worker ---------------
@@ -779,27 +780,21 @@ fn lifecycle() {
          -name 'build-*' 2>/dev/null)\" ]";
     wait_until_succeeds(Node::Worker, no_build_cgroups, 60);
 
-    // --- stopping the worker mid-build kills the build and its lease ------
+    // --- stopping the worker mid-build leaves the build running -----------
+    // KillMode=process. The hub fails the job while no capable worker
+    // is connected, so the client retries until the resubmission
+    // dedupes onto the surviving build.
+    let adopted = count(Node::Worker, "tribuchet-worker", "adopted running build");
     succeed(
         Node::Hub,
-        "systemd-run --unit=stopbuild bash -lc 'nix-build /etc/tt/stop.nix --no-out-link'",
+        "rm -f /tmp/stop.ok && systemd-run --unit=stopbuild bash -lc \
+         'until nix-build /etc/tt/stop.nix --no-out-link; do sleep 2; done && touch /tmp/stop.ok'",
     );
     wait_until_succeeds(Node::Worker, "pgrep -f 'stop-marker-runnin[g]'", 60);
-    let released = count(Node::Worker, "tribuchet-sandboxd", "released");
 
     // --- no worker: build is declined and falls back to a local build -----
     succeed(Node::Worker, "systemctl stop tribuchet-worker");
-    // systemd kills the unit's cgroup subtree; sandboxd reaps the lease
-    wait_until_succeeds(Node::Worker, "! pgrep -f 'stop-marker-runnin[g]'", 60);
-    wait_until_succeeds(Node::Worker, no_build_cgroups, 60);
-    // sandboxd reaped the lease of the killed build and returned its block
-    wait_until_succeeds(
-        Node::Worker,
-        &format!("[ $(journalctl -u tribuchet-sandboxd | grep -c released) -gt {released} ]"),
-        60,
-    );
-    // stop the client before its declined build falls back to a local run
-    run(Node::Hub, "systemctl kill --signal=SIGKILL stopbuild");
+    succeed(Node::Worker, "pgrep -f 'stop-marker-runnin[g]'");
     // Let the hub observe the session tear down so it no longer counts capable.
     succeed(Node::Hub, "sleep 3");
     write_echo_deriv(
@@ -814,8 +809,18 @@ fn lifecycle() {
         &format!("grep -q 'fallback-payload built-locally' {}", out.trim()),
     );
     assert_journal(Node::Hub, "tribuchet-hub", "no capable worker; declining");
+
+    // --- the restarted worker re-adopts and delivers the stopped build ----
     succeed(Node::Worker, "systemctl start tribuchet-worker");
     wait_journal(Node::Hub, "tribuchet-hub", "worker registered", 60);
+    wait_until_succeeds(Node::Hub, "test -f /tmp/stop.ok", 120);
+    let adopted_now = count(Node::Worker, "tribuchet-worker", "adopted running build");
+    assert!(
+        adopted_now > adopted,
+        "start did not adopt the stopped-worker build"
+    );
+    // the finished build's lease and cgroup are gone again
+    wait_until_succeeds(Node::Worker, no_build_cgroups, 60);
 
     // --- build really ran on the worker -----------------------------------
     assert_journal(Node::Worker, "tribuchet-worker", "builder finished");

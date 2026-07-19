@@ -230,10 +230,12 @@ pub fn setup_stage() -> ! {
         // The builder gets /dev/null as stdin, like under Nix.
         let null = fs::File::open("/dev/null")?;
         unistd::dup2_stdin(&null).map_err(ioerr("dup2 stdin"))?;
-        // Pre-open the error file: the fd keeps working after
-        // pivot_root detaches the host filesystem, a path would not.
+        // Pre-open the error and exit-status files: the fds keep
+        // working after pivot_root detaches the host filesystem, a
+        // path would not.
         let err_file = fs::File::create(setup_error_file(&spec.root))?;
-        enter_and_exec(&spec).inspect_err(|e| {
+        let status_file = fs::File::create(exit_status_file(&spec.root))?;
+        enter_and_exec(&spec, &status_file).inspect_err(|e| {
             let _ = (&err_file).write_all(e.to_string().as_bytes());
         })
     })()
@@ -247,7 +249,10 @@ pub fn setup_stage() -> ! {
 
 const CLOSE_RANGE_CLOEXEC: libc::c_uint = 4;
 
-fn enter_and_exec(spec: &SandboxSpec) -> io::Result<std::convert::Infallible> {
+fn enter_and_exec(
+    spec: &SandboxSpec,
+    status_file: &fs::File,
+) -> io::Result<std::convert::Infallible> {
     // sandboxd placed this process in the build cgroup before the spec
     // arrived on stdin; CLONE_NEWCGROUP below roots the namespace there.
     let binfmt_line = match &spec.emulator {
@@ -280,6 +285,7 @@ fn enter_and_exec(spec: &SandboxSpec) -> io::Result<std::convert::Infallible> {
         network: spec.network,
         has_cgroup: spec.cgroup.is_some(),
         uid_count,
+        status_file,
     })?;
     let prog =
         CString::new(spec.builder.as_str()).map_err(|_| io::Error::other("NUL in builder path"))?;
@@ -519,19 +525,27 @@ fn loopback_up() -> io::Result<()> {
 }
 
 /// Fork so the exec'd builder is PID 1 of the new PID namespace;
-/// this process becomes a shim that forwards the builder's exit
-/// status. When PID 1 dies the kernel kills every namespace member,
-/// so daemonized/setsid'd builder children cannot outlive the build.
-fn fork_into_pid_ns() -> io::Result<bool> {
+/// this process becomes a shim that persists the builder's exit
+/// status to `status_file` (so a worker that is not our parent can
+/// still learn it) and then exits with it. When PID 1 dies the kernel
+/// kills every namespace member, so daemonized/setsid'd builder
+/// children cannot outlive the build.
+fn fork_into_pid_ns(status_file: &fs::File) -> io::Result<bool> {
     match unsafe { unistd::fork() }.map_err(ioerr("fork"))? {
         unistd::ForkResult::Child => Ok(true),
         unistd::ForkResult::Parent { child } => {
+            use std::io::Write;
             use wait::{WaitStatus, waitpid};
-            // Drop every inherited fd: the long-lived shim must not
-            // hold the log pipes (or the setup error file) open for
-            // the build's whole lifetime.
+            // Drop every inherited fd except the status file: the
+            // long-lived shim must not hold the log pipes (or the
+            // setup error file) open for the build's whole lifetime.
+            let mut status_file = status_file;
+            let keep = status_file.as_raw_fd().cast_unsigned();
             unsafe {
-                libc::syscall(libc::SYS_close_range, 3, libc::c_uint::MAX, 0);
+                if keep > 3 {
+                    libc::syscall(libc::SYS_close_range, 3, keep - 1, 0);
+                }
+                libc::syscall(libc::SYS_close_range, keep + 1, libc::c_uint::MAX, 0);
             }
             let code = loop {
                 match waitpid(child, None) {
@@ -541,6 +555,8 @@ fn fork_into_pid_ns() -> io::Result<bool> {
                     Err(_) => break 1,
                 }
             };
+            let _ = writeln!(status_file, "{code}");
+            let _ = status_file.sync_all();
             unsafe { libc::_exit(code) }
         }
     }
@@ -563,6 +579,9 @@ struct SetupParams<'a> {
     has_cgroup: bool,
     /// Uids mapped in the lease (1 or 65536).
     uid_count: u32,
+    /// Pre-opened file the PID-1 shim writes the builder's exit code
+    /// to (readable by the worker even when it is not the parent).
+    status_file: &'a fs::File,
 }
 
 fn setup(p: &SetupParams) -> io::Result<()> {
@@ -621,7 +640,7 @@ fn setup(p: &SetupParams) -> io::Result<()> {
 
     // CLONE_NEWPID only applies to children: fork so the builder
     // runs as PID 1. Everything below runs in the child.
-    if !fork_into_pid_ns()? {
+    if !fork_into_pid_ns(p.status_file)? {
         unreachable!("parent never returns");
     }
 
@@ -859,6 +878,22 @@ fn apply_process_limits(system: &str) -> io::Result<()> {
 
 pub fn setup_error_file(root: &Path) -> PathBuf {
     root.with_file_name("setup-error")
+}
+
+/// Where the PID-1 shim records the builder's exit code. Next to the
+/// sandbox root (like the setup-error file), so the builder cannot
+/// forge it.
+pub fn exit_status_file(root: &Path) -> PathBuf {
+    root.with_file_name("exit-status")
+}
+
+/// Exit code the shim persisted, if the build has finished.
+pub fn exit_status_impl(spec: &SandboxSpec) -> Option<i32> {
+    fs::read_to_string(exit_status_file(&spec.root))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 pub fn setup_error_detail_impl(spec: &SandboxSpec) -> Option<String> {

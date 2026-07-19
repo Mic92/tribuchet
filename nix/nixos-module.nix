@@ -2,10 +2,11 @@
 #
 # Hub: socket-activated (systemd holds the attach socket and the worker
 # port), so hub restarts never refuse connections, clients just queue.
-# Worker: a small reaper process is the main pid; the unit execs the
-# worker through a stable /run symlink and reloads instead of
-# restarting on package changes, so running builds survive upgrades
-# (the reaper execs a fresh worker generation that re-adopts them).
+# Worker: builds run in their own process groups and sandboxd-leased
+# cgroups, and KillMode=process leaves them alive across a unit stop
+# or restart. A restarted worker re-adopts them from the state
+# persisted in its build dirs, so package upgrades and settings
+# changes are plain restarts.
 self:
 {
   config,
@@ -27,8 +28,6 @@ let
     // hub.settings
   );
   workerToml = format.generate "worker.toml" worker.settings;
-  workerExec = "/run/tribuchet-worker/exec";
-  flipWorkerExec = "${pkgs.coreutils}/bin/ln -sfn ${lib.getExe' worker.package "tribuchet"} ${workerExec}";
   attachWrapper = pkgs.writeShellScript "tribuchet-attach" ''
     exec ${lib.getExe' hub.package "tribuchet"} attach "$1" --socket ${hub.socketPath}
   '';
@@ -335,30 +334,18 @@ in
         # the socket must exist before the worker starts
         wants = [ "tribuchet-sandboxd.socket" ];
         after = [ "tribuchet-sandboxd.socket" ];
-        # only ExecReload carries the package store path, so a new
-        # package reloads instead of restarting; settings changes also
-        # arrive via reload (the fresh worker generation re-reads the
-        # config file). With reloadIfChanged a restart trigger causes
-        # a reload, and unlike reloadTriggers it does not warn about
-        # the combination.
-        reloadIfChanged = true;
         restartTriggers = [ workerToml ];
         serviceConfig = {
           Type = "notify";
           LoadCredential = lib.optional (worker.keyFile != null) "worker-key:${worker.keyFile}";
           User = "tribuchet";
           Group = "tribuchet";
-          # READY/watchdog come from the worker child; the main pid
-          # is the build reaper it was exec'd by.
-          NotifyAccess = "all";
           WatchdogSec = "30";
-          ExecStartPre = flipWorkerExec;
-          ExecReload = [
-            flipWorkerExec
-            "${pkgs.coreutils}/bin/kill -HUP $MAINPID"
-          ];
-          ExecStart = "${workerExec} worker --config /etc/tribuchet/worker.toml";
-          RuntimeDirectory = "tribuchet-worker";
+          ExecStart = "${lib.getExe' worker.package "tribuchet"} worker --config /etc/tribuchet/worker.toml";
+          # Stop and restart signal only the worker itself. Running
+          # builds keep going in their build cgroups and are re-adopted
+          # by the next worker instance.
+          KillMode = "process";
           StateDirectory = "tribuchet";
           Environment = [
             "RUST_LOG=info"

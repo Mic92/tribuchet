@@ -1,4 +1,4 @@
-# Logs ~64KB per second: slow enough to reload the worker before the
+# Logs ~64KB per second: slow enough to restart the worker before the
 # 1MB max-log-size is reached, fast enough to exceed it soon after, so
 # the limit must be enforced on the re-adopted build.
 { bash }:

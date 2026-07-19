@@ -1,8 +1,8 @@
 //! TOML configuration for the long-running services (hub, worker).
 //!
 //! The services take a single `--config` path instead of command-line
-//! flags so that a worker reload (which execs a new worker generation
-//! through the reaper) picks up settings changes without a restart.
+//! flags so that a unit restart picks up settings changes without
+//! editing the unit.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

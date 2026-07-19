@@ -15,10 +15,9 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-#[cfg(all(test, target_os = "macos"))]
-use std::process::{Child, Stdio};
+use std::process::{Child, Command, Stdio};
 
 use anyhow::{Context, Result};
 
@@ -206,79 +205,61 @@ pub fn prepare(
     Ok(spec)
 }
 
-/// Turn a prepared sandbox into a reaper spawn request plus, on
-/// Linux, the pipe carrying the serialized spec to the setup stage:
-/// (request, read end for the child's stdin, write end the caller
-/// must fill with `send_spec_to` after the spawn).
-pub fn spawn_request(
-    spec: &SandboxSpec,
-) -> Result<(
-    crate::worker::reaper::SpawnRequest,
-    Option<std::os::fd::OwnedFd>,
-    Option<std::os::fd::OwnedFd>,
-)> {
-    let cmd = platform::command(spec)?;
-    let argv: Vec<String> = std::iter::once(cmd.get_program())
-        .chain(cmd.get_args())
-        .map(|s| s.to_string_lossy().into_owned())
-        .collect();
-    let req = crate::worker::reaper::SpawnRequest {
-        argv,
-        // The derivation env must not reach the pre-sandbox setup stage
-        // (worker binary, worker host credentials): LD_PRELOAD would run
-        // client code outside the sandbox. With the spec on stdin the
-        // env is applied at the builder exec instead.
-        env: if platform::SPEC_VIA_STDIN {
-            Vec::new()
-        } else {
-            spec.env
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect()
-        },
-        cwd: cmd
-            .get_current_dir()
-            .map(|p| p.to_string_lossy().into_owned()),
-        has_stdin: platform::SPEC_VIA_STDIN,
-        token: String::new(),
-    };
-    if platform::SPEC_VIA_STDIN {
-        let (r, w) = nix::unistd::pipe().context("creating spec pipe")?;
-        Ok((req, Some(r), Some(w)))
-    } else {
-        Ok((req, None, None))
-    }
-}
-
-/// Write the serialized spec into the setup stage's stdin pipe; call
-/// after the reaper confirmed the spawn. No-op platform-wise on macOS
-/// (no pipe exists there).
-pub fn send_spec_to(spec: &SandboxSpec, w: std::os::fd::OwnedFd) -> Result<()> {
-    serde_json::to_writer(fs::File::from(w), spec).context("sending sandbox spec")
-}
-
-/// Spawn the builder directly (macOS unit tests only; real builds go
-/// through the reaper) with stdout/stderr on `log`.
-#[cfg(all(test, target_os = "macos"))]
-pub fn spawn(spec: &SandboxSpec, log: fs::File) -> Result<Child> {
+/// The prepared sandbox as a spawnable command plus, on Linux, the
+/// write end of the pipe carrying the serialized spec to the setup
+/// stage's stdin.
+fn build_command(spec: &SandboxSpec) -> Result<(Command, Option<OwnedFd>)> {
     let mut cmd = platform::command(spec)?;
     // Own process group, so orphaned builder children can be killed
-    // after the builder exits (there is no PID namespace to do it).
+    // after the builder exits.
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    // The derivation env must not reach the pre-sandbox setup stage
+    // (worker binary, worker host credentials): LD_PRELOAD would run
+    // client code outside the sandbox. With the spec on stdin the env
+    // is applied at the builder exec instead.
     cmd.env_clear();
-    // Mirror the reaper: with the spec on stdin the builder env is
-    // applied at the builder exec, not on the setup stage process.
     if !platform::SPEC_VIA_STDIN {
         cmd.envs(&spec.env);
     }
-    cmd.stdin(platform::stdin_mode())
-        .stdout(Stdio::from(log.try_clone()?))
-        .stderr(Stdio::from(log));
-    let mut child = cmd
+    if platform::SPEC_VIA_STDIN {
+        // O_CLOEXEC: a write end inherited by the child would keep the
+        // spec read from ever seeing EOF.
+        let (r, w) =
+            nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).context("creating spec pipe")?;
+        cmd.stdin(Stdio::from(fs::File::from(r)));
+        Ok((cmd, Some(w)))
+    } else {
+        cmd.stdin(Stdio::null());
+        Ok((cmd, None))
+    }
+}
+
+/// Spawn the sandboxed build with stdout/stderr on `log`. The build
+/// is a direct child of the worker, but its state (log, exit status)
+/// is persisted on disk so it survives a worker restart. On Linux the
+/// returned write end must be filled with `send_spec_to` once the
+/// spec is complete (the setup stage blocks on stdin until then).
+pub fn spawn(spec: &SandboxSpec, log: &fs::File) -> Result<(Child, Option<OwnedFd>)> {
+    let (mut cmd, spec_w) = build_command(spec)?;
+    cmd.stdout(Stdio::from(log.try_clone()?))
+        .stderr(Stdio::from(log.try_clone()?));
+    let child = cmd
         .spawn()
         .with_context(|| format!("spawning builder {}", spec.builder))?;
-    platform::send_spec(&mut child, spec)?;
-    Ok(child)
+    Ok((child, spec_w))
+}
+
+/// Write the serialized spec into the setup stage's stdin pipe. Call
+/// after the lease filled in the cgroup. No pipe exists on macOS.
+pub fn send_spec_to(spec: &SandboxSpec, w: OwnedFd) -> Result<()> {
+    serde_json::to_writer(fs::File::from(w), spec).context("sending sandbox spec")
+}
+
+/// Exit code of a finished build, persisted by the Linux PID-1 shim.
+/// None on macOS (the exit code comes from waiting the child) and
+/// while the build is still running.
+pub fn exit_status(spec: &SandboxSpec) -> Option<i32> {
+    platform::exit_status_impl(spec)
 }
 
 /// Setup-stage failure message, written by the stage before the host
@@ -409,8 +390,13 @@ mod tests {
             ..test_spec(dir.path())
         };
         fs::create_dir_all(&spec.build_dir)?;
-        let (req, _r, _w) = spawn_request(&spec)?;
-        assert!(req.env.is_empty(), "setup stage env: {:?}", req.env);
+        let (cmd, _w) = build_command(&spec)?;
+        assert_eq!(
+            cmd.get_envs().count(),
+            0,
+            "setup stage env: {:?}",
+            cmd.get_envs().collect::<Vec<_>>()
+        );
         Ok(())
     }
 
@@ -459,7 +445,7 @@ mod tests {
         fs::create_dir_all(&spec.build_dir)?;
         platform::prepare(&mut spec)?;
         let log_path = dir.path().join("build.log");
-        let mut child = spawn(&spec, fs::File::create(&log_path)?)?;
+        let (mut child, _w) = spawn(&spec, &fs::File::create(&log_path)?)?;
         let status = child.wait()?;
         let log = fs::read_to_string(&log_path)?;
         assert_eq!(status.code(), Some(7), "{status:?} log: {log}");

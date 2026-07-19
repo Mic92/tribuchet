@@ -1,14 +1,11 @@
 # nix-darwin module for the tribuchet hub and worker.
 #
-# Worker: launchd has no ExecReload, so zero-downtime upgrades work
-# like on NixOS, just driven from activation: the daemon execs a
-# stable symlink in the state dir, activation flips it to the new
-# package and sends SIGHUP, and the reaper execs a fresh worker
-# generation that re-adopts running builds. The plist contains neither
-# the package store path nor the settings (those live in
-# /etc/tribuchet/worker.toml), so neither a package bump nor a
-# settings change makes nix-darwin restart the daemon; both arrive via
-# the SIGHUP reload.
+# Worker: the daemon execs a stable symlink in the state dir, so the
+# plist contains neither the package store path nor the settings
+# (those live in /etc/tribuchet/worker.toml). Activation flips the
+# symlink to the new package and restarts the daemon via launchctl
+# kickstart. Running builds do not survive a worker restart on macOS
+# until the per-uid agent design lands.
 #
 # Hub: launchd holds the attach socket and the worker port (the hub
 # adopts them via launch_activate_socket), so hub restarts never
@@ -100,9 +97,8 @@ in
         }
       '';
       description = ''
-        Contents of worker.toml. Changes are applied with a SIGHUP
-        reload, so running builds survive them. The `hub` key is
-        required.
+        Contents of worker.toml. Changes are applied by restarting
+        the daemon at activation. The `hub` key is required.
       '';
     };
     logFile = lib.mkOption {
@@ -161,15 +157,15 @@ in
         EnvironmentVariables.RUST_LOG = "info";
       };
 
-      # The symlink must point at the new package before launchd could
-      # (re)start the daemon; the SIGHUP afterwards hands running builds
-      # over to the new binary.
+      # The symlink must point at the new package before launchd
+      # (re)starts the daemon. The kickstart afterwards restarts the
+      # worker on the new binary and settings.
       system.activationScripts.preActivation.text = ''
         mkdir -p ${lib.escapeShellArg (toString cfg.stateDir)}
         ln -sfn ${lib.getExe' cfg.package "tribuchet"} ${lib.escapeShellArg execLink}
       '';
       system.activationScripts.postActivation.text = ''
-        /bin/launchctl kill SIGHUP system/${label} 2>/dev/null || true
+        /bin/launchctl kickstart -k system/${label} 2>/dev/null || true
       '';
     })
   ];

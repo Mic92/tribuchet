@@ -13,7 +13,7 @@ use std::path::PathBuf;
 /// parent holds processes) and enable the memory controller for
 /// siblings. Best-effort: on a non-delegated host the writes fail and
 /// sandboxd's build cgroups just have no memory.max.
-// Only the Linux reaper calls this; there is no macOS equivalent.
+// Called once at worker startup. There is no macOS equivalent.
 #[cfg(target_os = "linux")]
 pub fn init() {
     let Ok(cg) = fs::read_to_string("/proc/self/cgroup") else {

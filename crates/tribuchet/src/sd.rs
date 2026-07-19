@@ -145,19 +145,14 @@ pub async fn stop_requested() {
 /// Keep the systemd watchdog fed (WatchdogSec=); a wedged runtime
 /// stops the pings and gets the service killed and restarted.
 pub fn spawn_watchdog() {
-    // Not sd_notify::watchdog_enabled(): that insists WATCHDOG_PID ==
-    // getpid(), but the worker is a fork below the main pid (the build
-    // reaper). systemd accepts WATCHDOG=1 from any unit process under
-    // NotifyAccess=all, so accept our parent's pid too.
     let Some(timeout) = std::env::var("WATCHDOG_USEC")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map(std::time::Duration::from_micros)
         .filter(|_| {
-            std::env::var("WATCHDOG_PID").ok().is_none_or(|p| {
-                p == std::process::id().to_string()
-                    || p == nix::unistd::getppid().as_raw().to_string()
-            })
+            std::env::var("WATCHDOG_PID")
+                .ok()
+                .is_none_or(|p| p == std::process::id().to_string())
         })
     else {
         return;

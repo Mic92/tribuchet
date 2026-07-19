@@ -122,21 +122,14 @@ pub fn setup_error_detail_impl(_spec: &SandboxSpec) -> Option<String> {
     None
 }
 
+/// No PID-1 shim on Darwin. The exit code comes from waiting the
+/// builder process directly.
+pub fn exit_status_impl(_spec: &SandboxSpec) -> Option<i32> {
+    None
+}
+
 /// sandbox-exec takes everything on the command line.
 pub const SPEC_VIA_STDIN: bool = false;
-
-#[cfg(test)]
-pub fn stdin_mode() -> Stdio {
-    Stdio::null()
-}
-
-// Result-returning to mirror the Linux implementation, which writes
-// the spec into the setup stage's stdin pipe and can fail.
-#[cfg(test)]
-#[allow(clippy::unnecessary_wraps)]
-pub fn send_spec(_child: &mut Child, _spec: &SandboxSpec) -> Result<()> {
-    Ok(())
-}
 
 pub fn cleanup(outputs: &[String], _dir: &Path) {
     // Outputs were written straight into /nix/store; drop them after
