@@ -1,21 +1,18 @@
 //! Per-job protocol with a worker: input staging, output relay and verification.
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, bail};
 use harmonia_utils_signature::{PublicKey, Signature};
-use nix::{dir, fcntl};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tonic::Status;
 
 use super::state::{HubState, Job};
-use crate::chunkio::ChunkWriter;
 use crate::proto::{
     BuildAssignment, BuildResult, CancelBuild, ExtraPath, HubMessage, NarTransfer, OutputNar,
     OutputSignature, PathInfoMsg, PathOffer, ResultAck, TmpDirArchive, attach_event, hub_message,
@@ -199,7 +196,7 @@ async fn stage_inputs(
             send(out_tx, hub_message::Msg::PathInfo(info)).await?;
             stream_store_path(&job.id, &path, out_tx).await?;
         }
-        stream_tmp_dir(&job.id, job.tmp_dir.clone(), out_tx).await
+        stream_tmp_dir(&job.id, &job.tmp_dir_tar, out_tx).await
     }
     .await;
     if res.is_err() {
@@ -399,35 +396,25 @@ async fn stream_store_path(
     .await
 }
 
-/// Tar+zstd the topTmpDir (structured attrs, passAsFile files) to the
-/// worker. Always sent last: its EOF tells the worker to start the build.
+/// Forward the client-shipped topTmpDir archive (structured attrs,
+/// passAsFile files) to the worker. Always sent last: its EOF tells
+/// the worker to start the build.
 async fn stream_tmp_dir(
     build_id: &str,
-    top_tmp_dir: Arc<fs::File>,
+    tmp_dir_tar: &[u8],
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
 ) -> Result<()> {
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
-    let task = tokio::task::spawn_blocking(move || -> Result<()> {
-        let enc = zstd::stream::write::Encoder::new(ChunkWriter::new(tx), 3)?;
-        let mut tar = tar::Builder::new(enc);
-        // Walk the directory through the fd validated at submission
-        // time, not by re-resolving the client-controlled path.
-        append_dir_fd(&mut tar, &top_tmp_dir, Path::new(""), 0)?;
-        tar.into_inner()?.finish()?.flush()?;
-        Ok(())
-    });
-    while let Some(chunk) = rx.recv().await {
+    for chunk in tmp_dir_tar.chunks(crate::chunkio::CHUNK_SIZE) {
         send(
             out_tx,
             hub_message::Msg::TmpDir(TmpDirArchive {
                 build_id: build_id.into(),
-                zstd_tar_chunk: chunk,
+                zstd_tar_chunk: chunk.to_vec(),
                 eof: false,
             }),
         )
         .await?;
     }
-    task.await??;
     send(
         out_tx,
         hub_message::Msg::TmpDir(TmpDirArchive {
@@ -437,94 +424,6 @@ async fn stream_tmp_dir(
         }),
     )
     .await
-}
-
-/// Recursively archive a client-owned directory through fds relative to
-/// the held handle. The client can rewrite the tree while the root hub
-/// walks it, so every descent uses openat with O_NOFOLLOW and headers
-/// are taken from the opened fd: an entry swapped for a symlink between
-/// listing and opening is archived as whatever it now is, never
-/// followed into a foreign root-readable file.
-fn append_dir_fd<W: io::Write>(
-    tar: &mut tar::Builder<W>,
-    dir: &fs::File,
-    prefix: &Path,
-    depth: u32,
-) -> Result<()> {
-    // Bound recursion so a client-crafted deep tree cannot overflow
-    // the spawn_blocking stack and abort the hub.
-    ensure!(depth < 128, "topTmpDir nesting too deep");
-    use std::os::fd::AsFd;
-    use std::os::unix::ffi::OsStringExt;
-    use std::os::unix::fs::MetadataExt;
-    // List through fdopendir on a dup of the validated handle instead
-    // of re-resolving the client-controlled path (and instead of
-    // /proc/self/fd, which is Linux-only and unreliable on macOS).
-    let mut listing = dir::Dir::from_fd(std::os::fd::OwnedFd::from(dir.try_clone()?))?;
-    // Collect names and types up front: dir::Entry borrows the
-    // iterator, and we recurse below.
-    let mut entries = Vec::new();
-    for res in listing.iter() {
-        let entry = res?;
-        let bytes = entry.file_name().to_bytes();
-        if bytes == b"." || bytes == b".." {
-            continue;
-        }
-        entries.push((
-            std::ffi::OsString::from_vec(bytes.to_vec()),
-            entry.file_type(),
-        ));
-    }
-    for (name, ftype) in entries {
-        let in_tar = prefix.join(&name);
-        // Tar carries only files, dirs and symlinks; openat would
-        // ENXIO on the .nix-socket recursive-nix leaves in topTmpDir.
-        // An unknown type is resolved by the O_NOFOLLOW open below.
-        if !matches!(
-            ftype,
-            None | Some(dir::Type::Directory | dir::Type::File | dir::Type::Symlink)
-        ) {
-            continue;
-        }
-        if ftype == Some(dir::Type::Symlink) {
-            let target = fcntl::readlinkat(dir.as_fd(), name.as_os_str())?;
-            let mut h = tar::Header::new_gnu();
-            h.set_entry_type(tar::EntryType::Symlink);
-            h.set_size(0);
-            h.set_mode(0o777);
-            tar.append_link(&mut h, &in_tar, target)?;
-            continue;
-        }
-        // O_NOFOLLOW: an entry swapped for a symlink since the listing
-        // fails the open instead of being followed. O_NONBLOCK: a fifo
-        // swapped in cannot stall the hub; the fstat below skips it.
-        let fd: fs::File = fcntl::openat(
-            dir.as_fd(),
-            name.as_os_str(),
-            fcntl::OFlag::O_RDONLY
-                | fcntl::OFlag::O_NOFOLLOW
-                | fcntl::OFlag::O_CLOEXEC
-                | fcntl::OFlag::O_NONBLOCK,
-            nix::sys::stat::Mode::empty(),
-        )?
-        .into();
-        let meta = fd.metadata()?;
-        let mut h = tar::Header::new_gnu();
-        h.set_mode(meta.mode() & 0o7777);
-        h.set_mtime(u64::try_from(meta.mtime()).unwrap_or(0));
-        if meta.is_dir() {
-            h.set_entry_type(tar::EntryType::Directory);
-            h.set_size(0);
-            tar.append_data(&mut h, &in_tar, io::empty())?;
-            append_dir_fd(tar, &fd, &in_tar, depth + 1)?;
-        } else if meta.is_file() {
-            h.set_entry_type(tar::EntryType::Regular);
-            h.set_size(meta.len());
-            tar.append_data(&mut h, &in_tar, &fd)?;
-        }
-        // anything else (fifo, socket, device) is not build-dir content
-    }
-    Ok(())
 }
 
 /// Hashes the decompressed NAR while the compressed chunks are relayed
@@ -871,7 +770,6 @@ async fn relay_build(
 
 #[cfg(test)]
 mod tests {
-    use super::super::submit::validate_top_tmp_dir;
     use super::*;
 
     fn info(path: &str, refs: &[&str]) -> PathInfoMsg {
@@ -923,87 +821,6 @@ mod tests {
         let b = "/nix/store/bbb";
         let ordered = order_by_references(vec![info(a, &[b]), info(b, &[a])]);
         assert_eq!(ordered.len(), 2);
-    }
-
-    /// Run stream_tmp_dir over an already-validated handle and return
-    /// the decompressed tar bytes.
-    async fn tmp_dir_tar(handle: fs::File) -> Vec<u8> {
-        let (tx, mut rx) = mpsc::channel(64);
-        stream_tmp_dir("b1", Arc::new(handle), &tx).await.unwrap();
-        drop(tx);
-        let mut compressed = Vec::new();
-        while let Some(Ok(msg)) = rx.recv().await {
-            if let Some(hub_message::Msg::TmpDir(c)) = msg.msg {
-                compressed.extend(c.zstd_tar_chunk);
-            }
-        }
-        zstd::decode_all(&compressed[..]).unwrap()
-    }
-
-    /// Swapping the submitted path for a symlink after validation must
-    /// not redirect what the hub tars: the archive is built from the
-    /// directory handle opened at validation time.
-    #[tokio::test]
-    async fn tmp_dir_archive_comes_from_the_validated_directory() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("build");
-        fs::create_dir(&dir).unwrap();
-        fs::write(dir.join("attrs"), "validated").unwrap();
-        let me = nix::unistd::getuid().as_raw();
-        let handle = validate_top_tmp_dir(dir.to_str().unwrap(), me).unwrap();
-
-        // attacker swaps the path for a symlink to a foreign directory
-        let foreign = tmp.path().join("foreign");
-        fs::create_dir(&foreign).unwrap();
-        fs::write(foreign.join("secret"), "foreign").unwrap();
-        fs::rename(&dir, tmp.path().join("moved-aside")).unwrap();
-        std::os::unix::fs::symlink(&foreign, &dir).unwrap();
-
-        let tar_bytes = tmp_dir_tar(handle).await;
-        let mut names = Vec::new();
-        let mut ar = tar::Archive::new(&tar_bytes[..]);
-        for entry in ar.entries().unwrap() {
-            names.push(entry.unwrap().path().unwrap().into_owned());
-        }
-        assert!(names.iter().any(|p| p.ends_with("attrs")), "{names:?}");
-        assert!(!names.iter().any(|p| p.ends_with("secret")), "{names:?}");
-    }
-
-    /// Symlinks inside the build dir are archived as symlinks; their
-    /// targets (potentially root-only files) are never read or shipped.
-    #[tokio::test]
-    async fn tmp_dir_archive_does_not_follow_symlink_entries() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("build");
-        fs::create_dir_all(dir.join("sub")).unwrap();
-        fs::write(dir.join("sub/file"), "payload").unwrap();
-        let secret = tmp.path().join("secret");
-        fs::write(&secret, "foreign-content").unwrap();
-        std::os::unix::fs::symlink(&secret, dir.join("link")).unwrap();
-        let me = nix::unistd::getuid().as_raw();
-        let handle = validate_top_tmp_dir(dir.to_str().unwrap(), me).unwrap();
-
-        let tar_bytes = tmp_dir_tar(handle).await;
-        assert!(!tar_bytes.windows(15).any(|w| w == b"foreign-content"));
-        let mut found = HashMap::new();
-        let mut ar = tar::Archive::new(&tar_bytes[..]);
-        for entry in ar.entries().unwrap() {
-            let entry = entry.unwrap();
-            found.insert(
-                entry.path().unwrap().into_owned(),
-                entry.header().entry_type(),
-            );
-        }
-        assert_eq!(
-            found.get(Path::new("link")),
-            Some(&tar::EntryType::Symlink),
-            "{found:?}"
-        );
-        assert_eq!(
-            found.get(Path::new("sub/file")),
-            Some(&tar::EntryType::Regular),
-            "{found:?}"
-        );
     }
 
     /// Wrong-key signatures must fail before any daemon contact, so a

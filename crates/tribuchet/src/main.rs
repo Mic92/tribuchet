@@ -12,6 +12,7 @@ mod rt;
 mod sd;
 mod store;
 mod tailscale;
+mod tmptar;
 mod worker;
 
 use std::path::PathBuf;

@@ -193,12 +193,31 @@ message OutputSignature {
 
 // Local service between `tribuchet attach` and the hub, served on a unix
 // socket. The hub is colocated with nix-daemon, so it reads input store
-// paths and topTmpDir directly from disk; attach only sends metadata.
+// paths directly from disk. Attach sends the request metadata followed
+// by its tarred topTmpDir contents, so the hub never reads the
+// client's build directory.
 service AttachHub {
-  rpc Build(BuildRequest) returns (stream AttachEvent);
+  rpc Build(stream BuildMessage) returns (stream AttachEvent);
+}
+
+// Client-streamed submission: the BuildRequest, then the zstd tar of
+// the client's topTmpDir, terminated by an eof chunk.
+message BuildMessage {
+  oneof msg {
+    BuildRequest request = 1;
+    TmpDirChunk tmp_dir = 2;
+  }
+}
+
+message TmpDirChunk {
+  bytes zstd_tar_chunk = 1;
+  bool eof = 2;
 }
 
 message BuildRequest {
+  // 7 was top_tmp_dir, back when the hub tarred the build dir itself.
+  reserved 7;
+  reserved "top_tmp_dir";
   string system = 1;
   string builder = 2;
   repeated string args = 3;
@@ -206,7 +225,6 @@ message BuildRequest {
   // Output name -> scratch store path.
   map<string, string> outputs = 5;
   repeated string input_paths = 6;
-  string top_tmp_dir = 7;
   string tmp_dir_in_sandbox = 8;
   string store_dir = 9;
   bool fixed_output = 10;

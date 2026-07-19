@@ -35,18 +35,16 @@ GC by per-build temp roots. The worker must be a trusted daemon user
 1. Nix invokes `tribuchet attach <build.json>`. The shim parses build.json
    (version 1: builder, args, env, inputPaths, outputs, system, topTmpDir,
    tmpDirInSandbox) and submits a build request to the hub over a unix
-   socket. The request carries the `topTmpDir` *path*; the hub (which runs
-   as root next to nix-daemon) tars its contents itself, because
-   structured attrs / `passAsFile` place files there that env refers to
-   via `tmpDirInSandbox` (`/build/.attrs.json` etc.). Since the hub reads
-   that directory off local disk, it first verifies the directory is
-   owned by the connecting peer (SO_PEERCRED) — a client cannot point the
-   hub at someone else's files.
+   socket, followed by a zstd tar of its own `topTmpDir`: structured
+   attrs / `passAsFile` place files there that env refers to via
+   `tmpDirInSandbox` (`/build/.attrs.json` etc.). The hub only buffers
+   and forwards that archive. It never reads client directories off
+   disk.
 2. Hub validates the request (store dir pinned to `/nix/store`, store-path
    basenames restricted to Nix's name charset, absolute builder,
    `tmpDirInSandbox` pinned to `/build`, no duplicate or input-aliasing
-   outputs) and dedupes by a hash of the request minus the per-attempt
-   `topTmpDir`. Nix derives the scratch outputs deterministically from
+   outputs, tmp dir archive size capped) and dedupes by a hash of the
+   request. Nix derives the scratch outputs deterministically from
    the drvPath, so submissions of the same derivation hash identically:
    a matching request attaches to the in-flight build's log and result,
    while a *different* request claiming an in-flight scratch path is
@@ -151,7 +149,7 @@ signatures).
   cannot serve validly-signed outputs.
 * The attach socket is group-restricted to `nixbld` (the hub refuses to
   start without that group). Request validation pins every client-chosen
-  path; `topTmpDir` must be owned by the connecting peer.
+  path.
 * The worker validates everything the hub sends (build ids, store paths,
   builder, sandbox dir) before using it in filesystem operations — a
   compromised hub does not get filesystem primitives on workers.

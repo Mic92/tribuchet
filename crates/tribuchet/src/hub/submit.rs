@@ -5,13 +5,14 @@ use std::path::{Component, Path};
 use std::sync::Arc;
 use std::time::Instant;
 
-use nix::fcntl;
 use sha2::{Digest, Sha256};
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::{Request, Response, Status};
+use tonic::{Request, Response, Status, Streaming};
 
 use super::state::{HubState, Job, Replay};
-use crate::proto::{AttachEvent, BuildRequest, attach_event, attach_hub_server};
+use crate::proto::{
+    AttachEvent, BuildMessage, BuildRequest, attach_event, attach_hub_server, build_message,
+};
 use crate::store::{STORE_DIR, valid_store_path};
 
 fn validate_request(req: &BuildRequest) -> Result<(), Status> {
@@ -66,39 +67,36 @@ fn validate_request(req: &BuildRequest) -> Result<(), Status> {
     {
         return Err(Status::invalid_argument("invalid tmpDirInSandbox"));
     }
-    let tmp = Path::new(&req.top_tmp_dir);
-    if !tmp.is_absolute() || tmp.components().any(|c| matches!(c, Component::ParentDir)) {
-        return Err(Status::invalid_argument("invalid topTmpDir"));
-    }
     Ok(())
 }
 
-/// The root hub tars `top_tmp_dir` off local disk; require it to be a
-/// real directory owned by the connecting peer so a client cannot have
-/// the hub ship `/root` or another user's build dir. Returns the opened
-/// directory: tarring later goes through this fd, so swapping the path
-/// for a symlink after validation cannot redirect what gets shipped.
-pub(super) fn validate_top_tmp_dir(
-    top_tmp_dir: &str,
-    peer_uid: u32,
-) -> Result<std::fs::File, Status> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let dir = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags((fcntl::OFlag::O_DIRECTORY | fcntl::OFlag::O_NOFOLLOW).bits())
-        .open(top_tmp_dir)
-        .map_err(|e| Status::invalid_argument(format!("topTmpDir {top_tmp_dir}: {e}")))?;
-    // O_DIRECTORY already guarantees a directory; only ownership is
-    // left to check, via fstat on the handle just opened.
-    let meta = dir
-        .metadata()
-        .map_err(|e| Status::invalid_argument(format!("topTmpDir {top_tmp_dir}: {e}")))?;
-    if meta.uid() != peer_uid {
-        return Err(Status::permission_denied(
-            "topTmpDir is not owned by the requesting user",
-        ));
+/// Cap on the client-shipped tmp dir archive: it is buffered in hub
+/// memory for the lifetime of the job (redispatch resends it).
+const MAX_TMP_DIR_TAR_BYTES: usize = 64 * 1024 * 1024;
+
+/// Read the client submission stream: the request first, then the
+/// zstd-tarred topTmpDir up to its eof chunk.
+async fn read_submission(
+    stream: &mut Streaming<BuildMessage>,
+) -> Result<(BuildRequest, Vec<u8>), Status> {
+    let bad = |what: &str| Status::invalid_argument(format!("malformed submission stream: {what}"));
+    let Some(build_message::Msg::Request(req)) = stream.message().await?.and_then(|m| m.msg) else {
+        return Err(bad("expected the build request first"));
+    };
+    let mut tar = Vec::new();
+    loop {
+        let Some(build_message::Msg::TmpDir(chunk)) = stream.message().await?.and_then(|m| m.msg)
+        else {
+            return Err(bad("expected tmp dir archive chunks"));
+        };
+        if tar.len() + chunk.zstd_tar_chunk.len() > MAX_TMP_DIR_TAR_BYTES {
+            return Err(Status::resource_exhausted("tmp dir archive too large"));
+        }
+        tar.extend(chunk.zstd_tar_chunk);
+        if chunk.eof {
+            return Ok((req, tar));
+        }
     }
-    Ok(dir)
 }
 
 /// Dedupe key: hash of the full canonicalized request, so only truly
@@ -221,20 +219,14 @@ impl attach_hub_server::AttachHub for AttachSvc {
 
     async fn build(
         &self,
-        request: Request<BuildRequest>,
+        request: Request<Streaming<BuildMessage>>,
     ) -> Result<Response<Self::BuildStream>, Status> {
-        let peer_uid = request
-            .extensions()
-            .get::<tonic::transport::server::UdsConnectInfo>()
-            .and_then(|info| info.peer_cred)
-            .map(|cred| cred.uid())
-            .ok_or_else(|| Status::internal("missing unix peer credentials"))?;
-        let req = request.into_inner();
+        let (req, tmp_dir_tar) = read_submission(&mut request.into_inner()).await?;
         if req.outputs.is_empty() {
             return Err(Status::invalid_argument("build request without outputs"));
         }
         validate_request(&req)?;
-        let tmp_dir = Arc::new(validate_top_tmp_dir(&req.top_tmp_dir, peer_uid)?);
+        let tmp_dir_tar = Arc::new(tmp_dir_tar);
         let key = dedupe_key(&req);
 
         let features = crate::build_json::required_system_features(&req.env);
@@ -265,7 +257,7 @@ impl attach_hub_server::AttachHub for AttachSvc {
                 id: new_id(),
                 key,
                 req,
-                tmp_dir,
+                tmp_dir_tar,
                 features,
                 replay: replay.clone(),
                 attempts: 0,
@@ -305,7 +297,6 @@ mod tests {
             env: HashMap::default(),
             outputs: [("out".to_string(), format!("/nix/store/{H}-out"))].into(),
             input_paths: vec![format!("/nix/store/{H}-dep")],
-            top_tmp_dir: "/tmp/nix-build-x".into(),
             tmp_dir_in_sandbox: "/build".into(),
             store_dir: "/nix/store".into(),
             fixed_output: false,
@@ -358,19 +349,6 @@ mod tests {
     }
 
     #[test]
-    fn top_tmp_dir_validation_rejects_symlinks_and_foreign_dirs() {
-        let tmp = tempfile::tempdir().unwrap();
-        let me = nix::unistd::getuid().as_raw();
-        let dir = tmp.path().join("build");
-        std::fs::create_dir(&dir).unwrap();
-        assert!(validate_top_tmp_dir(dir.to_str().unwrap(), me).is_ok());
-        assert!(validate_top_tmp_dir(dir.to_str().unwrap(), me + 1).is_err());
-        let link = tmp.path().join("link");
-        std::os::unix::fs::symlink(&dir, &link).unwrap();
-        assert!(validate_top_tmp_dir(link.to_str().unwrap(), me).is_err());
-    }
-
-    #[test]
     fn dedupe_key_binds_full_request() {
         let a = dedupe_key(&base_request());
         assert_eq!(a, dedupe_key(&base_request()));
@@ -380,17 +358,6 @@ mod tests {
         let mut req = base_request();
         req.env.insert("X".into(), "1".into());
         assert_ne!(a, dedupe_key(&req));
-    }
-
-    /// Two submissions of the same derivation differ only in the
-    /// per-attempt `topTmpDir`; the key ignores it so they dedupe.
-    #[test]
-    fn dedupe_key_ignores_per_attempt_top_tmp_dir() {
-        let a = base_request();
-        let mut b = base_request();
-        b.top_tmp_dir = "/nix/var/nix/builds/nix-1909052-1544484239".into();
-        assert_ne!(a.top_tmp_dir, b.top_tmp_dir);
-        assert_eq!(dedupe_key(&a), dedupe_key(&b));
     }
 
     /// Strings shifted between adjacent sections must not collide:

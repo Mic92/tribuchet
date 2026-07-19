@@ -142,10 +142,9 @@ pub(super) struct Job {
     pub(super) id: String,
     pub(super) key: String,
     pub(super) req: BuildRequest,
-    /// The topTmpDir as validated at submission time, held open so the
-    /// later tar step cannot be redirected by swapping the path for a
-    /// symlink while the job is queued.
-    pub(super) tmp_dir: Arc<fs::File>,
+    /// The client's zstd-tarred topTmpDir, buffered so redispatch can
+    /// resend it without another round-trip to the client.
+    pub(super) tmp_dir_tar: Arc<Vec<u8>>,
     /// requiredSystemFeatures; only workers advertising them get the job.
     pub(super) features: Vec<String>,
     pub(super) replay: Arc<Replay>,
@@ -454,7 +453,7 @@ mod tests {
                 system: "x86_64-linux".into(),
                 ..Default::default()
             },
-            tmp_dir: Arc::new(fs::File::open(std::env::temp_dir()).unwrap()),
+            tmp_dir_tar: Arc::new(Vec::new()),
             features: vec![],
             replay: replay.clone(),
             attempts: 0,
