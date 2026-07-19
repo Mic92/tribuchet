@@ -76,7 +76,7 @@ jobs:
         with:
           ref: ${{ env.E2E_SHA }}
 
-      - uses: NixOS/nix-installer-action@6b8548fe06acfb0155a50ab5d561accb215764cc
+      - uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6
         with:
           extra-conf: ${{ env.NIX_EXTRA_CONF }}
 
@@ -139,7 +139,7 @@ jobs:
         with:
           ref: ${{ env.E2E_SHA }}
 
-      - uses: NixOS/nix-installer-action@6b8548fe06acfb0155a50ab5d561accb215764cc
+      - uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6
         with:
           extra-conf: ${{ env.NIX_EXTRA_CONF }}
 
