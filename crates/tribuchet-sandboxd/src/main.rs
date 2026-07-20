@@ -19,12 +19,13 @@ use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use nix::sys::socket::{UnixCredentials, getsockopt, sockopt::PeerCredentials};
 use nix::unistd::{Gid, Pid, Uid, User};
-use sandbox_proto::{AllocateReply, AllocateRequest, METHOD_ALLOCATE, METHOD_PURGE};
+use sandbox_proto::framing;
+use sandbox_proto::linux::{AllocateReply, AllocateRequest, METHOD_ALLOCATE, METHOD_PURGE};
 
 #[derive(Parser)]
 struct Args {
     /// Unix socket to listen on (systemd socket activation wins if set).
-    #[arg(long, default_value = sandbox_proto::SOCKET_PATH)]
+    #[arg(long, default_value = sandbox_proto::linux::SOCKET_PATH)]
     socket: PathBuf,
     /// User the worker runs as; only this uid may request leases.
     #[arg(long, default_value = "tribuchet")]
@@ -70,7 +71,7 @@ fn main() -> Result<()> {
         std::thread::spawn(move || {
             if let Err(e) = handle(&daemon, &conn) {
                 tracing::warn!("lease failed: {e:#}");
-                let _ = sandbox_proto::send_error(&conn, &format!("{e:#}"));
+                let _ = framing::send_error(&conn, &format!("{e:#}"));
             }
         });
     }
@@ -101,7 +102,7 @@ fn handle(daemon: &Daemon, conn: &UnixStream) -> Result<()> {
         daemon.worker.uid
     );
 
-    let (method, params, fds): (_, serde_json::Value, _) = sandbox_proto::recv_call(conn)?;
+    let (method, params, fds): (_, serde_json::Value, _) = framing::recv_call(conn)?;
     match method.as_str() {
         METHOD_ALLOCATE => {
             handle_allocate(daemon, conn, peer, serde_json::from_value(params)?, fds)
@@ -156,7 +157,7 @@ fn handle_allocate(
         // From here the cgroup exists on disk; remove it on any early exit.
         let setup = (|| {
             lease::enter_cgroup(&cgroup, stage_fd.as_fd(), daemon.worker.uid)?;
-            sandbox_proto::send_reply(
+            framing::send_reply(
                 conn,
                 &AllocateReply { pool_base: base },
                 &[cgroup.dir.as_raw_fd()],
@@ -201,5 +202,5 @@ fn handle_purge(daemon: &Daemon, conn: &UnixStream, fds: Vec<std::os::fd::OwnedF
         "purge target must be a worker-owned directory"
     );
     lease::purge_tree(&dir)?;
-    sandbox_proto::send_reply(conn, &serde_json::json!({}), &[])
+    framing::send_reply(conn, &serde_json::json!({}), &[])
 }

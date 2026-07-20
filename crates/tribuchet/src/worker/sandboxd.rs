@@ -13,9 +13,12 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use sandbox_proto::{AllocateReply, AllocateRequest, METHOD_ALLOCATE, METHOD_PURGE, PurgeRequest};
+use sandbox_proto::framing;
+use sandbox_proto::linux::{
+    AllocateReply, AllocateRequest, METHOD_ALLOCATE, METHOD_PURGE, PurgeRequest,
+};
 
-pub use sandbox_proto::SOCKET_PATH;
+pub use sandbox_proto::linux::SOCKET_PATH;
 
 /// Ask sandboxd (root) to empty a worker-owned dir of leased-uid files.
 pub fn purge(socket: &Path, dir: &Path) -> Result<()> {
@@ -30,8 +33,8 @@ pub fn purge(socket: &Path, dir: &Path) -> Result<()> {
     .with_context(|| format!("opening {}", dir.display()))?;
     let conn = UnixStream::connect(socket)
         .with_context(|| format!("connecting to sandboxd at {}", socket.display()))?;
-    sandbox_proto::send_call(&conn, METHOD_PURGE, &PurgeRequest {}, &[fd.as_raw_fd()])?;
-    let (_, _): (serde_json::Value, _) = sandbox_proto::recv_reply(&conn)?;
+    framing::send_call(&conn, METHOD_PURGE, &PurgeRequest {}, &[fd.as_raw_fd()])?;
+    let (_, _): (serde_json::Value, _) = framing::recv_reply(&conn)?;
     Ok(())
 }
 
@@ -101,7 +104,7 @@ impl SandboxPrep {
         // The holder must survive until sandboxd has verified the
         // pidfd/userns pair and written maps through /proc/<pid>;
         // afterwards the fd alone pins the namespace.
-        sandbox_proto::send_call(
+        framing::send_call(
             &conn,
             METHOD_ALLOCATE,
             &AllocateRequest {
@@ -115,8 +118,8 @@ impl SandboxPrep {
                 tmp_dir_fd.as_raw_fd(),
             ],
         )?;
-        let (reply, fds): (AllocateReply, Vec<OwnedFd>) = sandbox_proto::recv_reply(&conn)
-            .context("leasing a sandbox from tribuchet-sandboxd")?;
+        let (reply, fds): (AllocateReply, Vec<OwnedFd>) =
+            framing::recv_reply(&conn).context("leasing a sandbox from tribuchet-sandboxd")?;
         let [cgroup_fd] = <[OwnedFd; 1]>::try_from(fds).map_err(|fds| {
             anyhow::anyhow!("expected 1 fd in the lease reply, got {}", fds.len())
         })?;
@@ -209,7 +212,7 @@ mod tests {
         std::thread::spawn(move || {
             let (conn, _) = listener.accept().unwrap();
             let (method, request, fds): (_, AllocateRequest, _) =
-                sandbox_proto::recv_call(&conn).unwrap();
+                framing::recv_call(&conn).unwrap();
             assert_eq!(method, METHOD_ALLOCATE);
             assert_eq!(request.uid_count, 65536);
             assert_eq!(
@@ -218,7 +221,7 @@ mod tests {
                 "userns, holder and stage pidfds plus tmp dir expected"
             );
             let cgroup = std::fs::File::open("/tmp").unwrap();
-            sandbox_proto::send_reply(
+            framing::send_reply(
                 &conn,
                 &AllocateReply {
                     pool_base: 3_000_000,
@@ -227,7 +230,7 @@ mod tests {
             )
             .unwrap();
             // keep the lease connection open until the client is done
-            let _ = sandbox_proto::recv_call::<serde_json::Value>(&conn);
+            let _ = framing::recv_call::<serde_json::Value>(&conn);
         })
     }
 
@@ -261,8 +264,8 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         std::thread::spawn(move || {
             let (conn, _) = listener.accept().unwrap();
-            let _ = sandbox_proto::recv_call::<AllocateRequest>(&conn).unwrap();
-            sandbox_proto::send_error(&conn, "com.tribuchet.Sandbox.PoolExhausted").unwrap();
+            let _ = framing::recv_call::<AllocateRequest>(&conn).unwrap();
+            framing::send_error(&conn, "com.tribuchet.Sandbox.PoolExhausted").unwrap();
         });
         let err = SandboxPrep::new()
             .unwrap()
