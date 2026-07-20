@@ -57,10 +57,29 @@ struct Agent {
     state_dir: PathBuf,
     worker_uid: u32,
     current: Mutex<Option<Build>>,
+    /// True under launchd, where the agent owns a dedicated uid: exit
+    /// after Cleanup so launchd starts a fresh agent, and sweep the
+    /// whole uid when killing. Self-bound sockets (development, tests)
+    /// share the developer's uid, where both would be destructive.
+    dedicated_uid: bool,
+}
+
+impl Agent {
+    fn kill_sweep(&self, pgid: Option<i32>) {
+        if let Some(pgid) = pgid {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pgid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        if self.dedicated_uid {
+            kill_own_uid_processes();
+        }
+    }
 }
 
 pub fn run(opts: Options) -> Result<()> {
-    let listener = listener(opts.socket.as_deref())?;
+    let (listener, launchd) = listener(opts.socket.as_deref())?;
     fs::create_dir_all(&opts.state_dir)
         .with_context(|| format!("creating state dir {}", opts.state_dir.display()))?;
     let agent = Arc::new(Agent {
@@ -69,6 +88,7 @@ pub fn run(opts: Options) -> Result<()> {
             .worker_uid
             .unwrap_or_else(|| nix::unistd::getuid().as_raw()),
         current: Mutex::new(None),
+        dedicated_uid: launchd,
     });
     tracing::info!(uid = nix::unistd::getuid().as_raw(), "agent listening");
     for conn in listener.incoming() {
@@ -85,14 +105,16 @@ pub fn run(opts: Options) -> Result<()> {
 }
 
 /// launchd-activated listener (socket named "agent" in the plist) or a
-/// self-bound one for development and tests.
-fn listener(socket: Option<&Path>) -> Result<UnixListener> {
+/// self-bound one for development and tests. The bool is true for the
+/// launchd case.
+fn listener(socket: Option<&Path>) -> Result<(UnixListener, bool)> {
     if let Some(l) = launchd_unix_listener("agent")? {
-        return Ok(l);
+        return Ok((l, true));
     }
     let path = socket.context("no launchd socket and no --socket given")?;
     let _ = fs::remove_file(path);
-    UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))
+    let l = UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
+    Ok((l, false))
 }
 
 fn handle(agent: &Arc<Agent>, conn: &UnixStream) -> Result<()> {
@@ -134,7 +156,7 @@ fn handle_start(
         }
         // A previous build's leftovers (missed by its kill sweep) must
         // not tamper with this one. The uid holds nothing else.
-        kill_own_uid_processes();
+        agent.kill_sweep(None);
 
         let scratch_root = agent.state_dir.join(&req.build_id);
         let build_dir = scratch_root.join("build");
@@ -210,11 +232,7 @@ fn handle_kill(agent: &Arc<Agent>, conn: &UnixStream, req: &KillRequest) -> Resu
             _ => return framing::send_error(conn, ERROR_UNKNOWN_BUILD),
         }
     };
-    let _ = nix::sys::signal::killpg(
-        nix::unistd::Pid::from_raw(pid),
-        nix::sys::signal::Signal::SIGKILL,
-    );
-    kill_own_uid_processes();
+    agent.kill_sweep(Some(pid));
     framing::send_reply(conn, &serde_json::json!({}), &[])
 }
 
@@ -240,7 +258,7 @@ fn handle_cleanup(agent: &Arc<Agent>, conn: &UnixStream, req: &CleanupRequest) -
             _ => return framing::send_error(conn, ERROR_UNKNOWN_BUILD),
         }
     };
-    kill_own_uid_processes();
+    agent.kill_sweep(Some(build.pid));
     let _ = fs::remove_dir_all(&build.scratch_root);
     for out in &build.outputs {
         // Scratch outputs live at their real store paths and are
@@ -250,10 +268,11 @@ fn handle_cleanup(agent: &Arc<Agent>, conn: &UnixStream, req: &CleanupRequest) -
         let _ = fs::remove_file(p);
     }
     framing::send_reply(conn, &serde_json::json!({}), &[])?;
-    // Socket-activated with no KeepAlive: exit when idle, launchd
-    // starts a fresh agent on the next connection.
-    tracing::info!(id = build.build_id, "cleanup done, exiting");
-    std::process::exit(0);
+    tracing::info!(id = build.build_id, "cleanup done");
+    if agent.dedicated_uid {
+        std::process::exit(0);
+    }
+    Ok(())
 }
 
 /// Fork and exec the builder: own process group, stdio on the log

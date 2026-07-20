@@ -12,6 +12,8 @@
 
 #[cfg(target_os = "macos")]
 pub mod agent;
+#[cfg(target_os = "macos")]
+mod agents;
 pub mod binfmt;
 mod build;
 mod caps;
