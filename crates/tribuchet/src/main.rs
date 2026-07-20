@@ -55,6 +55,19 @@ enum Command {
         #[command(subcommand)]
         action: ca::CaAction,
     },
+    /// macOS per-uid build agent, launched by launchd, one per pool user.
+    #[cfg(target_os = "macos")]
+    Agent {
+        /// Unix socket to bind when not launched by launchd.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// Directory for per-build scratch dirs.
+        #[arg(long)]
+        state_dir: PathBuf,
+        /// Uid allowed to lease builds (the worker user).
+        #[arg(long)]
+        worker_uid: Option<u32>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -84,5 +97,15 @@ fn main() -> anyhow::Result<()> {
             worker::run(cfg)
         }
         Command::Ca { action } => ca::run(action),
+        #[cfg(target_os = "macos")]
+        Command::Agent {
+            socket,
+            state_dir,
+            worker_uid,
+        } => worker::agent::run(worker::agent::Options {
+            socket,
+            state_dir,
+            worker_uid,
+        }),
     }
 }

@@ -221,17 +221,18 @@ fn build_command(spec: &SandboxSpec) -> Result<(Command, Option<OwnedFd>)> {
     if !platform::SPEC_VIA_STDIN {
         cmd.envs(&spec.env);
     }
+    // The spec pipe exists only on Linux (SPEC_VIA_STDIN). O_CLOEXEC:
+    // a write end inherited by a concurrently spawned sibling build
+    // would keep the spec read from ever seeing EOF.
+    #[cfg(target_os = "linux")]
     if platform::SPEC_VIA_STDIN {
-        // O_CLOEXEC: a write end inherited by the child would keep the
-        // spec read from ever seeing EOF.
         let (r, w) =
             nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).context("creating spec pipe")?;
         cmd.stdin(Stdio::from(fs::File::from(r)));
-        Ok((cmd, Some(w)))
-    } else {
-        cmd.stdin(Stdio::null());
-        Ok((cmd, None))
+        return Ok((cmd, Some(w)));
     }
+    cmd.stdin(Stdio::null());
+    Ok((cmd, None))
 }
 
 /// Spawn the sandboxed build with stdout/stderr on `log`. The build

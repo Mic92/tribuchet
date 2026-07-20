@@ -77,6 +77,35 @@ impl ActivatedSockets {
 /// sockets.
 #[cfg(target_os = "macos")]
 fn launchd_sockets(out: &mut ActivatedSockets) -> Result<()> {
+    for name in ["attach", "workers"] {
+        for fd in launchd_socket_fds(name)? {
+            out.adopt(fd)?;
+        }
+    }
+    Ok(())
+}
+
+/// The blocking unix listener launchd holds under `name` in the
+/// plist's `Sockets` dictionary, or None when not launchd-activated.
+#[cfg(target_os = "macos")]
+pub fn launchd_unix_listener(name: &str) -> Result<Option<std::os::unix::net::UnixListener>> {
+    use std::os::fd::FromRawFd as _;
+    let Some(fd) = launchd_socket_fds(name)?.into_iter().next() else {
+        return Ok(None);
+    };
+    if socket_family(fd)? != Some(socket::AddressFamily::Unix) {
+        bail!("launchd socket {name} is not a unix socket");
+    }
+    // Safety: launchd passed this fd for us to own.
+    Ok(Some(unsafe {
+        std::os::unix::net::UnixListener::from_raw_fd(fd)
+    }))
+}
+
+/// Fds launchd holds under `name`, empty when not running under
+/// launchd or the plist declares no such socket.
+#[cfg(target_os = "macos")]
+fn launchd_socket_fds(name: &str) -> Result<Vec<RawFd>> {
     unsafe extern "C" {
         fn launch_activate_socket(
             name: *const libc::c_char,
@@ -84,35 +113,25 @@ fn launchd_sockets(out: &mut ActivatedSockets) -> Result<()> {
             cnt: *mut libc::size_t,
         ) -> libc::c_int;
     }
-    for name in ["attach", "workers"] {
-        let cname = std::ffi::CString::new(name).unwrap();
-        let mut fds: *mut libc::c_int = std::ptr::null_mut();
-        let mut cnt: libc::size_t = 0;
-        let rc = unsafe { launch_activate_socket(cname.as_ptr(), &raw mut fds, &raw mut cnt) };
-        match rc {
-            0 => {}
-            // Not running under launchd, or no socket of this name in
-            // the plist: fall back to self-binding.
-            libc::ESRCH | libc::ENOENT => continue,
-            _ => {
-                return Err(std::io::Error::from_raw_os_error(rc))
-                    .with_context(|| format!("launch_activate_socket({name})"));
-            }
+    let cname = std::ffi::CString::new(name).unwrap();
+    let mut fds: *mut libc::c_int = std::ptr::null_mut();
+    let mut cnt: libc::size_t = 0;
+    let rc = unsafe { launch_activate_socket(cname.as_ptr(), &raw mut fds, &raw mut cnt) };
+    match rc {
+        0 => {}
+        libc::ESRCH | libc::ENOENT => return Ok(Vec::new()),
+        _ => {
+            return Err(std::io::Error::from_raw_os_error(rc))
+                .with_context(|| format!("launch_activate_socket({name})"));
         }
-        if fds.is_null() || cnt == 0 {
-            continue;
-        }
-        let adopted: Result<()> = (|| {
-            for &fd in unsafe { std::slice::from_raw_parts(fds, cnt) } {
-                out.adopt(fd)?;
-            }
-            Ok(())
-        })();
-        // launch_activate_socket allocates the fd array with malloc.
-        unsafe { libc::free(fds.cast()) };
-        adopted?;
     }
-    Ok(())
+    if fds.is_null() || cnt == 0 {
+        return Ok(Vec::new());
+    }
+    let out = unsafe { std::slice::from_raw_parts(fds, cnt) }.to_vec();
+    // launch_activate_socket allocates the fd array with malloc.
+    unsafe { libc::free(fds.cast()) };
+    Ok(out)
 }
 
 fn socket_family(fd: RawFd) -> Result<Option<socket::AddressFamily>> {

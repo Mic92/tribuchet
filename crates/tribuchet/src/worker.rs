@@ -10,6 +10,8 @@
 //!
 //! Runs up to `--max-jobs` builds concurrently over one hub session.
 
+#[cfg(target_os = "macos")]
+pub mod agent;
 pub mod binfmt;
 mod build;
 mod caps;

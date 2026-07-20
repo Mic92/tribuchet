@@ -6,5 +6,6 @@
 //! platform modules compile and unit-test everywhere; only the daemons
 //! that speak them are platform-gated.
 
+pub mod darwin;
 pub mod framing;
 pub mod linux;
