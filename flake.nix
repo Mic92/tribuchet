@@ -116,7 +116,11 @@
                 builtins.toJSON {
                   hub = eval.config.launchd.daemons.tribuchet-hub.serviceConfig;
                   worker = eval.config.launchd.daemons.tribuchet-worker.serviceConfig;
-                  activation = eval.config.system.activationScripts.postActivation.text;
+                  agent = eval.config.launchd.daemons.tribuchet-agent-1.serviceConfig;
+                  users = eval.config.users.knownUsers;
+                  activation =
+                    eval.config.system.activationScripts.preActivation.text
+                    + eval.config.system.activationScripts.postActivation.text;
                 }
               )
             );

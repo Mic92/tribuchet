@@ -1,11 +1,12 @@
 # nix-darwin module for the tribuchet hub and worker.
 #
-# Worker: the daemon execs a stable symlink in the state dir, so the
-# plist contains neither the package store path nor the settings
-# (those live in /etc/tribuchet/worker.toml). Activation flips the
-# symlink to the new package and restarts the daemon via launchctl
-# kickstart. Running builds do not survive a worker restart on macOS
-# until the per-uid agent design lands.
+# Worker: runs unprivileged as _tribuchet and leases every build to a
+# per-uid agent (_tribuchetbldN, socket-activated LaunchDaemon), which
+# owns the builder process, so builds survive worker restarts. The
+# daemon execs a stable symlink in the state dir, so the plist
+# contains neither the package store path nor the settings (those
+# live in /etc/tribuchet/worker.toml). Activation flips the symlink
+# to the new package and restarts the daemon via launchctl kickstart.
 #
 # Hub: launchd holds the attach socket and the worker port (the hub
 # adopts them via launch_activate_socket), so hub restarts never
@@ -24,7 +25,21 @@ let
   execLink = "${cfg.stateDir}/exec";
   label = "org.nixos.tribuchet-worker";
   format = pkgs.formats.toml { };
-  workerToml = format.generate "worker.toml" ({ state-dir = toString cfg.stateDir; } // cfg.settings);
+  agentIds = lib.range 1 cfg.agents;
+  agentUser = i: "_tribuchetbld${toString i}";
+  agentSocket = i: "/var/run/tribuchet/agents/${toString i}.sock";
+  agentStateDir = i: "/var/lib/tribuchet-agents/${toString i}";
+  # nixbld gid: build users must be able to create their outputs in
+  # the group-writable /nix/store.
+  nixbldGid = 350;
+  workerToml = format.generate "worker.toml" (
+    {
+      state-dir = toString cfg.stateDir;
+      agent-sockets = map agentSocket agentIds;
+      max-jobs = cfg.agents;
+    }
+    // cfg.settings
+  );
   hubToml = format.generate "hub.toml" (
     {
       socket = toString hub.socketPath;
@@ -88,6 +103,25 @@ in
       default = "/var/lib/tribuchet";
       description = "State directory: TLS material, build dirs, exec symlink.";
     };
+    agents = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 4;
+      description = ''
+        Number of per-uid build agents. Bounds concurrent builds and
+        sets the worker's max-jobs (overridable via `settings`, but
+        never above the agent count).
+      '';
+    };
+    uid = lib.mkOption {
+      type = lib.types.int;
+      default = 400;
+      description = "Uid of the _tribuchet worker user.";
+    };
+    agentUidBase = lib.mkOption {
+      type = lib.types.int;
+      default = 401;
+      description = "First uid of the _tribuchetbldN agent users (one per agent).";
+    };
     settings = lib.mkOption {
       type = format.type;
       example = lib.literalExpression ''
@@ -143,26 +177,98 @@ in
 
     (lib.mkIf cfg.enable {
       environment.etc."tribuchet/worker.toml".source = workerToml;
-      launchd.daemons.tribuchet-worker.serviceConfig = {
-        ProgramArguments = [
-          execLink
-          "worker"
-          "--config"
-          "/etc/tribuchet/worker.toml"
-        ];
-        KeepAlive = true;
-        RunAtLoad = true;
-        StandardOutPath = toString cfg.logFile;
-        StandardErrorPath = toString cfg.logFile;
-        EnvironmentVariables.RUST_LOG = "info";
-      };
+
+      # Worker user plus one build user per agent, all in nixbld so
+      # they can write /nix/store. The worker imports inputs through
+      # the nix-daemon, which requires trusting its user.
+      users.knownUsers = [ "_tribuchet" ] ++ map agentUser agentIds;
+      users.users = lib.mkMerge (
+        [
+          {
+            _tribuchet = {
+              uid = cfg.uid;
+              gid = nixbldGid;
+              home = "/var/empty";
+              shell = "/usr/bin/false";
+              description = "tribuchet worker";
+            };
+          }
+        ]
+        ++ map (i: {
+          ${agentUser i} = {
+            uid = cfg.agentUidBase + i - 1;
+            gid = nixbldGid;
+            home = "/var/empty";
+            shell = "/usr/bin/false";
+            description = "tribuchet build agent ${toString i}";
+          };
+        }) agentIds
+      );
+      nix.settings.trusted-users = [ "_tribuchet" ];
+
+      launchd.daemons = lib.mkMerge (
+        [
+          {
+            tribuchet-worker.serviceConfig = {
+              ProgramArguments = [
+                execLink
+                "worker"
+                "--config"
+                "/etc/tribuchet/worker.toml"
+              ];
+              UserName = "_tribuchet";
+              KeepAlive = true;
+              RunAtLoad = true;
+              StandardOutPath = toString cfg.logFile;
+              StandardErrorPath = toString cfg.logFile;
+              EnvironmentVariables.RUST_LOG = "info";
+            };
+          }
+        ]
+        # One socket-activated agent per build user. launchd owns the
+        # socket, the agent starts on the first connection and exits
+        # after each build's Cleanup. The socket mode is open because
+        # the agent itself only accepts connections from the worker
+        # uid (getpeereid).
+        ++ map (i: {
+          "tribuchet-agent-${toString i}".serviceConfig = {
+            ProgramArguments = [
+              (lib.getExe' cfg.package "tribuchet")
+              "agent"
+              "--state-dir"
+              (agentStateDir i)
+              "--worker-uid"
+              (toString cfg.uid)
+            ];
+            UserName = agentUser i;
+            Sockets.agent = {
+              SockPathName = agentSocket i;
+              SockPathMode = 438; # 0666
+            };
+            StandardOutPath = "/var/log/tribuchet-agent-${toString i}.log";
+            StandardErrorPath = "/var/log/tribuchet-agent-${toString i}.log";
+            EnvironmentVariables.RUST_LOG = "info";
+          };
+        }) agentIds
+      );
 
       # The symlink must point at the new package before launchd
       # (re)starts the daemon. The kickstart afterwards restarts the
-      # worker on the new binary and settings.
+      # worker on the new binary and settings; running builds stay in
+      # their agents and are re-adopted.
       system.activationScripts.preActivation.text = ''
         mkdir -p ${lib.escapeShellArg (toString cfg.stateDir)}
+        chown ${toString cfg.uid} ${lib.escapeShellArg (toString cfg.stateDir)}
+        touch ${lib.escapeShellArg (toString cfg.logFile)}
+        chown ${toString cfg.uid} ${lib.escapeShellArg (toString cfg.logFile)}
         ln -sfn ${lib.getExe' cfg.package "tribuchet"} ${lib.escapeShellArg execLink}
+        ${lib.concatMapStrings (i: ''
+          mkdir -p ${agentStateDir i}
+          chown ${toString (cfg.agentUidBase + i - 1)} ${agentStateDir i}
+          chmod 0700 ${agentStateDir i}
+          touch /var/log/tribuchet-agent-${toString i}.log
+          chown ${toString (cfg.agentUidBase + i - 1)} /var/log/tribuchet-agent-${toString i}.log
+        '') agentIds}
       '';
       system.activationScripts.postActivation.text = ''
         /bin/launchctl kickstart -k system/${label} 2>/dev/null || true
