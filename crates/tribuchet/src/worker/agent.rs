@@ -83,7 +83,13 @@ pub fn run(opts: Options) -> Result<()> {
     fs::create_dir_all(&opts.state_dir)
         .with_context(|| format!("creating state dir {}", opts.state_dir.display()))?;
     let agent = Arc::new(Agent {
-        state_dir: opts.state_dir,
+        // Canonical vnode path: scratch dirs derived from it feed the
+        // builder's env, cwd and the seatbelt SCRATCH_DIR filter, and
+        // Seatbelt only matches canonical paths.
+        state_dir: opts
+            .state_dir
+            .canonicalize()
+            .with_context(|| format!("canonicalizing state dir {}", opts.state_dir.display()))?,
         worker_uid: opts
             .worker_uid
             .unwrap_or_else(|| nix::unistd::getuid().as_raw()),

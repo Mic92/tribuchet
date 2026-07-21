@@ -329,10 +329,14 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let (socket, tar_path) = spawn_test_agent(dir.path())?;
         let build_id = "00000000000000000000000000000001";
-        let output = dir.path().join("fake-output");
-        let secret = dir.path().join("secret");
+        // Canonical paths: the profile's path filters only match
+        // canonical paths and macOS temp dirs live under the /var
+        // symlink. Real outputs are /nix/store paths, already canonical.
+        let dir_path = dir.path().canonicalize()?;
+        let output = dir_path.join("fake-output");
+        let secret = dir_path.join("secret");
         fs::write(&secret, "key-material")?;
-        let outside = dir.path().join("outside");
+        let outside = dir_path.join("outside");
         let outputs = vec![output.to_string_lossy().into_owned()];
         let mut req = start_request(
             build_id,
