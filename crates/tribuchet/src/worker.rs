@@ -106,17 +106,7 @@ impl WorkerCtx {
         log_path: &Path,
         timed_out: Option<String>,
     ) -> Option<String> {
-        self.abort_reason_from_meta(dedupe_key, fs::metadata(log_path).ok(), timed_out)
-    }
-
-    /// Like [`Self::abort_reason`], for callers that hold the log as
-    /// an fd instead of a path (macOS agent builds).
-    fn abort_reason_from_meta(
-        &self,
-        dedupe_key: &str,
-        log: Option<fs::Metadata>,
-        timed_out: Option<String>,
-    ) -> Option<String> {
+        let log = fs::metadata(log_path).ok();
         let silent = log
             .as_ref()
             .and_then(|m| m.modified().ok())

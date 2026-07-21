@@ -17,7 +17,9 @@ use std::collections::HashMap;
 use std::fs;
 #[cfg(target_os = "linux")]
 use std::os::fd::OwnedFd;
-use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::path::Path;
+use std::path::PathBuf;
 #[cfg(target_os = "linux")]
 use std::process::{Child, Command, Stdio};
 
@@ -252,30 +254,19 @@ pub fn send_spec_to(spec: &SandboxSpec, w: OwnedFd) -> Result<()> {
     serde_json::to_writer(fs::File::from(w), spec).context("sending sandbox spec")
 }
 
-/// Exit code of a finished build, persisted by the Linux PID-1 shim.
-/// None while the build is still running (and always on macOS, where
-/// the agent holds the exit code).
+/// Exit code of a finished build, persisted by the PID-1 shim. None
+/// while the build is still running.
+#[cfg(target_os = "linux")]
 pub fn exit_status(spec: &SandboxSpec) -> Option<i32> {
-    #[cfg(target_os = "linux")]
-    return platform::exit_status_impl(spec);
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = spec;
-        None
-    }
+    platform::exit_status_impl(spec)
 }
 
 /// Setup-stage failure message, written by the stage before the host
 /// filesystem became unreachable. Read by the worker when the build
 /// exits nonzero.
+#[cfg(target_os = "linux")]
 pub fn setup_error_detail(spec: &SandboxSpec) -> Option<String> {
-    #[cfg(target_os = "linux")]
-    return platform::setup_error_detail_impl(spec);
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = spec;
-        None
-    }
+    platform::setup_error_detail_impl(spec)
 }
 
 /// Entry point of the re-exec'd setup stage: builds run as
@@ -291,12 +282,9 @@ pub fn setup_stage() -> ! {
 #[cfg(target_os = "linux")]
 pub use platform::SETUP_STAGE_ARG;
 
+#[cfg(target_os = "linux")]
 pub fn cleanup(outputs: &[String], dir: &Path) {
-    #[cfg(target_os = "linux")]
     platform::cleanup(outputs, dir);
-    // macOS: the agent's Cleanup removes the scratch dir and outputs.
-    #[cfg(not(target_os = "linux"))]
-    let _ = (outputs, dir);
 }
 
 #[cfg(target_os = "linux")]

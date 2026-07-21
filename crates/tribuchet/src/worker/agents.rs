@@ -117,6 +117,12 @@ impl AgentPool {
     pub(super) fn release(&self, socket: PathBuf) {
         self.free.lock().unwrap().push(socket);
     }
+
+    /// Take a specific agent out of the pool: an adopted build already
+    /// occupies it, so new builds must not be placed there.
+    pub(super) fn reserve(&self, socket: &Path) {
+        self.free.lock().unwrap().retain(|s| s != socket);
+    }
 }
 
 /// The lease connection of one running build.

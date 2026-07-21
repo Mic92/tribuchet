@@ -12,7 +12,11 @@ use harmonia_store_remote::{DaemonClient, DaemonStore};
 use harmonia_utils_signature::SecretKey;
 use tokio::sync::mpsc;
 
-use super::build::{ActiveBuild, supervise};
+use super::build::ActiveBuild;
+#[cfg(target_os = "linux")]
+use super::build::supervise;
+#[cfg(target_os = "macos")]
+use super::build::{LogMirror, supervise_agent};
 use super::logtail::LogTail;
 use super::{DaemonConn, WorkerCtx, msg, sandbox};
 use crate::chunkio::CHUNK_SIZE;
@@ -32,29 +36,7 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>, signing_key: &Arc<SecretK
     for entry in entries.flatten() {
         let dir = entry.path();
         if let Ok(s) = fs::read_to_string(dir.join("finished.json")) {
-            let Ok(f) = serde_json::from_str::<FinishedState>(&s) else {
-                ctx.remove_build_dir(&dir);
-                continue;
-            };
-            tracing::info!(id = f.build_id, "adopted finished build awaiting delivery");
-            ctx.resumable.lock().unwrap().insert(
-                f.dedupe_key.clone(),
-                ResumableBuild {
-                    build_id: f.build_id,
-                    out_tx: None,
-                    finished: Some(FinishedBuild {
-                        exit_code: f.exit_code,
-                        error: f.error,
-                        outputs: f.outputs,
-                        extras: f.extras,
-                        dir: dir.clone(),
-                        finished_at: Instant::now(),
-                    }),
-                    delivering: false,
-                    dir,
-                    log_tail: None,
-                },
-            );
+            adopt_finished(ctx, &s, dir);
             continue;
         }
         let Ok(s) = fs::read_to_string(dir.join("resume.json")) else {
@@ -64,14 +46,34 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>, signing_key: &Arc<SecretK
             ctx.remove_build_dir(&dir);
             continue;
         };
-        // Without a leased cgroup there is nothing that ties the
-        // persisted pid to this build (macOS until the agent track
-        // lands): a recycled pid must not be supervised as a build.
+        // Something must tie the persisted state to live processes,
+        // otherwise a recycled pid could be supervised as a build. On
+        // Linux that is the leased cgroup (or a persisted exit
+        // status), on macOS the agent that still knows the build.
+        #[cfg(target_os = "linux")]
         if st.spec.cgroup.is_none() && sandbox::exit_status(&st.spec).is_none() {
             tracing::warn!(id = st.build_id, "dropping unadoptable running build");
             ctx.remove_build_dir(&dir);
             continue;
         }
+        #[cfg(target_os = "macos")]
+        let agent = {
+            let Some(socket) = st.agent_socket.clone() else {
+                tracing::warn!(id = st.build_id, "dropping unadoptable running build");
+                ctx.remove_build_dir(&dir);
+                continue;
+            };
+            ctx.agents.reserve(&socket);
+            match super::agents::AgentBuild::adopt(&socket, &st.build_id) {
+                Ok((build, _)) => (socket, build),
+                Err(e) => {
+                    tracing::warn!(id = st.build_id, "re-adopting build from its agent: {e:#}");
+                    ctx.agents.release(socket);
+                    ctx.remove_build_dir(&dir);
+                    continue;
+                }
+            }
+        };
         tracing::info!(id = st.build_id, pid = st.pid, "adopted running build");
         // The temp roots taken at negotiation died with the previous
         // generation's daemon connection; without new ones a GC could
@@ -94,13 +96,55 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>, signing_key: &Arc<SecretK
         tokio::task::spawn_blocking(move || {
             let ctx = task_ctx;
             let key = st.dedupe_key.clone();
+            #[cfg(target_os = "linux")]
             let fin = supervise(&ctx, &st, dir, &signing_key, None);
+            #[cfg(target_os = "macos")]
+            let fin = {
+                let (socket, build) = agent;
+                // Keep mirroring the agent-side log into dir/build.log
+                // so replay and abort heuristics see fresh data.
+                let mirror = LogMirror::start(&build.log, dir.join("build.log")).ok();
+                let fin = supervise_agent(&ctx, &st, dir, &socket, build, &signing_key);
+                if let Some(m) = mirror {
+                    m.stop();
+                }
+                ctx.agents.release(socket);
+                fin
+            };
             // Roots live until the outputs are packed.
             drop(gc_roots);
             drop(permit);
             record_finished(&ctx, &key, fin);
         });
     }
+}
+
+/// Register a finished-but-undelivered result found on disk for
+/// redelivery to a resumed session.
+fn adopt_finished(ctx: &Arc<WorkerCtx>, state_json: &str, dir: PathBuf) {
+    let Ok(f) = serde_json::from_str::<FinishedState>(state_json) else {
+        ctx.remove_build_dir(&dir);
+        return;
+    };
+    tracing::info!(id = f.build_id, "adopted finished build awaiting delivery");
+    ctx.resumable.lock().unwrap().insert(
+        f.dedupe_key.clone(),
+        ResumableBuild {
+            build_id: f.build_id,
+            out_tx: None,
+            finished: Some(FinishedBuild {
+                exit_code: f.exit_code,
+                error: f.error,
+                outputs: f.outputs,
+                extras: f.extras,
+                dir: dir.clone(),
+                finished_at: Instant::now(),
+            }),
+            delivering: false,
+            dir,
+            log_tail: None,
+        },
+    );
 }
 
 /// Take fresh temp roots for an adopted build's inputs on a new daemon
@@ -231,11 +275,15 @@ pub(super) struct ResumeState {
     pub(super) dedupe_key: String,
     /// Original assignment id: names the cgroup and the log file.
     pub(super) build_id: String,
-    /// The spawned shim. Used for process-group kills and, without a
-    /// cgroup, as a liveness probe.
+    /// The spawned shim (Linux) or agent-side builder (macOS). Used
+    /// for process-group kills and, without a cgroup, as a liveness
+    /// probe.
     pub(super) pid: i32,
     pub(super) spec: sandbox::SandboxSpec,
     pub(super) deadline_unix: u64,
+    /// macOS: socket of the agent that owns the build, for re-adoption.
+    #[serde(default)]
+    pub(super) agent_socket: Option<PathBuf>,
 }
 
 /// On-disk form of a finished-but-undelivered result; the packed NARs

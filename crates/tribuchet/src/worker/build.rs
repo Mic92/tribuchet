@@ -13,12 +13,12 @@ use harmonia_store_path::{StoreDir, StorePath, StorePathSet};
 use harmonia_store_path_info::{UnkeyedValidPathInfo, ValidPathInfo};
 use harmonia_store_remote::{DaemonClient, DaemonStore};
 use harmonia_utils_signature::SecretKey;
+#[cfg(target_os = "linux")]
 use nix::sys::signal;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use super::caps::requires_uid_range;
-#[cfg(target_os = "linux")]
 use super::logtail::tail_log;
 use super::resume::{FinishedBuild, PackedExtra, PackedOutput, ResumeState};
 use super::{DaemonConn, WorkerCtx, sandbox, unix_now};
@@ -459,6 +459,7 @@ impl ActiveBuild {
             pid,
             spec,
             deadline_unix: unix_now() + timeout.as_secs(),
+            agent_socket: None,
         };
         fs::write(self.dir.join("resume.json"), serde_json::to_vec(&resume)?)?;
 
@@ -550,127 +551,49 @@ impl ActiveBuild {
             "builder started on agent"
         );
 
-        // Live log streaming straight off the agent's log fd, with the
-        // offset persisted in the build dir like on Linux.
+        // Mirror the agent-side log into dir/build.log so the shared
+        // tailing, replay and resume paths work exactly as on Linux.
+        let mirror = LogMirror::start(&build.log, self.dir.join("build.log"))?;
         let log_done = Arc::new(atomic::AtomicBool::new(false));
         let tailer = {
             let tx = out_tx.clone();
             let build_id = a.build_id.clone();
-            let log = build.log.try_clone()?;
             let log_done = log_done.clone();
             let dir = self.dir.clone();
             std::thread::spawn(move || {
-                super::logtail::tail_file(log, &dir, &build_id, &tx, || {
-                    log_done.load(Ordering::Relaxed)
-                });
+                tail_log(&dir, &build_id, &tx, || log_done.load(Ordering::Relaxed));
             })
         };
-        let fin = self.supervise_agent(socket, build, unix_now() + timeout.as_secs(), signing_key);
-        log_done.store(true, Ordering::Relaxed);
-        let _ = tailer.join();
-        Ok(fin)
-    }
-
-    /// Wait out a build running on an agent, pack its outputs, and
-    /// have the agent clean up. The macOS counterpart of `supervise`.
-    #[cfg(target_os = "macos")]
-    fn supervise_agent(
-        &self,
-        socket: &Path,
-        build: super::agents::AgentBuild,
-        deadline_unix: u64,
-        signing_key: &SecretKey,
-    ) -> FinishedBuild {
-        let a = &self.assignment;
-        let log = build.log.try_clone().ok();
-        // The exit notice arrives on the lease connection. Wait for it
-        // on its own thread so the abort conditions keep being polled.
-        let waiter = std::thread::spawn(move || build.wait_exit());
-        let mut aborted: Option<String> = None;
-        while !waiter.is_finished() {
-            if aborted.is_none() {
-                let timed_out =
-                    (unix_now() >= deadline_unix).then(|| "build timed out".to_string());
-                let meta = log.as_ref().and_then(|l| l.metadata().ok());
-                if let Some(r) = self
-                    .ctx
-                    .abort_reason_from_meta(&a.dedupe_key, meta, timed_out)
-                {
-                    aborted = Some(r);
-                    if let Err(e) = super::agents::kill(socket, &a.build_id) {
-                        tracing::warn!(id = a.build_id, "killing the build via its agent: {e:#}");
-                    }
-                }
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        }
-        let code = match waiter.join() {
-            Ok(Ok(code)) => code,
-            Ok(Err(e)) => {
-                aborted.get_or_insert(format!("agent connection lost: {e:#}"));
-                1
-            }
-            Err(_) => {
-                aborted.get_or_insert("agent wait thread panicked".into());
-                1
-            }
-        };
-        tracing::info!(id = a.build_id, exit_code = code, aborted = ?aborted, "builder finished");
-        // Copy the log next to the packed NARs so a resumed session's
-        // replay (which reads dir/build.log) still works.
-        if let Some(mut l) = log {
-            use std::io::Seek as _;
-            if l.seek(io::SeekFrom::Start(0)).is_ok()
-                && let Ok(mut f) = fs::File::create(self.dir.join("build.log"))
-            {
-                let _ = io::copy(&mut l, &mut f);
-            }
-        }
-        let (exit_code, error, packed_outputs, extras) = if let Some(reason) = aborted {
-            (1, reason, vec![], vec![])
-        } else if code != 0 {
-            (code, String::new(), vec![], vec![])
-        } else {
-            // The outputs are agent-owned files at their real store
-            // paths; Finish makes them readable for packing.
-            let outputs: Vec<String> = a.outputs.values().cloned().collect();
-            let spec = sandbox::SandboxSpec {
+        // From here a restarted worker can re-adopt the build from
+        // its agent.
+        let resume = ResumeState {
+            dedupe_key: a.dedupe_key.clone(),
+            build_id: a.build_id.clone(),
+            pid: build.pid,
+            spec: sandbox::SandboxSpec {
                 outputs,
                 store_inputs: self.inputs.clone(),
                 recursive_nix: self.ctx.recursive_nix,
                 ..sandbox::SandboxSpec::default()
-            };
-            let remaining = Duration::from_secs(deadline_unix.saturating_sub(unix_now()));
-            let deadline = Instant::now() + remaining.max(Duration::from_mins(10));
-            let packed = super::agents::finish(socket, &a.build_id)
-                .context("finishing the build on its agent")
-                .and_then(|()| {
-                    tokio::runtime::Handle::current().block_on(pack_outputs_and_extras(
-                        &self.dir,
-                        &spec,
-                        deadline,
-                        signing_key,
-                        &a.build_id,
-                    ))
-                });
-            match packed {
-                Ok((o, e)) => (0, String::new(), o, e),
-                Err(e) => (1, format!("{e:#}"), vec![], vec![]),
-            }
+            },
+            deadline_unix: unix_now() + timeout.as_secs(),
+            agent_socket: Some(socket.to_path_buf()),
         };
-        // The agent removes its scratch dir and the scratch outputs
-        // (packing above already read them) and forgets the build.
-        if let Err(e) = super::agents::cleanup(socket, &a.build_id) {
-            tracing::warn!(id = a.build_id, "agent cleanup failed: {e:#}");
-        }
-        FinishedBuild {
-            exit_code,
-            error,
-            outputs: packed_outputs,
-            extras,
-            dir: self.dir.clone(),
-            finished_at: Instant::now(),
-        }
+        fs::write(self.dir.join("resume.json"), serde_json::to_vec(&resume)?)?;
+        let fin = supervise_agent(
+            &self.ctx,
+            &resume,
+            self.dir.clone(),
+            socket,
+            build,
+            signing_key,
+        );
+        // The mirror is drained before the tailer's final read so no
+        // trailing log lines are lost.
+        mirror.stop();
+        log_done.store(true, Ordering::Relaxed);
+        let _ = tailer.join();
+        Ok(fin)
     }
 
     /// Tear down a build abandoned before execution: stop the import
@@ -698,6 +621,7 @@ impl ActiveBuild {
 /// populated (Linux lease) or, without a cgroup, the shim/builder pid
 /// still exists. The pid check alone would be fooled by pid reuse for
 /// adopted builds, so the cgroup wins when there is one.
+#[cfg(target_os = "linux")]
 fn build_alive(st: &ResumeState) -> bool {
     if let Some(cg) = &st.spec.cgroup {
         return match fs::read_to_string(cg.join("cgroup.events")) {
@@ -714,6 +638,7 @@ fn build_alive(st: &ResumeState) -> bool {
 /// so both entry points share one wait/kill/pack path. `child` is the
 /// spawned shim for a fresh build, reaped here. An adopted build has
 /// no child, its exit code comes from the persisted exit-status file.
+#[cfg(target_os = "linux")]
 pub(super) fn supervise(
     ctx: &WorkerCtx,
     st: &ResumeState,
@@ -815,10 +740,152 @@ pub(super) fn supervise(
 /// setsid()'d out of the group; the shim is outside the pidns, so its
 /// death does not tear it down. cgroup.kill (group-writable via
 /// sandboxd) reaches everything.
+#[cfg(target_os = "linux")]
 fn kill_build(pgrp: nix::unistd::Pid, cgroup: Option<&Path>) {
     let _ = signal::killpg(pgrp, signal::Signal::SIGKILL);
     if let Some(cg) = cgroup {
         let _ = fs::write(cg.join("cgroup.kill"), "1");
+    }
+}
+
+/// Wait out a build running on an agent (fresh or re-adopted), pack
+/// its outputs, and have the agent clean up. The macOS counterpart of
+/// `supervise`, driven off the same persisted `ResumeState`.
+#[cfg(target_os = "macos")]
+pub(super) fn supervise_agent(
+    ctx: &WorkerCtx,
+    st: &ResumeState,
+    dir: PathBuf,
+    socket: &Path,
+    build: super::agents::AgentBuild,
+    signing_key: &SecretKey,
+) -> FinishedBuild {
+    let log_path = dir.join("build.log");
+    // The exit notice arrives on the lease connection. Wait for it on
+    // its own thread so the abort conditions keep being polled.
+    let waiter = std::thread::spawn(move || build.wait_exit());
+    let mut aborted: Option<String> = None;
+    while !waiter.is_finished() {
+        if aborted.is_none() {
+            let timed_out = (unix_now() >= st.deadline_unix).then(|| "build timed out".to_string());
+            if let Some(r) = ctx.abort_reason(&st.dedupe_key, &log_path, timed_out) {
+                aborted = Some(r);
+                if let Err(e) = super::agents::kill(socket, &st.build_id) {
+                    tracing::warn!(id = st.build_id, "killing the build via its agent: {e:#}");
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let code = match waiter.join() {
+        Ok(Ok(code)) => code,
+        Ok(Err(e)) => {
+            aborted.get_or_insert(format!("agent connection lost: {e:#}"));
+            1
+        }
+        Err(_) => {
+            aborted.get_or_insert("agent wait thread panicked".into());
+            1
+        }
+    };
+    tracing::info!(id = st.build_id, exit_code = code, aborted = ?aborted, "builder finished");
+    let (exit_code, error, outputs, extras) = if let Some(reason) = aborted {
+        (1, reason, vec![], vec![])
+    } else if code != 0 {
+        (code, String::new(), vec![], vec![])
+    } else {
+        // The outputs are agent-owned files at their real store
+        // paths; Finish makes them readable for packing.
+        let remaining = Duration::from_secs(st.deadline_unix.saturating_sub(unix_now()));
+        let deadline = Instant::now() + remaining.max(Duration::from_mins(10));
+        let packed = super::agents::finish(socket, &st.build_id)
+            .context("finishing the build on its agent")
+            .and_then(|()| {
+                tokio::runtime::Handle::current().block_on(pack_outputs_and_extras(
+                    &dir,
+                    &st.spec,
+                    deadline,
+                    signing_key,
+                    &st.build_id,
+                ))
+            });
+        match packed {
+            Ok((o, e)) => (0, String::new(), o, e),
+            Err(e) => (1, format!("{e:#}"), vec![], vec![]),
+        }
+    };
+    // The agent removes its scratch dir and the scratch outputs
+    // (packing above already read them) and forgets the build.
+    if let Err(e) = super::agents::cleanup(socket, &st.build_id) {
+        tracing::warn!(id = st.build_id, "agent cleanup failed: {e:#}");
+    }
+    FinishedBuild {
+        exit_code,
+        error,
+        outputs,
+        extras,
+        dir,
+        finished_at: Instant::now(),
+    }
+}
+
+/// Background thread appending everything the agent writes to its log
+/// fd into the build dir's build.log, so the path-based tailing,
+/// replay and resume machinery works as on Linux.
+#[cfg(target_os = "macos")]
+pub(super) struct LogMirror {
+    done: Arc<atomic::AtomicBool>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+#[cfg(target_os = "macos")]
+impl LogMirror {
+    /// Start mirroring `log` into `dest_path`, appending where a
+    /// previous worker generation's mirror left off.
+    pub(super) fn start(log: &fs::File, dest_path: PathBuf) -> Result<Self> {
+        let mut src = log.try_clone()?;
+        let done = Arc::new(atomic::AtomicBool::new(false));
+        let thread = {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                use std::io::{Read as _, Seek as _};
+                let Ok(mut dest) = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&dest_path)
+                else {
+                    return;
+                };
+                let already = dest.metadata().map(|m| m.len()).unwrap_or(0);
+                if src.seek(io::SeekFrom::Start(already)).is_err() {
+                    return;
+                }
+                let mut buf = [0u8; 8192];
+                loop {
+                    match src.read(&mut buf) {
+                        Ok(0) => {
+                            if done.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            std::thread::sleep(Duration::from_millis(200));
+                        }
+                        Ok(n) => {
+                            if dest.write_all(&buf[..n]).is_err() {
+                                return;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+            })
+        };
+        Ok(Self { done, thread })
+    }
+
+    /// Drain what is still buffered agent-side, then stop.
+    pub(super) fn stop(self) {
+        self.done.store(true, Ordering::Relaxed);
+        let _ = self.thread.join();
     }
 }
 
