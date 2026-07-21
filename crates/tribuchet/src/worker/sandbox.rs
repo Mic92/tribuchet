@@ -6,31 +6,37 @@
 //! shipped tmp dir mounted at /build, minimal /dev, fresh /proc, chroot.
 //! Reference: `nix/src/libstore/unix/build/derivation-builder.cc`.
 //!
-//! macOS: no bind mounts, so inputs are materialized in the host
-//! /nix/store, the per-build tmp dir path (Nix sends the real topTmpDir
-//! on Darwin) is a symlink to the build dir, and the builder runs
-//! under `sandbox-exec` with a deny-default write profile modeled on
-//! Nix's `sandbox-defaults.sb` (reads stay permissive, like Nix's own
-//! comparatively weak Darwin sandbox).
+//! macOS: builds are not run by the worker at all. Each one is leased
+//! to a per-uid launchd agent that applies a seatbelt profile (see
+//! worker/agent.rs and worker/agents.rs). The pieces here that stay in
+//! use on macOS are the spec type (which the shared output-packing
+//! code reads) and the exit/cleanup shims.
 
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
 use std::fs;
+#[cfg(target_os = "linux")]
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
 use std::process::{Child, Command, Stdio};
 
+#[cfg(target_os = "linux")]
 use anyhow::{Context, Result};
 
+#[cfg(target_os = "linux")]
 use super::binfmt;
 use crate::netpolicy::NetPolicy;
+#[cfg(target_os = "linux")]
 use crate::proto::BuildAssignment;
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-#[cfg_attr(test, derive(Default))]
+// On macOS only the fields the shared packing code reads are used;
+// the rest exists so a Linux worker's persisted spec deserializes.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SandboxSpec {
     pub builder: String,
     /// Derivation system, e.g. "i686-linux" (drives Linux personality).
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub system: String,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
@@ -44,9 +50,8 @@ pub struct SandboxSpec {
     pub binds_ro: Vec<(PathBuf, PathBuf)>,
     /// Device nodes the sandbox itself provides; the only binds that
     /// stay writable. Never derived from request-supplied paths.
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub binds_dev: Vec<(PathBuf, PathBuf)>,
-    /// Scratch output store paths (used by the macOS profile).
+    /// Scratch output store paths.
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub outputs: Vec<String>,
     /// Input store paths visible to the builder; reference-scan
@@ -57,41 +62,31 @@ pub struct SandboxSpec {
     /// sandbox, link target). Bind-mounting such a path would silently
     /// dereference it, so they are recreated as symlinks instead.
     #[serde(default)]
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub symlink_inputs: Vec<(PathBuf, PathBuf)>,
     /// Per-build cgroup; the builder enters it from pre_exec so the
     /// memory limit covers the whole build, including the setup phase.
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub cgroup: Option<PathBuf>,
     /// Path to the user namespace mapped by tribuchet-sandboxd; the
     /// setup stage joins it instead of writing uid maps itself.
-    /// Unused on macOS (Seatbelt sandbox).
     #[serde(default)]
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub leased_userns: Option<PathBuf>,
     /// Uids mapped in that namespace at in-ns 0 (1 or 65536).
     #[serde(default)]
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub leased_uid_count: Option<u32>,
     /// Fixed-output build: private netns with the presto-pasta
     /// user-mode NAT; host abstract sockets and loopback services
     /// stay unreachable.
     #[serde(default)]
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub net_isolation: bool,
     /// Flow policy applied to that network.
     #[serde(default)]
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub net_policy: NetPolicy,
     /// Static emulator binary for foreign-system builds, bound at
     /// binfmt::INTERP_PATH and registered in a per-userns binfmt_misc
-    /// instance (Linux only).
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    /// instance.
     pub emulator: Option<PathBuf>,
     /// Secret files the build must never read (worker signing/TLS
-    /// keys). macOS: Seatbelt deny rules; Linux: defense in depth, the
-    /// mount namespace already hides them.
-    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    /// keys). Defense in depth, the mount namespace already hides them.
     pub deny_read: Vec<PathBuf>,
     /// Sandbox has the host daemon socket bind-mounted in; the
     /// closure-delta producer also consults this flag.
@@ -101,6 +96,7 @@ pub struct SandboxSpec {
 
 /// Default daemon socket path inside the sandbox; `nix` looks here
 /// unless `NIX_REMOTE` overrides.
+#[cfg(target_os = "linux")]
 pub const NIX_DAEMON_SOCKET: &str = "/nix/var/nix/daemon-socket/socket";
 
 /// Host path where the builder's output for `scratch` lands.
@@ -113,6 +109,7 @@ pub fn output_host_path(spec: &SandboxSpec, scratch: &str) -> PathBuf {
 }
 
 /// Worker-side sandbox configuration for one build.
+#[cfg(target_os = "linux")]
 #[derive(Default)]
 pub struct PrepareOpts<'a> {
     pub bin_sh: Option<&'a Path>,
@@ -134,6 +131,7 @@ pub struct PrepareOpts<'a> {
     pub nix_daemon_socket: Option<&'a Path>,
 }
 
+#[cfg(target_os = "linux")]
 pub fn prepare(
     a: &BuildAssignment,
     dir: &Path,
@@ -174,40 +172,38 @@ pub fn prepare(
         deny_read: opts.secrets.to_vec(),
         recursive_nix: opts.recursive_nix,
     };
-    if cfg!(target_os = "linux") {
-        if let Some(em) = opts.emulator {
-            spec.binds_ro
-                .push((em.to_owned(), PathBuf::from(binfmt::INTERP_PATH)));
-        }
-        if let Some(sh) = opts.bin_sh {
-            // Like Nix's busybox sandbox path: shebangs and system(3)
-            // need a shell at /bin/sh.
-            spec.binds_ro
-                .push((sh.to_owned(), PathBuf::from("/bin/sh")));
-        }
-        if opts.recursive_nix {
-            let host = opts
-                .nix_daemon_socket
-                .unwrap_or_else(|| Path::new(NIX_DAEMON_SOCKET));
-            spec.binds_ro
-                .push((host.to_path_buf(), PathBuf::from(NIX_DAEMON_SOCKET)));
-            // The hub-side patched Nix points NIX_REMOTE at its own
-            // topTmpDir/.nix-socket (where its in-process recursive
-            // daemon would listen); redirect to the worker's daemon.
-            spec.env.insert(
-                "NIX_REMOTE".to_owned(),
-                format!("unix://{NIX_DAEMON_SOCKET}"),
-            );
-        }
+    if let Some(em) = opts.emulator {
+        spec.binds_ro
+            .push((em.to_owned(), PathBuf::from(binfmt::INTERP_PATH)));
+    }
+    if let Some(sh) = opts.bin_sh {
+        // Like Nix's busybox sandbox path: shebangs and system(3)
+        // need a shell at /bin/sh.
+        spec.binds_ro
+            .push((sh.to_owned(), PathBuf::from("/bin/sh")));
+    }
+    if opts.recursive_nix {
+        let host = opts
+            .nix_daemon_socket
+            .unwrap_or_else(|| Path::new(NIX_DAEMON_SOCKET));
+        spec.binds_ro
+            .push((host.to_path_buf(), PathBuf::from(NIX_DAEMON_SOCKET)));
+        // The hub-side patched Nix points NIX_REMOTE at its own
+        // topTmpDir/.nix-socket (where its in-process recursive
+        // daemon would listen); redirect to the worker's daemon.
+        spec.env.insert(
+            "NIX_REMOTE".to_owned(),
+            format!("unix://{NIX_DAEMON_SOCKET}"),
+        );
     }
     spec.binds_ro.sort(); // deterministic mount order
     platform::prepare(&mut spec)?;
     Ok(spec)
 }
 
-/// The prepared sandbox as a spawnable command plus, on Linux, the
-/// write end of the pipe carrying the serialized spec to the setup
-/// stage's stdin.
+/// The prepared sandbox as a spawnable command plus the write end of
+/// the pipe carrying the serialized spec to the setup stage's stdin.
+#[cfg(target_os = "linux")]
 fn build_command(spec: &SandboxSpec) -> Result<(Command, Option<OwnedFd>)> {
     let mut cmd = platform::command(spec)?;
     // Own process group, so orphaned builder children can be killed
@@ -221,10 +217,8 @@ fn build_command(spec: &SandboxSpec) -> Result<(Command, Option<OwnedFd>)> {
     if !platform::SPEC_VIA_STDIN {
         cmd.envs(&spec.env);
     }
-    // The spec pipe exists only on Linux (SPEC_VIA_STDIN). O_CLOEXEC:
-    // a write end inherited by a concurrently spawned sibling build
-    // would keep the spec read from ever seeing EOF.
-    #[cfg(target_os = "linux")]
+    // O_CLOEXEC: a write end inherited by a concurrently spawned
+    // sibling build would keep the spec read from ever seeing EOF.
     if platform::SPEC_VIA_STDIN {
         let (r, w) =
             nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).context("creating spec pipe")?;
@@ -237,9 +231,10 @@ fn build_command(spec: &SandboxSpec) -> Result<(Command, Option<OwnedFd>)> {
 
 /// Spawn the sandboxed build with stdout/stderr on `log`. The build
 /// is a direct child of the worker, but its state (log, exit status)
-/// is persisted on disk so it survives a worker restart. On Linux the
-/// returned write end must be filled with `send_spec_to` once the
-/// spec is complete (the setup stage blocks on stdin until then).
+/// is persisted on disk so it survives a worker restart. The returned
+/// write end must be filled with `send_spec_to` once the spec is
+/// complete (the setup stage blocks on stdin until then).
+#[cfg(target_os = "linux")]
 pub fn spawn(spec: &SandboxSpec, log: &fs::File) -> Result<(Child, Option<OwnedFd>)> {
     let (mut cmd, spec_w) = build_command(spec)?;
     cmd.stdout(Stdio::from(log.try_clone()?))
@@ -251,23 +246,36 @@ pub fn spawn(spec: &SandboxSpec, log: &fs::File) -> Result<(Child, Option<OwnedF
 }
 
 /// Write the serialized spec into the setup stage's stdin pipe. Call
-/// after the lease filled in the cgroup. No pipe exists on macOS.
+/// after the lease filled in the cgroup.
+#[cfg(target_os = "linux")]
 pub fn send_spec_to(spec: &SandboxSpec, w: OwnedFd) -> Result<()> {
     serde_json::to_writer(fs::File::from(w), spec).context("sending sandbox spec")
 }
 
 /// Exit code of a finished build, persisted by the Linux PID-1 shim.
-/// None on macOS (the exit code comes from waiting the child) and
-/// while the build is still running.
+/// None while the build is still running (and always on macOS, where
+/// the agent holds the exit code).
 pub fn exit_status(spec: &SandboxSpec) -> Option<i32> {
-    platform::exit_status_impl(spec)
+    #[cfg(target_os = "linux")]
+    return platform::exit_status_impl(spec);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = spec;
+        None
+    }
 }
 
 /// Setup-stage failure message, written by the stage before the host
 /// filesystem became unreachable. Read by the worker when the build
 /// exits nonzero.
 pub fn setup_error_detail(spec: &SandboxSpec) -> Option<String> {
-    platform::setup_error_detail_impl(spec)
+    #[cfg(target_os = "linux")]
+    return platform::setup_error_detail_impl(spec);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = spec;
+        None
+    }
 }
 
 /// Entry point of the re-exec'd setup stage: builds run as
@@ -284,22 +292,21 @@ pub fn setup_stage() -> ! {
 pub use platform::SETUP_STAGE_ARG;
 
 pub fn cleanup(outputs: &[String], dir: &Path) {
+    #[cfg(target_os = "linux")]
     platform::cleanup(outputs, dir);
+    // macOS: the agent's Cleanup removes the scratch dir and outputs.
+    #[cfg(not(target_os = "linux"))]
+    let _ = (outputs, dir);
 }
 
 #[cfg(target_os = "linux")]
 #[path = "sandbox/linux.rs"]
 mod platform;
 
-#[cfg(target_os = "macos")]
-#[path = "sandbox/darwin.rs"]
-mod platform;
-
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "linux")]
     fn min_assignment() -> crate::proto::BuildAssignment {
         crate::proto::BuildAssignment {
             build_id: "0123456789abcdef0123456789abcdef".into(),
@@ -317,7 +324,6 @@ mod tests {
 
     /// recursive-nix flag toggles a daemon-socket bind; without it,
     /// no /nix/var path appears in binds_ro.
-    #[cfg(target_os = "linux")]
     #[test]
     fn recursive_nix_adds_the_daemon_socket_bind() -> Result<()> {
         let host = tempfile::tempdir()?;
@@ -365,13 +371,7 @@ mod tests {
     fn test_spec(dir: &Path) -> SandboxSpec {
         SandboxSpec {
             builder: "/bin/sh".into(),
-            system: if cfg!(target_os = "linux") {
-                "x86_64-linux".into()
-            } else {
-                "aarch64-darwin".into()
-            },
-            // The hub's tmpDirInSandbox; on macOS prepare() must
-            // rewrite it to the local build dir.
+            system: "x86_64-linux".into(),
             cwd: "/build".into(),
             root: dir.join("root"),
             build_dir: dir.join("top/build"),
@@ -382,7 +382,6 @@ mod tests {
     /// The derivation env is client-controlled (LD_PRELOAD, …) and must
     /// not be applied to the setup stage, which runs the worker binary
     /// with the worker's host credentials before entering the sandbox.
-    #[cfg(target_os = "linux")]
     #[test]
     fn derivation_env_stays_off_the_setup_stage() -> Result<()> {
         let dir = tempfile::tempdir()?;
@@ -398,59 +397,6 @@ mod tests {
             "setup stage env: {:?}",
             cmd.get_envs().collect::<Vec<_>>()
         );
-        Ok(())
-    }
-
-    /// End-to-end smoke test of the Darwin sandbox: prepare's env
-    /// rewrite of the hub's tmpDirInSandbox to the local build dir,
-    /// writes confined to that dir, deny_read on worker secrets, and
-    /// exit-code plumbing through sandbox-exec.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn sandbox_runs_builder() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let secret = dir.path().join("secret");
-        fs::write(&secret, "key-material")?;
-        let outside = dir.path().join("outside");
-        let build_dir = dir.path().join("top/build");
-        let mut spec = SandboxSpec {
-            args: vec![
-                "-c".into(),
-                // Each escape attempt exits with its own code so a
-                // failure names the broken rule; 7 means all held.
-                // $FOO: derivation env reaches the builder.
-                // $NIX_BUILD_TOP/$ATTRS: prepare() rewrote /build to
-                // the local build dir (Linux-hub cross-dispatch).
-                format!(
-                    "test \"$FOO\" = bar || exit 1; \
-                     test \"$NIX_BUILD_TOP\" = \"{build_dir}\" || exit 5; \
-                     test \"$ATTRS\" = \"{build_dir}/.attrs.json\" || exit 6; \
-                     echo ok > out || exit 2; \
-                     cat {secret} 2>/dev/null && exit 3; \
-                     echo escaped > {outside} 2>/dev/null && exit 4; \
-                     exit 7",
-                    secret = secret.display(),
-                    outside = outside.display(),
-                    build_dir = build_dir.display(),
-                ),
-            ],
-            env: HashMap::from([
-                ("FOO".into(), "bar".into()),
-                ("NIX_BUILD_TOP".into(), "/build".into()),
-                ("ATTRS".into(), "/build/.attrs.json".into()),
-            ]),
-            build_dir,
-            deny_read: vec![secret],
-            ..test_spec(dir.path())
-        };
-        fs::create_dir_all(&spec.build_dir)?;
-        platform::prepare(&mut spec)?;
-        let log_path = dir.path().join("build.log");
-        let (mut child, _w) = spawn(&spec, &fs::File::create(&log_path)?)?;
-        let status = child.wait()?;
-        let log = fs::read_to_string(&log_path)?;
-        assert_eq!(status.code(), Some(7), "{status:?} log: {log}");
-        assert_eq!(fs::read_to_string(spec.build_dir.join("out"))?, "ok\n");
         Ok(())
     }
 }

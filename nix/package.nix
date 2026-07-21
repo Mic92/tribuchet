@@ -62,9 +62,9 @@ craneLib.buildPackage (
     passthru = { inherit cargoArtifacts e2eTests; };
   }
   // lib.optionalAttrs stdenv.isDarwin {
-    # nested sandbox-exec is not permitted inside the Nix build sandbox;
+    # sandbox_init is not permitted inside the Nix build sandbox;
     # `nix develop -c cargo test` runs it
-    cargoTestExtraArgs = "-- --skip=worker::sandbox::tests::sandbox_runs_builder";
+    cargoTestExtraArgs = "-- --skip=worker::agents::tests::seatbelt_profile_confines_the_builder";
   }
   // lib.optionalAttrs stdenv.isLinux {
     # default network backend for fixed-output builds

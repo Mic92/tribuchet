@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use super::caps::requires_uid_range;
+#[cfg(target_os = "linux")]
 use super::logtail::tail_log;
 use super::resume::{FinishedBuild, PackedExtra, PackedOutput, ResumeState};
 use super::{DaemonConn, WorkerCtx, sandbox, unix_now};
@@ -33,40 +34,28 @@ use crate::tmptar::unpack_tmp_dir_archive;
 /// a mapped user namespace (65536 uids for uid-range builds, one
 /// otherwise) plus a delegated cgroup, so no build runs as the
 /// worker's own uid. The sandbox setup stage joins the pre-mapped
-/// namespace and no host file is chowned. macOS builds run as the
-/// worker under the Seatbelt profile.
-enum BuildOwner {
-    #[cfg(not(target_os = "linux"))]
-    Worker,
-    #[cfg(target_os = "linux")]
-    Leased {
-        _lease: super::sandboxd::SandboxLease,
-    },
+/// namespace and no host file is chowned. macOS builds go through the
+/// per-uid agents instead (see `execute` below).
+#[cfg(target_os = "linux")]
+struct BuildOwner {
+    _lease: super::sandboxd::SandboxLease,
 }
 
 /// Pre-spawn half of a lease: the user namespace exists (so its path
 /// can go into the spec) but sandboxd has not been contacted yet.
+#[cfg(target_os = "linux")]
 struct OwnerPrep {
-    #[cfg(target_os = "linux")]
     ns: super::sandboxd::SandboxPrep,
-    #[cfg(target_os = "linux")]
     uid_count: u32,
 }
 
+#[cfg(target_os = "linux")]
 impl BuildOwner {
     fn prepare(a: &BuildAssignment) -> Result<OwnerPrep> {
-        #[cfg(target_os = "linux")]
-        return Ok(OwnerPrep {
+        Ok(OwnerPrep {
             ns: super::sandboxd::SandboxPrep::new()?,
             uid_count: if requires_uid_range(&a.env) { 65536 } else { 1 },
-        });
-        #[cfg(not(target_os = "linux"))]
-        {
-            if requires_uid_range(&a.env) {
-                bail!("the uid-range feature is only supported on Linux workers");
-            }
-            Ok(OwnerPrep {})
-        }
+        })
     }
 
     /// Lease the sandbox now that the setup stage exists, so sandboxd
@@ -78,41 +67,33 @@ impl BuildOwner {
         stage: i32,
         spec: &mut sandbox::SandboxSpec,
     ) -> Result<Self> {
-        #[cfg(target_os = "linux")]
+        let socket = ctx
+            .sandboxd
+            .as_deref()
+            .context("tribuchet-sandboxd socket unavailable")?;
+        let OwnerPrep { ns, uid_count } = prep;
+        let tmp_dir = spec.build_dir.parent().unwrap_or(&spec.build_dir);
+        let lease = ns.allocate(
+            socket,
+            build_id,
+            uid_count,
+            nix::unistd::Pid::from_raw(stage),
+            tmp_dir,
+        )?;
+        tracing::info!(
+            build_id,
+            pool_base = lease.pool_base,
+            uid_count,
+            "leased sandbox"
+        );
+        // memory.max is group-writable for the worker.
+        if let Some(bytes) = ctx.build_memory_max
+            && let Err(e) = fs::write(lease.cgroup().join("memory.max"), bytes.to_string())
         {
-            let socket = ctx
-                .sandboxd
-                .as_deref()
-                .context("tribuchet-sandboxd socket unavailable")?;
-            let OwnerPrep { ns, uid_count } = prep;
-            let tmp_dir = spec.build_dir.parent().unwrap_or(&spec.build_dir);
-            let lease = ns.allocate(
-                socket,
-                build_id,
-                uid_count,
-                nix::unistd::Pid::from_raw(stage),
-                tmp_dir,
-            )?;
-            tracing::info!(
-                build_id,
-                pool_base = lease.pool_base,
-                uid_count,
-                "leased sandbox"
-            );
-            // memory.max is group-writable for the worker.
-            if let Some(bytes) = ctx.build_memory_max
-                && let Err(e) = fs::write(lease.cgroup().join("memory.max"), bytes.to_string())
-            {
-                tracing::warn!("setting memory.max on the leased cgroup: {e}");
-            }
-            spec.cgroup = Some(lease.cgroup().to_path_buf());
-            Ok(Self::Leased { _lease: lease })
+            tracing::warn!("setting memory.max on the leased cgroup: {e}");
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (ctx, build_id, prep, stage, spec);
-            Ok(Self::Worker)
-        }
+        spec.cgroup = Some(lease.cgroup().to_path_buf());
+        Ok(Self { _lease: lease })
     }
 }
 
@@ -412,16 +393,10 @@ impl ActiveBuild {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     fn build_spec(&self, prep: &OwnerPrep) -> Result<sandbox::SandboxSpec> {
         let a = &self.assignment;
-        // The spec fields stay Option: the macOS spec has no lease.
-        #[cfg(target_os = "linux")]
         let (leased_userns, leased_uid_count) = (Some(prep.ns.ns_path()), Some(prep.uid_count));
-        #[cfg(not(target_os = "linux"))]
-        let (leased_userns, leased_uid_count) = {
-            let _ = prep;
-            (None, None)
-        };
         let spec = sandbox::prepare(
             a,
             &self.dir,
@@ -452,6 +427,7 @@ impl ActiveBuild {
     /// output packing and signing. Sends only logs; the result and
     /// output NARs go through deliver(), which can run again on a
     /// later session if this one dies first.
+    #[cfg(target_os = "linux")]
     pub(super) fn execute(
         &self,
         out_tx: &mpsc::Sender<WorkerMessage>,
@@ -506,6 +482,195 @@ impl ActiveBuild {
         log_done.store(true, Ordering::Relaxed);
         let _ = tailer.join();
         Ok(fin)
+    }
+
+    /// macOS: lease a per-uid agent and run the build there. The agent
+    /// unpacks the tmp dir into its own scratch dir, applies the
+    /// seatbelt profile and owns the builder process. The worker tails
+    /// the log fd, polls its abort conditions, and packs the outputs
+    /// (written at their real store paths) once the agent made them
+    /// readable.
+    #[cfg(target_os = "macos")]
+    pub(super) fn execute(
+        &self,
+        out_tx: &mpsc::Sender<WorkerMessage>,
+        signing_key: &SecretKey,
+        timeout: Duration,
+    ) -> Result<FinishedBuild> {
+        if requires_uid_range(&self.assignment.env) {
+            bail!("the uid-range feature is only supported on Linux workers");
+        }
+        let socket = self
+            .ctx
+            .agents
+            .acquire()
+            .context("no free build agent (max-jobs exceeds the agent count?)")?;
+        let result = self.execute_on_agent(&socket, out_tx, signing_key, timeout);
+        self.ctx.agents.release(socket);
+        result
+    }
+
+    #[cfg(target_os = "macos")]
+    fn execute_on_agent(
+        &self,
+        socket: &Path,
+        out_tx: &mpsc::Sender<WorkerMessage>,
+        signing_key: &SecretKey,
+        timeout: Duration,
+    ) -> Result<FinishedBuild> {
+        let a = &self.assignment;
+        let outputs: Vec<String> = a.outputs.values().cloned().collect();
+        let profile =
+            super::agents::seatbelt_profile(&outputs, &self.ctx.secret_paths, a.fixed_output)?;
+        // Re-tar the staged tmp dir: the agent unpacks it into its own
+        // scratch dir, since the worker's copy is not agent-writable.
+        fs::write(
+            self.dir.join("top.tar.zst"),
+            crate::tmptar::tar_zstd_dir(&self.dir.join("top"))?,
+        )?;
+        let req = sandbox_proto::darwin::StartRequest {
+            build_id: a.build_id.clone(),
+            builder: a.builder.clone(),
+            args: a.args.clone(),
+            env: a.env.clone(),
+            tmp_dir_in_sandbox: a.tmp_dir_in_sandbox.clone(),
+            profile,
+            outputs: outputs.clone(),
+        };
+        let build = super::agents::AgentBuild::start(
+            socket,
+            &req,
+            &fs::File::open(self.dir.join("top.tar.zst"))?,
+        )?;
+        tracing::info!(
+            id = a.build_id,
+            pid = build.pid,
+            agent = %socket.display(),
+            scratch = %build.scratch_dir.display(),
+            "builder started on agent"
+        );
+
+        // Live log streaming straight off the agent's log fd, with the
+        // offset persisted in the build dir like on Linux.
+        let log_done = Arc::new(atomic::AtomicBool::new(false));
+        let tailer = {
+            let tx = out_tx.clone();
+            let build_id = a.build_id.clone();
+            let log = build.log.try_clone()?;
+            let log_done = log_done.clone();
+            let dir = self.dir.clone();
+            std::thread::spawn(move || {
+                super::logtail::tail_file(log, &dir, &build_id, &tx, || {
+                    log_done.load(Ordering::Relaxed)
+                });
+            })
+        };
+        let fin = self.supervise_agent(socket, build, unix_now() + timeout.as_secs(), signing_key);
+        log_done.store(true, Ordering::Relaxed);
+        let _ = tailer.join();
+        Ok(fin)
+    }
+
+    /// Wait out a build running on an agent, pack its outputs, and
+    /// have the agent clean up. The macOS counterpart of `supervise`.
+    #[cfg(target_os = "macos")]
+    fn supervise_agent(
+        &self,
+        socket: &Path,
+        build: super::agents::AgentBuild,
+        deadline_unix: u64,
+        signing_key: &SecretKey,
+    ) -> FinishedBuild {
+        let a = &self.assignment;
+        let log = build.log.try_clone().ok();
+        // The exit notice arrives on the lease connection. Wait for it
+        // on its own thread so the abort conditions keep being polled.
+        let waiter = std::thread::spawn(move || build.wait_exit());
+        let mut aborted: Option<String> = None;
+        while !waiter.is_finished() {
+            if aborted.is_none() {
+                let timed_out =
+                    (unix_now() >= deadline_unix).then(|| "build timed out".to_string());
+                let meta = log.as_ref().and_then(|l| l.metadata().ok());
+                if let Some(r) = self
+                    .ctx
+                    .abort_reason_from_meta(&a.dedupe_key, meta, timed_out)
+                {
+                    aborted = Some(r);
+                    if let Err(e) = super::agents::kill(socket, &a.build_id) {
+                        tracing::warn!(id = a.build_id, "killing the build via its agent: {e:#}");
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let code = match waiter.join() {
+            Ok(Ok(code)) => code,
+            Ok(Err(e)) => {
+                aborted.get_or_insert(format!("agent connection lost: {e:#}"));
+                1
+            }
+            Err(_) => {
+                aborted.get_or_insert("agent wait thread panicked".into());
+                1
+            }
+        };
+        tracing::info!(id = a.build_id, exit_code = code, aborted = ?aborted, "builder finished");
+        // Copy the log next to the packed NARs so a resumed session's
+        // replay (which reads dir/build.log) still works.
+        if let Some(mut l) = log {
+            use std::io::Seek as _;
+            if l.seek(io::SeekFrom::Start(0)).is_ok()
+                && let Ok(mut f) = fs::File::create(self.dir.join("build.log"))
+            {
+                let _ = io::copy(&mut l, &mut f);
+            }
+        }
+        let (exit_code, error, packed_outputs, extras) = if let Some(reason) = aborted {
+            (1, reason, vec![], vec![])
+        } else if code != 0 {
+            (code, String::new(), vec![], vec![])
+        } else {
+            // The outputs are agent-owned files at their real store
+            // paths; Finish makes them readable for packing.
+            let outputs: Vec<String> = a.outputs.values().cloned().collect();
+            let spec = sandbox::SandboxSpec {
+                outputs,
+                store_inputs: self.inputs.clone(),
+                recursive_nix: self.ctx.recursive_nix,
+                ..sandbox::SandboxSpec::default()
+            };
+            let remaining = Duration::from_secs(deadline_unix.saturating_sub(unix_now()));
+            let deadline = Instant::now() + remaining.max(Duration::from_mins(10));
+            let packed = super::agents::finish(socket, &a.build_id)
+                .context("finishing the build on its agent")
+                .and_then(|()| {
+                    tokio::runtime::Handle::current().block_on(pack_outputs_and_extras(
+                        &self.dir,
+                        &spec,
+                        deadline,
+                        signing_key,
+                        &a.build_id,
+                    ))
+                });
+            match packed {
+                Ok((o, e)) => (0, String::new(), o, e),
+                Err(e) => (1, format!("{e:#}"), vec![], vec![]),
+            }
+        };
+        // The agent removes its scratch dir and the scratch outputs
+        // (packing above already read them) and forgets the build.
+        if let Err(e) = super::agents::cleanup(socket, &a.build_id) {
+            tracing::warn!(id = a.build_id, "agent cleanup failed: {e:#}");
+        }
+        FinishedBuild {
+            exit_code,
+            error,
+            outputs: packed_outputs,
+            extras,
+            dir: self.dir.clone(),
+            finished_at: Instant::now(),
+        }
     }
 
     /// Tear down a build abandoned before execution: stop the import

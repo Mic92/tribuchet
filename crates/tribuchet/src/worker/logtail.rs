@@ -50,10 +50,23 @@ pub(super) fn tail_log(
     out_tx: &mpsc::Sender<WorkerMessage>,
     done: impl Fn() -> bool,
 ) {
-    use std::io::Seek;
-    let Ok(mut file) = std::fs::File::open(dir.join("build.log")) else {
+    let Ok(file) = std::fs::File::open(dir.join("build.log")) else {
         return;
     };
+    tail_file(file, dir, build_id, out_tx, done);
+}
+
+/// Like [`tail_log`], but on an already-open log file (macOS agent
+/// builds get the log as an fd, its path is agent-owned). The offset
+/// is still persisted in `dir`.
+pub(super) fn tail_file(
+    mut file: std::fs::File,
+    dir: &Path,
+    build_id: &str,
+    out_tx: &mpsc::Sender<WorkerMessage>,
+    done: impl Fn() -> bool,
+) {
+    use std::io::Seek;
     let mut sent = read_log_offset(dir);
     if file.seek(std::io::SeekFrom::Start(sent)).is_err() {
         return;

@@ -84,6 +84,9 @@ struct WorkerCtx {
     /// tribuchet-sandboxd socket; every Linux build leases its user
     /// namespace and cgroup from it. None on macOS.
     sandboxd: Option<PathBuf>,
+    /// macOS: the per-uid build agents, one leased per build.
+    #[cfg(target_os = "macos")]
+    agents: agents::AgentPool,
     /// Dedupe keys of builds the hub cancelled; the supervising loops
     /// abort them. Keyed like the registry, since a resumed build's
     /// build_id changes while it runs.
@@ -103,7 +106,17 @@ impl WorkerCtx {
         log_path: &Path,
         timed_out: Option<String>,
     ) -> Option<String> {
-        let log = fs::metadata(log_path).ok();
+        self.abort_reason_from_meta(dedupe_key, fs::metadata(log_path).ok(), timed_out)
+    }
+
+    /// Like [`Self::abort_reason`], for callers that hold the log as
+    /// an fd instead of a path (macOS agent builds).
+    fn abort_reason_from_meta(
+        &self,
+        dedupe_key: &str,
+        log: Option<fs::Metadata>,
+        timed_out: Option<String>,
+    ) -> Option<String> {
         let silent = log
             .as_ref()
             .and_then(|m| m.modified().ok())
@@ -316,6 +329,21 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
         Some(p) => Some(p),
         None => option_env!("TRIBUCHET_BIN_SH").map(PathBuf::from),
     };
+    // macOS builds each run on one agent, so the agent list bounds
+    // concurrency. A Linux config must not carry the option silently.
+    #[cfg(target_os = "macos")]
+    {
+        anyhow::ensure!(
+            !opts.agent_sockets.is_empty(),
+            "agent-sockets must list at least one build agent on macOS"
+        );
+        opts.max_jobs = opts.max_jobs.min(opts.agent_sockets.len() as u32);
+    }
+    #[cfg(not(target_os = "macos"))]
+    anyhow::ensure!(
+        opts.agent_sockets.is_empty(),
+        "agent-sockets is only supported on macOS workers"
+    );
     let fod_isolation = cfg!(target_os = "linux") && Path::new("/dev/net/tun").exists();
     // main logs the config before the baked-in bin_sh default applies;
     // log the effective values.
@@ -352,6 +380,8 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
         max_log_size: opts.max_log_size,
         recursive_nix: opts.recursive_nix,
         sandboxd: sandboxd_socket()?,
+        #[cfg(target_os = "macos")]
+        agents: agents::AgentPool::new(opts.agent_sockets.clone()),
     });
 
     // Ready once local setup is done, not once the hub answers: the
