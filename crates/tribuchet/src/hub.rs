@@ -433,20 +433,27 @@ fn bind_attach_socket(socket: &Path) -> Result<tokio::net::UnixListener> {
     Ok(uds)
 }
 
-/// Restrict an attach socket path bound by launchd to the nixbld group
-/// with mode 0660, like bind_attach_socket() does for self-bound and
-/// systemd does for socket-activated ones; launchd's `Sockets` plist
-/// dictionary has a mode key but no owner/group key.
+/// Verify that a launchd-bound attach socket sits in a directory only
+/// the nixbld group can reach. launchd's `Sockets` dictionary has a
+/// mode key but no group key and the rootless hub cannot chown the
+/// root-owned socket, so the parent directory carries the restriction
+/// bind_attach_socket() puts on the socket itself.
 #[cfg(target_os = "macos")]
-fn restrict_attach_socket(socket: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+fn check_attach_socket_dir(socket: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
     let Some(group) = Group::from_name("nixbld")? else {
         bail!(
             "group nixbld not found; refusing to serve a hub socket without a group to restrict it to"
         );
     };
-    std::os::unix::fs::chown(socket, None, Some(group.gid.as_raw()))?;
-    fs::set_permissions(socket, fs::Permissions::from_mode(0o660))?;
+    let dir = socket.parent().context("attach socket has no parent")?;
+    let meta = fs::metadata(dir)?;
+    if meta.gid() != group.gid.as_raw() || meta.mode() & 0o007 != 0 {
+        bail!(
+            "{} must be group nixbld with no access for others to restrict the attach socket",
+            dir.display()
+        );
+    }
     Ok(())
 }
 
@@ -576,10 +583,11 @@ async fn run_async(cfg: crate::config::HubConfig) -> Result<()> {
     let uds = match activated.unix {
         // Activated socket: systemd owns the path, mode and group
         // (SocketGroup=/SocketMode= in the .socket unit). launchd has
-        // no group key, so on macOS the hub restricts the path itself.
+        // no group key, so on macOS the socket's directory carries the
+        // group restriction.
         Some(l) => {
             #[cfg(target_os = "macos")]
-            restrict_attach_socket(socket)?;
+            check_attach_socket_dir(socket)?;
             tokio::net::UnixListener::from_std(l).context("adopting activated unix socket")?
         }
         None => bind_attach_socket(socket)?,

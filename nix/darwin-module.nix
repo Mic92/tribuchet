@@ -8,9 +8,10 @@
 # live in /etc/tribuchet/worker.toml). Activation flips the symlink
 # to the new package and restarts the daemon via launchctl kickstart.
 #
-# Hub: launchd holds the attach socket and the worker port (the hub
-# adopts them via launch_activate_socket), so hub restarts never
-# refuse connections, clients just queue.
+# Hub: runs unprivileged as _tribuchet. launchd holds the attach
+# socket and the worker port (the hub adopts them via
+# launch_activate_socket), so hub restarts never refuse connections,
+# clients just queue.
 self:
 {
   config,
@@ -26,6 +27,9 @@ let
   label = "org.nixos.tribuchet-worker";
   format = pkgs.formats.toml { };
   agentIds = lib.range 1 cfg.agents;
+  # launchd cannot set a socket group and the rootless hub cannot
+  # chown the socket, so this directory carries the nixbld restriction.
+  attachDir = lib.escapeShellArg (dirOf (toString hub.socketPath));
   agentUser = i: "_tribuchetbld${toString i}";
   agentSocket = i: "/var/run/tribuchet/agents/${toString i}.sock";
   agentStateDir = i: "/var/lib/tribuchet-agents/${toString i}";
@@ -70,8 +74,12 @@ in
     };
     socketPath = lib.mkOption {
       type = lib.types.path;
-      default = "/var/run/tribuchet/hub.sock";
-      description = "Unix socket `tribuchet attach` (Nix's external builder) connects to.";
+      default = "/var/lib/tribuchet-hub/attach.sock";
+      description = ''
+        Unix socket `tribuchet attach` (Nix's external builder)
+        connects to. Its directory is made root:nixbld 0750 at
+        activation, so keep it out of /var/run (wiped at boot).
+      '';
     };
     configDir = lib.mkOption {
       type = lib.types.path;
@@ -143,6 +151,28 @@ in
   };
 
   config = lib.mkMerge [
+    # Hub and worker share the _tribuchet user. It is in nixbld (build
+    # users must write /nix/store) and trusted by the nix-daemon (the
+    # worker imports inputs, the hub queries and exports store paths).
+    (lib.mkIf (hub.enable || cfg.enable) {
+      users.knownUsers = [ "_tribuchet" ];
+      users.users._tribuchet = {
+        uid = cfg.uid;
+        gid = nixbldGid;
+        home = "/var/empty";
+        shell = "/usr/bin/false";
+        description = "tribuchet";
+      };
+      nix.settings.trusted-users = [ "_tribuchet" ];
+      # The hub TLS key pair and CA material must be readable by
+      # _tribuchet only.
+      system.activationScripts.preActivation.text = ''
+        mkdir -p /etc/tribuchet
+        chown -R ${toString cfg.uid} /etc/tribuchet
+        chmod 0700 /etc/tribuchet
+      '';
+    })
+
     (lib.mkIf hub.enable {
       environment.etc."tribuchet/hub.toml".source = hubToml;
       launchd.daemons.tribuchet-hub.serviceConfig = {
@@ -152,15 +182,17 @@ in
           "--config"
           "/etc/tribuchet/hub.toml"
         ];
+        UserName = "_tribuchet";
         # launchd owns the listeners (socket activation): the hub
         # adopts them by these names via launch_activate_socket, so
         # they keep accepting across hub restarts.
         Sockets = {
           attach = {
             SockPathName = toString hub.socketPath;
-            # 0660; launchd cannot set a group, so until the hub starts
-            # and chowns the path to nixbld only root can connect.
-            SockPathMode = 432;
+            # The socket itself is open. Its root:nixbld 0750 directory
+            # (created below) restricts who can reach it, and the hub
+            # refuses to serve without that restriction.
+            SockPathMode = 438; # 0666
           };
           workers = {
             SockNodeName = hub.listenAddress;
@@ -173,28 +205,23 @@ in
         StandardErrorPath = toString hub.logFile;
         EnvironmentVariables.RUST_LOG = "info";
       };
+      system.activationScripts.preActivation.text = ''
+        mkdir -p ${attachDir}
+        chown root:${toString nixbldGid} ${attachDir}
+        chmod 0750 ${attachDir}
+        touch ${lib.escapeShellArg (toString hub.logFile)}
+        chown ${toString cfg.uid} ${lib.escapeShellArg (toString hub.logFile)}
+      '';
     })
 
     (lib.mkIf cfg.enable {
       environment.etc."tribuchet/worker.toml".source = workerToml;
 
-      # Worker user plus one build user per agent, all in nixbld so
-      # they can write /nix/store. The worker imports inputs through
-      # the nix-daemon, which requires trusting its user.
-      users.knownUsers = [ "_tribuchet" ] ++ map agentUser agentIds;
+      # One build user per agent, in nixbld so they can create their
+      # outputs in /nix/store.
+      users.knownUsers = map agentUser agentIds;
       users.users = lib.mkMerge (
-        [
-          {
-            _tribuchet = {
-              uid = cfg.uid;
-              gid = nixbldGid;
-              home = "/var/empty";
-              shell = "/usr/bin/false";
-              description = "tribuchet worker";
-            };
-          }
-        ]
-        ++ map (i: {
+        map (i: {
           ${agentUser i} = {
             uid = cfg.agentUidBase + i - 1;
             gid = nixbldGid;
@@ -204,7 +231,6 @@ in
           };
         }) agentIds
       );
-      nix.settings.trusted-users = [ "_tribuchet" ];
 
       launchd.daemons = lib.mkMerge (
         [
