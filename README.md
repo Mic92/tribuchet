@@ -31,7 +31,7 @@ transfer, scheduling, and execution itself.
 - Builds survive hub and worker restarts/reloads, so deploys don't
   kill in-flight builds; they're cancelled when the client goes away.
 - Sandboxing equivalent to Nix's own (Linux namespaces + per-build
-  cgroup limits, macOS `sandbox-exec`), plus `uid-range` builds and
+  cgroup limits, macOS Seatbelt under per-build users), plus `uid-range` builds and
   cross-system user-mode emulation.
 - Fixed-output derivations get network through [presto-pasta]
   (embedded user-mode NAT) in an otherwise isolated network namespace,

@@ -112,15 +112,22 @@ Reference implementations: `nix/src/libstore/unix/build/` and
   protocol, ports/port ranges; first match wins) evaluated for every
   outbound connection of such builds.
 * macOS: no mount namespace, but inputs already live at their real
-  /nix/store paths thanks to the daemon import; the worker's own
-  per-build dir becomes the cwd and env values referencing the hub's
+  /nix/store paths thanks to the daemon import. The worker leases each
+  build to a per-uid agent (`tribuchet agent`, a socket-activated
+  launchd daemon running as one of the `_tribuchetbldN` build users):
+  the agent unpacks the shipped tmp dir into its own scratch dir,
+  which becomes the cwd, and env values referencing the hub's
   `tmpDirInSandbox` (e.g. `/build` from a Linux hub) are rewritten to
-  it, so no symlink is created at a hub-chosen path. The builder runs
-  under `/usr/bin/sandbox-exec` with a deny-default write profile
-  modeled on Nix's `sandbox-defaults.sb` (reads stay permissive except
-  for the worker's key material; writes are scoped to the build dir,
+  it, so no symlink is created at a hub-chosen path. The agent applies
+  a deny-default Seatbelt profile via `sandbox_init_with_parameters`
+  before exec'ing the builder, modeled on Nix's `sandbox-defaults.sb`
+  (reads stay permissive; writes are scoped to the scratch dir,
   outputs, and specific device nodes; signals are limited to the
-  sandbox).
+  sandbox). The agent and its builder share a uid, so the profile is
+  the only wall between them: an escaped builder could tamper with its
+  agent, but not with the worker or other builds. Since the agent, not
+  the worker, owns the builder process, running builds survive worker
+  restarts and are re-adopted.
 * Fixed-output derivations are detected via the `outputHash` env var —
   or, under `__structuredAttrs`, inside the `__json` env blob — and get
   network access (no NEWNET on Linux, network allowance in the macOS
@@ -222,6 +229,8 @@ while running builds keep going (KillMode=process plus re-adoption).
 The e2e test consumes the same module. macOS hosts use the
 `darwinModules.default` nix-darwin module, which ships both services:
 the hub adopts its listeners from launchd (`launch_activate_socket`,
-the analogue of the socket-activated NixOS unit), and the worker's
+the analogue of the socket-activated NixOS unit), the worker's
 launchd daemon execs a stable symlink that activation flips before
-restarting the daemon.
+restarting the daemon, and one socket-activated agent daemon per
+build user runs the builds. Both hub and worker run as the
+unprivileged `_tribuchet` user.
