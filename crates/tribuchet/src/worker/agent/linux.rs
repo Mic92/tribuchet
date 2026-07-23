@@ -1,12 +1,15 @@
 //! Linux side of the agent: systemd socket activation, the
-//! /proc-based uid sweep and the agent's pre-mapped user namespace.
+//! /proc-based uid sweep, the agent's pre-mapped user namespace and
+//! the per-build cgroups.
 //!
 //! At startup the agent creates a user namespace mapping in-ns
 //! 0..65536 to its uid block. Writing another namespace's uid_map
 //! needs CAP_SETUID in the parent namespace, so the agent unit runs
-//! with AmbientCapabilities=CAP_SETUID CAP_SETGID and the caps are
-//! dropped right after the write. Sandboxed builds join that
-//! namespace via the worker's setup stage, spawned here.
+//! with AmbientCapabilities=CAP_SETUID CAP_SETGID CAP_CHOWN; the
+//! setuid/setgid caps are dropped right after the write, CAP_CHOWN
+//! stays for handing each build cgroup to its mapped root uid.
+//! Sandboxed builds join that namespace via the worker's setup
+//! stage, spawned here.
 
 use std::fs;
 use std::os::fd::OwnedFd;
@@ -18,7 +21,7 @@ use anyhow::{Context, Result, bail, ensure};
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use sandbox_proto::agent::StartRequest;
 
-use super::{Build, Options};
+use super::{Build, Options, cgroup};
 use crate::worker::sandbox::{self, SandboxSpec};
 use crate::worker::userns::{self, UsernsHolder};
 
@@ -30,10 +33,12 @@ pub const FS_HELPER_ARG: &str = "__agent_fs";
 const UID_COUNT: u32 = 65536;
 
 /// Per-agent confinement state: the pre-mapped user namespace backing
-/// every build this agent runs. None without `--uid-base` (development
-/// runs and containers without a uid block).
+/// every build this agent runs, and the delegated cgroup subtree the
+/// per-build cgroups live in. Both are None for development runs
+/// (no `--uid-base`, no delegated unit).
 pub(super) struct Confinement {
     userns: Option<Userns>,
+    cgroup_base: Option<PathBuf>,
 }
 
 struct Userns {
@@ -45,8 +50,12 @@ struct Userns {
 
 impl Confinement {
     pub(super) fn init(opts: &Options) -> Result<Self> {
+        // Vacate the unit cgroup before forking the userns holder;
+        // with the holder still in it the leaf cannot be enabled.
+        let cgroup_base = cgroup::init();
         Ok(Self {
             userns: opts.uid_base.map(Userns::create).transpose()?,
+            cgroup_base,
         })
     }
 
@@ -77,13 +86,22 @@ pub(super) fn spawn_builder(
         serde_json::from_value(sandbox_json.clone()).context("decoding the sandbox spec")?;
     spec.root = scratch_root.join("root");
     spec.build_dir = build_dir.to_path_buf();
-    spec.leased_userns = Some(userns::ns_path(&userns.fd));
+    let (_ns_fd, ns_path) = userns::inherited_ns(&userns.fd)?;
+    spec.leased_userns = Some(ns_path);
     spec.leased_uid_count.get_or_insert(UID_COUNT);
     spec.pool_base = Some(userns.uid_base);
-    // No delegated per-build cgroup on the agent path.
-    spec.cgroup = None;
+    spec.cgroup = confinement
+        .cgroup_base
+        .as_deref()
+        .map(|base| cgroup::create(base, &req.build_id, userns.uid_base))
+        .transpose()?;
     sandbox::prepare_root(&mut spec).context("creating the sandbox root skeleton")?;
     let (child, spec_w) = sandbox::spawn(&spec, log)?;
+    // The setup stage waits for the spec on stdin; move it into the
+    // build cgroup first so its cgroup namespace is rooted there.
+    if let Some(cg) = &spec.cgroup {
+        cgroup::enter(cg, child.id().cast_signed(), userns.uid_base)?;
+    }
     if let Some(w) = spec_w {
         sandbox::send_spec_to(&spec, w)?;
     }
@@ -109,11 +127,16 @@ pub(super) fn finish(confinement: &Confinement, root: Option<&Path>, outputs: &[
     }
 }
 
-/// Remove a build's scratch tree and stray outputs. A namespace
-/// build's tree contains uid-block files only deletable inside the
-/// userns; its outputs live under that tree.
+/// Remove a build's cgroup and scratch tree, plus stray outputs. A
+/// namespace build's tree contains uid-block files only deletable
+/// inside the userns; its outputs live under that tree.
 pub(super) fn cleanup(confinement: &Confinement, build: &Build) {
     if build.sandbox_root.is_some() {
+        if let Some(base) = &confinement.cgroup_base
+            && let Err(e) = cgroup::destroy(&base.join(format!("build-{}", build.id)))
+        {
+            tracing::warn!("removing the build cgroup: {e:#}");
+        }
         if let Err(e) = run_in_userns(
             confinement,
             "remove",
@@ -141,9 +164,10 @@ fn run_in_userns(confinement: &Confinement, op: &str, paths: &[PathBuf]) -> Resu
         .as_ref()
         .context("no pre-mapped user namespace")?;
     let exe = std::env::current_exe()?;
+    let (_ns_fd, ns_path) = userns::inherited_ns(&userns.fd)?;
     let status = Command::new(exe)
         .arg(FS_HELPER_ARG)
-        .arg(userns::ns_path(&userns.fd))
+        .arg(ns_path)
         .arg(op)
         .args(paths)
         .status()?;
@@ -219,26 +243,33 @@ impl Userns {
     }
 }
 
-/// Drop every capability of the agent process; nothing after the map
-/// write needs privilege.
+/// Drop the agent's capabilities down to CAP_CHOWN; only handing the
+/// build cgroups to their mapped root uid still needs privilege after
+/// the map write.
 fn drop_caps() -> Result<()> {
     rustix::thread::clear_ambient_capability_set().context("clearing the ambient set")?;
     rustix::thread::set_capabilities(
         None,
         rustix::thread::CapabilitySets {
-            effective: rustix::thread::CapabilitySet::empty(),
-            permitted: rustix::thread::CapabilitySet::empty(),
+            effective: rustix::thread::CapabilitySet::CHOWN,
+            permitted: rustix::thread::CapabilitySet::CHOWN,
             inheritable: rustix::thread::CapabilitySet::empty(),
         },
     )
-    .context("clearing the capability sets")?;
+    .context("reducing the capability sets")?;
     Ok(())
 }
 
 /// systemd-activated listener (the socket unit's fd), or None when not
-/// socket-activated.
+/// socket-activated. The shared adoption helper serves the async hub
+/// and marks the fd non-blocking; the agent's accept loop is
+/// synchronous.
 pub(super) fn activated_unix_listener() -> Result<Option<UnixListener>> {
-    Ok(crate::sd::activated_sockets()?.unix)
+    let listener = crate::sd::activated_sockets()?.unix;
+    if let Some(l) = &listener {
+        l.set_nonblocking(false)?;
+    }
+    Ok(listener)
 }
 
 pub(super) fn peer_uid(conn: &UnixStream) -> Result<u32> {

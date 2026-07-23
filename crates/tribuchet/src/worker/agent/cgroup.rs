@@ -1,0 +1,93 @@
+//! Per-build cgroups under the agent's delegated subtree.
+//!
+//! The agent unit runs with Delegate=yes, so systemd hands the unit
+//! cgroup to the agent user. Each build gets a `build-<id>` child next
+//! to the agent's own leaf: the sandbox's cgroup namespace is rooted
+//! there and the payload (nspawn, NixOS containers) manages its own
+//! subgroups, which is why the cgroup is chowned to the build's
+//! mapped root uid; that chown is what the agent keeps CAP_CHOWN for.
+
+use std::fs;
+use std::os::unix::fs::chown;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, ensure};
+
+/// Vacate the delegated unit cgroup (cgroup v2's no-internal-process
+/// rule forbids enabling controllers while it holds processes) and
+/// enable the memory controller for the build cgroups created next to
+/// the leaf. None when the unit is not delegated (development runs):
+/// builds then run without a cgroup of their own.
+pub(super) fn init() -> Option<PathBuf> {
+    let cg = fs::read_to_string("/proc/self/cgroup").ok()?;
+    let path = cg.lines().find_map(|l| l.strip_prefix("0::"))?;
+    let base = PathBuf::from(format!("/sys/fs/cgroup{}", path.trim()));
+    let controllers = fs::read_to_string(base.join("cgroup.controllers")).ok()?;
+    let leaf = base.join("agent");
+    if fs::create_dir_all(&leaf).is_err() || fs::write(leaf.join("cgroup.procs"), "0").is_err() {
+        tracing::info!("no delegated cgroup; builds run without one");
+        return None;
+    }
+    if controllers.split_whitespace().any(|c| c == "memory")
+        && let Err(e) = fs::write(base.join("cgroup.subtree_control"), "+memory")
+    {
+        tracing::warn!("enabling +memory on {}: {e}", base.display());
+    }
+    Some(base)
+}
+
+/// Create the build's cgroup and hand it to the build's mapped root
+/// uid so the in-sandbox payload can manage subgroups. cgroup.procs
+/// stays agent-owned until [`enter`] moved the setup stage in;
+/// cgroup.kill and memory.max stay agent-owned for good.
+pub(super) fn create(base: &Path, build_id: &str, owner_uid: u32) -> Result<PathBuf> {
+    let dir = base.join(format!("build-{build_id}"));
+    fs::create_dir(&dir).with_context(|| format!("creating cgroup {}", dir.display()))?;
+    chown(&dir, Some(owner_uid), None)?;
+    for f in ["cgroup.subtree_control", "cgroup.threads"] {
+        chown(dir.join(f), Some(owner_uid), None)?;
+    }
+    Ok(dir)
+}
+
+/// Move a pid into the build cgroup, then hand cgroup.procs to the
+/// build's mapped root uid (the payload migrates processes into its
+/// own subgroups). Called on the setup stage before the spec is sent,
+/// so its CLONE_NEWCGROUP is rooted there.
+pub(super) fn enter(dir: &Path, pid: i32, owner_uid: u32) -> Result<()> {
+    fs::write(dir.join("cgroup.procs"), pid.to_string())
+        .with_context(|| format!("moving pid {pid} into {}", dir.display()))?;
+    chown(dir.join("cgroup.procs"), Some(owner_uid), None)?;
+    Ok(())
+}
+
+/// Kill everything in the build cgroup, wait for it to drain and
+/// remove it, subgroups first (cgroup dirs can only be rmdir'd).
+pub(super) fn destroy(dir: &Path) -> Result<()> {
+    match fs::write(dir.join("cgroup.kill"), "1") {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        other => other.context("writing cgroup.kill")?,
+    }
+    let deadline = Instant::now() + Duration::from_mins(1);
+    // A vanished events file (systemd already removed the cgroup)
+    // counts as drained.
+    while fs::read_to_string(dir.join("cgroup.events")).is_ok_and(|e| !e.contains("populated 0")) {
+        ensure!(Instant::now() < deadline, "cgroup did not drain");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut dirs = vec![dir.to_path_buf()];
+    let mut i = 0;
+    while i < dirs.len() {
+        for entry in fs::read_dir(&dirs[i])?.flatten() {
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                dirs.push(entry.path());
+            }
+        }
+        i += 1;
+    }
+    for d in dirs.iter().rev() {
+        fs::remove_dir(d).with_context(|| format!("removing cgroup {}", d.display()))?;
+    }
+    Ok(())
+}

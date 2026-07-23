@@ -65,11 +65,11 @@ pub struct SandboxSpec {
     /// dereference it, so they are recreated as symlinks instead.
     #[serde(default)]
     pub symlink_inputs: Vec<(PathBuf, PathBuf)>,
-    /// Per-build cgroup; the builder enters it from pre_exec so the
-    /// memory limit covers the whole build, including the setup phase.
+    /// Per-build cgroup the agent moved the setup stage into; the
+    /// sandbox roots its cgroup namespace there.
     pub cgroup: Option<PathBuf>,
-    /// Path to the user namespace mapped by tribuchet-sandboxd; the
-    /// setup stage joins it instead of writing uid maps itself.
+    /// Path to the agent's pre-mapped user namespace; the setup stage
+    /// joins it instead of writing uid maps itself.
     #[serde(default)]
     pub leased_userns: Option<PathBuf>,
     /// Uids mapped in that namespace at in-ns 0 (1 or 65536).
@@ -120,9 +120,10 @@ pub fn output_host_path(spec: &SandboxSpec, scratch: &str) -> PathBuf {
 pub struct PrepareOpts<'a> {
     pub bin_sh: Option<&'a Path>,
     pub secrets: &'a [PathBuf],
-    /// User namespace leased from tribuchet-sandboxd.
+    /// The agent's pre-mapped user namespace. The worker leaves it
+    /// unset; the agent fills it in before spawning the setup stage.
     pub leased_userns: Option<PathBuf>,
-    /// Uids mapped in the leased namespace (1 or 65536).
+    /// Uids the build needs mapped (1 or 65536).
     pub leased_uid_count: Option<u32>,
     pub emulator: Option<&'a Path>,
     /// Fixed-output builds get a private netns with user-mode NAT.
@@ -172,7 +173,7 @@ pub fn prepare(
         cgroup: None,
         leased_userns: opts.leased_userns.clone(),
         leased_uid_count: opts.leased_uid_count,
-        // filled in once sandboxd has leased the block
+        // filled in by the agent, like the namespace and cgroup
         pool_base: None,
         net_isolation: opts.net_isolation && a.fixed_output,
         net_policy: opts.net_policy.clone(),

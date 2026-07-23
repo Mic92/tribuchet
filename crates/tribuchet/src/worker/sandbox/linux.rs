@@ -262,16 +262,17 @@ fn enter_and_exec(
     spec: &SandboxSpec,
     status_file: &fs::File,
 ) -> io::Result<std::convert::Infallible> {
-    // sandboxd placed this process in the build cgroup before the spec
-    // arrived on stdin; CLONE_NEWCGROUP below roots the namespace there.
+    // The agent placed this process in the build cgroup before the
+    // spec arrived on stdin; CLONE_NEWCGROUP below roots the namespace
+    // there.
     let binfmt_line = match &spec.emulator {
         Some(_) => Some(binfmt::register_line(&spec.system).ok_or_else(|| {
             io::Error::other(format!("no binfmt magic known for system {}", spec.system))
         })?),
         None => None,
     };
-    // The leased namespace already carries its maps (in-ns 0..count,
-    // written by sandboxd); setup becomes in-ns root after joining.
+    // The leased namespace already carries its maps (written by the
+    // agent at startup); setup becomes in-ns root after joining.
     let uid_count = spec
         .leased_uid_count
         .ok_or_else(|| io::Error::other("sandbox spec lacks a leased uid count"))?;
@@ -578,7 +579,7 @@ struct SetupParams<'a> {
     binfmt_line: Option<&'a str>,
     net_isolation: bool,
     net_policy: &'a NetPolicy,
-    /// Leased user namespace to join, mapped by tribuchet-sandboxd.
+    /// The agent's pre-mapped user namespace to join.
     leased_userns: &'a Path,
     build_dir: &'a Path,
     binds: &'a [(PathBuf, PathBuf)],
@@ -618,7 +619,7 @@ fn setup(p: &SetupParams) -> io::Result<()> {
         // delegated subtree (usable by nspawn inside the sandbox).
         flags |= CloneFlags::CLONE_NEWCGROUP;
     }
-    // sandboxd already wrote the maps of the leased namespace; join it
+    // The agent already wrote the maps of its namespace; join it
     // (allowed: this uid owns it) and unshare the rest inside. Then
     // become in-ns root (backed by the pool base uid): the worker uid
     // is not mapped here, so the file creation and mounts below need

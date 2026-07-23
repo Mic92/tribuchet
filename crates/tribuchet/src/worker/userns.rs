@@ -5,6 +5,8 @@ use std::fs;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
 
+use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+
 use anyhow::{Context, Result, bail};
 
 /// A forked child that unshared an unmapped user namespace and blocks;
@@ -65,6 +67,15 @@ impl Drop for UsernsHolder {
     }
 }
 
-pub(in crate::worker) fn ns_path(userns: &OwnedFd) -> PathBuf {
-    format!("/proc/{}/fd/{}", std::process::id(), userns.as_raw_fd()).into()
+/// Duplicate the namespace fd without close-on-exec so a spawned child
+/// inherits it, plus the /proc/self/fd path the child opens it under.
+/// Children cannot go through the agent's /proc instead: the agent
+/// keeps CAP_CHOWN, so the ptrace access check denies its cap-less
+/// children.
+pub(in crate::worker) fn inherited_ns(userns: &OwnedFd) -> Result<(OwnedFd, PathBuf)> {
+    let dup = userns.try_clone().context("duplicating the userns fd")?;
+    fcntl(&dup, FcntlArg::F_SETFD(FdFlag::empty()))
+        .context("clearing close-on-exec on the userns fd")?;
+    let path = format!("/proc/self/fd/{}", dup.as_raw_fd()).into();
+    Ok((dup, path))
 }

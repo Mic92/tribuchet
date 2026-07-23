@@ -28,6 +28,8 @@ use sandbox_proto::framing;
 use crate::tmptar::unpack_tmp_dir_archive;
 
 #[cfg(target_os = "linux")]
+mod cgroup;
+#[cfg(target_os = "linux")]
 #[path = "agent/linux.rs"]
 mod platform;
 #[cfg(target_os = "macos")]
