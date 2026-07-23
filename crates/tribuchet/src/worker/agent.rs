@@ -1,15 +1,15 @@
-//! `tribuchet agent`: macOS per-uid build agent.
+//! `tribuchet agent`: per-uid build agent.
 //!
-//! One socket-activated launchd daemon per pool user. The worker
-//! leases a build by connecting and sending Start. The agent unpacks
-//! the tmp dir, applies the seatbelt profile in the forked child and
-//! execs the builder as its own (non-worker) uid. The builder is the
-//! agent's child, so builds survive worker restarts and the agent
-//! holds the log and exit status until the worker adopts them. The
-//! protocol lives in crates/sandbox-proto/src/agent.rs.
+//! One socket-activated daemon per pool user (launchd on macOS,
+//! systemd on Linux). The worker leases a build by connecting and
+//! sending Start. The agent unpacks the tmp dir, confines the forked
+//! child (seatbelt on macOS) and execs the builder as its own
+//! (non-worker) uid. The builder is the agent's child, so builds
+//! survive worker restarts and the agent holds the log and exit
+//! status until the worker adopts them. The protocol lives in
+//! crates/sandbox-proto/src/agent.rs.
 
 use std::collections::HashMap;
-use std::ffi::CString;
 use std::fs;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -21,12 +21,18 @@ use anyhow::{Context, Result, bail, ensure};
 use sandbox_proto::agent::{
     AdoptReply, AdoptRequest, CleanupRequest, ERROR_BUSY, ERROR_UNKNOWN_BUILD, ExitNotice,
     FinishRequest, KillRequest, METHOD_ADOPT, METHOD_CLEANUP, METHOD_FINISH, METHOD_KILL,
-    METHOD_START, SCRATCH_DIR_PARAM, StartReply, StartRequest,
+    METHOD_START, StartReply, StartRequest,
 };
 use sandbox_proto::framing;
 
-use crate::sd::launchd_unix_listener;
 use crate::tmptar::unpack_tmp_dir_archive;
+
+#[cfg(target_os = "linux")]
+#[path = "agent/linux.rs"]
+mod platform;
+#[cfg(target_os = "macos")]
+#[path = "agent/darwin.rs"]
+mod platform;
 
 pub struct Options {
     /// Unix socket to bind when launchd did not pass one.
@@ -40,11 +46,11 @@ pub struct Options {
 
 /// The one build this agent holds, from Start until Cleanup.
 struct Build {
-    build_id: String,
+    id: String,
     /// Builder pid, also its process group.
     pid: i32,
     /// Scratch dir the build runs in (`<state>/<id>/build`).
-    build_dir: PathBuf,
+    dir: PathBuf,
     /// Whole per-build tree removed by Cleanup (`<state>/<id>`).
     scratch_root: PathBuf,
     outputs: Vec<String>,
@@ -57,10 +63,11 @@ struct Agent {
     state_dir: PathBuf,
     worker_uid: u32,
     current: Mutex<Option<Build>>,
-    /// True under launchd, where the agent owns a dedicated uid: exit
-    /// after Cleanup so launchd starts a fresh agent, and sweep the
-    /// whole uid when killing. Self-bound sockets (development, tests)
-    /// share the developer's uid, where both would be destructive.
+    /// True under a service manager, where the agent owns a dedicated
+    /// uid: exit after Cleanup so a fresh agent is started, and sweep
+    /// the whole uid when killing. Self-bound sockets (development,
+    /// tests) share the developer's uid, where both would be
+    /// destructive.
     dedicated_uid: bool,
 }
 
@@ -78,8 +85,8 @@ impl Agent {
     }
 }
 
-pub fn run(opts: Options) -> Result<()> {
-    let (listener, launchd) = listener(opts.socket.as_deref())?;
+pub fn run(opts: &Options) -> Result<()> {
+    let (listener, activated) = listener(opts.socket.as_deref())?;
     fs::create_dir_all(&opts.state_dir)
         .with_context(|| format!("creating state dir {}", opts.state_dir.display()))?;
     let agent = Arc::new(Agent {
@@ -94,7 +101,7 @@ pub fn run(opts: Options) -> Result<()> {
             .worker_uid
             .unwrap_or_else(|| nix::unistd::getuid().as_raw()),
         current: Mutex::new(None),
-        dedicated_uid: launchd,
+        dedicated_uid: activated,
     });
     tracing::info!(uid = nix::unistd::getuid().as_raw(), "agent listening");
     for conn in listener.incoming() {
@@ -110,23 +117,23 @@ pub fn run(opts: Options) -> Result<()> {
     Ok(())
 }
 
-/// launchd-activated listener (socket named "agent" in the plist) or a
-/// self-bound one for development and tests. The bool is true for the
-/// launchd case.
+/// Service-manager-activated listener (launchd socket named "agent",
+/// or the systemd socket unit's fd) or a self-bound one for
+/// development and tests. The bool is true for the activated case.
 fn listener(socket: Option<&Path>) -> Result<(UnixListener, bool)> {
-    if let Some(l) = launchd_unix_listener("agent")? {
+    if let Some(l) = platform::activated_unix_listener()? {
         return Ok((l, true));
     }
-    let path = socket.context("no launchd socket and no --socket given")?;
+    let path = socket.context("no activated socket and no --socket given")?;
     let _ = fs::remove_file(path);
     let l = UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
     Ok((l, false))
 }
 
 fn handle(agent: &Arc<Agent>, conn: &UnixStream) -> Result<()> {
-    let (peer_uid, _) = nix::unistd::getpeereid(conn)?;
+    let peer_uid = platform::peer_uid(conn)?;
     ensure!(
-        peer_uid.as_raw() == agent.worker_uid,
+        peer_uid == agent.worker_uid,
         "connection from uid {peer_uid}, only the worker uid {} may lease",
         agent.worker_uid
     );
@@ -178,9 +185,9 @@ fn handle_start(
         let exit = Arc::new((Mutex::new(None), Condvar::new()));
         reap_on_exit(child, exit.clone());
         *current = Some(Build {
-            build_id: req.build_id.clone(),
+            id: req.build_id.clone(),
             pid,
-            build_dir: build_dir.clone(),
+            dir: build_dir.clone(),
             scratch_root,
             outputs: req.outputs,
             exit: exit.clone(),
@@ -204,12 +211,9 @@ fn handle_adopt(agent: &Arc<Agent>, conn: &UnixStream, req: &AdoptRequest) -> Re
     let (pid, build_dir, scratch_root, exit) = {
         let current = agent.current.lock().unwrap();
         match current.as_ref() {
-            Some(b) if b.build_id == req.build_id => (
-                b.pid,
-                b.build_dir.clone(),
-                b.scratch_root.clone(),
-                b.exit.clone(),
-            ),
+            Some(b) if b.id == req.build_id => {
+                (b.pid, b.dir.clone(), b.scratch_root.clone(), b.exit.clone())
+            }
             _ => return framing::send_error(conn, ERROR_UNKNOWN_BUILD),
         }
     };
@@ -234,7 +238,7 @@ fn handle_kill(agent: &Arc<Agent>, conn: &UnixStream, req: &KillRequest) -> Resu
     let pid = {
         let current = agent.current.lock().unwrap();
         match current.as_ref() {
-            Some(b) if b.build_id == req.build_id => b.pid,
+            Some(b) if b.id == req.build_id => b.pid,
             _ => return framing::send_error(conn, ERROR_UNKNOWN_BUILD),
         }
     };
@@ -246,7 +250,7 @@ fn handle_finish(agent: &Arc<Agent>, conn: &UnixStream, req: &FinishRequest) -> 
     let outputs = {
         let current = agent.current.lock().unwrap();
         match current.as_ref() {
-            Some(b) if b.build_id == req.build_id => b.outputs.clone(),
+            Some(b) if b.id == req.build_id => b.outputs.clone(),
             _ => return framing::send_error(conn, ERROR_UNKNOWN_BUILD),
         }
     };
@@ -260,7 +264,7 @@ fn handle_cleanup(agent: &Arc<Agent>, conn: &UnixStream, req: &CleanupRequest) -
     let build = {
         let mut current = agent.current.lock().unwrap();
         match current.as_ref() {
-            Some(b) if b.build_id == req.build_id => current.take().unwrap(),
+            Some(b) if b.id == req.build_id => current.take().unwrap(),
             _ => return framing::send_error(conn, ERROR_UNKNOWN_BUILD),
         }
     };
@@ -274,7 +278,7 @@ fn handle_cleanup(agent: &Arc<Agent>, conn: &UnixStream, req: &CleanupRequest) -
         let _ = fs::remove_file(p);
     }
     framing::send_reply(conn, &serde_json::json!({}), &[])?;
-    tracing::info!(id = build.build_id, "cleanup done");
+    tracing::info!(id = build.id, "cleanup done");
     if agent.dedicated_uid {
         std::process::exit(0);
     }
@@ -282,8 +286,8 @@ fn handle_cleanup(agent: &Arc<Agent>, conn: &UnixStream, req: &CleanupRequest) -
 }
 
 /// Fork and exec the builder: own process group, stdio on the log
-/// file, cwd and env rewritten to the scratch dir, seatbelt profile
-/// applied in the child right before exec.
+/// file, cwd and env rewritten to the scratch dir, platform
+/// confinement applied in the child right before exec.
 fn spawn_builder(
     req: &StartRequest,
     build_dir: &Path,
@@ -307,15 +311,7 @@ fn spawn_builder(
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log.try_clone()?));
     cmd.process_group(0);
-    if !req.profile.is_empty() {
-        let seatbelt = Seatbelt::new(&req.profile, &[(SCRATCH_DIR_PARAM, &build_dir_str)])?;
-        // SAFETY: sandbox_init_with_parameters is called with
-        // pointers into memory owned by the moved-in Seatbelt; no
-        // allocation happens after fork.
-        unsafe {
-            cmd.pre_exec(move || seatbelt.apply());
-        }
-    }
+    platform::confine(&mut cmd, req, &build_dir_str)?;
     cmd.spawn()
         .with_context(|| format!("spawning builder {}", req.builder))
 }
@@ -327,71 +323,10 @@ fn rewrite_tmp_dir_env(env: &mut HashMap<String, String>, from: &str, to: &str) 
     let prefix = format!("{from}/");
     for v in env.values_mut() {
         if v == from {
-            *v = to.to_owned();
+            to.clone_into(v);
         } else if let Some(rest) = v.strip_prefix(&prefix) {
             *v = format!("{to}/{rest}");
         }
-    }
-}
-
-/// Pre-allocated arguments for `sandbox_init_with_parameters`, so the
-/// post-fork hook only makes the libc call.
-struct Seatbelt {
-    profile: CString,
-    // key/value CStrings backing the pointer array
-    _params: Vec<CString>,
-    param_ptrs: Vec<*const libc::c_char>,
-}
-
-// The raw pointers point into the CStrings owned by the same struct.
-unsafe impl Send for Seatbelt {}
-unsafe impl Sync for Seatbelt {}
-
-impl Seatbelt {
-    fn new(profile: &str, params: &[(&str, &str)]) -> Result<Self> {
-        let profile = CString::new(profile).context("NUL byte in seatbelt profile")?;
-        let mut owned = Vec::new();
-        for (k, v) in params {
-            owned.push(CString::new(*k)?);
-            owned.push(CString::new(*v)?);
-        }
-        let mut param_ptrs: Vec<*const libc::c_char> = owned.iter().map(|c| c.as_ptr()).collect();
-        param_ptrs.push(std::ptr::null());
-        Ok(Self {
-            profile,
-            _params: owned,
-            param_ptrs,
-        })
-    }
-
-    fn apply(&self) -> std::io::Result<()> {
-        unsafe extern "C" {
-            fn sandbox_init_with_parameters(
-                profile: *const libc::c_char,
-                flags: u64,
-                parameters: *const *const libc::c_char,
-                errorbuf: *mut *mut libc::c_char,
-            ) -> libc::c_int;
-            fn sandbox_free_error(errorbuf: *mut libc::c_char);
-        }
-        let mut err: *mut libc::c_char = std::ptr::null_mut();
-        let rc = unsafe {
-            sandbox_init_with_parameters(
-                self.profile.as_ptr(),
-                0,
-                self.param_ptrs.as_ptr(),
-                &raw mut err,
-            )
-        };
-        if rc == 0 {
-            return Ok(());
-        }
-        // Post-fork: report the errno-style failure without touching
-        // the (heap-allocated) error string beyond freeing it.
-        if !err.is_null() {
-            unsafe { sandbox_free_error(err) };
-        }
-        Err(std::io::Error::other("sandbox_init_with_parameters failed"))
     }
 }
 
@@ -434,7 +369,7 @@ fn notify_exit(conn: &UnixStream, exit: &(Mutex<Option<i32>>, Condvar)) -> Resul
 fn kill_own_uid_processes() {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let others = own_uid_pids()
+        let others = platform::own_uid_pids()
             .into_iter()
             .filter(|&pid| pid != std::process::id().cast_signed())
             .collect::<Vec<_>>();
@@ -453,34 +388,6 @@ fn kill_own_uid_processes() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-}
-
-/// Pids owned by this uid, via libproc's proc_listpids (macOS has no
-/// /proc to enumerate).
-fn own_uid_pids() -> Vec<i32> {
-    // From <libproc.h>; the libc crate binds proc_listpids but not the
-    // filter constants.
-    const PROC_UID_ONLY: u32 = 2;
-    let uid = nix::unistd::getuid().as_raw();
-    // Sized generously instead of the size-probe round trip: the uid
-    // runs one build plus the agent, and a truncated list only means
-    // the next sweep iteration picks up the rest.
-    let mut pids = vec![0i32; 4096];
-    let bytes = unsafe {
-        libc::proc_listpids(
-            PROC_UID_ONLY,
-            uid,
-            pids.as_mut_ptr().cast(),
-            (pids.len() * size_of::<i32>()) as libc::c_int,
-        )
-    };
-    if bytes <= 0 {
-        tracing::warn!("proc_listpids failed, kill sweep degraded to the process group");
-        return Vec::new();
-    }
-    pids.truncate(bytes as usize / size_of::<i32>());
-    pids.retain(|&pid| pid > 0);
-    pids
 }
 
 /// Make an output tree readable (and directories searchable) for the
@@ -527,13 +434,13 @@ mod tests {
 
     #[test]
     fn make_readable_skips_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("out");
         fs::create_dir(&out).unwrap();
         fs::write(out.join("file"), "x").unwrap();
         std::os::unix::fs::symlink("/etc/passwd", out.join("link")).unwrap();
         make_readable(&out);
-        use std::os::unix::fs::PermissionsExt;
         assert_ne!(
             fs::metadata(out.join("file")).unwrap().permissions().mode() & 0o444,
             0

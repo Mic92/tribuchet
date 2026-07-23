@@ -247,7 +247,7 @@ mod tests {
         {
             let socket = socket.clone();
             std::thread::spawn(move || {
-                let _ = super::super::agent::run(super::super::agent::Options {
+                let _ = super::super::agent::run(&super::super::agent::Options {
                     socket: Some(socket),
                     state_dir,
                     worker_uid: None,
