@@ -275,6 +275,7 @@ mod tests {
             env: HashMap::from([("NIX_BUILD_TOP".into(), "/build".into())]),
             tmp_dir_in_sandbox: "/build".into(),
             profile: String::new(),
+            sandbox: None,
             outputs,
         }
     }

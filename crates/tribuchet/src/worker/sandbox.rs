@@ -205,7 +205,7 @@ pub fn prepare(
         );
     }
     spec.binds_ro.sort(); // deterministic mount order
-    platform::prepare(&mut spec)?;
+    platform::prepare_root(&mut spec)?;
     Ok(spec)
 }
 
@@ -260,38 +260,10 @@ pub fn send_spec_to(spec: &SandboxSpec, w: OwnedFd) -> Result<()> {
     serde_json::to_writer(fs::File::from(w), spec).context("sending sandbox spec")
 }
 
-/// Exit code of a finished build, persisted by the PID-1 shim. None
-/// while the build is still running.
 #[cfg(target_os = "linux")]
-pub fn exit_status(spec: &SandboxSpec) -> Option<i32> {
-    platform::exit_status_impl(spec)
-}
-
-/// Setup-stage failure message, written by the stage before the host
-/// filesystem became unreachable. Read by the worker when the build
-/// exits nonzero.
-#[cfg(target_os = "linux")]
-pub fn setup_error_detail(spec: &SandboxSpec) -> Option<String> {
-    platform::setup_error_detail_impl(spec)
-}
-
-/// Entry point of the re-exec'd setup stage: builds run as
-/// `/proc/self/exe __sandbox_setup` with the spec on stdin, so the
-/// namespace/mount/uid work runs in a fresh process instead of a
-/// post-fork `pre_exec` closure, where only async-signal-safe code is
-/// allowed.
-#[cfg(target_os = "linux")]
-pub fn setup_stage() -> ! {
-    platform::setup_stage()
-}
-
-#[cfg(target_os = "linux")]
-pub use platform::SETUP_STAGE_ARG;
-
-#[cfg(target_os = "linux")]
-pub fn cleanup(outputs: &[String], dir: &Path) {
-    platform::cleanup(outputs, dir);
-}
+pub use platform::{
+    SETUP_STAGE_ARG, cleanup, exit_status, prepare_root, setup_error_detail, setup_stage,
+};
 
 #[cfg(target_os = "linux")]
 #[path = "sandbox/linux.rs"]

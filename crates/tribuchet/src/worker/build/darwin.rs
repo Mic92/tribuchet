@@ -66,6 +66,7 @@ impl ActiveBuild {
             env: a.env.clone(),
             tmp_dir_in_sandbox: a.tmp_dir_in_sandbox.clone(),
             profile,
+            sandbox: None,
             outputs: outputs.clone(),
         };
         let build = agents::AgentBuild::start(

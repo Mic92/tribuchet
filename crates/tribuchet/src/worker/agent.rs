@@ -56,6 +56,9 @@ struct Build {
     dir: PathBuf,
     /// Whole per-build tree removed by Cleanup (`<state>/<id>`).
     scratch_root: PathBuf,
+    /// Private sandbox root under the scratch dir (Linux namespace
+    /// builds); outputs land below it instead of at their store paths.
+    sandbox_root: Option<PathBuf>,
     outputs: Vec<String>,
     /// Exit code once the wait thread reaped the builder. Kept in
     /// agent memory only: the build can write everything on disk here.
@@ -65,6 +68,7 @@ struct Build {
 struct Agent {
     state_dir: PathBuf,
     worker_uid: u32,
+    confinement: platform::Confinement,
     current: Mutex<Option<Build>>,
     /// True under a service manager, where the agent owns a dedicated
     /// uid: exit after Cleanup so a fresh agent is started, and sweep
@@ -89,9 +93,7 @@ impl Agent {
 }
 
 pub fn run(opts: &Options) -> Result<()> {
-    // Held for the process lifetime: it pins the agent's pre-mapped
-    // user namespace on Linux.
-    let _confinement = platform::Confinement::init(opts)?;
+    let confinement = platform::Confinement::init(opts)?;
     let (listener, activated) = listener(opts.socket.as_deref())?;
     fs::create_dir_all(&opts.state_dir)
         .with_context(|| format!("creating state dir {}", opts.state_dir.display()))?;
@@ -106,6 +108,7 @@ pub fn run(opts: &Options) -> Result<()> {
         worker_uid: opts
             .worker_uid
             .unwrap_or_else(|| nix::unistd::getuid().as_raw()),
+        confinement,
         current: Mutex::new(None),
         dedicated_uid: activated,
     });
@@ -186,7 +189,8 @@ fn handle_start(
 
         let log_path = scratch_root.join("build.log");
         let log_w = fs::File::create(&log_path)?;
-        let child = spawn_builder(&req, &build_dir, &log_w)?;
+        let (child, sandbox_root) =
+            platform::spawn_builder(&agent.confinement, &req, &scratch_root, &build_dir, &log_w)?;
         let pid = child.id().cast_signed();
         let exit = Arc::new((Mutex::new(None), Condvar::new()));
         reap_on_exit(child, exit.clone());
@@ -195,6 +199,7 @@ fn handle_start(
             pid,
             dir: build_dir.clone(),
             scratch_root,
+            sandbox_root,
             outputs: req.outputs,
             exit: exit.clone(),
         });
@@ -253,17 +258,26 @@ fn handle_kill(agent: &Arc<Agent>, conn: &UnixStream, req: &KillRequest) -> Resu
 }
 
 fn handle_finish(agent: &Arc<Agent>, conn: &UnixStream, req: &FinishRequest) -> Result<()> {
-    let outputs = {
+    let (outputs, root) = {
         let current = agent.current.lock().unwrap();
         match current.as_ref() {
-            Some(b) if b.id == req.build_id => b.outputs.clone(),
+            Some(b) if b.id == req.build_id => (b.outputs.clone(), b.sandbox_root.clone()),
             _ => return framing::send_error(conn, ERROR_UNKNOWN_BUILD),
         }
     };
     for out in &outputs {
-        make_readable(Path::new(out));
+        make_readable(&output_host_path(root.as_deref(), out));
     }
     framing::send_reply(conn, &serde_json::json!({}), &[])
+}
+
+/// Host location of a scratch output: below the private sandbox root
+/// on Linux namespace builds, at its real store path otherwise.
+fn output_host_path(root: Option<&Path>, out: &str) -> PathBuf {
+    match root {
+        Some(r) => r.join(out.trim_start_matches('/')),
+        None => PathBuf::from(out),
+    }
 }
 
 fn handle_cleanup(agent: &Arc<Agent>, conn: &UnixStream, req: &CleanupRequest) -> Result<()> {
@@ -277,11 +291,13 @@ fn handle_cleanup(agent: &Arc<Agent>, conn: &UnixStream, req: &CleanupRequest) -
     agent.kill_sweep(Some(build.pid));
     let _ = fs::remove_dir_all(&build.scratch_root);
     for out in &build.outputs {
-        // Scratch outputs live at their real store paths and are
-        // agent-owned. The sticky store dir lets the owner delete them.
-        let p = Path::new(out);
-        let _ = fs::remove_dir_all(p);
-        let _ = fs::remove_file(p);
+        // Outside a private sandbox root, scratch outputs live at
+        // their real store paths and are agent-owned; the sticky store
+        // dir lets the owner delete them. Under a sandbox root they
+        // are inside the scratch tree removed above.
+        let p = output_host_path(build.sandbox_root.as_deref(), out);
+        let _ = fs::remove_dir_all(&p);
+        let _ = fs::remove_file(&p);
     }
     framing::send_reply(conn, &serde_json::json!({}), &[])?;
     tracing::info!(id = build.id, "cleanup done");
@@ -291,10 +307,11 @@ fn handle_cleanup(agent: &Arc<Agent>, conn: &UnixStream, req: &CleanupRequest) -
     Ok(())
 }
 
-/// Fork and exec the builder: own process group, stdio on the log
-/// file, cwd and env rewritten to the scratch dir, platform
-/// confinement applied in the child right before exec.
-fn spawn_builder(
+/// Fork and exec the builder directly (no namespace sandbox): own
+/// process group, stdio on the log file, cwd and env rewritten to the
+/// scratch dir, platform confinement applied in the child right
+/// before exec.
+fn spawn_plain(
     req: &StartRequest,
     build_dir: &Path,
     log: &fs::File,

@@ -48,6 +48,12 @@ pub struct StartRequest {
     pub tmp_dir_in_sandbox: String,
     /// SBPL profile text, may reference [`SCRATCH_DIR_PARAM`].
     pub profile: String,
+    /// Linux: the worker's serialized sandbox spec (bind mounts,
+    /// network policy, namespaces). The agent fills in its scratch
+    /// paths and pre-mapped user namespace and spawns the setup stage
+    /// with it instead of executing the builder directly.
+    #[serde(default)]
+    pub sandbox: Option<serde_json::Value>,
     /// Scratch output store paths, acted on by `Finish` and `Cleanup`.
     pub outputs: Vec<String>,
 }

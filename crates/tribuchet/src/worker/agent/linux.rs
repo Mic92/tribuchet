@@ -5,20 +5,22 @@
 //! 0..65536 to its uid block. Writing another namespace's uid_map
 //! needs CAP_SETUID in the parent namespace, so the agent unit runs
 //! with AmbientCapabilities=CAP_SETUID CAP_SETGID and the caps are
-//! dropped right after the write. Builds do not yet run inside the
-//! namespace; that sandbox setup still lives in the worker.
+//! dropped right after the write. Sandboxed builds join that
+//! namespace via the worker's setup stage, spawned here.
 
 use std::fs;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command};
 
 use anyhow::{Context, Result, ensure};
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use sandbox_proto::agent::StartRequest;
 
 use super::Options;
-use crate::worker::userns::UsernsHolder;
+use crate::worker::sandbox::{self, SandboxSpec};
+use crate::worker::userns::{self, UsernsHolder};
 
 /// Uids mapped into the agent's user namespace: enough for uid-range
 /// (nspawn) builds, single-uid builds nest a 1-uid map inside it.
@@ -28,20 +30,20 @@ const UID_COUNT: u32 = 65536;
 /// every build this agent runs. None without `--uid-base` (development
 /// runs and containers without a uid block).
 pub(super) struct Confinement {
-    _userns: Option<Userns>,
+    userns: Option<Userns>,
 }
 
 struct Userns {
     /// Pausing child that keeps the namespace alive.
     holder: UsernsHolder,
-    _fd: OwnedFd,
-    _uid_base: u32,
+    fd: OwnedFd,
+    uid_base: u32,
 }
 
 impl Confinement {
     pub(super) fn init(opts: &Options) -> Result<Self> {
         Ok(Self {
-            _userns: opts.uid_base.map(Userns::create).transpose()?,
+            userns: opts.uid_base.map(Userns::create).transpose()?,
         })
     }
 
@@ -51,8 +53,42 @@ impl Confinement {
     }
 }
 
-/// Builder confinement hook; the namespace sandbox is not applied
-/// yet, only seatbelt-profile requests are rejected.
+/// Spawn the build. With a sandbox spec from the worker the setup
+/// stage runs it inside the agent's pre-mapped user namespace; without
+/// one (development, tests) the builder is exec'd directly.
+pub(super) fn spawn_builder(
+    confinement: &Confinement,
+    req: &StartRequest,
+    scratch_root: &Path,
+    build_dir: &Path,
+    log: &fs::File,
+) -> Result<(Child, Option<PathBuf>)> {
+    let Some(sandbox_json) = &req.sandbox else {
+        return Ok((super::spawn_plain(req, build_dir, log)?, None));
+    };
+    let userns = confinement
+        .userns
+        .as_ref()
+        .context("sandboxed build requested but the agent has no --uid-base")?;
+    let mut spec: SandboxSpec =
+        serde_json::from_value(sandbox_json.clone()).context("decoding the sandbox spec")?;
+    spec.root = scratch_root.join("root");
+    spec.build_dir = build_dir.to_path_buf();
+    spec.leased_userns = Some(userns::ns_path(&userns.fd));
+    spec.leased_uid_count = Some(UID_COUNT);
+    spec.pool_base = Some(userns.uid_base);
+    // No delegated per-build cgroup on the agent path.
+    spec.cgroup = None;
+    sandbox::prepare_root(&mut spec).context("creating the sandbox root skeleton")?;
+    let (child, spec_w) = sandbox::spawn(&spec, log)?;
+    if let Some(w) = spec_w {
+        sandbox::send_spec_to(&spec, w)?;
+    }
+    Ok((child, Some(spec.root)))
+}
+
+/// Confinement hook of the direct-exec path (no sandbox spec):
+/// seatbelt-profile requests have no Linux equivalent there.
 pub(super) fn confine(_cmd: &mut Command, req: &StartRequest, _build_dir: &str) -> Result<()> {
     ensure!(
         req.profile.is_empty(),
@@ -81,8 +117,8 @@ impl Userns {
         );
         Ok(Self {
             holder,
-            _fd: fd,
-            _uid_base: uid_base,
+            fd,
+            uid_base,
         })
     }
 }

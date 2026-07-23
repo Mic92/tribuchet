@@ -2,8 +2,10 @@
 //! confinement and the libproc-based uid sweep.
 
 use std::ffi::CString;
+use std::fs;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command};
 
 use anyhow::{Context, Result};
 use sandbox_proto::agent::{SCRATCH_DIR_PARAM, StartRequest};
@@ -24,6 +26,18 @@ impl Confinement {
     pub(super) fn exempt_pid(&self) -> Option<i32> {
         None
     }
+}
+
+/// Exec the builder under the request's seatbelt profile. Outputs land
+/// at their real store paths, so there is no private sandbox root.
+pub(super) fn spawn_builder(
+    _confinement: &Confinement,
+    req: &StartRequest,
+    _scratch_root: &Path,
+    build_dir: &Path,
+    log: &fs::File,
+) -> Result<(Child, Option<PathBuf>)> {
+    Ok((super::spawn_plain(req, build_dir, log)?, None))
 }
 
 /// Apply the request's seatbelt profile in the forked child right

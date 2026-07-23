@@ -38,7 +38,11 @@ nix::ioctl_write_ptr_bad!(
     libc::ifreq
 );
 
-pub fn prepare(spec: &mut SandboxSpec) -> Result<()> {
+/// Create the sandbox root skeleton (directories, /etc files, /dev
+/// nodes) for a spec whose scratch paths the caller filled in. Runs on
+/// the worker for its own builds and in the build agent for leased
+/// ones.
+pub fn prepare_root(spec: &mut SandboxSpec) -> Result<()> {
     let root = &spec.root;
     write_skeleton(spec)?;
     populate_dev(root, &mut spec.binds_dev)?;
@@ -221,6 +225,11 @@ pub const SETUP_STAGE_ARG: &str = "__sandbox_setup";
 /// The spec travels via the setup stage's stdin.
 pub const SPEC_VIA_STDIN: bool = true;
 
+/// Entry point of the re-exec'd setup stage: builds run as
+/// `/proc/self/exe __sandbox_setup` with the spec on stdin, so the
+/// namespace/mount/uid work runs in a fresh process instead of a
+/// post-fork `pre_exec` closure, where only async-signal-safe code is
+/// allowed.
 pub fn setup_stage() -> ! {
     use std::io::{Read, Write};
     let err = (|| -> io::Result<std::convert::Infallible> {
@@ -888,7 +897,9 @@ pub fn exit_status_file(root: &Path) -> PathBuf {
 }
 
 /// Exit code the shim persisted, if the build has finished.
-pub fn exit_status_impl(spec: &SandboxSpec) -> Option<i32> {
+/// Exit code of a finished build, persisted by the PID-1 shim. None
+/// while the build is still running.
+pub fn exit_status(spec: &SandboxSpec) -> Option<i32> {
     fs::read_to_string(exit_status_file(&spec.root))
         .ok()?
         .trim()
@@ -896,7 +907,10 @@ pub fn exit_status_impl(spec: &SandboxSpec) -> Option<i32> {
         .ok()
 }
 
-pub fn setup_error_detail_impl(spec: &SandboxSpec) -> Option<String> {
+/// Setup-stage failure message, written by the stage before the host
+/// filesystem became unreachable. Read by the worker when the build
+/// exits nonzero.
+pub fn setup_error_detail(spec: &SandboxSpec) -> Option<String> {
     fs::read_to_string(setup_error_file(&spec.root))
         .ok()
         .filter(|s| !s.is_empty())
