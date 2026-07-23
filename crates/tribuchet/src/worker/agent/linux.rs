@@ -13,6 +13,7 @@
 
 use std::fs;
 use std::os::fd::OwnedFd;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -63,6 +64,42 @@ impl Confinement {
     pub(super) fn exempt_pid(&self) -> Option<i32> {
         self.userns.as_ref().map(|ns| ns.holder.pid().as_raw())
     }
+}
+
+/// Unpack the tmp dir archive. With a user namespace the unpack runs
+/// through the userns helper as in-ns root, so the files belong to
+/// the uid block and the builder can rewrite and unlink them; the
+/// agent's own uid is not mapped in the build's namespace.
+pub(super) fn stage_tmp_dir(
+    confinement: &Confinement,
+    scratch_root: &Path,
+    build_dir: &Path,
+    tar: OwnedFd,
+) -> Result<()> {
+    let Some(userns) = &confinement.userns else {
+        return super::stage_scratch(fs::File::from(tar), scratch_root, build_dir);
+    };
+    // The scratch root is agent-owned and the agent's uid is unmapped
+    // in the namespace, so in-ns root could not create the build dir
+    // inside it otherwise. The sticky bit keeps the uid block from
+    // deleting the agent's own files; the traverse-only state dir
+    // hides the scratch root from other users.
+    fs::set_permissions(scratch_root, fs::Permissions::from_mode(0o1777))?;
+    let exe = std::env::current_exe()?;
+    let (_ns_fd, ns_path) = userns::inherited_ns(&userns.fd)?;
+    let status = Command::new(exe)
+        .arg(FS_HELPER_ARG)
+        .arg(ns_path)
+        .arg("unpack")
+        .arg(scratch_root)
+        .arg(build_dir)
+        .stdin(std::process::Stdio::from(fs::File::from(tar)))
+        .status()?;
+    ensure!(
+        status.success(),
+        "userns unpack helper exited with {status}"
+    );
+    Ok(())
 }
 
 /// Spawn the build. With a sandbox spec from the worker the setup
@@ -185,6 +222,15 @@ pub fn fs_helper_stage() -> ! {
         let op = args.next().context("missing op")?;
         nix::sched::setns(ns, nix::sched::CloneFlags::CLONE_NEWUSER)
             .context("joining the agent user namespace")?;
+        if op.to_str() == Some("unpack") {
+            // Become in-ns root so the unpacked files belong to the
+            // uid block instead of the agent's unmapped uid.
+            nix::unistd::setgid(nix::unistd::Gid::from_raw(0)).context("setgid 0 in the ns")?;
+            nix::unistd::setuid(nix::unistd::Uid::from_raw(0)).context("setuid 0 in the ns")?;
+            let scratch_root = PathBuf::from(args.next().context("missing scratch root")?);
+            let build_dir = PathBuf::from(args.next().context("missing build dir")?);
+            return super::stage_scratch(std::io::stdin(), &scratch_root, &build_dir);
+        }
         for path in args {
             let path = Path::new(&path);
             match op.to_str() {

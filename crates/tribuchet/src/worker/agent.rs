@@ -27,6 +27,18 @@ use sandbox_proto::framing;
 
 use crate::tmptar::unpack_tmp_dir_archive;
 
+/// Unpack the zstd-compressed tmp dir archive into the scratch root
+/// and make sure the build dir exists even for an empty archive.
+/// Files belong to whoever runs this: the agent on the direct-exec
+/// and macOS paths, in-ns root through the userns helper on the Linux
+/// namespace path.
+fn stage_scratch(tar: impl std::io::Read, scratch_root: &Path, build_dir: &Path) -> Result<()> {
+    let dec = zstd::stream::read::Decoder::new(tar)?;
+    unpack_tmp_dir_archive(dec, scratch_root).context("unpacking tmp dir archive")?;
+    fs::create_dir_all(build_dir)?;
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 mod cgroup;
 #[cfg(target_os = "linux")]
@@ -187,9 +199,9 @@ fn handle_start(
         let scratch_root = agent.state_dir.join(&req.build_id);
         let build_dir = scratch_root.join("build");
         let _ = fs::remove_dir_all(&scratch_root);
-        fs::create_dir_all(&build_dir)?;
-        let dec = zstd::stream::read::Decoder::new(fs::File::from(tmp_tar))?;
-        unpack_tmp_dir_archive(dec, &scratch_root).context("unpacking tmp dir archive")?;
+        fs::create_dir_all(&scratch_root)?;
+        platform::stage_tmp_dir(&agent.confinement, &scratch_root, &build_dir, tmp_tar)
+            .context("staging the tmp dir archive")?;
 
         let log_path = scratch_root.join("build.log");
         let log_w = fs::File::create(&log_path)?;

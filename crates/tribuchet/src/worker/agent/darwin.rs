@@ -3,6 +3,7 @@
 
 use std::ffi::CString;
 use std::fs;
+use std::os::fd::OwnedFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -26,6 +27,17 @@ impl Confinement {
     pub(super) fn exempt_pid(&self) -> Option<i32> {
         None
     }
+}
+
+/// The agent runs the builder as its own uid, so it unpacks the tmp
+/// dir itself.
+pub(super) fn stage_tmp_dir(
+    _confinement: &Confinement,
+    scratch_root: &Path,
+    build_dir: &Path,
+    tar: OwnedFd,
+) -> Result<()> {
+    super::stage_scratch(fs::File::from(tar), scratch_root, build_dir)
 }
 
 /// Exec the builder under the request's seatbelt profile. Outputs land

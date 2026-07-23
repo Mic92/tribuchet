@@ -54,22 +54,14 @@ pub fn prepare_root(spec: &mut SandboxSpec) -> Result<()> {
             spec.binds_ro.push((real, ca.to_path_buf()));
         }
     }
-    // The worker cannot chown to the leased range: the sandbox root is
-    // recreated on an in-namespace tmpfs instead (mount_filesystems);
-    // the on-disk trees the build still writes are opened up. The 0700
-    // per-build parent (see BuildOwner) keeps other local users out.
+    // The agent cannot chown to the leased range: the sandbox root is
+    // recreated on an in-namespace tmpfs instead (mount_filesystems),
+    // and the on-disk store dir the build still writes its outputs
+    // into is opened up. The build dir is already owned by the leased
+    // range; the group-restricted state dir keeps other users out.
     {
         use std::os::unix::fs::PermissionsExt;
-        for dir in [
-            root.join("nix/store"),
-            spec.build_dir.clone(),
-            spec.build_dir
-                .parent()
-                .unwrap_or(&spec.build_dir)
-                .to_path_buf(),
-        ] {
-            fs::set_permissions(&dir, fs::Permissions::from_mode(0o1777))?;
-        }
+        fs::set_permissions(root.join("nix/store"), fs::Permissions::from_mode(0o1777))?;
     }
     Ok(())
 }
