@@ -22,6 +22,7 @@ pub const SCRATCH_DIR_PARAM: &str = "SCRATCH_DIR";
 
 pub const METHOD_START: &str = "com.tribuchet.Agent.Start";
 pub const METHOD_ADOPT: &str = "com.tribuchet.Agent.Adopt";
+pub const METHOD_STATUS: &str = "com.tribuchet.Agent.Status";
 pub const METHOD_KILL: &str = "com.tribuchet.Agent.Kill";
 pub const METHOD_FINISH: &str = "com.tribuchet.Agent.Finish";
 pub const METHOD_CLEANUP: &str = "com.tribuchet.Agent.Cleanup";
@@ -87,6 +88,16 @@ pub struct AdoptReply {
     pub scratch_dir: String,
     /// Set when the builder already exited.
     pub exit_code: Option<i32>,
+}
+
+/// Which build the agent currently owns, so a fresh worker generation
+/// can clean up builds a dead predecessor never recorded.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StatusRequest {}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StatusReply {
+    pub current: Option<String>,
 }
 
 /// Kill the build's process group, then every remaining process of the

@@ -104,6 +104,35 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>, signing_key: &Arc<SecretK
     }
 }
 
+/// Clean up agent builds without an on-disk record, left by a Start
+/// that raced the previous worker's shutdown. They fail every later
+/// Start on their agent with Busy. Runs after adoption, so adopted
+/// agents are already out of the pool.
+pub(super) fn sweep_orphaned_agent_builds(ctx: &Arc<WorkerCtx>) {
+    for socket in ctx.agents.idle_sockets() {
+        let id = match super::agents::current_build(&socket) {
+            Ok(Some(id)) => id,
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::warn!("querying agent {}: {e:#}", socket.display());
+                continue;
+            }
+        };
+        tracing::warn!(id, "cleaning up an orphaned agent build");
+        // Cleanup is slow. Run it in the background, with the agent
+        // reserved, so the hub connection is not delayed.
+        ctx.agents.reserve(&socket);
+        let ctx = ctx.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ = super::agents::kill(&socket, &id);
+            if let Err(e) = super::agents::cleanup(&socket, &id) {
+                tracing::warn!(id, "orphaned build cleanup failed: {e:#}");
+            }
+            ctx.agents.release(socket);
+        });
+    }
+}
+
 /// Register a finished-but-undelivered result found on disk for
 /// redelivery to a resumed session.
 fn adopt_finished(ctx: &Arc<WorkerCtx>, state_json: &str, dir: PathBuf) {

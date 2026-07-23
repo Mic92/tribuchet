@@ -21,7 +21,7 @@ use anyhow::{Context, Result, bail, ensure};
 use sandbox_proto::agent::{
     AdoptReply, AdoptRequest, CleanupRequest, ERROR_BUSY, ERROR_UNKNOWN_BUILD, ExitNotice,
     FinishRequest, KillRequest, METHOD_ADOPT, METHOD_CLEANUP, METHOD_FINISH, METHOD_KILL,
-    METHOD_START, StartReply, StartRequest,
+    METHOD_START, METHOD_STATUS, StartReply, StartRequest, StatusReply,
 };
 use sandbox_proto::framing;
 
@@ -166,6 +166,10 @@ fn handle(agent: &Arc<Agent>, conn: &UnixStream) -> Result<()> {
     match method.as_str() {
         METHOD_START => handle_start(agent, conn, serde_json::from_value(params)?, fds),
         METHOD_ADOPT => handle_adopt(agent, conn, &serde_json::from_value(params)?),
+        METHOD_STATUS => {
+            let current = agent.current.lock().unwrap().as_ref().map(|b| b.id.clone());
+            framing::send_reply(conn, &StatusReply { current }, &[])
+        }
         METHOD_KILL => handle_kill(agent, conn, &serde_json::from_value(params)?),
         METHOD_FINISH => handle_finish(agent, conn, &serde_json::from_value(params)?),
         METHOD_CLEANUP => handle_cleanup(agent, conn, &serde_json::from_value(params)?),

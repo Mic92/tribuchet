@@ -39,7 +39,7 @@ use caps::{host_system, system_caps};
 use logtail::spawn_log_tail;
 use resume::{
     ResumableBuild, ack_delivery, adopt_builds, execute_to_finished, record_finished,
-    spawn_resumable_reaper, try_deliver,
+    spawn_resumable_reaper, sweep_orphaned_agent_builds, try_deliver,
 };
 
 use crate::config::{Auth, WorkerConfig};
@@ -335,6 +335,7 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
     spawn_resumable_reaper(ctx.clone());
     spawn_handover();
     adopt_builds(&ctx, &signing_key).await;
+    sweep_orphaned_agent_builds(&ctx);
 
     // Reconnect with backoff: a hub restart must not drain the fleet.
     let mut backoff = Duration::from_secs(1);

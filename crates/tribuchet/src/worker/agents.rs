@@ -21,7 +21,8 @@ use anyhow::{Context, Result};
 use sandbox_proto::agent::SCRATCH_DIR_PARAM;
 use sandbox_proto::agent::{
     AdoptReply, AdoptRequest, CleanupRequest, ExitNotice, FinishRequest, KillRequest, METHOD_ADOPT,
-    METHOD_CLEANUP, METHOD_FINISH, METHOD_KILL, METHOD_START, StartReply, StartRequest,
+    METHOD_CLEANUP, METHOD_FINISH, METHOD_KILL, METHOD_START, METHOD_STATUS, StartReply,
+    StartRequest, StatusReply, StatusRequest,
 };
 use sandbox_proto::framing;
 
@@ -129,6 +130,11 @@ impl AgentPool {
     pub(super) fn reserve(&self, socket: &Path) {
         self.free.lock().unwrap().retain(|s| s != socket);
     }
+
+    /// Sockets not occupied by an adopted build.
+    pub(super) fn idle_sockets(&self) -> Vec<PathBuf> {
+        self.free.lock().unwrap().clone()
+    }
 }
 
 /// The lease connection of one running build.
@@ -203,6 +209,14 @@ fn control<T: serde::Serialize>(socket: &Path, method: &str, req: &T) -> Result<
     framing::send_call(&conn, method, req, &[])?;
     let (_, _): (serde_json::Value, _) = framing::recv_reply(&conn)?;
     Ok(())
+}
+
+/// The build the agent behind `socket` currently owns, if any.
+pub(super) fn current_build(socket: &Path) -> Result<Option<String>> {
+    let conn = connect(socket)?;
+    framing::send_call(&conn, METHOD_STATUS, &StatusRequest {}, &[])?;
+    let (reply, _): (StatusReply, _) = framing::recv_reply(&conn)?;
+    Ok(reply.current)
 }
 
 /// Kill the build's processes. The agent keeps the build until Cleanup.
