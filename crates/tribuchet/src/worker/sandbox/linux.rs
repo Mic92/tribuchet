@@ -896,17 +896,6 @@ pub fn exit_status_file(root: &Path) -> PathBuf {
     root.with_file_name("exit-status")
 }
 
-/// Exit code the shim persisted, if the build has finished.
-/// Exit code of a finished build, persisted by the PID-1 shim. None
-/// while the build is still running.
-pub fn exit_status(spec: &SandboxSpec) -> Option<i32> {
-    fs::read_to_string(exit_status_file(&spec.root))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
-}
-
 /// Setup-stage failure message, written by the stage before the host
 /// filesystem became unreachable. Read by the worker when the build
 /// exits nonzero.
@@ -914,9 +903,4 @@ pub fn setup_error_detail(spec: &SandboxSpec) -> Option<String> {
     fs::read_to_string(setup_error_file(&spec.root))
         .ok()
         .filter(|s| !s.is_empty())
-}
-
-pub fn cleanup(_outputs: &[String], _dir: &Path) {
-    // Mounts lived in the child's namespace and died with it; the
-    // build dir itself is removed by the caller.
 }

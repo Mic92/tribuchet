@@ -1,9 +1,8 @@
-//! Worker-created user namespaces: the unshare-and-pause holder child
-//! plus the pidfd/ns-path helpers shared by the sandboxd client and
-//! the Linux build agent.
+//! The Linux build agent's user namespace: an unshare-and-pause
+//! holder child keeps it alive for the agent's lifetime.
 
 use std::fs;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -16,7 +15,6 @@ use anyhow::{Context, Result, bail};
 /// the write end and keep it (and us) waiting forever.
 pub(in crate::worker) struct UsernsHolder {
     child: nix::unistd::Pid,
-    pub(in crate::worker) pidfd: OwnedFd,
 }
 
 impl UsernsHolder {
@@ -43,8 +41,7 @@ impl UsernsHolder {
                     let userns = fs::File::open(format!("/proc/{child}/ns/user"))
                         .map(OwnedFd::from)
                         .context("opening the child user namespace")?;
-                    let pidfd = pidfd_open(child).context("opening a pidfd of the holder")?;
-                    Ok((Self { child, pidfd }, userns))
+                    Ok((Self { child }, userns))
                 })();
                 if holder.is_err() {
                     let _ = nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGKILL);
@@ -70,12 +67,4 @@ impl Drop for UsernsHolder {
 
 pub(in crate::worker) fn ns_path(userns: &OwnedFd) -> PathBuf {
     format!("/proc/{}/fd/{}", std::process::id(), userns.as_raw_fd()).into()
-}
-
-/// pidfd_open(2); no nix wrapper yet.
-pub(in crate::worker) fn pidfd_open(pid: nix::unistd::Pid) -> Result<OwnedFd> {
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid.as_raw(), 0) };
-    let fd = nix::errno::Errno::result(fd).context("pidfd_open")?;
-    let fd = RawFd::try_from(fd).context("pidfd_open returned an invalid fd")?;
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }

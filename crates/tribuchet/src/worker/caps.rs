@@ -17,7 +17,8 @@ pub(super) fn requires_uid_range(env: &HashMap<String, String>) -> bool {
 /// scheduling. Mirrors Nix's defaults. Emulated systems get only the
 /// baseline: kvm is an x86 device to an emulated guest, and uid-range
 /// and recursive-nix under emulation are untested. uid-range comes
-/// from the sandboxd lease, which every Linux worker has.
+/// from the agent's pre-mapped user namespace, which every Linux
+/// worker has.
 fn local_features(native: bool, opts: &WorkerConfig) -> Vec<String> {
     let mut features = vec![
         "nixos-test".to_owned(),

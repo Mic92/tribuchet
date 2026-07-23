@@ -13,9 +13,6 @@ use harmonia_utils_signature::SecretKey;
 use tokio::sync::mpsc;
 
 use super::build::ActiveBuild;
-#[cfg(target_os = "linux")]
-use super::build::supervise;
-#[cfg(target_os = "macos")]
 use super::build::{LogMirror, supervise_agent};
 use super::logtail::LogTail;
 use super::{DaemonConn, WorkerCtx, msg, sandbox};
@@ -26,8 +23,7 @@ use crate::proto::{
 };
 
 /// Pick up builds a previous worker instance left behind: still
-/// running (their sandbox outlives the worker and the exit status
-/// lands in the persisted exit-status file) or finished but
+/// running (their agent outlives the worker) or finished but
 /// undelivered. Anything stale is swept.
 pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>, signing_key: &Arc<SecretKey>) {
     let Ok(entries) = fs::read_dir(ctx.state_dir.join("builds")) else {
@@ -43,24 +39,16 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>, signing_key: &Arc<SecretK
             continue; // already swept by sweep_state_dir
         };
         let Ok(st) = serde_json::from_str::<ResumeState>(&s) else {
-            ctx.remove_build_dir(&dir);
+            super::remove_build_dir(&dir);
             continue;
         };
         // Something must tie the persisted state to live processes,
-        // otherwise a recycled pid could be supervised as a build. On
-        // Linux that is the leased cgroup (or a persisted exit
-        // status), on macOS the agent that still knows the build.
-        #[cfg(target_os = "linux")]
-        if st.spec.cgroup.is_none() && sandbox::exit_status(&st.spec).is_none() {
-            tracing::warn!(id = st.build_id, "dropping unadoptable running build");
-            ctx.remove_build_dir(&dir);
-            continue;
-        }
-        #[cfg(target_os = "macos")]
+        // otherwise a recycled pid could be supervised as a build.
+        // That tie is the agent that still knows the build.
         let agent = {
             let Some(socket) = st.agent_socket.clone() else {
                 tracing::warn!(id = st.build_id, "dropping unadoptable running build");
-                ctx.remove_build_dir(&dir);
+                super::remove_build_dir(&dir);
                 continue;
             };
             ctx.agents.reserve(&socket);
@@ -69,7 +57,7 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>, signing_key: &Arc<SecretK
                 Err(e) => {
                     tracing::warn!(id = st.build_id, "re-adopting build from its agent: {e:#}");
                     ctx.agents.release(socket);
-                    ctx.remove_build_dir(&dir);
+                    super::remove_build_dir(&dir);
                     continue;
                 }
             }
@@ -96,9 +84,6 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>, signing_key: &Arc<SecretK
         tokio::task::spawn_blocking(move || {
             let ctx = task_ctx;
             let key = st.dedupe_key.clone();
-            #[cfg(target_os = "linux")]
-            let fin = supervise(&ctx, &st, dir, &signing_key, None);
-            #[cfg(target_os = "macos")]
             let fin = {
                 let (socket, build) = agent;
                 // Keep mirroring the agent-side log into dir/build.log
@@ -123,7 +108,7 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>, signing_key: &Arc<SecretK
 /// redelivery to a resumed session.
 fn adopt_finished(ctx: &Arc<WorkerCtx>, state_json: &str, dir: PathBuf) {
     let Ok(f) = serde_json::from_str::<FinishedState>(state_json) else {
-        ctx.remove_build_dir(&dir);
+        super::remove_build_dir(&dir);
         return;
     };
     tracing::info!(id = f.build_id, "adopted finished build awaiting delivery");
@@ -190,7 +175,7 @@ pub(super) fn spawn_resumable_reaper(ctx: Arc<WorkerCtx>) {
                 });
             }
             for (key, dir) in expired {
-                ctx.remove_build_dir(&dir);
+                super::remove_build_dir(&dir);
                 tracing::warn!(
                     key,
                     "dropping undelivered build result (no resume within TTL)"
@@ -267,21 +252,18 @@ pub(super) struct PackedOutput {
 }
 
 /// On-disk state for re-adopting a running build after a worker
-/// restart. The build's identity across restarts is its leased cgroup
-/// (spec.cgroup). The exit code comes from the exit-status file the
-/// PID-1 shim persists.
+/// restart. The build's identity across restarts is the agent that
+/// owns it; the exit code comes from the agent's exit notice.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(super) struct ResumeState {
     pub(super) dedupe_key: String,
     /// Original assignment id: names the cgroup and the log file.
     pub(super) build_id: String,
-    /// The spawned shim (Linux) or agent-side builder (macOS). Used
-    /// for process-group kills and, without a cgroup, as a liveness
-    /// probe.
+    /// Agent-side pid of the builder (Linux: its setup stage).
     pub(super) pid: i32,
     pub(super) spec: sandbox::SandboxSpec,
     pub(super) deadline_unix: u64,
-    /// macOS: socket of the agent that owns the build, for re-adoption.
+    /// Socket of the agent that owns the build, for re-adoption.
     #[serde(default)]
     pub(super) agent_socket: Option<PathBuf>,
 }
@@ -455,7 +437,7 @@ pub(super) fn ack_delivery(ctx: &Arc<WorkerCtx>, key: &str, build_id: &str) {
         }
     };
     if let Some(e) = removed {
-        ctx.remove_build_dir(&e.dir);
+        super::remove_build_dir(&e.dir);
         tracing::info!(id = build_id, "build result acknowledged");
     }
 }

@@ -78,7 +78,7 @@ pub(super) fn spawn_builder(
     spec.root = scratch_root.join("root");
     spec.build_dir = build_dir.to_path_buf();
     spec.leased_userns = Some(userns::ns_path(&userns.fd));
-    spec.leased_uid_count = Some(UID_COUNT);
+    spec.leased_uid_count.get_or_insert(UID_COUNT);
     spec.pool_base = Some(userns.uid_base);
     // No delegated per-build cgroup on the agent path.
     spec.cgroup = None;

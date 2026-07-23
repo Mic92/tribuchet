@@ -11,17 +11,13 @@
 //! Runs up to `--max-jobs` builds concurrently over one hub session.
 
 pub mod agent;
-#[cfg(target_os = "macos")]
 mod agents;
 pub mod binfmt;
 mod build;
 mod caps;
-mod cgroup;
 mod logtail;
 mod resume;
 pub mod sandbox;
-#[cfg(target_os = "linux")]
-mod sandboxd;
 #[cfg(target_os = "linux")]
 mod userns;
 
@@ -60,7 +56,6 @@ type DaemonConn = DaemonClient<tokio::net::unix::OwnedReadHalf, tokio::net::unix
 struct WorkerCtx {
     state_dir: PathBuf,
     sandbox_bin_sh: Option<PathBuf>,
-    build_memory_max: Option<u64>,
     /// Files a build must never read even where DAC would allow it
     /// (macOS Seatbelt deny rules; Linux relies on the mount namespace).
     secret_paths: Vec<PathBuf>,
@@ -82,15 +77,7 @@ struct WorkerCtx {
     /// Builder gets the host nix-daemon socket bind-mounted in; the
     /// worker advertises the `recursive-nix` feature.
     pub(super) recursive_nix: bool,
-    /// tribuchet-sandboxd socket; every Linux build leases its user
-    /// namespace and cgroup from it. None on macOS.
-    sandboxd: Option<PathBuf>,
-    /// The builds dir sits on a filesystem without idmapped mounts
-    /// (9p, NFS): stop asking sandboxd for pack mounts.
-    #[cfg(target_os = "linux")]
-    idmap_unsupported: std::sync::atomic::AtomicBool,
-    /// macOS: the per-uid build agents, one leased per build.
-    #[cfg(target_os = "macos")]
+    /// The per-uid build agents, one leased per build.
     agents: agents::AgentPool,
     /// Dedupe keys of builds the hub cancelled; the supervising loops
     /// abort them. Keyed like the registry, since a resumed build's
@@ -137,23 +124,6 @@ impl WorkerCtx {
             ));
         }
         None
-    }
-
-    /// Remove a build dir. Leased-uid files (from any Linux build,
-    /// fresh or adopted) are handled via a sandboxd Purge.
-    pub(super) fn remove_build_dir(&self, dir: &Path) {
-        if fs::remove_dir_all(dir).is_ok() {
-            return;
-        }
-        #[cfg(target_os = "linux")]
-        if let Some(sock) = &self.sandboxd
-            && let Err(e) = sandboxd::purge(sock, dir)
-        {
-            tracing::warn!("sandboxd purge {}: {e:#}", dir.display());
-        }
-        if let Err(e) = fs::remove_dir_all(dir) {
-            tracing::warn!("cleaning up {}: {e}", dir.display());
-        }
     }
 
     fn resumable_keys(&self) -> Vec<String> {
@@ -237,6 +207,14 @@ fn load_signing_key(state_dir: &Path) -> Result<SecretKey> {
     }
 }
 
+/// Remove a build dir. Only worker-owned staging and packing files
+/// live here; the build's own files sit in agent scratch.
+pub(super) fn remove_build_dir(dir: &Path) {
+    if let Err(e) = fs::remove_dir_all(dir) {
+        tracing::warn!("cleaning up {}: {e}", dir.display());
+    }
+}
+
 /// Remove leftovers from interrupted runs: abandoned build dirs.
 fn sweep_state_dir(state_dir: &Path) {
     if let Ok(entries) = fs::read_dir(state_dir.join("builds")) {
@@ -274,31 +252,7 @@ fn request_job() -> WorkerMessage {
     msg(worker_message::Msg::RequestJob(RequestJob {}))
 }
 
-/// Linux workers depend on tribuchet-sandboxd for every build's uid
-/// mapping and cgroup, so a missing socket is a startup error rather
-/// than a degraded mode.
-#[cfg(target_os = "linux")]
-fn sandboxd_socket() -> Result<Option<PathBuf>> {
-    let socket = Path::new(sandboxd::SOCKET_PATH);
-    anyhow::ensure!(
-        socket.exists(),
-        "tribuchet-sandboxd is not available at {}",
-        socket.display()
-    );
-    Ok(Some(socket.to_path_buf()))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn sandboxd_socket() -> Result<Option<PathBuf>> {
-    Ok(None)
-}
-
 pub fn run(opts: WorkerConfig) -> Result<()> {
-    // Vacate the unit's root cgroup so subtree_control can be enabled
-    // there (no-internal-processes rule). Must happen before any build
-    // cgroup is created next to the worker's leaf.
-    #[cfg(target_os = "linux")]
-    cgroup::init();
     let rt = crate::rt::runtime("trib-worker")?;
     rt.block_on(run_async(opts))
 }
@@ -324,21 +278,18 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
         Some(p) => Some(p),
         None => option_env!("TRIBUCHET_BIN_SH").map(PathBuf::from),
     };
-    // macOS builds each run on one agent, so the agent list bounds
-    // concurrency. A Linux config must not carry the option silently.
-    #[cfg(target_os = "macos")]
-    {
-        anyhow::ensure!(
-            !opts.agent_sockets.is_empty(),
-            "agent-sockets must list at least one build agent on macOS"
-        );
-        opts.max_jobs = opts.max_jobs.min(opts.agent_sockets.len() as u32);
-    }
-    #[cfg(not(target_os = "macos"))]
+    // Every build runs on one agent, so the agent list bounds
+    // concurrency.
     anyhow::ensure!(
-        opts.agent_sockets.is_empty(),
-        "agent-sockets is only supported on macOS workers"
+        !opts.agent_sockets.is_empty(),
+        "agent-sockets must list at least one build agent"
     );
+    opts.max_jobs = opts
+        .max_jobs
+        .min(u32::try_from(opts.agent_sockets.len()).unwrap_or(u32::MAX));
+    if opts.build_memory_max_bytes.is_some() {
+        tracing::warn!("build-memory-max is not enforced on the agent-based build path yet");
+    }
     let fod_isolation = cfg!(target_os = "linux") && Path::new("/dev/net/tun").exists();
     // main logs the config before the baked-in bin_sh default applies;
     // log the effective values.
@@ -363,7 +314,6 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
     let ctx = Arc::new(WorkerCtx {
         state_dir: opts.state_dir.clone(),
         sandbox_bin_sh: opts.sandbox_bin_sh.clone(),
-        build_memory_max: opts.build_memory_max_bytes,
         secret_paths: vec![opts.key.clone(), opts.state_dir.join("signing.key")],
         slots: Arc::new(Semaphore::new(opts.max_jobs.max(1) as usize)),
         cancelled: Mutex::new(HashSet::new()),
@@ -374,10 +324,6 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
         max_silent_time: Duration::from_secs(opts.max_silent_time_secs),
         max_log_size: opts.max_log_size,
         recursive_nix: opts.recursive_nix,
-        sandboxd: sandboxd_socket()?,
-        #[cfg(target_os = "linux")]
-        idmap_unsupported: std::sync::atomic::AtomicBool::new(false),
-        #[cfg(target_os = "macos")]
         agents: agents::AgentPool::new(opts.agent_sockets.clone()),
     });
 

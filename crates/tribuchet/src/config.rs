@@ -171,8 +171,8 @@ pub struct WorkerConfig {
     /// client side (see `nix/patches/`).
     #[serde(default)]
     pub recursive_nix: bool,
-    /// macOS: sockets of the per-uid build agents, one per pool user.
-    /// The agent count bounds concurrent builds.
+    /// Sockets of the per-uid build agents, one per pool user. The
+    /// agent count bounds concurrent builds.
     #[serde(default)]
     pub agent_sockets: Vec<PathBuf>,
 }

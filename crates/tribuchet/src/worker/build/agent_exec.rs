@@ -1,4 +1,9 @@
-//! macOS build execution on the per-uid agents.
+//! Build execution on the per-uid agents.
+//!
+//! Both platforms lease one agent per build; the platform difference
+//! is confined to the StartRequest: macOS sends a seatbelt profile,
+//! Linux the serialized sandbox spec the agent runs the setup stage
+//! with.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -6,30 +11,33 @@ use std::sync::atomic::{self, Ordering};
 use std::time::{Duration, Instant};
 use std::{fs, io};
 
-use anyhow::{Context, Result, bail};
+#[cfg(target_os = "macos")]
+use anyhow::bail;
+use anyhow::{Context, Result};
 use harmonia_utils_signature::SecretKey;
 use tokio::sync::mpsc;
 
 use super::{ActiveBuild, pack_outputs_and_extras, unix_now};
 use crate::proto::WorkerMessage;
+#[cfg(target_os = "macos")]
 use crate::worker::caps::requires_uid_range;
 use crate::worker::logtail::tail_log;
 use crate::worker::resume::{FinishedBuild, ResumeState};
 use crate::worker::{WorkerCtx, agents, sandbox};
 
 impl ActiveBuild {
-    /// macOS: lease a per-uid agent and run the build there. The agent
-    /// unpacks the tmp dir into its own scratch dir, applies the
-    /// seatbelt profile and owns the builder process. The worker tails
-    /// the log fd, polls its abort conditions, and packs the outputs
-    /// (written at their real store paths) once the agent made them
-    /// readable.
+    /// Lease a per-uid agent and run the build there. The agent
+    /// unpacks the tmp dir into its own scratch dir, confines and owns
+    /// the builder process. The worker tails the log fd, polls its
+    /// abort conditions, and packs the outputs once the agent made
+    /// them readable.
     pub(in crate::worker) fn execute(
         &self,
         out_tx: &mpsc::Sender<WorkerMessage>,
         signing_key: &SecretKey,
         timeout: Duration,
     ) -> Result<FinishedBuild> {
+        #[cfg(target_os = "macos")]
         if requires_uid_range(&self.assignment.env) {
             bail!("the uid-range feature is only supported on Linux workers");
         }
@@ -52,7 +60,26 @@ impl ActiveBuild {
     ) -> Result<FinishedBuild> {
         let a = &self.assignment;
         let outputs: Vec<String> = a.outputs.values().cloned().collect();
-        let profile = agents::seatbelt_profile(&outputs, &self.ctx.secret_paths, a.fixed_output)?;
+        // The agent-side confinement of the builder: a seatbelt
+        // profile on macOS, the namespace sandbox spec on Linux. The
+        // spec doubles as the packing/resume state, so the Linux one
+        // carries the full input and network configuration.
+        #[cfg(target_os = "macos")]
+        let (profile, sandbox_json, spec) = (
+            agents::seatbelt_profile(&outputs, &self.ctx.secret_paths, a.fixed_output)?,
+            None,
+            sandbox::SandboxSpec {
+                outputs: outputs.clone(),
+                store_inputs: self.inputs.clone(),
+                recursive_nix: self.ctx.recursive_nix,
+                ..sandbox::SandboxSpec::default()
+            },
+        );
+        #[cfg(target_os = "linux")]
+        let (profile, sandbox_json, mut spec) = {
+            let spec = self.build_spec()?;
+            (String::new(), Some(serde_json::to_value(&spec)?), spec)
+        };
         // Re-tar the staged tmp dir: the agent unpacks it into its own
         // scratch dir, since the worker's copy is not agent-writable.
         fs::write(
@@ -66,7 +93,7 @@ impl ActiveBuild {
             env: a.env.clone(),
             tmp_dir_in_sandbox: a.tmp_dir_in_sandbox.clone(),
             profile,
-            sandbox: None,
+            sandbox: sandbox_json,
             outputs: outputs.clone(),
         };
         let build = agents::AgentBuild::start(
@@ -81,9 +108,20 @@ impl ActiveBuild {
             scratch = %build.scratch_dir.display(),
             "builder started on agent"
         );
+        // The agent placed the sandbox root in its scratch dir; record
+        // it so packing and adopted supervision find the outputs.
+        #[cfg(target_os = "linux")]
+        {
+            spec.root = build
+                .scratch_dir
+                .parent()
+                .context("agent scratch dir has no parent")?
+                .join("root");
+        }
 
-        // Mirror the agent-side log into dir/build.log so the shared
-        // tailing, replay and resume paths work exactly as on Linux.
+        // Mirror the agent-side log into dir/build.log so the
+        // path-based tailing, replay and resume machinery keeps
+        // working across worker restarts.
         let mirror = LogMirror::start(&build.log, self.dir.join("build.log"))?;
         let log_done = Arc::new(atomic::AtomicBool::new(false));
         let tailer = {
@@ -101,12 +139,7 @@ impl ActiveBuild {
             dedupe_key: a.dedupe_key.clone(),
             build_id: a.build_id.clone(),
             pid: build.pid,
-            spec: sandbox::SandboxSpec {
-                outputs,
-                store_inputs: self.inputs.clone(),
-                recursive_nix: self.ctx.recursive_nix,
-                ..sandbox::SandboxSpec::default()
-            },
+            spec,
             deadline_unix: unix_now() + timeout.as_secs(),
             agent_socket: Some(socket.to_path_buf()),
         };
@@ -126,11 +159,45 @@ impl ActiveBuild {
         let _ = tailer.join();
         Ok(fin)
     }
+
+    /// The Linux sandbox spec sent with the StartRequest. The agent
+    /// fills in its scratch paths, user namespace and uid block before
+    /// spawning the setup stage with it.
+    #[cfg(target_os = "linux")]
+    fn build_spec(&self) -> Result<sandbox::SandboxSpec> {
+        use crate::worker::caps::requires_uid_range;
+        let a = &self.assignment;
+        let uid_count = if requires_uid_range(&a.env) { 65536 } else { 1 };
+        let spec = sandbox::prepare(
+            a,
+            &self.dir,
+            &self.inputs,
+            &sandbox::PrepareOpts {
+                bin_sh: self.ctx.sandbox_bin_sh.as_deref(),
+                secrets: &self.ctx.secret_paths,
+                leased_userns: None,
+                leased_uid_count: Some(uid_count),
+                emulator: self.ctx.emulators.get(&a.system).map(PathBuf::as_path),
+                net_isolation: self.ctx.fod_isolation,
+                net_policy: self.ctx.fod_network.clone(),
+                recursive_nix: self.ctx.recursive_nix,
+                nix_daemon_socket: None,
+            },
+        )?;
+        tracing::info!(
+            id = a.build_id,
+            fixed_output = a.fixed_output,
+            network = spec.network,
+            net_isolation = spec.net_isolation,
+            "sandbox network decision"
+        );
+        Ok(spec)
+    }
 }
 
 /// Wait out a build running on an agent (fresh or re-adopted), pack
-/// its outputs, and have the agent clean up. The macOS counterpart of
-/// `supervise`, driven off the same persisted `ResumeState`.
+/// its outputs, and have the agent clean up. Driven off the persisted
+/// `ResumeState` so fresh and adopted builds share one path.
 pub(in crate::worker) fn supervise_agent(
     ctx: &WorkerCtx,
     st: &ResumeState,
@@ -171,10 +238,17 @@ pub(in crate::worker) fn supervise_agent(
     let (exit_code, error, outputs, extras) = if let Some(reason) = aborted {
         (1, reason, vec![], vec![])
     } else if code != 0 {
-        (code, String::new(), vec![], vec![])
+        // A Linux setup-stage failure leaves its message under the
+        // sandbox root; a plain builder failure leaves none.
+        #[cfg(target_os = "linux")]
+        let detail = sandbox::setup_error_detail(&st.spec).unwrap_or_default();
+        #[cfg(target_os = "macos")]
+        let detail = String::new();
+        (code, detail, vec![], vec![])
     } else {
-        // The outputs are agent-owned files at their real store
-        // paths; Finish makes them readable for packing.
+        // Finish makes the outputs (at their real store paths on
+        // macOS, under the sandbox root on Linux) readable for
+        // packing.
         let remaining = Duration::from_secs(st.deadline_unix.saturating_sub(unix_now()));
         let deadline = Instant::now() + remaining.max(Duration::from_mins(10));
         let packed = agents::finish(socket, &st.build_id)
@@ -210,8 +284,8 @@ pub(in crate::worker) fn supervise_agent(
 }
 
 /// Background thread appending everything the agent writes to its log
-/// fd into the build dir's build.log, so the path-based tailing,
-/// replay and resume machinery works as on Linux.
+/// fd into the build dir's build.log, feeding the path-based tailing,
+/// replay and resume machinery.
 pub(in crate::worker) struct LogMirror {
     done: Arc<atomic::AtomicBool>,
     thread: std::thread::JoinHandle<()>,
@@ -226,7 +300,7 @@ impl LogMirror {
         let thread = {
             let done = done.clone();
             std::thread::spawn(move || {
-                use std::io::{Read as _, Seek as _};
+                use std::io::{Read as _, Seek as _, Write as _};
                 let Ok(mut dest) = fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -234,7 +308,7 @@ impl LogMirror {
                 else {
                     return;
                 };
-                let already = dest.metadata().map(|m| m.len()).unwrap_or(0);
+                let already = dest.metadata().map_or(0, |m| m.len());
                 if src.seek(io::SeekFrom::Start(already)).is_err() {
                     return;
                 }

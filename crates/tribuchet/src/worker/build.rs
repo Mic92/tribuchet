@@ -691,16 +691,9 @@ impl<W: Write> Write for TeeScanner<'_, W> {
     }
 }
 
-#[cfg(target_os = "linux")]
-#[path = "build/linux.rs"]
-mod platform;
-#[cfg(target_os = "macos")]
-#[path = "build/darwin.rs"]
-mod platform;
-#[cfg(target_os = "linux")]
-pub(super) use platform::supervise;
-#[cfg(target_os = "macos")]
-pub(super) use platform::{LogMirror, supervise_agent};
+#[path = "build/agent_exec.rs"]
+mod agent_exec;
+pub(super) use agent_exec::{LogMirror, supervise_agent};
 
 #[cfg(test)]
 mod tests {

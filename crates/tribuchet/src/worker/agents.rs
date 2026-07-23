@@ -1,4 +1,4 @@
-//! Worker-side client for the macOS per-uid build agents.
+//! Worker-side client for the per-uid build agents.
 //!
 //! Each build leases one agent from the fixed list in the worker
 //! config. The Start/Adopt connection stays open for the build's
@@ -11,19 +11,24 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+#[cfg(target_os = "macos")]
 use std::fmt::Write as _;
 
-use anyhow::{Context, Result, bail};
+#[cfg(target_os = "macos")]
+use anyhow::bail;
+use anyhow::{Context, Result};
+#[cfg(target_os = "macos")]
+use sandbox_proto::agent::SCRATCH_DIR_PARAM;
 use sandbox_proto::agent::{
     AdoptReply, AdoptRequest, CleanupRequest, ExitNotice, FinishRequest, KillRequest, METHOD_ADOPT,
-    METHOD_CLEANUP, METHOD_FINISH, METHOD_KILL, METHOD_START, SCRATCH_DIR_PARAM, StartReply,
-    StartRequest,
+    METHOD_CLEANUP, METHOD_FINISH, METHOD_KILL, METHOD_START, StartReply, StartRequest,
 };
 use sandbox_proto::framing;
 
 /// SBPL string literal escaping: a quote or backslash in an
 /// interpolated path must not terminate the literal and inject
 /// profile directives.
+#[cfg(target_os = "macos")]
 fn sb_escape(s: &str) -> Result<String> {
     if s.bytes().any(|b| b.is_ascii_control()) {
         bail!("control character in sandbox profile path {s:?}");
@@ -37,6 +42,7 @@ fn sb_escape(s: &str) -> Result<String> {
 /// [`SCRATCH_DIR_PARAM`] parameter, filled in agent-side) and the
 /// scratch output store paths. Unfiltered `(allow signal)` would let
 /// builds signal other agent-uid processes, most notably the agent.
+#[cfg(target_os = "macos")]
 pub(super) fn seatbelt_profile(
     outputs: &[String],
     deny_read: &[PathBuf],
@@ -272,7 +278,12 @@ mod tests {
             build_id: build_id.into(),
             builder: "/bin/sh".into(),
             args: vec!["-c".into(), script],
-            env: HashMap::from([("NIX_BUILD_TOP".into(), "/build".into())]),
+            // A real assignment's env carries PATH; the scripts here
+            // need it for mkdir.
+            env: HashMap::from([
+                ("NIX_BUILD_TOP".into(), "/build".into()),
+                ("PATH".into(), std::env::var("PATH").unwrap_or_default()),
+            ]),
             tmp_dir_in_sandbox: "/build".into(),
             profile: String::new(),
             sandbox: None,
@@ -326,6 +337,7 @@ mod tests {
     /// stay confined to the scratch dir and the declared output.
     /// Skipped inside the Nix build sandbox (sandbox_init is not
     /// permitted there); `nix develop -c cargo test` runs it.
+    #[cfg(target_os = "macos")]
     #[test]
     fn seatbelt_profile_confines_the_builder() -> Result<()> {
         let dir = tempfile::tempdir()?;

@@ -260,9 +260,7 @@ pub fn send_spec_to(spec: &SandboxSpec, w: OwnedFd) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-pub use platform::{
-    SETUP_STAGE_ARG, cleanup, exit_status, prepare_root, setup_error_detail, setup_stage,
-};
+pub use platform::{SETUP_STAGE_ARG, prepare_root, setup_error_detail, setup_stage};
 
 #[cfg(target_os = "linux")]
 #[path = "sandbox/linux.rs"]
