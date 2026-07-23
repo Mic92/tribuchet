@@ -315,13 +315,46 @@ in
           Restart = "on-failure";
           NoNewPrivileges = true;
           PrivateTmp = true;
+          PrivateDevices = true;
+          PrivateNetwork = true;
           ProtectHome = true;
           ProtectSystem = "strict";
+          ProtectKernelModules = true;
+          ProtectKernelTunables = true;
+          ProtectClock = true;
+          ProtectHostname = true;
           # build cgroups it delegates, and the socket when started standalone
           ReadWritePaths = [
             "/sys/fs/cgroup"
             "/run"
           ];
+          # setuid/setgid: uid/gid maps of the leased user namespaces
+          # chown/dac/fowner: chown_tree, purge_tree and cgroup handover
+          # sys_admin + sys_chroot: cgroups and joining the worker's
+          #   mount namespace for open_tree and mount_setattr
+          # sys_ptrace: pidfd_getfd from the open_tree helper
+          CapabilityBoundingSet = [
+            "CAP_CHOWN"
+            "CAP_DAC_OVERRIDE"
+            "CAP_DAC_READ_SEARCH"
+            "CAP_FOWNER"
+            "CAP_SETUID"
+            "CAP_SETGID"
+            "CAP_SYS_ADMIN"
+            "CAP_SYS_CHROOT"
+            "CAP_SYS_PTRACE"
+          ];
+          # user: the idmap holder namespaces; mnt: setns into the
+          # worker's mount namespace
+          RestrictNamespaces = [
+            "user"
+            "mnt"
+          ];
+          RestrictAddressFamilies = [ "AF_UNIX" ];
+          RestrictRealtime = true;
+          RestrictSUIDSGID = true;
+          LockPersonality = true;
+          MemoryDenyWriteExecute = true;
           SystemCallArchitectures = "native";
           # mount_setattr and pidfd_getfd back the idmapped pack mounts
           SystemCallFilter = [
