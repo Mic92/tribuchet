@@ -22,6 +22,8 @@ mod resume;
 pub mod sandbox;
 #[cfg(target_os = "linux")]
 mod sandboxd;
+#[cfg(target_os = "linux")]
+mod userns;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
