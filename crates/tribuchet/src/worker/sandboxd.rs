@@ -15,14 +15,43 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use sandbox_proto::framing;
 use sandbox_proto::linux::{
-    AllocateReply, AllocateRequest, METHOD_ALLOCATE, METHOD_PURGE, PurgeRequest,
+    AllocateReply, AllocateRequest, METHOD_ALLOCATE, METHOD_OPEN_IDMAPPED, METHOD_PURGE,
+    OpenIdmappedRequest, PurgeRequest,
 };
 
 pub use sandbox_proto::linux::SOCKET_PATH;
 
 /// Ask sandboxd (root) to empty a worker-owned dir of leased-uid files.
 pub fn purge(socket: &Path, dir: &Path) -> Result<()> {
-    let fd = nix::fcntl::open(
+    let fd = open_dir(dir)?;
+    let conn = connect(socket)?;
+    framing::send_call(&conn, METHOD_PURGE, &PurgeRequest {}, &[fd.as_raw_fd()])?;
+    let (_, _): (serde_json::Value, _) = framing::recv_reply(&conn)?;
+    Ok(())
+}
+
+/// Idmapped mount of a worker-owned build dir presenting the leased
+/// uid block as worker-owned.
+pub fn open_idmapped(socket: &Path, dir: &Path, uid_base: u32, uid_count: u32) -> Result<OwnedFd> {
+    let fd = open_dir(dir)?;
+    let conn = connect(socket)?;
+    framing::send_call(
+        &conn,
+        METHOD_OPEN_IDMAPPED,
+        &OpenIdmappedRequest {
+            uid_base,
+            uid_count,
+        },
+        &[fd.as_raw_fd()],
+    )?;
+    let (_, fds): (serde_json::Value, Vec<OwnedFd>) = framing::recv_reply(&conn)?;
+    <[OwnedFd; 1]>::try_from(fds)
+        .map(|[mount]| mount)
+        .map_err(|fds| anyhow::anyhow!("expected the mount fd in the reply, got {} fds", fds.len()))
+}
+
+fn open_dir(dir: &Path) -> Result<OwnedFd> {
+    nix::fcntl::open(
         dir,
         nix::fcntl::OFlag::O_DIRECTORY
             | nix::fcntl::OFlag::O_NOFOLLOW
@@ -30,12 +59,12 @@ pub fn purge(socket: &Path, dir: &Path) -> Result<()> {
             | nix::fcntl::OFlag::O_CLOEXEC,
         nix::sys::stat::Mode::empty(),
     )
-    .with_context(|| format!("opening {}", dir.display()))?;
-    let conn = UnixStream::connect(socket)
-        .with_context(|| format!("connecting to sandboxd at {}", socket.display()))?;
-    framing::send_call(&conn, METHOD_PURGE, &PurgeRequest {}, &[fd.as_raw_fd()])?;
-    let (_, _): (serde_json::Value, _) = framing::recv_reply(&conn)?;
-    Ok(())
+    .with_context(|| format!("opening {}", dir.display()))
+}
+
+fn connect(socket: &Path) -> Result<UnixStream> {
+    UnixStream::connect(socket)
+        .with_context(|| format!("connecting to sandboxd at {}", socket.display()))
 }
 
 /// One leased sandbox: a mapped user namespace and its build cgroup.
@@ -90,17 +119,8 @@ impl SandboxPrep {
         tmp_dir: &Path,
     ) -> Result<SandboxLease> {
         let stage_fd = pidfd_open(stage).context("opening a pidfd of the setup stage")?;
-        let tmp_dir_fd = nix::fcntl::open(
-            tmp_dir,
-            nix::fcntl::OFlag::O_DIRECTORY
-                | nix::fcntl::OFlag::O_NOFOLLOW
-                | nix::fcntl::OFlag::O_RDONLY
-                | nix::fcntl::OFlag::O_CLOEXEC,
-            nix::sys::stat::Mode::empty(),
-        )
-        .with_context(|| format!("opening tmp dir {}", tmp_dir.display()))?;
-        let conn = UnixStream::connect(socket)
-            .with_context(|| format!("connecting to sandboxd at {}", socket.display()))?;
+        let tmp_dir_fd = open_dir(tmp_dir)?;
+        let conn = connect(socket)?;
         // The holder must survive until sandboxd has verified the
         // pidfd/userns pair and written maps through /proc/<pid>;
         // afterwards the fd alone pins the namespace.

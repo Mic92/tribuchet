@@ -75,6 +75,10 @@ pub struct SandboxSpec {
     /// Uids mapped in that namespace at in-ns 0 (1 or 65536).
     #[serde(default)]
     pub leased_uid_count: Option<u32>,
+    /// First host uid of the leased block, for the idmapped pack
+    /// mount that reads permission-restricted outputs.
+    #[serde(default)]
+    pub pool_base: Option<u32>,
     /// Fixed-output build: private netns with the presto-pasta
     /// user-mode NAT; host abstract sockets and loopback services
     /// stay unreachable.
@@ -168,6 +172,8 @@ pub fn prepare(
         cgroup: None,
         leased_userns: opts.leased_userns.clone(),
         leased_uid_count: opts.leased_uid_count,
+        // filled in once sandboxd has leased the block
+        pool_base: None,
         net_isolation: opts.net_isolation && a.fixed_output,
         net_policy: opts.net_policy.clone(),
         emulator: opts.emulator.map(Path::to_path_buf),

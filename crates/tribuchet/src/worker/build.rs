@@ -3,6 +3,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, Write};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{self, Ordering};
@@ -93,6 +94,7 @@ impl BuildOwner {
             tracing::warn!("setting memory.max on the leased cgroup: {e}");
         }
         spec.cgroup = Some(lease.cgroup().to_path_buf());
+        spec.pool_base = Some(lease.pool_base);
         Ok(Self { _lease: lease })
     }
 }
@@ -714,9 +716,11 @@ pub(super) fn supervise(
         // At least a few minutes to pack even if the build ate its budget.
         let remaining = Duration::from_secs(st.deadline_unix.saturating_sub(unix_now()));
         let deadline = Instant::now() + remaining.max(Duration::from_mins(10));
+        let pack_root = pack_mount(ctx, &st.spec);
         match tokio::runtime::Handle::current().block_on(pack_outputs_and_extras(
             &dir,
             &st.spec,
+            pack_root.as_ref(),
             deadline,
             signing_key,
             &st.build_id,
@@ -804,6 +808,7 @@ pub(super) fn supervise_agent(
                 tokio::runtime::Handle::current().block_on(pack_outputs_and_extras(
                     &dir,
                     &st.spec,
+                    None,
                     deadline,
                     signing_key,
                     &st.build_id,
@@ -889,11 +894,37 @@ impl LogMirror {
     }
 }
 
+/// Idmapped mount of the build's private root (leased uids presented
+/// as the worker), so packing reads outputs regardless of their
+/// permission bits. `None` (unsupported filesystem, old sandboxd, or
+/// no lease) leaves packing on the direct paths.
+#[cfg(target_os = "linux")]
+fn pack_mount(ctx: &WorkerCtx, spec: &sandbox::SandboxSpec) -> Option<OwnedFd> {
+    let socket = ctx.sandboxd.as_deref()?;
+    let (base, count) = (spec.pool_base?, spec.leased_uid_count?);
+    if ctx.idmap_unsupported.load(Ordering::Relaxed) {
+        return None;
+    }
+    match super::sandboxd::open_idmapped(socket, &spec.root, base, count) {
+        Ok(fd) => Some(fd),
+        Err(e) => {
+            // Filesystem support cannot change while the worker runs;
+            // other errors (a restarting sandboxd) stay retried.
+            if format!("{e:#}").contains("does not support idmapped mounts") {
+                ctx.idmap_unsupported.store(true, Ordering::Relaxed);
+            }
+            tracing::warn!("packing without an idmapped mount: {e:#}");
+            None
+        }
+    }
+}
+
 /// Pack the outputs, then (under recursive-nix) the closure-delta
 /// extras.
 async fn pack_outputs_and_extras(
     dir: &Path,
     spec: &sandbox::SandboxSpec,
+    pack_root: Option<&OwnedFd>,
     deadline: Instant,
     signing_key: &SecretKey,
     build_id: &str,
@@ -906,7 +937,15 @@ async fn pack_outputs_and_extras(
     } else {
         BTreeSet::new()
     };
-    let packed = pack_outputs(dir, spec, &extra_candidates, deadline, signing_key).await?;
+    let packed = pack_outputs(
+        dir,
+        spec,
+        pack_root,
+        &extra_candidates,
+        deadline,
+        signing_key,
+    )
+    .await?;
     let extras = if spec.recursive_nix {
         pack_extras(
             dir,
@@ -946,6 +985,7 @@ async fn query_all_valid_paths() -> Result<BTreeSet<harmonia_store_path::StorePa
 async fn pack_outputs(
     dir: &Path,
     spec: &sandbox::SandboxSpec,
+    pack_root: Option<&OwnedFd>,
     extra_candidates: &BTreeSet<harmonia_store_path::StorePath>,
     deadline: Instant,
     signing_key: &SecretKey,
@@ -954,7 +994,16 @@ async fn pack_outputs(
     candidates.extend(extra_candidates.iter().cloned());
     let mut packed = Vec::new();
     for scratch in &spec.outputs {
-        let host_path = sandbox::output_host_path(spec, scratch);
+        let host_path = match pack_root {
+            // The mount clones spec.root, so the same relative path
+            // reaches the output with the worker as apparent owner.
+            Some(fd) => PathBuf::from(format!(
+                "/proc/self/fd/{}/{}",
+                fd.as_raw_fd(),
+                scratch.trim_start_matches('/')
+            )),
+            None => sandbox::output_host_path(spec, scratch),
+        };
         // lstat: a symlink output whose target only resolves inside
         // the sandbox is still a valid output.
         if host_path.symlink_metadata().is_err() {

@@ -16,6 +16,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"
 hyper-util = "0.1"
+rustix = { version = "1", features = ["mount", "process"] }
 nix = { version = "0.31", features = ["dir", "mount", "sched", "user", "fs", "hostname", "signal", "process", "resource", "personality", "socket", "uio"] }
 libc = "0.2"
 prost = "0.14"

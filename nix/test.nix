@@ -95,6 +95,12 @@ in
             coreutils = "${pkgs.coreutils}";
           }
         '';
+        environment.etc."tt/restrictedperms.nix".text = ''
+          import ${./tests/restrictedperms.nix} {
+            bash = "${pkgs.bash}";
+            coreutils = "${pkgs.coreutils}";
+          }
+        '';
         environment.etc."tt/fod.nix".text = ''
           import ${./tests/fod.nix} {
             bash = "${pkgs.bash}";

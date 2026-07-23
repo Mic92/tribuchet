@@ -84,6 +84,10 @@ struct WorkerCtx {
     /// tribuchet-sandboxd socket; every Linux build leases its user
     /// namespace and cgroup from it. None on macOS.
     sandboxd: Option<PathBuf>,
+    /// The builds dir sits on a filesystem without idmapped mounts
+    /// (9p, NFS): stop asking sandboxd for pack mounts.
+    #[cfg(target_os = "linux")]
+    idmap_unsupported: std::sync::atomic::AtomicBool,
     /// macOS: the per-uid build agents, one leased per build.
     #[cfg(target_os = "macos")]
     agents: agents::AgentPool,
@@ -370,6 +374,8 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
         max_log_size: opts.max_log_size,
         recursive_nix: opts.recursive_nix,
         sandboxd: sandboxd_socket()?,
+        #[cfg(target_os = "linux")]
+        idmap_unsupported: std::sync::atomic::AtomicBool::new(false),
         #[cfg(target_os = "macos")]
         agents: agents::AgentPool::new(opts.agent_sockets.clone()),
     });

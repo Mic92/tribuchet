@@ -345,6 +345,20 @@ in derivation {{
 // ===========================================================================
 
 #[test]
+fn build_restricted_permissions() {
+    // The builder tightens its output to owner-only permissions, so
+    // packing needs the idmapped mount to read it.
+    let out = succeed(
+        Node::Hub,
+        "nix-build /etc/tt/restrictedperms.nix --no-out-link",
+    );
+    succeed(
+        Node::Hub,
+        &format!("grep -q restricted-perms-ok {}/private/data", out.trim()),
+    );
+}
+
+#[test]
 fn build_remote() {
     // Input added at runtime, so it cannot be in the worker's store image: it
     // must travel over the wire.

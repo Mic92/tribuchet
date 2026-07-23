@@ -8,6 +8,7 @@ pub const SOCKET_PATH: &str = "/run/tribuchet-sandboxd.sock";
 
 pub const METHOD_ALLOCATE: &str = "com.tribuchet.Sandbox.Allocate";
 pub const METHOD_PURGE: &str = "com.tribuchet.Sandbox.Purge";
+pub const METHOD_OPEN_IDMAPPED: &str = "com.tribuchet.Sandbox.OpenIdmapped";
 
 /// Lease a per-build sandbox. Attached fds: the worker-created user
 /// namespace (0), a pidfd of the process holding it (1), a pidfd of
@@ -36,6 +37,18 @@ pub struct AllocateRequest {
 /// lease is gone. Reply is `{}`.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PurgeRequest {}
+
+/// Open an idmapped mount of a worker-owned directory (fd 0) that
+/// presents files owned by the leased uid block as worker-owned, so
+/// the worker can pack outputs regardless of their permission bits.
+/// The reply is `{}` with the detached mount as fd 0.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenIdmappedRequest {
+    /// First host uid of the block, as leased by Allocate.
+    pub uid_base: u32,
+    /// Uids in the block (1 or 65536).
+    pub uid_count: u32,
+}
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AllocateReply {

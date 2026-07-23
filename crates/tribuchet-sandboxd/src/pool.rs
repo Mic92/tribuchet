@@ -25,6 +25,13 @@ impl UidPool {
         Some(self.start + u32::try_from(free).ok()? * BLOCK)
     }
 
+    /// Whether `base..base+count` lies within the pool, i.e. could
+    /// have come from a lease.
+    pub fn covers(&self, base: u32, count: u32) -> bool {
+        let end = self.start + u32::try_from(self.in_use.len()).unwrap_or(0) * BLOCK;
+        base >= self.start && count <= BLOCK && base.saturating_add(count) <= end
+    }
+
     /// Return a block to the pool.
     pub fn release(&mut self, base: u32) {
         let index = (base - self.start) / BLOCK;

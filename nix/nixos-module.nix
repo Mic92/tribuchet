@@ -323,7 +323,12 @@ in
             "/run"
           ];
           SystemCallArchitectures = "native";
-          SystemCallFilter = [ "@system-service" ];
+          # mount_setattr and pidfd_getfd back the idmapped pack mounts
+          SystemCallFilter = [
+            "@system-service"
+            "mount_setattr"
+            "pidfd_getfd"
+          ];
           SystemCallErrorNumber = "EPERM";
         };
       };

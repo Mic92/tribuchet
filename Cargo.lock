@@ -2348,6 +2348,7 @@ dependencies = [
  "clap",
  "libc",
  "nix",
+ "rustix",
  "sandbox-proto",
  "sd-notify",
  "serde_json",

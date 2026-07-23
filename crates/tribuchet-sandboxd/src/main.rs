@@ -6,6 +6,7 @@
 //! when the lease connection closes. See crates/sandbox-proto for the
 //! wire protocol.
 
+mod idmap;
 mod lease;
 mod pool;
 
@@ -20,7 +21,10 @@ use clap::Parser;
 use nix::sys::socket::{UnixCredentials, getsockopt, sockopt::PeerCredentials};
 use nix::unistd::{Gid, Pid, Uid, User};
 use sandbox_proto::framing;
-use sandbox_proto::linux::{AllocateReply, AllocateRequest, METHOD_ALLOCATE, METHOD_PURGE};
+use sandbox_proto::linux::{
+    AllocateReply, AllocateRequest, METHOD_ALLOCATE, METHOD_OPEN_IDMAPPED, METHOD_PURGE,
+    OpenIdmappedRequest,
+};
 
 #[derive(Parser)]
 struct Args {
@@ -108,6 +112,9 @@ fn handle(daemon: &Daemon, conn: &UnixStream) -> Result<()> {
             handle_allocate(daemon, conn, peer, serde_json::from_value(params)?, fds)
         }
         METHOD_PURGE => handle_purge(daemon, conn, fds),
+        METHOD_OPEN_IDMAPPED => {
+            handle_open_idmapped(daemon, conn, peer, &serde_json::from_value(params)?, fds)
+        }
         m => anyhow::bail!("unknown method {m}"),
     }
 }
@@ -194,13 +201,53 @@ fn handle_allocate(
 }
 
 fn handle_purge(daemon: &Daemon, conn: &UnixStream, fds: Vec<std::os::fd::OwnedFd>) -> Result<()> {
+    let dir = worker_dir(daemon, fds)?;
+    lease::purge_tree(&dir)?;
+    framing::send_reply(conn, &serde_json::json!({}), &[])
+}
+
+/// Idmapped mount of a build dir so the worker can pack outputs the
+/// leased uids made unreadable to it. The uid range must come from
+/// this pool: the worker must not gain reads on files of arbitrary
+/// uids inside directories it owns.
+fn handle_open_idmapped(
+    daemon: &Daemon,
+    conn: &UnixStream,
+    peer: UnixCredentials,
+    request: &OpenIdmappedRequest,
+    fds: Vec<std::os::fd::OwnedFd>,
+) -> Result<()> {
+    let dir = worker_dir(daemon, fds)?;
+    ensure!(
+        daemon
+            .pool
+            .lock()
+            .unwrap()
+            .covers(request.uid_base, request.uid_count),
+        "uid range outside the lease pool"
+    );
+    // The worker runs under ProtectSystem in its own mount namespace,
+    // and cloning a mount only works from inside that namespace.
+    let mntns = std::fs::File::open(format!("/proc/{}/ns/mnt", peer.pid()))
+        .context("opening the worker mount namespace")?;
+    let mount = idmap::open(
+        dir.as_fd(),
+        mntns.as_fd(),
+        &daemon.worker,
+        request.uid_base,
+        request.uid_count,
+    )?;
+    framing::send_reply(conn, &serde_json::json!({}), &[mount.as_raw_fd()])
+}
+
+/// The worker-owned directory passed as fd 0 of a request.
+fn worker_dir(daemon: &Daemon, fds: Vec<std::os::fd::OwnedFd>) -> Result<std::os::fd::OwnedFd> {
     let mut fds = fds.into_iter();
     let dir = fds.next().context("missing directory fd")?;
     let st = nix::sys::stat::fstat(&dir)?;
     ensure!(
         st.st_mode & libc::S_IFMT == libc::S_IFDIR && st.st_uid == daemon.worker.uid.as_raw(),
-        "purge target must be a worker-owned directory"
+        "target must be a worker-owned directory"
     );
-    lease::purge_tree(&dir)?;
-    framing::send_reply(conn, &serde_json::json!({}), &[])
+    Ok(dir)
 }
