@@ -1,9 +1,9 @@
-//! Messages spoken with the macOS per-uid build agents.
+//! Messages spoken with the per-uid build agents.
 //!
-//! One socket-activated launchd daemon per pool user. The agents are
-//! the uid pool: a connection whose `Start` is accepted holds the
-//! lease. The agent runs one build at a time, keeps its scratch dir,
-//! log and exit status, and survives worker restarts. Control calls
+//! One daemon per pool user. The agents are the uid pool: a
+//! connection whose `Start` is accepted holds the lease. The agent
+//! runs one build at a time, keeps its scratch dir, log and exit
+//! status, and survives worker restarts. Control calls
 //! (`Kill`, `Adopt`, `Finish`, `Cleanup`) are accepted on any
 //! connection. Only a second `Start` is refused with [`ERROR_BUSY`].
 

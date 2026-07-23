@@ -6,7 +6,7 @@
 //! execs the builder as its own (non-worker) uid. The builder is the
 //! agent's child, so builds survive worker restarts and the agent
 //! holds the log and exit status until the worker adopts them. The
-//! protocol lives in crates/sandbox-proto/src/darwin.rs.
+//! protocol lives in crates/sandbox-proto/src/agent.rs.
 
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -18,7 +18,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
-use sandbox_proto::darwin::{
+use sandbox_proto::agent::{
     AdoptReply, AdoptRequest, CleanupRequest, ERROR_BUSY, ERROR_UNKNOWN_BUILD, ExitNotice,
     FinishRequest, KillRequest, METHOD_ADOPT, METHOD_CLEANUP, METHOD_FINISH, METHOD_KILL,
     METHOD_START, SCRATCH_DIR_PARAM, StartReply, StartRequest,

@@ -59,7 +59,7 @@ impl ActiveBuild {
             self.dir.join("top.tar.zst"),
             crate::tmptar::tar_zstd_dir(&self.dir.join("top"))?,
         )?;
-        let req = sandbox_proto::darwin::StartRequest {
+        let req = sandbox_proto::agent::StartRequest {
             build_id: a.build_id.clone(),
             builder: a.builder.clone(),
             args: a.args.clone(),

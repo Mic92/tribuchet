@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use std::fmt::Write as _;
 
 use anyhow::{Context, Result, bail};
-use sandbox_proto::darwin::{
+use sandbox_proto::agent::{
     AdoptReply, AdoptRequest, CleanupRequest, ExitNotice, FinishRequest, KillRequest, METHOD_ADOPT,
     METHOD_CLEANUP, METHOD_FINISH, METHOD_KILL, METHOD_START, SCRATCH_DIR_PARAM, StartReply,
     StartRequest,
