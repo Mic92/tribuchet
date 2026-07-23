@@ -2,10 +2,11 @@
 #
 # Hub: socket-activated (systemd holds the attach socket and the worker
 # port), so hub restarts never refuse connections, clients just queue.
-# Worker: builds run in their own process groups and sandboxd-leased
-# cgroups, and KillMode=process leaves them alive across a unit stop
-# or restart. A restarted worker re-adopts them from the state
-# persisted in its build dirs, so package upgrades and settings
+# Worker: runs unprivileged as tribuchet and leases every build to a
+# per-uid agent (tribuchet-agent-N, socket-activated), which owns the
+# builder process and its user namespace, so builds survive worker
+# stops and restarts. A restarted worker re-adopts them from the
+# state persisted in its build dirs, so package upgrades and settings
 # changes are plain restarts.
 self:
 {
@@ -19,6 +20,20 @@ let
   worker = config.services.tribuchet-worker;
   defaultPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
   format = pkgs.formats.toml { };
+  agentIds = lib.range 1 worker.agents;
+  agentUser = i: "tribuchet-agent-${toString i}";
+  forEachAgent = f: lib.listToAttrs (map (i: lib.nameValuePair (agentUser i) (f i)) agentIds);
+  agentSocket = i: "/run/tribuchet/agents/${toString i}.sock";
+  # ExecStart cannot resolve the worker's uid, which the agent needs
+  # for its peer-uid check.
+  agentStart =
+    i:
+    pkgs.writeShellScript "tribuchet-agent-${toString i}" ''
+      exec ${lib.getExe' worker.package "tribuchet"} agent \
+        --state-dir /var/lib/${agentUser i} \
+        --uid-base ${toString (worker.agentUidBase + (i - 1) * 65536)} \
+        --worker-uid "$(${lib.getExe' pkgs.coreutils "id"} -u tribuchet)"
+    '';
   hubToml = format.generate "hub.toml" (
     {
       socket = toString hub.socketPath;
@@ -27,7 +42,13 @@ let
     }
     // hub.settings
   );
-  workerToml = format.generate "worker.toml" worker.settings;
+  workerToml = format.generate "worker.toml" (
+    {
+      agent-sockets = map agentSocket agentIds;
+      max-jobs = worker.agents;
+    }
+    // worker.settings
+  );
   attachWrapper = pkgs.writeShellScript "tribuchet-attach" ''
     exec ${lib.getExe' hub.package "tribuchet"} attach "$1" --socket ${hub.socketPath}
   '';
@@ -166,6 +187,25 @@ in
         unset when using this.
       '';
     };
+    agents = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 4;
+      description = ''
+        Number of per-uid build agents. Bounds concurrent builds and
+        sets the worker's max-jobs (overridable via `settings`, but
+        never above the agent count).
+      '';
+    };
+    agentUidBase = lib.mkOption {
+      type = lib.types.int;
+      default = 1325400064;
+      description = ''
+        First uid of the agents' 65536-uid blocks (agent i maps block
+        i-1). The default starts right after nix-daemon's
+        auto-allocate-uids range so the two never hand out the same
+        uids on one host.
+      '';
+    };
     settings = lib.mkOption {
       type = format.type;
       example = lib.literalExpression ''
@@ -287,124 +327,111 @@ in
     (lib.mkIf worker.enable {
       environment.etc."tribuchet/worker.toml".source = workerToml;
 
-      users.users.tribuchet = {
-        isSystemUser = true;
-        group = "tribuchet";
-        # /dev/kvm for kvm-requiring builds
-        extraGroups = [ "kvm" ];
-      };
-      users.groups.tribuchet = { };
       # the worker imports build inputs through the nix-daemon without
       # signatures, which only trusted users may do
       nix.settings.trusted-users = [ "tribuchet" ];
 
-      # Root daemon leasing per-build user namespaces, uid ranges and
-      # delegated cgroups to the unprivileged worker. Socket-activated,
-      # but the daemon binds the socket itself when started directly.
-      systemd.sockets.tribuchet-sandboxd = {
-        wantedBy = [ "sockets.target" ];
-        listenStreams = [ "/run/tribuchet-sandboxd.sock" ];
-        # access control is sandboxd's SO_PEERCRED check
-        socketConfig.SocketMode = "0666";
-      };
-      systemd.services.tribuchet-sandboxd = {
-        serviceConfig = {
-          Type = "notify";
-          ExecStart = "${lib.getExe' worker.package "tribuchet-sandboxd"} --worker-user tribuchet";
-          Environment = "RUST_LOG=info";
-          Restart = "on-failure";
-          NoNewPrivileges = true;
-          PrivateTmp = true;
-          PrivateDevices = true;
-          PrivateNetwork = true;
-          ProtectHome = true;
-          ProtectSystem = "strict";
-          ProtectKernelModules = true;
-          ProtectKernelTunables = true;
-          ProtectClock = true;
-          ProtectHostname = true;
-          # build cgroups it delegates, and the socket when started standalone
-          ReadWritePaths = [
-            "/sys/fs/cgroup"
-            "/run"
-          ];
-          # setuid/setgid: uid/gid maps of the leased user namespaces
-          # chown/dac/fowner: chown_tree, purge_tree and cgroup handover
-          # sys_admin + sys_chroot: cgroups and joining the worker's
-          #   mount namespace for open_tree and mount_setattr
-          # sys_ptrace: pidfd_getfd from the open_tree helper
-          CapabilityBoundingSet = [
-            "CAP_CHOWN"
-            "CAP_DAC_OVERRIDE"
-            "CAP_DAC_READ_SEARCH"
-            "CAP_FOWNER"
-            "CAP_SETUID"
-            "CAP_SETGID"
-            "CAP_SYS_ADMIN"
-            "CAP_SYS_CHROOT"
-            "CAP_SYS_PTRACE"
-          ];
-          # user: the idmap holder namespaces; mnt: setns into the
-          # worker's mount namespace
-          RestrictNamespaces = [
-            "user"
-            "mnt"
-          ];
-          RestrictAddressFamilies = [ "AF_UNIX" ];
-          RestrictRealtime = true;
-          RestrictSUIDSGID = true;
-          LockPersonality = true;
-          MemoryDenyWriteExecute = true;
-          SystemCallArchitectures = "native";
-          # mount_setattr and pidfd_getfd back the idmapped pack mounts
-          SystemCallFilter = [
-            "@system-service"
-            "mount_setattr"
-            "pidfd_getfd"
-          ];
-          SystemCallErrorNumber = "EPERM";
+      # One build user per agent. Builds run as (or map) that agent's
+      # uid, never the worker's, so a running build can neither tamper
+      # with the worker nor leave files it cannot delete.
+      users.users = {
+        tribuchet = {
+          isSystemUser = true;
+          group = "tribuchet";
         };
-      };
+      }
+      // forEachAgent (i: {
+        isSystemUser = true;
+        group = agentUser i;
+        # /dev/kvm for kvm-requiring builds
+        extraGroups = [ "kvm" ];
+      });
+      users.groups = {
+        tribuchet = { };
+      }
+      // forEachAgent (_: { });
 
-      systemd.services.tribuchet-worker = {
-        wantedBy = [ "multi-user.target" ];
-        # sandboxd may be socket-activated or run standalone; either way
-        # the socket must exist before the worker starts
-        wants = [ "tribuchet-sandboxd.socket" ];
-        after = [ "tribuchet-sandboxd.socket" ];
-        restartTriggers = [ workerToml ];
-        serviceConfig = {
-          Type = "notify";
-          LoadCredential = lib.optional (worker.keyFile != null) "worker-key:${worker.keyFile}";
-          User = "tribuchet";
-          Group = "tribuchet";
-          WatchdogSec = "30";
-          ExecStart = "${lib.getExe' worker.package "tribuchet"} worker --config /etc/tribuchet/worker.toml";
-          # Stop and restart signal only the worker itself. Running
-          # builds keep going in their build cgroups and are re-adopted
-          # by the next worker instance.
-          KillMode = "process";
-          StateDirectory = "tribuchet";
-          Environment = [
-            "RUST_LOG=info"
-          ]
-          ++ lib.optional (worker.keyFile != null) "TRIBUCHET_KEY=%d/worker-key";
-          # delegate the cgroup subtree so the worker can apply
-          # per-build pids/memory limits and cgroup.kill teardown
-          Delegate = true;
-          # Builders inherit this; match nix-daemon so they are not stuck at
-          # the systemd default soft limit of 1024 and fail with EMFILE.
-          LimitNOFILE = 1048576;
-          # builds write only the state dir (writable under strict);
-          # store writes go through the nix-daemon socket
-          NoNewPrivileges = true;
-          PrivateTmp = true;
-          ProtectHome = true;
-          ProtectSystem = "strict";
-          RestrictSUIDSGID = true;
-          Restart = "on-failure";
+      # One socket-activated agent per build user. systemd owns the
+      # socket, the agent starts on the first connection and exits
+      # after each build's Cleanup. The socket mode is open because
+      # the agent itself only accepts connections from the worker uid.
+      systemd.sockets = forEachAgent (i: {
+        wantedBy = [ "sockets.target" ];
+        listenStreams = [ (agentSocket i) ];
+        socketConfig.SocketMode = "0666";
+      });
+
+      systemd.services =
+        forEachAgent (i: {
+          # Exiting after every build is the agent's normal lifecycle,
+          # not a crash loop.
+          unitConfig.StartLimitIntervalSec = 0;
+          serviceConfig = {
+            ExecStart = agentStart i;
+            User = agentUser i;
+            Group = agentUser i;
+            StateDirectory = agentUser i;
+            # Traverse-only for the worker and the uid block: the
+            # per-build scratch dirs under it are world-writable for
+            # the block, but their names are unguessable build ids and
+            # the missing read bit hides them.
+            StateDirectoryMode = "0711";
+            # Writing the uid/gid maps of the agent's pre-mapped user
+            # namespace needs CAP_SETUID/CAP_SETGID over the uid block;
+            # the agent drops both right after the write. CAP_CHOWN
+            # stays: each build cgroup is handed to its mapped root uid.
+            AmbientCapabilities = [
+              "CAP_SETUID"
+              "CAP_SETGID"
+              "CAP_CHOWN"
+            ];
+            CapabilityBoundingSet = [
+              "CAP_SETUID"
+              "CAP_SETGID"
+              "CAP_CHOWN"
+            ];
+            # delegate the cgroup subtree so the agent can create the
+            # per-build cgroup the sandbox roots its cgroup namespace in
+            Delegate = true;
+            # Builders inherit this; match nix-daemon so they are not
+            # stuck at the systemd default soft limit of 1024 and fail
+            # with EMFILE.
+            LimitNOFILE = 1048576;
+            Environment = "RUST_LOG=info";
+          };
+        })
+        // {
+          tribuchet-worker = {
+            wantedBy = [ "multi-user.target" ];
+            # the agent sockets must exist before the worker leases builds
+            wants = map (i: "${agentUser i}.socket") agentIds;
+            after = map (i: "${agentUser i}.socket") agentIds;
+            restartTriggers = [ workerToml ];
+            serviceConfig = {
+              Type = "notify";
+              LoadCredential = lib.optional (worker.keyFile != null) "worker-key:${worker.keyFile}";
+              User = "tribuchet";
+              Group = "tribuchet";
+              WatchdogSec = "30";
+              ExecStart = "${lib.getExe' worker.package "tribuchet"} worker --config /etc/tribuchet/worker.toml";
+              # Running builds live in the agent services and are
+              # re-adopted by the next worker instance.
+              StateDirectory = "tribuchet";
+              Environment = [
+                "RUST_LOG=info"
+              ]
+              ++ lib.optional (worker.keyFile != null) "TRIBUCHET_KEY=%d/worker-key";
+              # the worker itself only stages inputs and packs outputs;
+              # store writes go through the nix-daemon socket
+              NoNewPrivileges = true;
+              PrivateTmp = true;
+              ProtectHome = true;
+              ProtectSystem = "strict";
+              RestrictSUIDSGID = true;
+              Restart = "on-failure";
+            };
+          };
         };
-      };
     })
   ];
 }

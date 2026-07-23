@@ -101,10 +101,10 @@ syntax as `trusted-public-keys`).
 ### 3. Workers
 
 Workers need a running nix-daemon of their own (inputs are imported
-through it and protected from garbage collection by temp roots). On
-Linux the worker runs unprivileged and leases each build's user
-namespace, uid range and cgroup from the small `tribuchet-sandboxd`
-root daemon (set up by the NixOS module).
+through it and protected from garbage collection by temp roots). The
+worker runs unprivileged and leases every build to a per-uid agent
+service (set up by the NixOS and nix-darwin modules), which owns the
+builder process and its uid block.
 
 `/etc/tribuchet/worker.toml`:
 

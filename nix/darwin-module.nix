@@ -267,6 +267,8 @@ in
               (toString cfg.uid)
             ];
             UserName = agentUser i;
+            # Agents exit after every build, do not throttle the relaunch.
+            ThrottleInterval = 1;
             Sockets.agent = {
               SockPathName = agentSocket i;
               SockPathMode = 438; # 0666

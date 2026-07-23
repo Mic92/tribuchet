@@ -2342,23 +2342,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tribuchet-sandboxd"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "libc",
- "nix",
- "rustix",
- "sandbox-proto",
- "sd-notify",
- "serde_json",
- "tempfile",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

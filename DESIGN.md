@@ -178,12 +178,12 @@ dedupe key routes it back to the worker holding the build, which
 resumes (or just re-delivers the finished result) instead of building
 again.
 
-Worker redeploys are plain unit restarts: builds run in their own
-process groups and sandboxd-leased cgroups, the worker unit uses
-KillMode=process, and resume state, logs and the exit status (written
-by the in-sandbox PID-1 shim) are persisted in the build dirs. The
-replacement worker re-adopts running builds, supervises them to
-completion and redelivers finished results. The hub covers the
+Worker redeploys are plain unit restarts: builds run under the
+per-uid agent services, which hold the log and exit status until a
+worker collects them, and resume state is persisted in the build
+dirs. The replacement worker re-adopts running builds from their
+agents, supervises them to completion and redelivers finished
+results. The hub covers the
 session gap by requeueing instead of failing jobs whose worker
 session died; the attached client sees a pause, not an error. A full
 stop behaves the same way: builds keep running, and their results

@@ -25,8 +25,6 @@ let
     strictDeps = true;
     nativeBuildInputs = [ protobuf ];
     PROTOC = "${protobuf}/bin/protoc";
-    # tribuchet-sandboxd is Linux-only (user namespaces, cgroups)
-    cargoExtraArgs = lib.optionalString (!stdenv.isLinux) "--workspace --exclude tribuchet-sandboxd";
   };
 
   cargoArtifacts = craneLib.buildDepsOnly commonArgs;

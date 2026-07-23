@@ -1,11 +1,8 @@
-//! Wire protocols between the tribuchet worker and its per-host
-//! privilege helpers: tribuchet-sandboxd on Linux and the per-uid
-//! build agents.
+//! Wire protocol between the tribuchet worker and the per-uid build
+//! agents.
 //!
-//! The message types are plain serde structs with no OS calls, so both
-//! platform modules compile and unit-test everywhere; only the daemons
-//! that speak them are platform-gated.
+//! The message types are plain serde structs with no OS calls; only
+//! the daemon speaking them cares about the platform.
 
 pub mod agent;
 pub mod framing;
-pub mod linux;
