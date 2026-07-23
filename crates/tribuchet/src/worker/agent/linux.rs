@@ -14,13 +14,16 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use sandbox_proto::agent::StartRequest;
 
-use super::Options;
+use super::{Build, Options};
 use crate::worker::sandbox::{self, SandboxSpec};
 use crate::worker::userns::{self, UsernsHolder};
+
+/// Argv[1] marker of the re-exec'd userns filesystem helper.
+pub const FS_HELPER_ARG: &str = "__agent_fs";
 
 /// Uids mapped into the agent's user namespace: enough for uid-range
 /// (nspawn) builds, single-uid builds nest a 1-uid map inside it.
@@ -85,6 +88,99 @@ pub(super) fn spawn_builder(
         sandbox::send_spec_to(&spec, w)?;
     }
     Ok((child, Some(spec.root)))
+}
+
+/// Make outputs readable for the worker. Files of a namespace build
+/// belong to the agent's uid block, so the chmod runs through the
+/// userns helper; direct-exec outputs are agent-owned.
+pub(super) fn finish(confinement: &Confinement, root: Option<&Path>, outputs: &[String]) {
+    let Some(root) = root else {
+        for out in outputs {
+            super::make_readable(Path::new(out));
+        }
+        return;
+    };
+    let paths: Vec<PathBuf> = outputs
+        .iter()
+        .map(|o| root.join(o.trim_start_matches('/')))
+        .collect();
+    if let Err(e) = run_in_userns(confinement, "make-readable", &paths) {
+        tracing::warn!("making outputs readable: {e:#}");
+    }
+}
+
+/// Remove a build's scratch tree and stray outputs. A namespace
+/// build's tree contains uid-block files only deletable inside the
+/// userns; its outputs live under that tree.
+pub(super) fn cleanup(confinement: &Confinement, build: &Build) {
+    if build.sandbox_root.is_some() {
+        if let Err(e) = run_in_userns(
+            confinement,
+            "remove",
+            std::slice::from_ref(&build.scratch_root),
+        ) {
+            tracing::warn!("removing the scratch tree: {e:#}");
+        }
+        return;
+    }
+    let _ = fs::remove_dir_all(&build.scratch_root);
+    for out in &build.outputs {
+        // Direct-exec scratch outputs live at their real store paths
+        // and are agent-owned; the sticky store dir lets the owner
+        // delete them.
+        let _ = fs::remove_dir_all(out);
+        let _ = fs::remove_file(out);
+    }
+}
+
+/// Re-exec this binary as the userns filesystem helper and wait it
+/// out.
+fn run_in_userns(confinement: &Confinement, op: &str, paths: &[PathBuf]) -> Result<()> {
+    let userns = confinement
+        .userns
+        .as_ref()
+        .context("no pre-mapped user namespace")?;
+    let exe = std::env::current_exe()?;
+    let status = Command::new(exe)
+        .arg(FS_HELPER_ARG)
+        .arg(userns::ns_path(&userns.fd))
+        .arg(op)
+        .args(paths)
+        .status()?;
+    ensure!(status.success(), "userns fs helper exited with {status}");
+    Ok(())
+}
+
+/// Entry point of the re-exec'd helper: joins the agent's user
+/// namespace, whose owner gets full capabilities over the uid-block
+/// files, and runs the filesystem operation the agent itself may not.
+pub fn fs_helper_stage() -> ! {
+    fn run() -> Result<()> {
+        let mut args = std::env::args_os().skip(2);
+        let ns = fs::File::open(args.next().context("missing userns path")?)?;
+        let op = args.next().context("missing op")?;
+        nix::sched::setns(ns, nix::sched::CloneFlags::CLONE_NEWUSER)
+            .context("joining the agent user namespace")?;
+        for path in args {
+            let path = Path::new(&path);
+            match op.to_str() {
+                Some("make-readable") => super::make_readable(path),
+                Some("remove") => {
+                    let _ = fs::remove_dir_all(path);
+                    let _ = fs::remove_file(path);
+                }
+                _ => bail!("unknown op {}", op.to_string_lossy()),
+            }
+        }
+        Ok(())
+    }
+    match run() {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("agent fs helper: {e:#}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Confinement hook of the direct-exec path (no sandbox spec):

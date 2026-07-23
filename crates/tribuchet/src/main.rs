@@ -79,6 +79,11 @@ fn main() -> anyhow::Result<()> {
     if std::env::args().nth(1).as_deref() == Some(worker::sandbox::SETUP_STAGE_ARG) {
         worker::sandbox::setup_stage();
     }
+    // Same for the build agent's userns filesystem helper.
+    #[cfg(target_os = "linux")]
+    if std::env::args().nth(1).as_deref() == Some(worker::agent::FS_HELPER_ARG) {
+        worker::agent::fs_helper_stage();
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),

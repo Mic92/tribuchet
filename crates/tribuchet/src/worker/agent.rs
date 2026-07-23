@@ -33,6 +33,8 @@ mod platform;
 #[cfg(target_os = "macos")]
 #[path = "agent/darwin.rs"]
 mod platform;
+#[cfg(target_os = "linux")]
+pub use platform::{FS_HELPER_ARG, fs_helper_stage};
 
 pub struct Options {
     /// Unix socket to bind when launchd did not pass one.
@@ -265,19 +267,8 @@ fn handle_finish(agent: &Arc<Agent>, conn: &UnixStream, req: &FinishRequest) -> 
             _ => return framing::send_error(conn, ERROR_UNKNOWN_BUILD),
         }
     };
-    for out in &outputs {
-        make_readable(&output_host_path(root.as_deref(), out));
-    }
+    platform::finish(&agent.confinement, root.as_deref(), &outputs);
     framing::send_reply(conn, &serde_json::json!({}), &[])
-}
-
-/// Host location of a scratch output: below the private sandbox root
-/// on Linux namespace builds, at its real store path otherwise.
-fn output_host_path(root: Option<&Path>, out: &str) -> PathBuf {
-    match root {
-        Some(r) => r.join(out.trim_start_matches('/')),
-        None => PathBuf::from(out),
-    }
 }
 
 fn handle_cleanup(agent: &Arc<Agent>, conn: &UnixStream, req: &CleanupRequest) -> Result<()> {
@@ -289,16 +280,7 @@ fn handle_cleanup(agent: &Arc<Agent>, conn: &UnixStream, req: &CleanupRequest) -
         }
     };
     agent.kill_sweep(Some(build.pid));
-    let _ = fs::remove_dir_all(&build.scratch_root);
-    for out in &build.outputs {
-        // Outside a private sandbox root, scratch outputs live at
-        // their real store paths and are agent-owned; the sticky store
-        // dir lets the owner delete them. Under a sandbox root they
-        // are inside the scratch tree removed above.
-        let p = output_host_path(build.sandbox_root.as_deref(), out);
-        let _ = fs::remove_dir_all(&p);
-        let _ = fs::remove_file(&p);
-    }
+    platform::cleanup(&agent.confinement, &build);
     framing::send_reply(conn, &serde_json::json!({}), &[])?;
     tracing::info!(id = build.id, "cleanup done");
     if agent.dedicated_uid {

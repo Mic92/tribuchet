@@ -40,6 +40,24 @@ pub(super) fn spawn_builder(
     Ok((super::spawn_plain(req, build_dir, log)?, None))
 }
 
+/// Make outputs readable for the worker; they live at their real
+/// store paths and are agent-owned.
+pub(super) fn finish(_confinement: &Confinement, _root: Option<&Path>, outputs: &[String]) {
+    for out in outputs {
+        super::make_readable(Path::new(out));
+    }
+}
+
+/// Remove the build's scratch tree and its store-path outputs; the
+/// sticky store dir lets the owning agent delete them.
+pub(super) fn cleanup(_confinement: &Confinement, build: &super::Build) {
+    let _ = fs::remove_dir_all(&build.scratch_root);
+    for out in &build.outputs {
+        let _ = fs::remove_dir_all(out);
+        let _ = fs::remove_file(out);
+    }
+}
+
 /// Apply the request's seatbelt profile in the forked child right
 /// before exec.
 pub(super) fn confine(cmd: &mut Command, req: &StartRequest, build_dir: &str) -> Result<()> {
