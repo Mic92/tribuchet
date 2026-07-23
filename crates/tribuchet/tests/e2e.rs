@@ -76,7 +76,10 @@ fn ssh_base(node: Node) -> Vec<String> {
         "ControlMaster=auto",
         "ControlPersist=300",
         "ConnectTimeout=10",
-        "ServerAliveInterval=15",
+        // A dropped ControlMaster kills every multiplexed session, so
+        // ride out VM stalls. run_timeout bounds each command.
+        "ServerAliveInterval=30",
+        "ServerAliveCountMax=10",
         "LogLevel=ERROR",
     ] {
         args.push("-o".into());
