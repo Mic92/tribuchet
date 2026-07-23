@@ -91,7 +91,7 @@ impl ActiveBuild {
     fn build_spec(&self, prep: &OwnerPrep) -> Result<sandbox::SandboxSpec> {
         let a = &self.assignment;
         let (leased_userns, leased_uid_count) = (Some(prep.ns.ns_path()), Some(prep.uid_count));
-        let spec = sandbox::prepare(
+        let mut spec = sandbox::prepare(
             a,
             &self.dir,
             &self.inputs,
@@ -107,6 +107,7 @@ impl ActiveBuild {
                 nix_daemon_socket: None,
             },
         )?;
+        sandbox::prepare_root(&mut spec)?;
         tracing::info!(
             id = a.build_id,
             fixed_output = a.fixed_output,

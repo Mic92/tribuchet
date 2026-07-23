@@ -205,7 +205,6 @@ pub fn prepare(
         );
     }
     spec.binds_ro.sort(); // deterministic mount order
-    platform::prepare_root(&mut spec)?;
     Ok(spec)
 }
 
