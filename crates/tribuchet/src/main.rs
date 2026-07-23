@@ -66,6 +66,9 @@ enum Command {
         /// Uid allowed to lease builds (the worker user).
         #[arg(long)]
         worker_uid: Option<u32>,
+        /// First uid of the agent's 65536-uid block (Linux).
+        #[arg(long)]
+        uid_base: Option<u32>,
     },
 }
 
@@ -100,10 +103,12 @@ fn main() -> anyhow::Result<()> {
             socket,
             state_dir,
             worker_uid,
+            uid_base,
         } => worker::agent::run(&worker::agent::Options {
             socket,
             state_dir,
             worker_uid,
+            uid_base,
         }),
     }
 }

@@ -42,6 +42,9 @@ pub struct Options {
     /// Uid allowed to lease builds, defaulting to the agent's own uid
     /// for development runs.
     pub worker_uid: Option<u32>,
+    /// First uid of this agent's 65536-uid block (Linux). Without it
+    /// builds run without a pre-mapped user namespace.
+    pub uid_base: Option<u32>,
 }
 
 /// The one build this agent holds, from Start until Cleanup.
@@ -80,12 +83,15 @@ impl Agent {
             );
         }
         if self.dedicated_uid {
-            kill_own_uid_processes();
+            kill_own_uid_processes(self.confinement.exempt_pid());
         }
     }
 }
 
 pub fn run(opts: &Options) -> Result<()> {
+    // Held for the process lifetime: it pins the agent's pre-mapped
+    // user namespace on Linux.
+    let _confinement = platform::Confinement::init(opts)?;
     let (listener, activated) = listener(opts.socket.as_deref())?;
     fs::create_dir_all(&opts.state_dir)
         .with_context(|| format!("creating state dir {}", opts.state_dir.display()))?;
@@ -363,15 +369,16 @@ fn notify_exit(conn: &UnixStream, exit: &(Mutex<Option<i32>>, Condvar)) -> Resul
     )
 }
 
-/// Kill every process of the agent's uid except the agent itself:
-/// catches setsid escapes from the process-group kill and leftovers
-/// from a previous build. kill(-1) would take the agent down too.
-fn kill_own_uid_processes() {
+/// Kill every process of the agent's uid except the agent itself and
+/// the `exempt` pid: catches setsid escapes from the process-group
+/// kill and leftovers from a previous build. kill(-1) would take the
+/// agent down too.
+fn kill_own_uid_processes(exempt: Option<i32>) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let others = platform::own_uid_pids()
             .into_iter()
-            .filter(|&pid| pid != std::process::id().cast_signed())
+            .filter(|&pid| pid != std::process::id().cast_signed() && Some(pid) != exempt)
             .collect::<Vec<_>>();
         if others.is_empty() {
             return;

@@ -251,6 +251,7 @@ mod tests {
                     socket: Some(socket),
                     state_dir,
                     worker_uid: None,
+                    uid_base: None,
                 });
             });
         }

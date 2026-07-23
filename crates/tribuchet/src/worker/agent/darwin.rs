@@ -8,15 +8,22 @@ use std::process::Command;
 use anyhow::{Context, Result};
 use sandbox_proto::agent::{SCRATCH_DIR_PARAM, StartRequest};
 
-/// launchd-held listener (socket named "agent" in the plist), or None
-/// when not launchd-activated.
-pub(super) fn activated_unix_listener() -> Result<Option<UnixListener>> {
-    crate::sd::launchd_unix_listener("agent")
-}
+use super::Options;
 
-pub(super) fn peer_uid(conn: &UnixStream) -> Result<u32> {
-    let (uid, _) = nix::unistd::getpeereid(conn)?;
-    Ok(uid.as_raw())
+/// Per-agent confinement state. macOS confinement is per build (the
+/// seatbelt profile arrives with the Start request), so nothing is
+/// set up at agent startup.
+pub(super) struct Confinement;
+
+impl Confinement {
+    pub(super) fn init(_opts: &Options) -> Result<Self> {
+        Ok(Self)
+    }
+
+    /// Nothing to exempt from the kill sweep.
+    pub(super) fn exempt_pid(&self) -> Option<i32> {
+        None
+    }
 }
 
 /// Apply the request's seatbelt profile in the forked child right
@@ -34,6 +41,17 @@ pub(super) fn confine(cmd: &mut Command, req: &StartRequest, build_dir: &str) ->
         cmd.pre_exec(move || seatbelt.apply());
     }
     Ok(())
+}
+
+/// launchd-held listener (socket named "agent" in the plist), or None
+/// when not launchd-activated.
+pub(super) fn activated_unix_listener() -> Result<Option<UnixListener>> {
+    crate::sd::launchd_unix_listener("agent")
+}
+
+pub(super) fn peer_uid(conn: &UnixStream) -> Result<u32> {
+    let (uid, _) = nix::unistd::getpeereid(conn)?;
+    Ok(uid.as_raw())
 }
 
 /// Pids owned by this uid, via libproc's proc_listpids (macOS has no

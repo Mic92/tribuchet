@@ -2319,6 +2319,7 @@ dependencies = [
  "prost",
  "rand",
  "rcgen",
+ "rustix",
  "sandbox-proto",
  "sd-notify",
  "serde",
