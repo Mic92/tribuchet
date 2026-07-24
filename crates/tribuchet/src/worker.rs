@@ -269,7 +269,7 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
     let builds_dir = opts.state_dir.join("builds");
     fs::create_dir_all(&builds_dir)?;
     // Traverse-only so leased build uids reach their own tree but
-    // other local users get no listing; see BuildOwner.
+    // other local users get no listing.
     fs::set_permissions(&builds_dir, fs::Permissions::from_mode(0o711))?;
     sweep_state_dir(&opts.state_dir);
     // Arc: SecretKey is not Clone (zeroized on drop); build threads share it.
