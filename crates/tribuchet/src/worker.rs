@@ -11,6 +11,8 @@
 //! Runs up to `--max-jobs` builds concurrently over one hub session.
 
 pub mod agent;
+#[cfg(target_os = "linux")]
+mod agent_spawn;
 mod agents;
 pub mod binfmt;
 mod build;
@@ -283,6 +285,18 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
         Some(p) => Some(p),
         None => option_env!("TRIBUCHET_BIN_SH").map(PathBuf::from),
     };
+    if opts.spawn_agents > 0 {
+        anyhow::ensure!(cfg!(target_os = "linux"), "spawn-agents requires Linux");
+        anyhow::ensure!(
+            opts.agent_sockets.is_empty(),
+            "agent-sockets and spawn-agents are mutually exclusive"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            opts.agent_sockets =
+                agent_spawn::spawn(&opts.state_dir, opts.spawn_agents, opts.agent_uid_base)?;
+        }
+    }
     // Every build runs on one agent, so the agent list bounds
     // concurrency.
     anyhow::ensure!(

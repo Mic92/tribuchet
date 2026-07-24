@@ -175,6 +175,16 @@ pub struct WorkerConfig {
     /// agent count bounds concurrent builds.
     #[serde(default)]
     pub agent_sockets: Vec<PathBuf>,
+    /// Number of agents the worker spawns and supervises itself, for
+    /// hosts without systemd-managed agent units such as containers.
+    /// Mutually exclusive with agent-sockets.
+    #[serde(default)]
+    pub spawn_agents: u32,
+    /// First uid used by spawned agents. Agent i runs as uid base+i-1
+    /// and maps the 65536-uid block starting at base+i*65536. Needs a
+    /// root worker. Unset, builds share the worker uid.
+    #[serde(default)]
+    pub agent_uid_base: Option<u32>,
 }
 
 impl WorkerConfig {
