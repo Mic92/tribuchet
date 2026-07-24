@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -213,7 +214,7 @@ fn handle_start(
             platform::spawn_builder(&agent.confinement, &req, &scratch_root, &build_dir, &log_w)?;
         let pid = child.id().cast_signed();
         let exit = Arc::new((Mutex::new(None), Condvar::new()));
-        reap_on_exit(child, exit.clone());
+        reap_on_exit(agent.clone(), req.build_id.clone(), child, exit.clone());
         *current = Some(Build {
             id: req.build_id.clone(),
             pid,
@@ -354,7 +355,13 @@ fn rewrite_tmp_dir_env(env: &mut HashMap<String, String>, from: &str, to: &str) 
 }
 
 /// Reap the builder on its own thread and publish the exit code.
-fn reap_on_exit(mut child: std::process::Child, exit: Arc<(Mutex<Option<i32>>, Condvar)>) {
+/// An OOM kill by memory.max is noted in the build log first.
+fn reap_on_exit(
+    agent: Arc<Agent>,
+    build_id: String,
+    mut child: std::process::Child,
+    exit: Arc<(Mutex<Option<i32>>, Condvar)>,
+) {
     std::thread::spawn(move || {
         use std::os::unix::process::ExitStatusExt;
         let code = match child.wait() {
@@ -363,6 +370,16 @@ fn reap_on_exit(mut child: std::process::Child, exit: Arc<(Mutex<Option<i32>>, C
                 .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)),
             Err(_) => 1,
         };
+        if platform::oom_killed(&agent.confinement, &build_id) {
+            tracing::warn!(id = build_id, "builder killed by the build memory limit");
+            let log = agent.state_dir.join(&build_id).join("build.log");
+            let _ = fs::OpenOptions::new()
+                .append(true)
+                .open(log)
+                .and_then(|mut f| {
+                    f.write_all(b"tribuchet: builder killed by the build memory limit\n")
+                });
+        }
         tracing::info!(code, "builder exited");
         *exit.0.lock().unwrap() = Some(code);
         exit.1.notify_all();

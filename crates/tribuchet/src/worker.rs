@@ -74,6 +74,8 @@ struct WorkerCtx {
     fod_network: crate::netpolicy::NetPolicy,
     max_silent_time: Duration,
     max_log_size: u64,
+    /// memory.max for each build's cgroup.
+    build_memory_max_bytes: Option<u64>,
     /// Builder gets the host nix-daemon socket bind-mounted in; the
     /// worker advertises the `recursive-nix` feature.
     pub(super) recursive_nix: bool,
@@ -287,8 +289,8 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
     opts.max_jobs = opts
         .max_jobs
         .min(u32::try_from(opts.agent_sockets.len()).unwrap_or(u32::MAX));
-    if opts.build_memory_max_bytes.is_some() {
-        tracing::warn!("build-memory-max is not enforced on the agent-based build path yet");
+    if cfg!(target_os = "macos") && opts.build_memory_max_bytes.is_some() {
+        tracing::warn!("build-memory-max is not enforced on macOS");
     }
     let fod_isolation = cfg!(target_os = "linux") && Path::new("/dev/net/tun").exists();
     // main logs the config before the baked-in bin_sh default applies;
@@ -323,6 +325,7 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
         fod_network: opts.fod_network.clone(),
         max_silent_time: Duration::from_secs(opts.max_silent_time_secs),
         max_log_size: opts.max_log_size,
+        build_memory_max_bytes: opts.build_memory_max_bytes,
         recursive_nix: opts.recursive_nix,
         agents: agents::AgentPool::new(opts.agent_sockets.clone()),
     });

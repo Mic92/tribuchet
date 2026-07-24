@@ -132,6 +132,9 @@ pub(super) fn spawn_builder(
         .as_deref()
         .map(|base| cgroup::create(base, &req.build_id, userns.uid_base))
         .transpose()?;
+    if let (Some(cg), Some(bytes)) = (&spec.cgroup, req.memory_max_bytes) {
+        cgroup::set_memory_max(cg, bytes)?;
+    }
     sandbox::prepare_root(&mut spec).context("creating the sandbox root skeleton")?;
     let (child, spec_w) = sandbox::spawn(&spec, log)?;
     // The setup stage waits for the spec on stdin; move it into the
@@ -320,6 +323,20 @@ pub(super) fn activated_unix_listener() -> Result<Option<UnixListener>> {
 
 pub(super) fn peer_uid(conn: &UnixStream) -> Result<u32> {
     Ok(getsockopt(conn, PeerCredentials)?.uid())
+}
+
+/// Whether the build cgroup's memory.max OOM-killed the build.
+pub(super) fn oom_killed(confinement: &Confinement, build_id: &str) -> bool {
+    let Some(base) = &confinement.cgroup_base else {
+        return false;
+    };
+    fs::read_to_string(base.join(format!("build-{build_id}")).join("memory.events")).is_ok_and(
+        |events| {
+            events
+                .lines()
+                .any(|l| l.strip_prefix("oom_kill ").is_some_and(|n| n.trim() != "0"))
+        },
+    )
 }
 
 /// Pids whose real uid is this uid, from /proc.

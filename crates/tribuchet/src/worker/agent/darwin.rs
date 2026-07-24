@@ -98,6 +98,11 @@ pub(super) fn peer_uid(conn: &UnixStream) -> Result<u32> {
     Ok(uid.as_raw())
 }
 
+/// No per-build memory limit on macOS.
+pub(super) fn oom_killed(_confinement: &Confinement, _build_id: &str) -> bool {
+    false
+}
+
 /// Pids owned by this uid, via libproc's proc_listpids (macOS has no
 /// /proc to enumerate).
 pub(super) fn own_uid_pids() -> Vec<i32> {

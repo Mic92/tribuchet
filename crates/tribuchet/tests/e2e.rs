@@ -534,6 +534,18 @@ fn build_kvm_emulated() {
     assert!(err.contains("exit code 222"), "{err}");
 }
 
+/// build-memory-max-bytes OOM-kills the builder, exit code 137, and
+/// the agent notes the OOM kill.
+#[test]
+fn build_memhog() {
+    let err = fail(Node::Hub, "nix-build /etc/tt/memhog.nix --no-out-link 2>&1");
+    assert!(err.contains("exit code 137"), "{err}");
+    succeed(
+        Node::Worker,
+        "journalctl | grep 'builder killed by the build memory limit'",
+    );
+}
+
 #[test]
 fn build_logbomb() {
     let err = fail(

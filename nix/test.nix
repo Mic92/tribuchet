@@ -129,6 +129,9 @@ in
         environment.etc."tt/logbomb.nix".text = ''
           import ${./tests/logbomb.nix} { bash = "${pkgs.bash}"; }
         '';
+        environment.etc."tt/memhog.nix".text = ''
+          import ${./tests/memhog.nix} { bash = "${pkgs.bash}"; }
+        '';
         environment.etc."tt/drain.nix".text = ''
           import ${./tests/drain.nix} { bash = "${pkgs.bash}"; }
         '';
@@ -217,6 +220,8 @@ in
         virtualisation.writableStore = true;
         # booting a NixOS container inside the sandbox needs room
         virtualisation.memorySize = 4096;
+        # the memhog subtest relies on a plain memcg OOM kill
+        boot.kernel.sysctl."vm.panic_on_oom" = lib.mkForce 0;
         virtualisation.diskSize = 4096;
         virtualisation.additionalPaths = [
           pkgs.stdenvNoCC
@@ -231,6 +236,8 @@ in
             hub = "https://hub:7437";
             max-jobs = 2;
             max-log-size = 1048576;
+            # 2 GiB, exceeded only by the memhog subtest
+            build-memory-max-bytes = 2147483648;
             recursive-nix = true;
             # exercised by the fod-policy subtest
             fod-network.rules = [

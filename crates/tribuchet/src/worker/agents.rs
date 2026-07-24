@@ -302,6 +302,7 @@ mod tests {
             profile: String::new(),
             sandbox: None,
             outputs,
+            memory_max_bytes: None,
         }
     }
 

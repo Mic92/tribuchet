@@ -57,6 +57,9 @@ pub struct StartRequest {
     pub sandbox: Option<serde_json::Value>,
     /// Scratch output store paths, acted on by `Finish` and `Cleanup`.
     pub outputs: Vec<String>,
+    /// memory.max for the build's cgroup. Unlimited when unset.
+    #[serde(default)]
+    pub memory_max_bytes: Option<u64>,
 }
 
 /// Attached fd 0 is a read handle on the build's log file, so the

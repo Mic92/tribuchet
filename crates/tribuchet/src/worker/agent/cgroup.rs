@@ -51,6 +51,15 @@ pub(super) fn create(base: &Path, build_id: &str, owner_uid: u32) -> Result<Path
     Ok(dir)
 }
 
+/// Cap the build's memory. memory.max stays agent-owned so the
+/// payload cannot raise it. oom.group makes the kernel kill the whole
+/// build instead of one victim, so it fails instead of hanging.
+pub(super) fn set_memory_max(dir: &Path, bytes: u64) -> Result<()> {
+    fs::write(dir.join("memory.max"), bytes.to_string())
+        .with_context(|| format!("writing memory.max in {}", dir.display()))?;
+    fs::write(dir.join("memory.oom.group"), "1").context("writing memory.oom.group")
+}
+
 /// Move a pid into the build cgroup, then hand cgroup.procs to the
 /// build's mapped root uid (the payload migrates processes into its
 /// own subgroups). Called on the setup stage before the spec is sent,

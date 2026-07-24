@@ -95,6 +95,7 @@ impl ActiveBuild {
             profile,
             sandbox: sandbox_json,
             outputs: outputs.clone(),
+            memory_max_bytes: self.ctx.build_memory_max_bytes,
         };
         let build = agents::AgentBuild::start(
             socket,
