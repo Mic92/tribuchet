@@ -23,8 +23,10 @@ BIN = REPO / "result" / "bin" / "tribuchet"
 HUB_LOG = REPO / "hub.log"
 WORKER_LOG = REPO / "worker.log"
 AGENT_LOG = REPO / "agent.log"
-AGENT_SOCKET = REPO / "agent.sock"
-AGENT_STATE = REPO / "agent-state"
+AGENT_SOCKET = Path("/var/lib/tribuchet-agent/agent.sock")
+AGENT_STATE = Path("/var/lib/tribuchet-agent/state")
+# Same default uid block as the NixOS module.
+AGENT_UID_BASE = 1325400064
 
 
 def run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
@@ -266,11 +268,12 @@ def job_conclusion(name: str) -> str | None:
     return None
 
 
-def start_agent(*, as_root: bool) -> None:
-    """One build agent in development mode (self-bound socket, no
-    dedicated uid block): builds run as the agent's own uid, which is
-    the worker's uid too."""
+def start_agent(worker_uid: int) -> None:
+    """One build agent as root (which has the capabilities the agent's
+    user namespaces need) with a self-bound socket."""
+    run(["sudo", "mkdir", "-p", str(AGENT_STATE)])
     agent_cmd = [
+        "sudo",
         "RUST_LOG=info",
         str(BIN),
         "agent",
@@ -278,9 +281,12 @@ def start_agent(*, as_root: bool) -> None:
         str(AGENT_SOCKET),
         "--state-dir",
         str(AGENT_STATE),
+        "--worker-uid",
+        str(worker_uid),
     ]
-    prefix = ["sudo"] if as_root else ["env"]
-    proc = spawn_daemon([*prefix, *agent_cmd], AGENT_LOG)
+    if sys.platform == "linux":
+        agent_cmd += ["--uid-base", str(AGENT_UID_BASE)]
+    proc = spawn_daemon(agent_cmd, AGENT_LOG)
     wait_for(
         lambda: AGENT_SOCKET.exists() or proc.poll() is not None,
         timeout=30,
@@ -289,6 +295,8 @@ def start_agent(*, as_root: bool) -> None:
     if proc.poll() is not None:
         sys.stderr.write(AGENT_LOG.read_text())
         raise SystemExit("agent exited")
+    # The unprivileged worker must connect to the root-owned socket.
+    run(["sudo", "chmod", "666", str(AGENT_SOCKET)])
 
 
 def worker_run(hub_ip: str) -> None:
@@ -314,21 +322,20 @@ def worker_run(hub_ip: str) -> None:
         "/etc/tribuchet/worker.toml",
     ]
     if sys.platform == "linux":
-        # The Linux worker and its agent run unprivileged as the runner
-        # user. Importing inputs through nix-daemon without signatures
-        # needs a trusted user.
+        # The worker runs unprivileged; builds run in the root agent's
+        # user namespaces. Importing inputs through nix-daemon without
+        # signatures needs a trusted user.
         user = out(["id", "-un"])
         run(["sudo", "chown", user, "/var/lib/tribuchet"])
         # Ubuntu 24.04 blocks unprivileged user namespaces by default
         run(["sudo", "sysctl", "-w", "kernel.apparmor_restrict_unprivileged_userns=0"])
         sudo_write("/etc/nix/nix.conf", f"trusted-users = root {user}\n", append=True)
         run(["sudo", "systemctl", "restart", "nix-daemon"])
-        start_agent(as_root=False)
+        start_agent(worker_uid=os.getuid())
         proc = spawn_daemon(["env", *worker_cmd], WORKER_LOG)
     else:
-        # macOS: root for the Seatbelt sandbox and nix-daemon trust; the
-        # agent must share the worker's uid, so it runs as root too.
-        start_agent(as_root=True)
+        # macOS: worker and agent run as root (Seatbelt, nix-daemon trust).
+        start_agent(worker_uid=0)
         proc = spawn_daemon(["sudo", *worker_cmd], WORKER_LOG)
 
     def finished() -> bool:
