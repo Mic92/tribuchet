@@ -69,6 +69,9 @@ enum Command {
         /// First uid of the agent's 65536-uid block (Linux).
         #[arg(long)]
         uid_base: Option<u32>,
+        /// The agent owns its uid even without socket activation.
+        #[arg(long)]
+        dedicated_uid: bool,
     },
 }
 
@@ -109,11 +112,13 @@ fn main() -> anyhow::Result<()> {
             state_dir,
             worker_uid,
             uid_base,
+            dedicated_uid,
         } => worker::agent::run(&worker::agent::Options {
             socket,
             state_dir,
             worker_uid,
             uid_base,
+            dedicated_uid,
         }),
     }
 }

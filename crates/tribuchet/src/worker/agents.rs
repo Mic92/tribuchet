@@ -272,6 +272,7 @@ mod tests {
                     state_dir,
                     worker_uid: None,
                     uid_base: None,
+                    dedicated_uid: false,
                 });
             });
         }

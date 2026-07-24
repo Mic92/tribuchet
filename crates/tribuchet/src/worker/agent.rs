@@ -62,6 +62,9 @@ pub struct Options {
     /// First uid of this agent's 65536-uid block (Linux). Without it
     /// builds run without a pre-mapped user namespace.
     pub uid_base: Option<u32>,
+    /// The agent owns its uid even without socket activation, so it
+    /// kill-sweeps the uid and exits after each build.
+    pub dedicated_uid: bool,
 }
 
 /// The one build this agent holds, from Start until Cleanup.
@@ -127,7 +130,7 @@ pub fn run(opts: &Options) -> Result<()> {
             .unwrap_or_else(|| nix::unistd::getuid().as_raw()),
         confinement,
         current: Mutex::new(None),
-        dedicated_uid: activated,
+        dedicated_uid: activated || opts.dedicated_uid,
     });
     tracing::info!(uid = nix::unistd::getuid().as_raw(), "agent listening");
     for conn in listener.incoming() {
