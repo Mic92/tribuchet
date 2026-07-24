@@ -53,7 +53,14 @@ message HubMessage {
     // The hub received and verified the result and output NARs; the
     // worker keeps the build for redelivery until this arrives.
     ResultAck result_ack = 7;
+    // Ends an input resend round; the worker re-checks its inputs
+    // and either starts the build or asks again.
+    StagingComplete staging_complete = 8;
   }
+}
+
+message StagingComplete {
+  string build_id = 1;
 }
 
 message ResultAck {
