@@ -166,6 +166,35 @@ launchd: the hub adopts its sockets from launchd, the worker daemon
 execs through a stable symlink that activation flips and SIGHUPs, again
 keeping builds alive across upgrades.
 
+### Container
+
+For hosts without Nix the flake builds an OCI image,
+`packages.x86_64-linux.worker-image`. It carries its own Nix store,
+starts a nix-daemon and the worker, and spawns its build agents based
+on `spawn-agents` and `agent-uid-base` in worker.toml. No added
+capabilities are needed, but the sandbox creates namespaces and
+mounts, which the default runtime seccomp profile forbids. Use the
+profile from `packages.x86_64-linux.seccomp-profile` and unmask
+/proc:
+
+```console
+$ podman run -d --name tribuchet-worker \
+    -v /etc/tribuchet:/etc/tribuchet:ro \
+    -v tribuchet-nix:/nix \
+    --security-opt seccomp=$(nix build --print-out-paths .#seccomp-profile) \
+    --security-opt unmask=ALL \
+    tribuchet-worker:latest
+```
+
+For docker replace `unmask=ALL` with `systempaths=unconfined`. On
+Kubernetes ship the profile as a `Localhost` seccomp profile, or fall
+back to `Unconfined`, and set `procMount: Unmasked`.
+
+Compared to the NixOS module the agents get no delegated cgroup, so
+`build-memory-max` and uid-range builds are unavailable. The `/nix`
+volume is only a cache. The daemon garbage-collects it via the
+`min-free` and `max-free` settings baked into the image.
+
 ## Fixed-output network policy
 
 On Linux workers with `/dev/net/tun`, fixed-output builds run in
