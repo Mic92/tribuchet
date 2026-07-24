@@ -93,6 +93,15 @@
             }
           );
 
+          nixos-test-container = pkgs.testers.runNixOSTest (
+            import ./nix/container-test.nix {
+              tribuchet = self.packages.x86_64-linux.default;
+              workerImage = self.packages.x86_64-linux.worker-image;
+              seccompProfile = self.packages.x86_64-linux.seccomp-profile;
+              nixosModule = self.nixosModules.default;
+            }
+          );
+
           nixos-test-tailscale = pkgs.testers.runNixOSTest (
             import ./nix/test-tailscale.nix {
               tribuchet = self.packages.x86_64-linux.default;
