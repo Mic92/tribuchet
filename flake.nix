@@ -31,21 +31,31 @@
       treefmtFor = pkgs: treefmt-nix.lib.evalModule pkgs ./nix/treefmt.nix;
     in
     {
-      packages = forAllSystems (pkgs: {
-        # Nix patched to let external builders implement recursive-nix:
-        # the rejection in external-derivation-builder.cc is dropped,
-        # and a result.json sidecar populates addedPaths so the output
-        # reference scan sees inner-built paths. Off-tree because the
-        # change is not upstream; opt in via
-        # services.tribuchet-hub.externalBuilders.recursiveNix.
-        nix-recursive = pkgs.nixVersions.latest.appendPatches [
-          ./nix/patches/recursive-nix-external-builders.patch
-        ];
+      packages = forAllSystems (
+        pkgs:
+        {
+          # Nix patched to let external builders implement recursive-nix:
+          # the rejection in external-derivation-builder.cc is dropped,
+          # and a result.json sidecar populates addedPaths so the output
+          # reference scan sees inner-built paths. Off-tree because the
+          # change is not upstream; opt in via
+          # services.tribuchet-hub.externalBuilders.recursiveNix.
+          nix-recursive = pkgs.nixVersions.latest.appendPatches [
+            ./nix/patches/recursive-nix-external-builders.patch
+          ];
 
-        default = pkgs.callPackage ./nix/package.nix {
-          craneLib = crane.mkLib pkgs;
-        };
-      });
+          default = pkgs.callPackage ./nix/package.nix {
+            craneLib = crane.mkLib pkgs;
+          };
+        }
+        # container route: worker image and its seccomp profile
+        // nixpkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          worker-image = pkgs.callPackage ./nix/worker-image.nix {
+            tribuchet = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+          };
+          seccomp-profile = pkgs.callPackage ./nix/seccomp-profile.nix { };
+        }
+      );
 
       formatter = forAllSystems (pkgs: (treefmtFor pkgs).config.build.wrapper);
 
@@ -79,6 +89,15 @@
           nixos-test = pkgs.testers.runNixOSTest (
             import ./nix/test.nix {
               tribuchet = self.packages.x86_64-linux.default;
+              nixosModule = self.nixosModules.default;
+            }
+          );
+
+          nixos-test-container = pkgs.testers.runNixOSTest (
+            import ./nix/container-test.nix {
+              tribuchet = self.packages.x86_64-linux.default;
+              workerImage = self.packages.x86_64-linux.worker-image;
+              seccompProfile = self.packages.x86_64-linux.seccomp-profile;
               nixosModule = self.nixosModules.default;
             }
           );
