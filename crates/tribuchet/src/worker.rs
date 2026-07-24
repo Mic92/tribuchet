@@ -34,7 +34,7 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
-use build::{ActiveBuild, validate_assignment};
+use build::{ActiveBuild, StagingStatus, validate_assignment};
 use caps::{host_system, system_caps};
 use logtail::spawn_log_tail;
 use resume::{
@@ -85,6 +85,9 @@ struct WorkerCtx {
     /// abort them. Keyed like the registry, since a resumed build's
     /// build_id changes while it runs.
     cancelled: Mutex<HashSet<String>>,
+    /// Input paths a build is currently importing. Other builds defer
+    /// to that import instead of requesting the same NAR again.
+    staging_inflight: Mutex<HashSet<String>>,
 }
 
 impl WorkerCtx {
@@ -319,6 +322,7 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
         secret_paths: vec![opts.key.clone(), opts.state_dir.join("signing.key")],
         slots: Arc::new(Semaphore::new(opts.max_jobs.max(1) as usize)),
         cancelled: Mutex::new(HashSet::new()),
+        staging_inflight: Mutex::new(HashSet::new()),
         resumable: Mutex::new(HashMap::new()),
         emulators,
         fod_isolation,
@@ -536,14 +540,24 @@ async fn session_loop(
             hub_message::Msg::TmpDir(t) => {
                 let id = t.build_id.clone();
                 if let Some(build) = active.get_mut(&id) {
-                    match build.feed_tmp_dir(t).await {
-                        Err(e) => abort_active(active, &id, out_tx, &e).await?,
-                        Ok(false) => {}
-                        Ok(true) => {
-                            let build = active.remove(&id).unwrap();
-                            launch_build(ctx, build, out_tx, signing_key, build_timeout);
-                        }
-                    }
+                    let res = build.feed_tmp_dir(t).await;
+                    advance_staging(active, &id, res, ctx, out_tx, signing_key, build_timeout)
+                        .await?;
+                }
+            }
+            hub_message::Msg::StagingComplete(s) => {
+                if let Some(build) = active.get_mut(&s.build_id) {
+                    let res = build.complete_staging().await;
+                    advance_staging(
+                        active,
+                        &s.build_id,
+                        res,
+                        ctx,
+                        out_tx,
+                        signing_key,
+                        build_timeout,
+                    )
+                    .await?;
                 }
             }
             hub_message::Msg::PathInfo(pi) => {
@@ -582,6 +596,40 @@ async fn session_loop(
             }
         }
     }
+}
+
+/// Act on a staging step: launch, request an input resend, or abort.
+async fn advance_staging(
+    active: &mut HashMap<String, ActiveBuild>,
+    id: &str,
+    res: Result<StagingStatus>,
+    ctx: &Arc<WorkerCtx>,
+    out_tx: &mpsc::Sender<WorkerMessage>,
+    signing_key: &Arc<SecretKey>,
+    build_timeout: Duration,
+) -> Result<()> {
+    match res {
+        Err(e) => abort_active(active, id, out_tx, &e).await?,
+        Ok(StagingStatus::InProgress) => {}
+        Ok(StagingStatus::Ready) => {
+            let build = active.remove(id).unwrap();
+            launch_build(ctx, build, out_tx, signing_key, build_timeout);
+        }
+        Ok(StagingStatus::NeedResend(paths)) => {
+            tracing::info!(
+                id,
+                count = paths.len(),
+                "re-requesting inputs another build failed to import"
+            );
+            out_tx
+                .send(msg(worker_message::Msg::MissingPaths(MissingPaths {
+                    build_id: id.to_string(),
+                    store_paths: paths,
+                })))
+                .await?;
+        }
+    }
+    Ok(())
 }
 
 /// Register a fully-staged build as resumable and run it on a blocking

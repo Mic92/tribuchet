@@ -1,6 +1,6 @@
 //! One build on this worker: input staging, sandbox execution, output packing.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -27,6 +27,19 @@ use crate::tmptar::unpack_tmp_dir_archive;
 /// Cap on a single NAR transfer in either direction; a `truncate -s 1P
 /// $out` build would otherwise tie up the worker and fill its disk.
 const MAX_NAR_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
+/// Cap on input re-request rounds; the set shrinks each round, so a
+/// hub that cannot deliver fails the build instead of looping.
+const MAX_RESEND_ROUNDS: u8 = 3;
+
+/// Where staging of one build stands after a hub message.
+pub(super) enum StagingStatus {
+    InProgress,
+    /// Everything staged; start the build.
+    Ready,
+    /// Deferred paths never became valid; ask the hub for them.
+    NeedResend(Vec<String>),
+}
 
 /// The worker must not trust the hub for filesystem-relevant strings:
 /// build ids become path components, output paths are packed (and on
@@ -85,6 +98,14 @@ pub(super) struct ActiveBuild {
     /// Paths reported missing, waiting for PathInfo + NAR. The value
     /// holds the parsed metadata once it arrived.
     pending: HashMap<String, Option<ValidPathInfo>>,
+    /// Missing paths another build is importing; not requested from
+    /// the hub, re-checked when staging completes.
+    deferred: Vec<String>,
+    /// Paths this build claimed in `WorkerCtx::staging_inflight`.
+    registered: HashSet<String>,
+    /// True once the tmp dir archive finished unpacking.
+    tmp_dir_done: bool,
+    resend_rounds: u8,
     /// Daemon connection; carries this build's temp roots, so it must
     /// outlive the build. None while an Importer borrows it.
     daemon: Option<DaemonConn>,
@@ -133,6 +154,10 @@ impl ActiveBuild {
             permit: None,
             inputs: Vec::new(),
             pending: HashMap::new(),
+            deferred: Vec::new(),
+            registered: HashSet::new(),
+            tmp_dir_done: false,
+            resend_rounds: 0,
             daemon: None,
             importer: None,
             tmp_unpacker: None,
@@ -170,16 +195,43 @@ impl ActiveBuild {
             .await
             .context("querying valid paths")?;
         let mut missing = Vec::new();
+        // One check-and-insert under the lock, so of several builds
+        // negotiating the same missing path exactly one requests it.
+        let mut inflight = self.ctx.staging_inflight.lock().unwrap();
         for (p, sp) in parsed {
             if valid.contains(&sp) {
                 self.inputs.push(p.clone());
+            } else if inflight.contains(p) {
+                // Another build is importing it; re-checked in
+                // complete_staging.
+                self.deferred.push(p.clone());
             } else {
+                inflight.insert(p.clone());
+                self.registered.insert(p.clone());
                 self.pending.insert(p.clone(), None);
                 missing.push(p.clone());
             }
         }
         self.daemon = Some(daemon);
         Ok(missing)
+    }
+
+    /// Drop a path's claim in the in-flight registry so other builds
+    /// stop deferring to it.
+    fn deregister(&mut self, path: &str) {
+        if self.registered.remove(path) {
+            self.ctx.staging_inflight.lock().unwrap().remove(path);
+        }
+    }
+
+    fn deregister_all(&mut self) {
+        if self.registered.is_empty() {
+            return;
+        }
+        let mut inflight = self.ctx.staging_inflight.lock().unwrap();
+        for p in self.registered.drain() {
+            inflight.remove(&p);
+        }
     }
 
     pub(super) fn feed_path_info(&mut self, pi: &PathInfoMsg) -> Result<()> {
@@ -245,14 +297,17 @@ impl ActiveBuild {
             if send_failed {
                 bail!("input import ended early for {}", n.store_path);
             }
+            self.deregister(&n.store_path);
             self.inputs.push(n.store_path);
         }
         Ok(())
     }
 
-    /// Returns true when the tmp dir transfer completed, which is the
-    /// signal to start the build.
-    pub(super) async fn feed_tmp_dir(&mut self, t: crate::proto::TmpDirArchive) -> Result<bool> {
+    /// Reports staging progress; the tmp dir eof completes round one.
+    pub(super) async fn feed_tmp_dir(
+        &mut self,
+        t: crate::proto::TmpDirArchive,
+    ) -> Result<StagingStatus> {
         let (tx, _) = self.tmp_unpacker.get_or_insert_with(|| {
             let dest = self.dir.join("top");
             let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
@@ -275,31 +330,32 @@ impl ActiveBuild {
             let (tx, task) = self.tmp_unpacker.take().unwrap();
             drop(tx);
             task.await??;
-            if self.importer.is_some() {
-                bail!("tmp dir transfer finished during an input NAR transfer");
-            }
-            self.finish_staging().await?;
-            return Ok(true);
+            self.tmp_dir_done = true;
+            return self.complete_staging().await;
         }
-        Ok(false)
+        Ok(StagingStatus::InProgress)
     }
 
-    /// Inputs the hub skipped (streamed for an earlier build in this
-    /// session) never got a NAR here; verify they are valid in the
-    /// local store before treating them as bind-mount sources.
-    async fn finish_staging(&mut self) -> Result<()> {
-        if self.pending.is_empty() {
-            return Ok(());
+    /// End of a staging round (tmp dir eof or StagingComplete): every
+    /// requested NAR must have arrived; deferred paths that are still
+    /// invalid are re-requested instead of failing the build.
+    pub(super) async fn complete_staging(&mut self) -> Result<StagingStatus> {
+        if !self.tmp_dir_done {
+            bail!("hub signalled staging completion before the tmp dir arrived");
+        }
+        if self.importer.is_some() {
+            bail!("staging round ended during an input NAR transfer");
+        }
+        if let Some(p) = self.pending.keys().next() {
+            bail!("hub never sent a NAR for requested input {p}");
+        }
+        if self.deferred.is_empty() {
+            return Ok(StagingStatus::Ready);
         }
         let store_dir = StoreDir::default();
         let mut set = StorePathSet::new();
-        let mut skipped = Vec::new();
-        for (p, info) in std::mem::take(&mut self.pending) {
-            if info.is_some() {
-                bail!("hub sent path info but no NAR for {p}");
-            }
-            set.insert(store_dir.parse(&p)?);
-            skipped.push(p);
+        for p in &self.deferred {
+            set.insert(store_dir.parse(p)?);
         }
         let daemon = self
             .daemon
@@ -308,16 +364,34 @@ impl ActiveBuild {
         let valid = daemon
             .query_valid_paths(&set, false)
             .await
-            .context("re-checking inputs staged for earlier builds")?;
-        for p in skipped {
-            if !valid.contains(&store_dir.parse(&p)?) {
-                bail!(
-                    "input {p} was staged for an earlier build but is not valid in the local store"
-                );
+            .context("re-checking inputs another build was importing")?;
+        let mut still_missing = Vec::new();
+        for p in std::mem::take(&mut self.deferred) {
+            if valid.contains(&store_dir.parse(&p)?) {
+                self.inputs.push(p);
+            } else {
+                still_missing.push(p);
             }
-            self.inputs.push(p);
         }
-        Ok(())
+        if still_missing.is_empty() {
+            return Ok(StagingStatus::Ready);
+        }
+        if self.resend_rounds >= MAX_RESEND_ROUNDS {
+            bail!(
+                "input {} was expected from another build's import but never became valid",
+                still_missing[0]
+            );
+        }
+        self.resend_rounds += 1;
+        // This build imports them itself now: claim and expect them.
+        let mut inflight = self.ctx.staging_inflight.lock().unwrap();
+        for p in &still_missing {
+            if inflight.insert(p.clone()) {
+                self.registered.insert(p.clone());
+            }
+            self.pending.insert(p.clone(), None);
+        }
+        Ok(StagingStatus::NeedResend(still_missing))
     }
 
     /// Tear down a build abandoned before execution: stop the import
@@ -325,6 +399,7 @@ impl ActiveBuild {
     /// daemon connection (and with it the temp roots) drops here; a
     /// half-imported path is the daemon's to clean up.
     pub(super) async fn abort(mut self) {
+        self.deregister_all();
         if let Some(Importer { tx, task, .. }) = self.importer.take() {
             drop(tx);
             task.abort();

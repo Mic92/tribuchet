@@ -172,27 +172,34 @@ mod tests {
 
     /// A message larger than one read buffer must be reassembled, and
     /// reading it must not consume the already-queued next message.
+    /// Sent from a thread: it exceeds macOS's socket buffer.
     #[test]
     fn large_message_leaves_the_next_one_intact() {
         let (a, b) = UnixStream::pair().unwrap();
+        let build_id = "x".repeat(64 * 1024);
         let request = AdoptRequest {
-            build_id: "x".repeat(64 * 1024),
+            build_id: build_id.clone(),
         };
-        send_call(&a, METHOD_ADOPT, &request, &[]).unwrap();
-        send_reply(
-            &a,
-            &StartReply {
-                pid: 7,
-                scratch_dir: "/scratch/next".into(),
-            },
-            &[],
-        )
-        .unwrap();
+        let sender = {
+            std::thread::spawn(move || {
+                send_call(&a, METHOD_ADOPT, &request, &[]).unwrap();
+                send_reply(
+                    &a,
+                    &StartReply {
+                        pid: 7,
+                        scratch_dir: "/scratch/next".into(),
+                    },
+                    &[],
+                )
+                .unwrap();
+            })
+        };
 
         let (_, received, _): (_, AdoptRequest, _) = recv_call(&b).unwrap();
-        assert_eq!(received, request);
+        assert_eq!(received.build_id, build_id);
         let (reply, _): (StartReply, _) = recv_reply(&b).unwrap();
         assert_eq!(reply.scratch_dir, "/scratch/next");
+        sender.join().unwrap();
     }
 
     #[test]
