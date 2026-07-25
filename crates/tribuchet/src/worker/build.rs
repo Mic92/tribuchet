@@ -545,7 +545,7 @@ async fn pack_extras(
         .map(String::as_str)
         .chain(spec_outputs.iter().map(String::as_str))
         .collect();
-    let mut queue: Vec<String> = outputs
+    let queue: Vec<String> = outputs
         .iter()
         .flat_map(|o| o.references.iter())
         .filter(|r| !known.contains(r.as_str()))
@@ -555,41 +555,7 @@ async fn pack_extras(
         return Ok(Vec::new());
     }
     let store_dir = StoreDir::default();
-    let mut daemon = DaemonClient::builder()
-        .connect_daemon()
-        .await
-        .context("connecting to the local nix-daemon")?;
-    // Transitive closure: the hub daemon rejects an import whose
-    // references are not already valid.
-    let mut infos: HashMap<String, UnkeyedValidPathInfo> = HashMap::new();
-    while let Some(path) = queue.pop() {
-        if infos.contains_key(&path) {
-            continue;
-        }
-        let sp = StorePath::from_base_path(store_base(&path))
-            .with_context(|| format!("parsing extra path {path}"))?;
-        // Hold a temp root so the daemon does not GC the path while
-        // we read it.
-        daemon
-            .add_temp_root(&sp)
-            .await
-            .with_context(|| format!("temp-rooting {path}"))?;
-        let info = daemon
-            .query_path_info(&sp)
-            .await
-            .with_context(|| format!("queryPathInfo {path}"))?
-            .ok_or_else(|| anyhow::anyhow!("extra {path} vanished from store"))?;
-        for r in &info.references {
-            let r = r
-                .to_absolute_path(&store_dir)
-                .to_string_lossy()
-                .into_owned();
-            if !known.contains(r.as_str()) {
-                queue.push(r);
-            }
-        }
-        infos.insert(path, info);
-    }
+    let mut infos = extra_closure(queue, &known, &store_dir).await?;
     // Referenced-before-referrer, matching hub-side sequential import.
     let ordered = topo_order(infos.keys().cloned(), |p| {
         infos[p]
@@ -656,6 +622,45 @@ async fn pack_extras(
         });
     }
     Ok(out)
+}
+
+/// Walk `queue` into a transitive closure of path infos, temp-rooting
+/// each path so the daemon does not GC it while we read it. The hub
+/// daemon rejects an import whose references are not already valid.
+async fn extra_closure(
+    mut queue: Vec<String>,
+    known: &BTreeSet<&str>,
+    store_dir: &StoreDir,
+) -> Result<HashMap<String, UnkeyedValidPathInfo>> {
+    let mut daemon = DaemonClient::builder()
+        .connect_daemon()
+        .await
+        .context("connecting to the local nix-daemon")?;
+    let mut infos: HashMap<String, UnkeyedValidPathInfo> = HashMap::new();
+    while let Some(path) = queue.pop() {
+        if infos.contains_key(&path) {
+            continue;
+        }
+        let sp = StorePath::from_base_path(store_base(&path))
+            .with_context(|| format!("parsing extra path {path}"))?;
+        daemon
+            .add_temp_root(&sp)
+            .await
+            .with_context(|| format!("temp-rooting {path}"))?;
+        let info = daemon
+            .query_path_info(&sp)
+            .await
+            .with_context(|| format!("queryPathInfo {path}"))?
+            .ok_or_else(|| anyhow::anyhow!("extra {path} vanished from store"))?;
+        for r in &info.references {
+            let r = r.to_absolute_path(store_dir).to_string_lossy().into_owned();
+            if !known.contains(r.as_str()) {
+                queue.push(r);
+            }
+        }
+        infos.insert(path, info);
+    }
+    Ok(infos)
 }
 
 struct NarPackResult {

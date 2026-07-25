@@ -870,7 +870,7 @@ fn apply_process_limits(system: &str) -> io::Result<()> {
     ) {
         0x0008 // PER_LINUX32
     } else {
-        unsafe { libc::personality(0xFFFF_FFFF) as libc::c_ulong }
+        libc::c_ulong::from(unsafe { libc::personality(0xFFFF_FFFF) }.cast_unsigned())
     };
     unsafe {
         libc::personality(base | 0x0004_0000 /* ADDR_NO_RANDOMIZE */)
