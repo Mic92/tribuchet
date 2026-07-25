@@ -1,7 +1,7 @@
-# The builder restricts its output to owner-only permissions (like
-# python's dist outputs). The worker packs as an unprivileged uid
+# The builder restricts its output to owner-only permissions, like
+# python's dist outputs. The worker packs as an unprivileged uid
 # while the files belong to the leased build uid, so reading them
-# takes the idmapped pack mount.
+# takes the agent's make-readable pass.
 {
   bash,
   coreutils,

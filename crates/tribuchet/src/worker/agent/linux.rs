@@ -126,7 +126,6 @@ pub(super) fn spawn_builder(
     let (_ns_fd, ns_path) = userns::inherited_ns(&userns.fd)?;
     spec.leased_userns = Some(ns_path);
     spec.leased_uid_count.get_or_insert(UID_COUNT);
-    spec.pool_base = Some(userns.uid_base);
     spec.cgroup = confinement
         .cgroup_base
         .as_deref()

@@ -350,7 +350,7 @@ in derivation {{
 #[test]
 fn build_restricted_permissions() {
     // The builder tightens its output to owner-only permissions, so
-    // packing needs the idmapped mount to read it.
+    // packing needs the agent's make-readable pass.
     let out = succeed(
         Node::Hub,
         "nix-build /etc/tt/restrictedperms.nix --no-out-link",
