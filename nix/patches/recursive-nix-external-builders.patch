@@ -2,8 +2,8 @@ From: Tribuchet contributors
 Subject: [PATCH] external builders: read result.json for recursive-nix additions
 
 external-derivation-builder.cc rejects recursive-nix, and the
-base-class registerOutputs() scans outputs against inputPaths ∪
-scratchOutputs ∪ addedPaths. addedPaths is populated only by Nix's
+base-class registerOutputs() scans outputs against inputPaths,
+scratchOutputs and addedPaths. addedPaths is populated only by Nix's
 in-process recursive-nix daemon, so for an external builder it is
 always empty: paths an out-of-process recursive implementation
 realises during the build are silently dropped from the output's
@@ -15,40 +15,40 @@ between the build child's exit and registerOutputs(). The external
 builder's override reads an optional result.json next to build.json
 and inserts each entry of its addedPaths array into addedPaths.
 
-diff --git a/src/libstore/unix/build/derivation-builder.cc b/src/libstore/unix/build/derivation-builder.cc
-index fc877dd..8a37e45 100644
---- a/src/libstore/unix/build/derivation-builder.cc
-+++ b/src/libstore/unix/build/derivation-builder.cc
-@@ -441,6 +441,13 @@ private:
+diff --git a/src/libstore/unix/build/derivation-builder-impl.hh b/src/libstore/unix/build/derivation-builder-impl.hh
+index cdfe9a901..f8da5e2a8 100644
+--- a/src/libstore/unix/build/derivation-builder-impl.hh
++++ b/src/libstore/unix/build/derivation-builder-impl.hh
+@@ -193,6 +193,11 @@ public:
  
  protected:
  
 +    /**
-+     * Subclass hook between the build child's exit and
-+     * registerOutputs(), for inserting paths into addedPaths so the
-+     * reference scan in registerOutputs() sees them.
++     * Subclass hook to insert paths into addedPaths before registerOutputs().
 +     */
 +    virtual void processSandboxResult() {}
 +
      /**
-      * Delete the temporary directory, if we have one.
-      *
-@@ -600,6 +607,10 @@ SingleDrvOutputs DerivationBuilderImpl::unprepareBuild()
+      * Acquire a build user lock. Return nullptr if no lock is available.
+      */
+diff --git a/src/libstore/unix/build/derivation-builder.cc b/src/libstore/unix/build/derivation-builder.cc
+index 3b02dfc4f..d63b33cd9 100644
+--- a/src/libstore/unix/build/derivation-builder.cc
++++ b/src/libstore/unix/build/derivation-builder.cc
+@@ -239,6 +239,8 @@ SingleDrvOutputs DerivationBuilderImpl::unprepareBuild()
          };
      }
  
-+    /* Subclass hook: insert recursive-nix additions into addedPaths
-+       before the reference scan in registerOutputs(). */
 +    processSandboxResult();
 +
      /* Compute the FS closure of the outputs and register them as
         being valid. */
      auto builtOutputs = registerOutputs();
 diff --git a/src/libstore/unix/build/external-derivation-builder.cc b/src/libstore/unix/build/external-derivation-builder.cc
-index 96301af..b90e03c 100644
+index 01002accd..0328e7856 100644
 --- a/src/libstore/unix/build/external-derivation-builder.cc
 +++ b/src/libstore/unix/build/external-derivation-builder.cc
-@@ -30,9 +30,6 @@ struct ExternalDerivationBuilder : DerivationBuilderImpl
+@@ -35,9 +35,6 @@ struct ExternalDerivationBuilder : DerivationBuilderImpl
  
      void startChild() override
      {
@@ -58,17 +58,14 @@ index 96301af..b90e03c 100644
          auto json = nlohmann::json::object();
  
          json.emplace("version", 1);
-@@ -104,6 +101,28 @@ struct ExternalDerivationBuilder : DerivationBuilderImpl
+@@ -109,6 +106,29 @@ struct ExternalDerivationBuilder : DerivationBuilderImpl
              }
          });
      }
 +
 +    /**
-+     * Insert entries of `addedPaths` in an optional `result.json`
-+     * next to `build.json` into addedPaths, so an external
-+     * recursive-nix implementation (where Nix itself never sees the
-+     * AddToStore calls) can still have its additions flow into the
-+     * reference scan in registerOutputs().
++     * Read the addedPaths of an external recursive-nix implementation
++     * from an optional result.json next to build.json.
 +     */
 +    void processSandboxResult() override
 +    {
@@ -81,9 +78,13 @@ index 96301af..b90e03c 100644
 +        if (added == result.end() || !added->is_array())
 +            return;
 +
++        std::promise<void> done;
++        done.set_value();
++        auto ready = done.get_future().share();
++        auto state(state_.lock());
 +        for (auto & p : *added)
-+            addedPaths.insert(store.parseStorePath(p.get<std::string>()));
++            state->addedPaths.emplace(store.parseStorePath(p.get<std::string>()), ready);
 +    }
  };
  
- DerivationBuilderUnique makeExternalDerivationBuilder(
+ } // namespace
