@@ -480,7 +480,7 @@ async fn session_loop(
                 let occupied = max_jobs as usize - ctx.slots.available_permits();
                 let running = occupied.saturating_sub(pending.len() + active.len());
                 out_tx.send(msg(worker_message::Msg::Heartbeat(Heartbeat {
-                    running_jobs: running as u32,
+                    running_jobs: u32::try_from(running).unwrap_or(u32::MAX),
                     load1: loadavg1(),
                 }))).await?;
                 continue;
@@ -492,39 +492,7 @@ async fn session_loop(
         let Some(m) = m.msg else { continue };
         match m {
             hub_message::Msg::Assignment(a) => {
-                // A key we already hold means a hub (likely freshly
-                // restarted) re-dispatched a build we are running or
-                // have finished: adopt the new build_id and deliver
-                // the result when there is one, instead of building
-                // again.
-                if ctx.adopt_assignment(&a, out_tx) {
-                    tracing::info!(id = a.build_id, key = a.dedupe_key, "build resumed");
-                    out_tx
-                        .send(msg(worker_message::Msg::Resumed(Resumed {
-                            build_id: a.build_id.clone(),
-                        })))
-                        .await?;
-                    let ctx = ctx.clone();
-                    tokio::task::spawn_blocking(move || try_deliver(&ctx, &a.dedupe_key));
-                    continue;
-                }
-                // Resumed assignments are credit-free on the hub, so
-                // never funded a permit into `pending`.
-                let permit = pending.pop();
-                tracing::info!(id = a.build_id, "build assigned");
-                // build ids are never reused; a duplicate is a confused hub
-                if let Some(old) = active.remove(&a.build_id) {
-                    tracing::warn!(id = old.assignment.build_id, "discarding duplicate build");
-                    old.abort().await;
-                }
-                let build_id = a.build_id.clone();
-                match validate_assignment(&a).and_then(|()| ActiveBuild::new(a, ctx.clone())) {
-                    Ok(mut b) => {
-                        b.permit = permit;
-                        active.insert(build_id, b);
-                    }
-                    Err(e) => fail_build(out_tx, &build_id, &e).await?,
-                }
+                handle_assignment(a, active, &mut pending, out_tx, ctx).await?;
             }
             hub_message::Msg::PathOffer(offer) => {
                 let Some(build) = active.get_mut(&offer.build_id) else {
@@ -582,29 +550,7 @@ async fn session_loop(
                     abort_active(active, &id, out_tx, &e).await?;
                 }
             }
-            hub_message::Msg::Cancel(c) => {
-                tracing::info!(id = c.build_id, "hub cancelled the build");
-                // Still staging: tear it down right here. Already
-                // executing: flag its dedupe key for the supervising
-                // loop. The key is the stable identity; the build_id
-                // the hub knows may predate a concurrent resume.
-                if let Some(build) = active.remove(&c.build_id) {
-                    build.abort().await;
-                    fail_build(out_tx, &c.build_id, &anyhow::anyhow!("build cancelled")).await?;
-                } else {
-                    // Only flag builds that are still running: a key
-                    // flagged for an already-finished build would
-                    // never be consumed and would kill the next build
-                    // sharing that dedupe key. The flag is set while
-                    // holding the registry lock so a build finishing
-                    // concurrently (record_finished) cannot slip
-                    // between the check and the insert.
-                    let map = ctx.resumable.lock().unwrap();
-                    if map.get(&c.dedupe_key).is_some_and(|e| e.finished.is_none()) {
-                        ctx.cancelled.lock().unwrap().insert(c.dedupe_key);
-                    }
-                }
-            }
+            hub_message::Msg::Cancel(c) => handle_cancel(c, active, out_tx, ctx).await?,
             hub_message::Msg::ResultAck(a) => {
                 ack_delivery(ctx, &a.dedupe_key, &a.build_id);
             }
@@ -642,6 +588,77 @@ async fn advance_staging(
                 })))
                 .await?;
         }
+    }
+    Ok(())
+}
+/// Cancel a build. Still staging: tear it down right here. Already
+/// executing: flag its dedupe key for the supervising loop. The key
+/// is the stable identity, the build_id the hub knows may predate a
+/// concurrent resume.
+async fn handle_cancel(
+    c: crate::proto::CancelBuild,
+    active: &mut HashMap<String, ActiveBuild>,
+    out_tx: &mpsc::Sender<WorkerMessage>,
+    ctx: &Arc<WorkerCtx>,
+) -> Result<()> {
+    tracing::info!(id = c.build_id, "hub cancelled the build");
+    if let Some(build) = active.remove(&c.build_id) {
+        build.abort().await;
+        fail_build(out_tx, &c.build_id, &anyhow::anyhow!("build cancelled")).await?;
+    } else {
+        // Only flag builds that are still running: a key flagged for
+        // an already-finished build would never be consumed and would
+        // kill the next build sharing that dedupe key. The flag is
+        // set while holding the registry lock so a build finishing
+        // concurrently in record_finished cannot slip between the
+        // check and the insert.
+        let map = ctx.resumable.lock().unwrap();
+        if map.get(&c.dedupe_key).is_some_and(|e| e.finished.is_none()) {
+            ctx.cancelled.lock().unwrap().insert(c.dedupe_key);
+        }
+    }
+    Ok(())
+}
+
+/// Adopt a re-dispatched build or stage a fresh assignment.
+async fn handle_assignment(
+    a: BuildAssignment,
+    active: &mut HashMap<String, ActiveBuild>,
+    pending: &mut Vec<tokio::sync::OwnedSemaphorePermit>,
+    out_tx: &mpsc::Sender<WorkerMessage>,
+    ctx: &Arc<WorkerCtx>,
+) -> Result<()> {
+    // A key we already hold means a hub (likely freshly restarted)
+    // re-dispatched a build we are running or have finished: adopt
+    // the new build_id and deliver the result when there is one,
+    // instead of building again.
+    if ctx.adopt_assignment(&a, out_tx) {
+        tracing::info!(id = a.build_id, key = a.dedupe_key, "build resumed");
+        out_tx
+            .send(msg(worker_message::Msg::Resumed(Resumed {
+                build_id: a.build_id.clone(),
+            })))
+            .await?;
+        let ctx = ctx.clone();
+        tokio::task::spawn_blocking(move || try_deliver(&ctx, &a.dedupe_key));
+        return Ok(());
+    }
+    // Resumed assignments are credit-free on the hub, so never funded
+    // a permit into `pending`.
+    let permit = pending.pop();
+    tracing::info!(id = a.build_id, "build assigned");
+    // build ids are never reused; a duplicate is a confused hub
+    if let Some(old) = active.remove(&a.build_id) {
+        tracing::warn!(id = old.assignment.build_id, "discarding duplicate build");
+        old.abort().await;
+    }
+    let build_id = a.build_id.clone();
+    match validate_assignment(&a).and_then(|()| ActiveBuild::new(a, ctx.clone())) {
+        Ok(mut b) => {
+            b.permit = permit;
+            active.insert(build_id, b);
+        }
+        Err(e) => fail_build(out_tx, &build_id, &e).await?,
     }
     Ok(())
 }

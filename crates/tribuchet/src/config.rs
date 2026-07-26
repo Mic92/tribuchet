@@ -182,7 +182,7 @@ pub struct WorkerConfig {
     pub spawn_agents: u32,
     /// First uid used by spawned agents. Agent i runs as uid base+i-1
     /// and maps the 65536-uid block starting at base+i*65536. Needs a
-    /// root worker. Unset, builds share the worker uid.
+    /// root worker. If unset, builds share the worker uid.
     #[serde(default)]
     pub agent_uid_base: Option<u32>,
 }

@@ -11,9 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 
-/// Uids per agent: the agent's own uid, then its 65536-uid block.
-/// Agent i gets uid `base + i - 1` and block `base + i * 65536`, so
-/// builds never share the agent's uid.
+/// Size of each agent's mapped uid block.
 const UID_BLOCK: u32 = 65536;
 
 /// One spawned agent slot.

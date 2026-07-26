@@ -186,6 +186,10 @@ $ podman run -d --name tribuchet-worker \
     tribuchet-worker:latest
 ```
 
+The extra syscall rule the sandbox needs is also available on its own
+in [`nix/seccomp-additions.json`](nix/seccomp-additions.json), to
+append to a base profile of your choice.
+
 For docker replace `unmask=ALL` with `systempaths=unconfined`. On
 Kubernetes ship the profile as a `Localhost` seccomp profile, or fall
 back to `Unconfined`, and set `procMount: Unmasked`.
