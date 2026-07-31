@@ -1,0 +1,103 @@
+// Messages spoken with the per-uid build agents. One daemon per pool
+// user; a connection whose Start is accepted holds the lease. The
+// agent runs one build at a time and survives worker restarts.
+// Control calls (Kill, Adopt, Finish, Cleanup) are accepted on any
+// connection; only a second Start is refused with ERROR_BUSY.
+syntax = "proto3";
+package agent;
+
+// One request from the worker; the agent answers with a Reply.
+message Call {
+  oneof call {
+    StartRequest start = 1;
+    AdoptRequest adopt = 2;
+    StatusRequest status = 3;
+    KillRequest kill = 4;
+    FinishRequest finish = 5;
+    CleanupRequest cleanup = 6;
+  }
+}
+
+// Kill, Finish and Cleanup answer with `empty`; ExitNotice arrives
+// later on the Start/Adopt connection.
+message Reply {
+  oneof reply {
+    string error = 1;
+    StartReply start = 2;
+    AdoptReply adopt = 3;
+    StatusReply status = 4;
+    ExitNotice exit = 5;
+    Empty empty = 6;
+  }
+}
+
+message Empty {}
+
+// Run one build. Attached fd 0 is the zstd tar of the build's tmp dir;
+// the agent unpacks it into its scratch dir, rewrites env values
+// referencing `tmp_dir_in_sandbox`, confines and execs the builder.
+message StartRequest {
+  string build_id = 1;
+  string builder = 2;
+  repeated string args = 3;
+  map<string, string> env = 4;
+  // In-sandbox tmp dir path (e.g. "/build") env values may reference.
+  string tmp_dir_in_sandbox = 5;
+  // SBPL profile text, may reference SCRATCH_DIR_PARAM.
+  string profile = 6;
+  // Linux: the worker's sandbox spec as JSON; the agent fills in its
+  // scratch paths and user namespace and runs the setup stage with it.
+  optional string sandbox_json = 7;
+  // Scratch output store paths, acted on by Finish and Cleanup.
+  repeated string outputs = 8;
+  // memory.max for the build's cgroup. Unlimited when unset.
+  optional uint64 memory_max_bytes = 9;
+}
+
+// Attached fd 0 is a read handle on the build's log file.
+message StartReply {
+  int32 pid = 1;
+  // The agent-owned scratch dir the build runs in (its cwd).
+  string scratch_dir = 2;
+}
+
+// Sent on the Start/Adopt connection when the builder exits.
+message ExitNotice {
+  int32 exit_code = 1;
+}
+
+// Reattach to the build after a worker restart.
+message AdoptRequest {
+  string build_id = 1;
+}
+
+message AdoptReply {
+  int32 pid = 1;
+  string scratch_dir = 2;
+  // Set when the builder already exited.
+  optional int32 exit_code = 3;
+}
+
+// Which build the agent currently owns, so a fresh worker generation
+// can clean up builds a dead predecessor never recorded.
+message StatusRequest {}
+
+message StatusReply {
+  optional string current = 1;
+}
+
+// Kill the build's process group and every remaining process of the
+// agent's uid except the agent itself.
+message KillRequest {
+  string build_id = 1;
+}
+
+// Make the scratch output trees readable by the worker for packing.
+message FinishRequest {
+  string build_id = 1;
+}
+
+// Remove the scratch dir and outputs; the agent forgets the build.
+message CleanupRequest {
+  string build_id = 1;
+}

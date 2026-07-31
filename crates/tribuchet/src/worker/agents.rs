@@ -14,15 +14,12 @@ use std::sync::Mutex;
 #[cfg(target_os = "macos")]
 use std::fmt::Write as _;
 
-#[cfg(target_os = "macos")]
-use anyhow::bail;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 #[cfg(target_os = "macos")]
 use sandbox_proto::agent::SCRATCH_DIR_PARAM;
 use sandbox_proto::agent::{
-    AdoptReply, AdoptRequest, CleanupRequest, ExitNotice, FinishRequest, KillRequest, METHOD_ADOPT,
-    METHOD_CLEANUP, METHOD_FINISH, METHOD_KILL, METHOD_START, METHOD_STATUS, StartReply,
-    StartRequest, StatusReply, StatusRequest,
+    AdoptRequest, CleanupRequest, FinishRequest, KillRequest, StartRequest, StatusRequest, call,
+    reply,
 };
 use sandbox_proto::framing;
 
@@ -151,8 +148,15 @@ impl AgentBuild {
     /// zstd tar of the build's tmp dir, passed as an fd.
     pub(super) fn start(socket: &Path, req: &StartRequest, tmp_tar: &fs::File) -> Result<Self> {
         let conn = connect(socket)?;
-        framing::send_call(&conn, METHOD_START, req, &[tmp_tar.as_raw_fd()])?;
-        let (reply, fds): (StartReply, _) = framing::recv_reply(&conn)?;
+        framing::send_call(
+            &conn,
+            call::Call::Start(Box::new(req.clone())),
+            &[tmp_tar.as_raw_fd()],
+        )?;
+        let (reply, fds) = framing::recv_reply(&conn)?;
+        let reply::Reply::Start(reply) = reply else {
+            bail!("unexpected agent reply {reply:?}");
+        };
         Ok(Self {
             conn,
             pid: reply.pid,
@@ -167,13 +171,15 @@ impl AgentBuild {
         let conn = connect(socket)?;
         framing::send_call(
             &conn,
-            METHOD_ADOPT,
-            &AdoptRequest {
+            call::Call::Adopt(AdoptRequest {
                 build_id: build_id.into(),
-            },
+            }),
             &[],
         )?;
-        let (reply, fds): (AdoptReply, _) = framing::recv_reply(&conn)?;
+        let (reply, fds) = framing::recv_reply(&conn)?;
+        let reply::Reply::Adopt(reply) = reply else {
+            bail!("unexpected agent reply {reply:?}");
+        };
         let build = Self {
             conn,
             pid: reply.pid,
@@ -185,7 +191,10 @@ impl AgentBuild {
 
     /// Block until the agent reports the builder's exit.
     pub(super) fn wait_exit(&self) -> Result<i32> {
-        let (notice, _): (ExitNotice, _) = framing::recv_reply(&self.conn)?;
+        let (reply, _) = framing::recv_reply(&self.conn)?;
+        let reply::Reply::Exit(notice) = reply else {
+            bail!("unexpected agent reply {reply:?}");
+        };
         Ok(notice.exit_code)
     }
 }
@@ -203,19 +212,22 @@ fn log_fd(fds: Vec<std::os::fd::OwnedFd>) -> Result<fs::File> {
     ))
 }
 
-/// Fire a control call that replies with an empty object.
-fn control<T: serde::Serialize>(socket: &Path, method: &str, req: &T) -> Result<()> {
+/// Fire a control call that replies with an empty message.
+fn control(socket: &Path, call: call::Call) -> Result<()> {
     let conn = connect(socket)?;
-    framing::send_call(&conn, method, req, &[])?;
-    let (_, _): (serde_json::Value, _) = framing::recv_reply(&conn)?;
+    framing::send_call(&conn, call, &[])?;
+    framing::recv_reply(&conn)?;
     Ok(())
 }
 
 /// The build the agent behind `socket` currently owns, if any.
 pub(super) fn current_build(socket: &Path) -> Result<Option<String>> {
     let conn = connect(socket)?;
-    framing::send_call(&conn, METHOD_STATUS, &StatusRequest {}, &[])?;
-    let (reply, _): (StatusReply, _) = framing::recv_reply(&conn)?;
+    framing::send_call(&conn, call::Call::Status(StatusRequest {}), &[])?;
+    let (reply, _) = framing::recv_reply(&conn)?;
+    let reply::Reply::Status(reply) = reply else {
+        bail!("unexpected agent reply {reply:?}");
+    };
     Ok(reply.current)
 }
 
@@ -223,10 +235,9 @@ pub(super) fn current_build(socket: &Path) -> Result<Option<String>> {
 pub(super) fn kill(socket: &Path, build_id: &str) -> Result<()> {
     control(
         socket,
-        METHOD_KILL,
-        &KillRequest {
+        call::Call::Kill(KillRequest {
             build_id: build_id.into(),
-        },
+        }),
     )
 }
 
@@ -234,10 +245,9 @@ pub(super) fn kill(socket: &Path, build_id: &str) -> Result<()> {
 pub(super) fn finish(socket: &Path, build_id: &str) -> Result<()> {
     control(
         socket,
-        METHOD_FINISH,
-        &FinishRequest {
+        call::Call::Finish(FinishRequest {
             build_id: build_id.into(),
-        },
+        }),
     )
 }
 
@@ -246,10 +256,9 @@ pub(super) fn finish(socket: &Path, build_id: &str) -> Result<()> {
 pub(super) fn cleanup(socket: &Path, build_id: &str) -> Result<()> {
     control(
         socket,
-        METHOD_CLEANUP,
-        &CleanupRequest {
+        call::Call::Cleanup(CleanupRequest {
             build_id: build_id.into(),
-        },
+        }),
     )
 }
 
@@ -301,7 +310,7 @@ mod tests {
             ]),
             tmp_dir_in_sandbox: "/build".into(),
             profile: String::new(),
-            sandbox: None,
+            sandbox_json: None,
             outputs,
             memory_max_bytes: None,
         }

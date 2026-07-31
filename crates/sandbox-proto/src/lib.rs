@@ -1,8 +1,6 @@
 //! Wire protocol between the tribuchet worker and the per-uid build
-//! agents.
-//!
-//! The message types are plain serde structs with no OS calls; only
-//! the daemon speaking them cares about the platform.
+//! agents: protobuf messages (proto/agent.proto) framed over a unix
+//! socket that also carries file descriptors.
 
 pub mod agent;
 pub mod framing;

@@ -1849,8 +1849,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "nix",
- "serde",
- "serde_json",
+ "prost",
+ "prost-build",
 ]
 
 [[package]]

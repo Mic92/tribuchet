@@ -7,7 +7,7 @@
 //! (non-worker) uid. The builder is the agent's child, so builds
 //! survive worker restarts and the agent holds the log and exit
 //! status until the worker adopts them. The protocol lives in
-//! crates/sandbox-proto/src/agent.rs.
+//! crates/sandbox-proto/proto/agent.proto.
 
 use std::collections::HashMap;
 use std::fs;
@@ -18,11 +18,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use sandbox_proto::agent::{
-    AdoptReply, AdoptRequest, CleanupRequest, ERROR_BUSY, ERROR_UNKNOWN_BUILD, ExitNotice,
-    FinishRequest, KillRequest, METHOD_ADOPT, METHOD_CLEANUP, METHOD_FINISH, METHOD_KILL,
-    METHOD_START, METHOD_STATUS, StartReply, StartRequest, StatusReply,
+    AdoptReply, AdoptRequest, CleanupRequest, ERROR_BUSY, ERROR_UNKNOWN_BUILD, Empty, ExitNotice,
+    FinishRequest, KillRequest, StartReply, StartRequest, StatusReply, call, reply,
 };
 use sandbox_proto::framing;
 
@@ -166,18 +165,17 @@ fn handle(agent: &Arc<Agent>, conn: &UnixStream) -> Result<()> {
         "connection from uid {peer_uid}, only the worker uid {} may lease",
         agent.worker_uid
     );
-    let (method, params, fds): (_, serde_json::Value, _) = framing::recv_call(conn)?;
-    match method.as_str() {
-        METHOD_START => handle_start(agent, conn, serde_json::from_value(params)?, fds),
-        METHOD_ADOPT => handle_adopt(agent, conn, &serde_json::from_value(params)?),
-        METHOD_STATUS => {
+    let (call, fds) = framing::recv_call(conn)?;
+    match call {
+        call::Call::Start(req) => handle_start(agent, conn, *req, fds),
+        call::Call::Adopt(req) => handle_adopt(agent, conn, &req),
+        call::Call::Status(_) => {
             let current = agent.current.lock().unwrap().as_ref().map(|b| b.id.clone());
-            framing::send_reply(conn, &StatusReply { current }, &[])
+            framing::send_reply(conn, reply::Reply::Status(StatusReply { current }), &[])
         }
-        METHOD_KILL => handle_kill(agent, conn, &serde_json::from_value(params)?),
-        METHOD_FINISH => handle_finish(agent, conn, &serde_json::from_value(params)?),
-        METHOD_CLEANUP => handle_cleanup(agent, conn, &serde_json::from_value(params)?),
-        m => bail!("unknown method {m}"),
+        call::Call::Kill(req) => handle_kill(agent, conn, &req),
+        call::Call::Finish(req) => handle_finish(agent, conn, &req),
+        call::Call::Cleanup(req) => handle_cleanup(agent, conn, &req),
     }
 }
 
@@ -233,10 +231,10 @@ fn handle_start(
     tracing::info!(id = req.build_id, pid, "builder started");
     framing::send_reply(
         conn,
-        &StartReply {
+        reply::Reply::Start(StartReply {
             pid,
             scratch_dir: build_dir.to_string_lossy().into_owned(),
-        },
+        }),
         &[log.as_raw_fd()],
     )?;
     notify_exit(conn, &exit)
@@ -256,11 +254,11 @@ fn handle_adopt(agent: &Arc<Agent>, conn: &UnixStream, req: &AdoptRequest) -> Re
     let exit_code = *exit.0.lock().unwrap();
     framing::send_reply(
         conn,
-        &AdoptReply {
+        reply::Reply::Adopt(AdoptReply {
             pid,
             scratch_dir: build_dir.to_string_lossy().into_owned(),
             exit_code,
-        },
+        }),
         &[log.as_raw_fd()],
     )?;
     if exit_code.is_some() {
@@ -278,7 +276,7 @@ fn handle_kill(agent: &Arc<Agent>, conn: &UnixStream, req: &KillRequest) -> Resu
         }
     };
     agent.kill_sweep(Some(pid));
-    framing::send_reply(conn, &serde_json::json!({}), &[])
+    framing::send_reply(conn, reply::Reply::Empty(Empty {}), &[])
 }
 
 fn handle_finish(agent: &Arc<Agent>, conn: &UnixStream, req: &FinishRequest) -> Result<()> {
@@ -290,7 +288,7 @@ fn handle_finish(agent: &Arc<Agent>, conn: &UnixStream, req: &FinishRequest) -> 
         }
     };
     platform::finish(&agent.confinement, root.as_deref(), &outputs);
-    framing::send_reply(conn, &serde_json::json!({}), &[])
+    framing::send_reply(conn, reply::Reply::Empty(Empty {}), &[])
 }
 
 fn handle_cleanup(agent: &Arc<Agent>, conn: &UnixStream, req: &CleanupRequest) -> Result<()> {
@@ -303,7 +301,7 @@ fn handle_cleanup(agent: &Arc<Agent>, conn: &UnixStream, req: &CleanupRequest) -
     };
     agent.kill_sweep(Some(build.pid));
     platform::cleanup(&agent.confinement, &build);
-    framing::send_reply(conn, &serde_json::json!({}), &[])?;
+    framing::send_reply(conn, reply::Reply::Empty(Empty {}), &[])?;
     tracing::info!(id = build.id, "cleanup done");
     if agent.dedicated_uid {
         std::process::exit(0);
@@ -399,9 +397,9 @@ fn notify_exit(conn: &UnixStream, exit: &(Mutex<Option<i32>>, Condvar)) -> Resul
     }
     framing::send_reply(
         conn,
-        &ExitNotice {
+        reply::Reply::Exit(ExitNotice {
             exit_code: code.unwrap(),
-        },
+        }),
         &[],
     )
 }
