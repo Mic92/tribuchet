@@ -16,6 +16,7 @@ use harmonia_utils_signature::SecretKey;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
+use super::pins;
 use super::resume::{PackedExtra, PackedOutput};
 use super::{DaemonConn, WorkerCtx, sandbox, unix_now};
 use crate::chunkio::ChannelReader;
@@ -117,6 +118,13 @@ fn store_base(store_path: &str) -> &str {
     store_path.rsplit('/').next().unwrap_or(store_path)
 }
 
+async fn add_temp_root(daemon: &mut DaemonConn, path: &str, sp: &StorePath) -> Result<()> {
+    daemon
+        .add_temp_root(sp)
+        .await
+        .with_context(|| format!("adding temp root for {path}"))
+}
+
 /// Drive one AddToStoreNar: hub chunks -> zstd decode -> daemon. The
 /// daemon verifies the NAR against info.nar_hash and registers the
 /// path, so no separate integrity check is needed here.
@@ -179,21 +187,63 @@ impl ActiveBuild {
             let sp: StorePath = store_dir
                 .parse(p)
                 .with_context(|| format!("offered path {p:?} is not a store path"))?;
-            // Temp root before the validity check: the daemon must not
-            // GC the path between check and build start. Temp roots die
-            // with this connection, which the build keeps open.
-            daemon
-                .add_temp_root(&sp)
-                .await
-                .with_context(|| format!("adding temp root for {p}"))?;
             set.insert(sp.clone());
             parsed.push((p, sp));
         }
+        // Temp roots must exist before the validity check so the
+        // daemon cannot GC a path between check and build start. They
+        // die with this connection, which the build keeps open. A temp
+        // root on a valid path protects its whole closure, so with the
+        // reference graph from the store database only the closure
+        // roots (plus paths the database doesn't know) need their own
+        // AddTempRoot round trip. Without the graph, every path does.
+        let plan = {
+            let offered = offered.to_vec();
+            match tokio::task::spawn_blocking(move || {
+                let db = pins::StoreDb::open_readonly(pins::nix_db_path())?;
+                pins::plan_pins(&db, &offered)
+            })
+            .await?
+            {
+                Ok(plan) => Some(plan),
+                Err(e) => {
+                    tracing::debug!("store db unavailable, pinning all inputs: {e:#}");
+                    None
+                }
+            }
+        };
+        let mut pinned = HashSet::new();
+        for (p, sp) in &parsed {
+            if plan.as_ref().is_none_or(|plan| plan.pins.contains(*p)) {
+                add_temp_root(&mut daemon, p, sp).await?;
+                pinned.insert(*p);
+            }
+        }
         // One bulk validity query instead of a round trip per path.
-        let valid = daemon
+        let mut valid = daemon
             .query_valid_paths(&set, false)
             .await
             .context("querying valid paths")?;
+        // If the database called a path valid but the daemon does not,
+        // a GC raced our snapshot and the pinned closure roots may no
+        // longer cover everything. Root every path and re-check, which
+        // restores the root-before-check guarantee.
+        if let Some(plan) = &plan
+            && parsed
+                .iter()
+                .any(|(p, sp)| plan.db_valid.contains(*p) && !valid.contains(sp))
+        {
+            tracing::warn!("garbage collection raced input pinning. Pinning all inputs");
+            for (p, sp) in &parsed {
+                if !pinned.contains(*p) {
+                    add_temp_root(&mut daemon, p, sp).await?;
+                }
+            }
+            valid = daemon
+                .query_valid_paths(&set, false)
+                .await
+                .context("re-querying valid paths")?;
+        }
         let mut missing = Vec::new();
         // One check-and-insert under the lock, so of several builds
         // negotiating the same missing path exactly one requests it.
