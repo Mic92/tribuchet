@@ -112,7 +112,7 @@ pub(super) fn spawn_builder(
     build_dir: &Path,
     log: &fs::File,
 ) -> Result<(Child, Option<PathBuf>)> {
-    let Some(sandbox_json) = &req.sandbox else {
+    let Some(sandbox_json) = &req.sandbox_json else {
         return Ok((super::spawn_plain(req, build_dir, log)?, None));
     };
     let userns = confinement
@@ -120,7 +120,7 @@ pub(super) fn spawn_builder(
         .as_ref()
         .context("sandboxed build requested but the agent has no --uid-base")?;
     let mut spec: SandboxSpec =
-        serde_json::from_value(sandbox_json.clone()).context("decoding the sandbox spec")?;
+        serde_json::from_str(sandbox_json).context("decoding the sandbox spec")?;
     spec.root = scratch_root.join("root");
     spec.build_dir = build_dir.to_path_buf();
     let (_ns_fd, ns_path) = userns::inherited_ns(&userns.fd)?;

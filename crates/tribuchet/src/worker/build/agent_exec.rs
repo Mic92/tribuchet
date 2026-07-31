@@ -78,7 +78,7 @@ impl ActiveBuild {
         #[cfg(target_os = "linux")]
         let (profile, sandbox_json, mut spec) = {
             let spec = self.build_spec()?;
-            (String::new(), Some(serde_json::to_value(&spec)?), spec)
+            (String::new(), Some(serde_json::to_string(&spec)?), spec)
         };
         // Re-tar the staged tmp dir: the agent unpacks it into its own
         // scratch dir, since the worker's copy is not agent-writable.
@@ -93,7 +93,7 @@ impl ActiveBuild {
             env: a.env.clone(),
             tmp_dir_in_sandbox: a.tmp_dir_in_sandbox.clone(),
             profile,
-            sandbox: sandbox_json,
+            sandbox_json,
             outputs: outputs.clone(),
             memory_max_bytes: self.ctx.build_memory_max_bytes,
         };

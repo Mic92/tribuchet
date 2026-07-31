@@ -1,6 +1,7 @@
-//! Length-prefixed JSON messages (u32 little-endian, then the object)
-//! over a unix stream socket, with file descriptors attached via
-//! SCM_RIGHTS. gRPC cannot carry fds, hence the separate protocol.
+//! Length-prefixed protobuf messages (u32 little-endian, then the
+//! encoded [`agent::Call`]/[`agent::Reply`]) over a unix stream
+//! socket, with file descriptors attached via SCM_RIGHTS. gRPC cannot
+//! carry fds, hence the separate protocol.
 
 use std::io::{IoSlice, IoSliceMut, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -8,16 +9,16 @@ use std::os::unix::net::UnixStream;
 
 use anyhow::{Context, Result, bail, ensure};
 use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, sendmsg};
-use serde::{Deserialize, Serialize};
+use prost::Message;
+
+use crate::agent::{self, call, reply};
 
 /// Peers are worker and agent on the same host; anything bigger than
 /// this is a corrupted length prefix, not a real message.
 const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 
-/// Send one message: `{"method": ..., "parameters": ...}` for calls,
-/// `{"parameters": ...}` for replies, `{"error": ...}` for errors.
-fn send_message(sock: &UnixStream, message: &serde_json::Value, fds: &[RawFd]) -> Result<()> {
-    let body = serde_json::to_vec(message)?;
+fn send_message(sock: &UnixStream, body: &impl Message, fds: &[RawFd]) -> Result<()> {
+    let body = body.encode_to_vec();
     let mut buf = (u32::try_from(body.len())?).to_le_bytes().to_vec();
     buf.extend_from_slice(&body);
     let iov = [IoSlice::new(&buf)];
@@ -33,7 +34,7 @@ fn send_message(sock: &UnixStream, message: &serde_json::Value, fds: &[RawFd]) -
 /// Receive one message and any attached fds. Only the length prefix
 /// and the message body are read, so the peer's next message stays
 /// queued.
-fn recv_message(sock: &UnixStream) -> Result<(serde_json::Value, Vec<OwnedFd>)> {
+fn recv_message<M: Message + Default>(sock: &UnixStream) -> Result<(M, Vec<OwnedFd>)> {
     let mut len_buf = [0u8; 4];
     let mut cmsg_buf = nix::cmsg_space!([RawFd; 8]);
     // The first read also collects the attached fds.
@@ -70,33 +71,24 @@ fn recv_message(sock: &UnixStream) -> Result<(serde_json::Value, Vec<OwnedFd>)> 
     (&mut &*sock)
         .read_exact(&mut data)
         .context("receiving message")?;
-    let value = serde_json::from_slice(&data).context("parsing message")?;
+    let value = M::decode(data.as_slice()).context("decoding message")?;
     Ok((value, fds))
 }
 
 /// Send a method call.
 ///
 /// # Errors
-/// Serialization or socket errors.
-pub fn send_call<T: Serialize>(
-    sock: &UnixStream,
-    method: &str,
-    parameters: &T,
-    fds: &[RawFd],
-) -> Result<()> {
-    send_message(
-        sock,
-        &serde_json::json!({ "method": method, "parameters": parameters }),
-        fds,
-    )
+/// Socket errors.
+pub fn send_call(sock: &UnixStream, call: call::Call, fds: &[RawFd]) -> Result<()> {
+    send_message(sock, &agent::Call { call: Some(call) }, fds)
 }
 
 /// Send a successful reply.
 ///
 /// # Errors
-/// Serialization or socket errors.
-pub fn send_reply<T: Serialize>(sock: &UnixStream, parameters: &T, fds: &[RawFd]) -> Result<()> {
-    send_message(sock, &serde_json::json!({ "parameters": parameters }), fds)
+/// Socket errors.
+pub fn send_reply(sock: &UnixStream, reply: reply::Reply, fds: &[RawFd]) -> Result<()> {
+    send_message(sock, &agent::Reply { reply: Some(reply) }, fds)
 }
 
 /// Send an error reply.
@@ -104,30 +96,16 @@ pub fn send_reply<T: Serialize>(sock: &UnixStream, parameters: &T, fds: &[RawFd]
 /// # Errors
 /// Socket errors.
 pub fn send_error(sock: &UnixStream, error: &str) -> Result<()> {
-    send_message(sock, &serde_json::json!({ "error": error }), &[])
+    send_reply(sock, reply::Reply::Error(error.to_owned()), &[])
 }
 
-/// Receive a method call and deserialize its parameters.
+/// Receive a method call.
 ///
 /// # Errors
 /// Socket errors, a closed connection, or a malformed call.
-pub fn recv_call<T: for<'de> Deserialize<'de>>(
-    sock: &UnixStream,
-) -> Result<(String, T, Vec<OwnedFd>)> {
-    let (value, fds) = recv_message(sock)?;
-    let method = value
-        .get("method")
-        .and_then(|m| m.as_str())
-        .context("call without method")?
-        .to_owned();
-    let parameters = serde_json::from_value(
-        value
-            .get("parameters")
-            .cloned()
-            .unwrap_or(serde_json::json!({})),
-    )
-    .context("parsing call parameters")?;
-    Ok((method, parameters, fds))
+pub fn recv_call(sock: &UnixStream) -> Result<(call::Call, Vec<OwnedFd>)> {
+    let (msg, fds): (agent::Call, _) = recv_message(sock)?;
+    Ok((msg.call.context("call without a payload")?, fds))
 }
 
 /// Receive a reply; an error reply becomes an `Err`.
@@ -135,25 +113,18 @@ pub fn recv_call<T: for<'de> Deserialize<'de>>(
 /// # Errors
 /// Socket errors, a closed connection, a malformed reply, or an error
 /// reply from the peer.
-pub fn recv_reply<T: for<'de> Deserialize<'de>>(sock: &UnixStream) -> Result<(T, Vec<OwnedFd>)> {
-    let (value, fds) = recv_message(sock)?;
-    if let Some(error) = value.get("error").and_then(|e| e.as_str()) {
-        bail!("peer error: {error}");
+pub fn recv_reply(sock: &UnixStream) -> Result<(reply::Reply, Vec<OwnedFd>)> {
+    let (msg, fds): (agent::Reply, _) = recv_message(sock)?;
+    match msg.reply.context("reply without a payload")? {
+        reply::Reply::Error(e) => bail!("peer error: {e}"),
+        r => Ok((r, fds)),
     }
-    let parameters = serde_json::from_value(
-        value
-            .get("parameters")
-            .cloned()
-            .unwrap_or(serde_json::json!({})),
-    )
-    .context("parsing reply parameters")?;
-    Ok((parameters, fds))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{AdoptRequest, ERROR_BUSY, METHOD_ADOPT, StartReply};
+    use crate::agent::{AdoptRequest, ERROR_BUSY, StartReply};
 
     #[test]
     fn call_roundtrip_with_fds() {
@@ -162,11 +133,15 @@ mod tests {
         let request = AdoptRequest {
             build_id: "b1".into(),
         };
-        send_call(&a, METHOD_ADOPT, &request, &[devnull.as_raw_fd()]).unwrap();
+        send_call(
+            &a,
+            call::Call::Adopt(request.clone()),
+            &[devnull.as_raw_fd()],
+        )
+        .unwrap();
 
-        let (method, received, fds): (_, AdoptRequest, _) = recv_call(&b).unwrap();
-        assert_eq!(method, METHOD_ADOPT);
-        assert_eq!(received, request);
+        let (received, fds) = recv_call(&b).unwrap();
+        assert_eq!(received, call::Call::Adopt(request));
         assert_eq!(fds.len(), 1);
     }
 
@@ -182,22 +157,28 @@ mod tests {
         };
         let sender = {
             std::thread::spawn(move || {
-                send_call(&a, METHOD_ADOPT, &request, &[]).unwrap();
+                send_call(&a, call::Call::Adopt(request), &[]).unwrap();
                 send_reply(
                     &a,
-                    &StartReply {
+                    reply::Reply::Start(StartReply {
                         pid: 7,
                         scratch_dir: "/scratch/next".into(),
-                    },
+                    }),
                     &[],
                 )
                 .unwrap();
             })
         };
 
-        let (_, received, _): (_, AdoptRequest, _) = recv_call(&b).unwrap();
+        let (received, _) = recv_call(&b).unwrap();
+        let call::Call::Adopt(received) = received else {
+            panic!("unexpected call {received:?}");
+        };
         assert_eq!(received.build_id, build_id);
-        let (reply, _): (StartReply, _) = recv_reply(&b).unwrap();
+        let (reply, _) = recv_reply(&b).unwrap();
+        let reply::Reply::Start(reply) = reply else {
+            panic!("unexpected reply {reply:?}");
+        };
         assert_eq!(reply.scratch_dir, "/scratch/next");
         sender.join().unwrap();
     }
@@ -207,14 +188,17 @@ mod tests {
         let (a, b) = UnixStream::pair().unwrap();
         send_reply(
             &a,
-            &StartReply {
+            reply::Reply::Start(StartReply {
                 pid: 42,
                 scratch_dir: "/scratch/b1".into(),
-            },
+            }),
             &[],
         )
         .unwrap();
-        let (reply, fds): (StartReply, _) = recv_reply(&b).unwrap();
+        let (reply, fds) = recv_reply(&b).unwrap();
+        let reply::Reply::Start(reply) = reply else {
+            panic!("unexpected reply {reply:?}");
+        };
         assert_eq!(reply.pid, 42);
         assert!(fds.is_empty());
     }
@@ -223,7 +207,7 @@ mod tests {
     fn error_reply_is_err() {
         let (a, b) = UnixStream::pair().unwrap();
         send_error(&a, ERROR_BUSY).unwrap();
-        let err = recv_reply::<StartReply>(&b).unwrap_err();
+        let err = recv_reply(&b).unwrap_err();
         assert!(err.to_string().contains("Busy"), "{err}");
     }
 
@@ -231,6 +215,6 @@ mod tests {
     fn closed_connection_is_err() {
         let (a, b) = UnixStream::pair().unwrap();
         drop(a);
-        assert!(recv_reply::<StartReply>(&b).is_err());
+        assert!(recv_reply(&b).is_err());
     }
 }

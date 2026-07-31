@@ -7,8 +7,10 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 nix.workspace = true
-serde.workspace = true
-serde_json.workspace = true
+prost.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true
 
 [lints]
 workspace = true
