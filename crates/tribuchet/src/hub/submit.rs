@@ -72,10 +72,10 @@ fn validate_request(req: &BuildRequest) -> Result<(), Status> {
 
 /// Cap on the client-shipped tmp dir archive: it is buffered in hub
 /// memory for the lifetime of the job (redispatch resends it).
-const MAX_TMP_DIR_TAR_BYTES: usize = 64 * 1024 * 1024;
+const MAX_TMP_DIR_BYTES: usize = 64 * 1024 * 1024;
 
 /// Read the client submission stream: the request first, then the
-/// zstd-tarred topTmpDir up to its eof chunk.
+/// zstd-packed build tmp dir up to its eof chunk.
 async fn read_submission(
     stream: &mut Streaming<BuildMessage>,
 ) -> Result<(BuildRequest, Vec<u8>), Status> {
@@ -83,18 +83,18 @@ async fn read_submission(
     let Some(build_message::Msg::Request(req)) = stream.message().await?.and_then(|m| m.msg) else {
         return Err(bad("expected the build request first"));
     };
-    let mut tar = Vec::new();
+    let mut pack = Vec::new();
     loop {
         let Some(build_message::Msg::TmpDir(chunk)) = stream.message().await?.and_then(|m| m.msg)
         else {
             return Err(bad("expected tmp dir archive chunks"));
         };
-        if tar.len() + chunk.zstd_tar_chunk.len() > MAX_TMP_DIR_TAR_BYTES {
+        if pack.len() + chunk.zstd_chunk.len() > MAX_TMP_DIR_BYTES {
             return Err(Status::resource_exhausted("tmp dir archive too large"));
         }
-        tar.extend(chunk.zstd_tar_chunk);
+        pack.extend(chunk.zstd_chunk);
         if chunk.eof {
-            return Ok((req, tar));
+            return Ok((req, pack));
         }
     }
 }
@@ -221,12 +221,12 @@ impl attach_hub_server::AttachHub for AttachSvc {
         &self,
         request: Request<Streaming<BuildMessage>>,
     ) -> Result<Response<Self::BuildStream>, Status> {
-        let (req, tmp_dir_tar) = read_submission(&mut request.into_inner()).await?;
+        let (req, tmp_dir_pack) = read_submission(&mut request.into_inner()).await?;
         if req.outputs.is_empty() {
             return Err(Status::invalid_argument("build request without outputs"));
         }
         validate_request(&req)?;
-        let tmp_dir_tar = Arc::new(tmp_dir_tar);
+        let tmp_dir_pack = Arc::new(tmp_dir_pack);
         let key = dedupe_key(&req);
 
         let features = crate::build_json::required_system_features(&req.env);
@@ -257,7 +257,7 @@ impl attach_hub_server::AttachHub for AttachSvc {
                 id: new_id(),
                 key,
                 req,
-                tmp_dir_tar,
+                tmp_dir_pack,
                 features,
                 replay: replay.clone(),
                 attempts: 0,

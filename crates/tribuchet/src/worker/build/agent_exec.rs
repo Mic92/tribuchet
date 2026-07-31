@@ -80,11 +80,11 @@ impl ActiveBuild {
             let spec = self.build_spec()?;
             (String::new(), Some(serde_json::to_string(&spec)?), spec)
         };
-        // Re-tar the staged tmp dir: the agent unpacks it into its own
+        // Re-pack the staged tmp dir: the agent unpacks it into its own
         // scratch dir, since the worker's copy is not agent-writable.
         fs::write(
-            self.dir.join("top.tar.zst"),
-            crate::tmptar::tar_zstd_dir(&self.dir.join("top"))?,
+            self.dir.join("top.tmpdir.zst"),
+            crate::tmpdir::pack_zstd_dir(&self.dir.join("top/build"))?,
         )?;
         let req = sandbox_proto::agent::StartRequest {
             build_id: a.build_id.clone(),
@@ -100,7 +100,7 @@ impl ActiveBuild {
         let build = agents::AgentBuild::start(
             socket,
             &req,
-            &fs::File::open(self.dir.join("top.tar.zst"))?,
+            &fs::File::open(self.dir.join("top.tmpdir.zst"))?,
         )?;
         tracing::info!(
             id = a.build_id,

@@ -164,7 +164,7 @@ async fn stage_inputs(
         .await
         .expect("staging semaphore closed");
     stream_inputs(state, job, out_tx, missing).await?;
-    stream_tmp_dir(&job.id, &job.tmp_dir_tar, out_tx).await
+    stream_tmp_dir(&job.id, &job.tmp_dir_pack, out_tx).await
 }
 
 /// Stream inputs re-requested after staging, then send StagingComplete.
@@ -388,20 +388,20 @@ async fn stream_store_path(
     .await
 }
 
-/// Forward the client-shipped topTmpDir archive (structured attrs,
+/// Forward the client-shipped build tmp dir entries (structured attrs,
 /// passAsFile files) to the worker. Always sent last: its EOF tells
 /// the worker to start the build.
 async fn stream_tmp_dir(
     build_id: &str,
-    tmp_dir_tar: &[u8],
+    tmp_dir_pack: &[u8],
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
 ) -> Result<()> {
-    for chunk in tmp_dir_tar.chunks(crate::chunkio::CHUNK_SIZE) {
+    for chunk in tmp_dir_pack.chunks(crate::chunkio::CHUNK_SIZE) {
         send(
             out_tx,
             hub_message::Msg::TmpDir(TmpDirArchive {
                 build_id: build_id.into(),
-                zstd_tar_chunk: chunk.to_vec(),
+                zstd_chunk: chunk.to_vec(),
                 eof: false,
             }),
         )
@@ -411,7 +411,7 @@ async fn stream_tmp_dir(
         out_tx,
         hub_message::Msg::TmpDir(TmpDirArchive {
             build_id: build_id.into(),
-            zstd_tar_chunk: Vec::new(),
+            zstd_chunk: Vec::new(),
             eof: true,
         }),
     )

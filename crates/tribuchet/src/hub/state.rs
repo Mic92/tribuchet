@@ -142,9 +142,9 @@ pub(super) struct Job {
     pub(super) id: String,
     pub(super) key: String,
     pub(super) req: BuildRequest,
-    /// The client's zstd-tarred topTmpDir, buffered so redispatch can
+    /// The client's zstd-packed build tmp dir, buffered so redispatch can
     /// resend it without another round-trip to the client.
-    pub(super) tmp_dir_tar: Arc<Vec<u8>>,
+    pub(super) tmp_dir_pack: Arc<Vec<u8>>,
     /// requiredSystemFeatures; only workers advertising them get the job.
     pub(super) features: Vec<String>,
     pub(super) replay: Arc<Replay>,
@@ -453,7 +453,7 @@ mod tests {
                 system: "x86_64-linux".into(),
                 ..Default::default()
             },
-            tmp_dir_tar: Arc::new(Vec::new()),
+            tmp_dir_pack: Arc::new(Vec::new()),
             features: vec![],
             replay: replay.clone(),
             attempts: 0,

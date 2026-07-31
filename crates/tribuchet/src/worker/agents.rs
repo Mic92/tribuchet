@@ -144,14 +144,14 @@ pub(super) struct AgentBuild {
 }
 
 impl AgentBuild {
-    /// Start a build on the agent behind `socket`. `tmp_tar` is the
-    /// zstd tar of the build's tmp dir, passed as an fd.
-    pub(super) fn start(socket: &Path, req: &StartRequest, tmp_tar: &fs::File) -> Result<Self> {
+    /// Start a build on the agent behind `socket`. `tmp_pack` is the
+    /// zstd entry stream of the build's tmp dir, passed as an fd.
+    pub(super) fn start(socket: &Path, req: &StartRequest, tmp_pack: &fs::File) -> Result<Self> {
         let conn = connect(socket)?;
         framing::send_call(
             &conn,
             call::Call::Start(Box::new(req.clone())),
-            &[tmp_tar.as_raw_fd()],
+            &[tmp_pack.as_raw_fd()],
         )?;
         let (reply, fds) = framing::recv_reply(&conn)?;
         let reply::Reply::Start(reply) = reply else {
@@ -269,7 +269,7 @@ mod tests {
     use std::io::Read;
 
     /// A dev-mode agent (self-bound socket, same uid) plus a staged
-    /// tmp dir tar for it, shared by the tests below.
+    /// tmp dir pack for it, shared by the tests below.
     fn spawn_test_agent(dir: &Path) -> Result<(PathBuf, PathBuf)> {
         let socket = dir.join("agent.sock");
         let state_dir = dir.join("state");
@@ -288,13 +288,13 @@ mod tests {
         while !socket.exists() {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        // tmp dir carrying build/.attrs.json, like the client tar
-        let top = dir.join("top");
-        fs::create_dir_all(top.join("build"))?;
-        fs::write(top.join("build/.attrs.json"), "{}")?;
-        let tar_path = dir.join("top.tar.zst");
-        fs::write(&tar_path, crate::tmptar::tar_zstd_dir(&top)?)?;
-        Ok((socket, tar_path))
+        // build dir carrying .attrs.json, like the client pack
+        let build = dir.join("top/build");
+        fs::create_dir_all(&build)?;
+        fs::write(build.join(".attrs.json"), "{}")?;
+        let pack_path = dir.join("top.tmpdir.zst");
+        fs::write(&pack_path, crate::tmpdir::pack_zstd_dir(&build)?)?;
+        Ok((socket, pack_path))
     }
 
     fn start_request(build_id: &str, script: String, outputs: Vec<String>) -> StartRequest {
@@ -323,7 +323,7 @@ mod tests {
     #[test]
     fn agent_runs_a_build_end_to_end() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let (socket, tar_path) = spawn_test_agent(dir.path())?;
+        let (socket, pack_path) = spawn_test_agent(dir.path())?;
         let build_id = "0123456789abcdef0123456789abcdef";
         let output = dir.path().join("fake-output");
         let req = start_request(
@@ -336,7 +336,7 @@ mod tests {
             ),
             vec![output.to_string_lossy().into_owned()],
         );
-        let build = AgentBuild::start(&socket, &req, &fs::File::open(&tar_path)?)?;
+        let build = AgentBuild::start(&socket, &req, &fs::File::open(&pack_path)?)?;
         assert!(build.pid > 0);
         assert_eq!(build.wait_exit()?, 0);
 
@@ -366,7 +366,7 @@ mod tests {
     #[test]
     fn seatbelt_profile_confines_the_builder() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let (socket, tar_path) = spawn_test_agent(dir.path())?;
+        let (socket, pack_path) = spawn_test_agent(dir.path())?;
         let build_id = "00000000000000000000000000000001";
         // Canonical paths: the profile's path filters only match
         // canonical paths and macOS temp dirs live under the /var
@@ -394,7 +394,7 @@ mod tests {
             outputs.clone(),
         );
         req.profile = seatbelt_profile(&outputs, &[secret], false)?;
-        let build = AgentBuild::start(&socket, &req, &fs::File::open(&tar_path)?)?;
+        let build = AgentBuild::start(&socket, &req, &fs::File::open(&pack_path)?)?;
         assert_eq!(build.wait_exit()?, 0);
         assert!(!outside.exists());
         finish(&socket, build_id)?;

@@ -33,11 +33,11 @@ impl Confinement {
 /// dir itself.
 pub(super) fn stage_tmp_dir(
     _confinement: &Confinement,
-    scratch_root: &Path,
+    _scratch_root: &Path,
     build_dir: &Path,
-    tar: OwnedFd,
+    pack: OwnedFd,
 ) -> Result<()> {
-    super::stage_scratch(fs::File::from(tar), scratch_root, build_dir)
+    super::stage_scratch(fs::File::from(pack), build_dir)
 }
 
 /// Exec the builder under the request's seatbelt profile. Outputs land
