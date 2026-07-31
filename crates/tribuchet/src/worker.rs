@@ -18,6 +18,7 @@ pub mod binfmt;
 mod build;
 mod caps;
 mod logtail;
+mod pins;
 mod resume;
 pub mod sandbox;
 #[cfg(target_os = "linux")]
