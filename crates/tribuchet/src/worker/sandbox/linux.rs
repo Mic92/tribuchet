@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use nix::errno::Errno;
 use nix::unistd;
-use rustix::event::{PollFd, PollFlags, poll};
+
 use rustix::fs::{Mode, StatVfsMountFlags, statvfs};
 use rustix::io::Errno as Rerrno;
 use rustix::ioctl::{Opcode, Setter, ioctl, opcode};
@@ -12,13 +12,12 @@ use rustix::mount::{
     mount_bind_recursive, mount_change, mount_remount, move_mount, open_tree, unmount,
 };
 use rustix::net::{
-    AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
-    SendAncillaryMessage, SendFlags, SocketFlags, SocketType, recv, recvmsg, send, sendmsg,
-    socket_with, socketpair,
+    AddressFamily, RecvFlags, SendAncillaryBuffer, SendAncillaryMessage, SendFlags, SocketFlags,
+    SocketType, recv, sendmsg, socket_with,
 };
 use rustix::process::{
-    DumpableBehavior, Gid, Pid, PidfdFlags, Resource, Rlimit, Uid, WaitOptions, getgid, getpid,
-    getrlimit, getuid, pidfd_open, pivot_root, set_dumpable_behavior, setrlimit, umask, waitpid,
+    DumpableBehavior, Gid, Pid, Resource, Rlimit, Uid, WaitOptions, getrlimit, pivot_root,
+    set_dumpable_behavior, setrlimit, umask, waitpid,
 };
 use rustix::stdio::dup2_stdin;
 use rustix::system::{setdomainname, sethostname};
@@ -30,12 +29,11 @@ use std::ffi::CString;
 use std::fs;
 use std::io;
 use std::mem::MaybeUninit;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::{SandboxSpec, binfmt};
-use crate::netpolicy::NetPolicy;
 
 // Interface name for the presto-pasta tap inside the build netns.
 // Addressing (link-local guest/gateway, DNS forwarded on the gateway
@@ -292,7 +290,6 @@ fn enter_and_exec(
         system: &spec.system,
         binfmt_line: binfmt_line.as_deref(),
         net_isolation: spec.net_isolation,
-        net_policy: &spec.net_policy,
         leased_userns,
         build_dir: &spec.build_dir,
         binds: &spec.binds_ro,
@@ -371,90 +368,11 @@ fn rerr(step: &'static str) -> impl Fn(Rerrno) -> io::Error {
     move |e| io::Error::other(format!("{step}: {e}"))
 }
 
+/// Socketpair end to the agent's per-build forwarder thread, which
+/// runs the presto-pasta datapath on the tap fd sent over it (see
+/// [`NetHelper::attach`]).
 struct NetHelper {
     sock: OwnedFd,
-}
-
-/// Fork a helper that stays outside the sandbox and runs the
-/// presto-pasta datapath on the tap fd the sandbox side sends over
-/// once its netns exists (see [`NetHelper::attach`]). Before any
-/// traffic is processed the helper confines itself to its own
-/// single-uid user namespace. The helper exits when the build process
-/// (its parent) dies, watched via a pidfd.
-fn fork_net_helper(policy: NetPolicy) -> io::Result<NetHelper> {
-    let target = getpid();
-    let (ours, theirs) = socketpair(
-        AddressFamily::UNIX,
-        SocketType::DGRAM,
-        SocketFlags::CLOEXEC,
-        None,
-    )
-    .map_err(rerr("socketpair"))?;
-    match unsafe { unistd::fork() }.map_err(ioerr("fork net helper"))? {
-        unistd::ForkResult::Child => {
-            drop(ours);
-            let code = net_helper(&theirs, target, policy);
-            unsafe { libc::_exit(code) }
-        }
-        unistd::ForkResult::Parent { .. } => {
-            drop(theirs);
-            Ok(NetHelper { sock: ours })
-        }
-    }
-}
-
-/// Helper body: receive the tap fd, drop privileges, start the
-/// datapath, acknowledge readiness, then wait for the build process
-/// to die.
-fn net_helper(sock: &OwnedFd, build_pid: Pid, policy: NetPolicy) -> i32 {
-    let Ok(pidfd) = pidfd_open(build_pid, PidfdFlags::empty()) else {
-        return 1;
-    };
-    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
-    let mut cmsg = RecvAncillaryBuffer::new(&mut space);
-    let mut buf = [0u8; 8];
-    let mut iov = [io::IoSliceMut::new(&mut buf)];
-    if recvmsg(sock, &mut iov, &mut cmsg, RecvFlags::empty()).is_err() {
-        return 1;
-    }
-    let Some(RecvAncillaryMessage::ScmRights(mut fds)) = cmsg.drain().next() else {
-        // build process died before creating the tap; nothing to do
-        return 1;
-    };
-    let Some(tap) = fds.next() else { return 1 };
-    // Confine the helper to its own self-mapped user namespace; it
-    // only needs the tap fd and outbound sockets.
-    let uid = getuid().as_raw();
-    let gid = getgid().as_raw();
-    // SAFETY: only namespace flags; no fd-table, fs or VM sharing changes.
-    let confined = unsafe { unshare_unsafe(UnshareFlags::NEWUSER) }.is_ok()
-        && fs::write("/proc/self/setgroups", "deny").is_ok()
-        && fs::write("/proc/self/uid_map", format!("{uid} {uid} 1")).is_ok()
-        && fs::write("/proc/self/gid_map", format!("{gid} {gid} 1")).is_ok();
-    if !confined {
-        return 1;
-    }
-    let net = presto_pasta::Config {
-        allow_flow: Some(std::sync::Arc::new(move |d: &presto_pasta::FlowDst| {
-            policy.allows(d.proto, d.ip, d.port)
-        })),
-        ..presto_pasta::Config::default()
-    };
-    let presto = presto_pasta::Presto::new(net, tap);
-    // Readiness ack: the sandbox side waits for this before building.
-    if send(sock, b"ok", SendFlags::empty()).is_err() {
-        return 1;
-    }
-    std::thread::spawn(move || {
-        if let Err(e) = presto.run() {
-            tracing::warn!("presto-pasta datapath exited: {e}");
-        }
-    });
-    // Exit (and release the tap, letting the netns go away) once the
-    // build process is gone.
-    let mut pfds = [PollFd::new(&pidfd, PollFlags::IN)];
-    while poll(&mut pfds, None).is_err() {}
-    0
 }
 
 /// Open the tap device inside the just-created netns.
@@ -480,8 +398,8 @@ fn open_tap(name: &str) -> io::Result<OwnedFd> {
 
 impl NetHelper {
     /// Called after unshare: create and configure the tap in the new
-    /// netns, hand its fd to the helper and wait until the datapath
-    /// runs. The local tap fd is closed afterwards; the helper's copy
+    /// netns, hand its fd to the agent and wait until the datapath
+    /// runs. The local tap fd is closed afterwards; the agent's copy
     /// keeps the interface carrier up.
     fn attach(self) -> io::Result<()> {
         let net = presto_pasta::Config::default();
@@ -502,7 +420,7 @@ impl NetHelper {
         match recv(&self.sock, &mut ack, RecvFlags::empty()) {
             Ok((n, _)) if n > 0 => Ok(()),
             _ => Err(io::Error::other(
-                "presto-pasta helper failed to start the datapath",
+                "the agent failed to start the presto-pasta datapath",
             )),
         }
     }
@@ -583,7 +501,6 @@ struct SetupParams<'a> {
     system: &'a str,
     binfmt_line: Option<&'a str>,
     net_isolation: bool,
-    net_policy: &'a NetPolicy,
     /// The agent's pre-mapped user namespace to join.
     leased_userns: &'a Path,
     build_dir: &'a Path,
@@ -611,10 +528,18 @@ fn setup(p: &SetupParams) -> io::Result<()> {
     if private_net {
         flags |= UnshareFlags::NEWNET;
     }
-    // Forked before the leased userns is joined, so the helper stays
-    // outside the sandbox as the worker uid.
+    // The agent runs the datapath. This end of the tap-handoff
+    // socketpair was inherited across the setup stage's exec.
     let net_helper = if p.net_isolation && p.network {
-        Some(fork_net_helper(p.net_policy.clone())?)
+        let fd = p
+            .spec
+            .net_fwd_fd
+            .ok_or_else(|| io::Error::other("sandbox spec lacks the tap handoff fd"))?;
+        // SAFETY: the fd was opened by the agent for this handoff and
+        // nothing else in the setup stage owns it.
+        Some(NetHelper {
+            sock: unsafe { OwnedFd::from_raw_fd(fd) },
+        })
     } else {
         None
     };

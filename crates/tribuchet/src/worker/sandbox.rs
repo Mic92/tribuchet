@@ -84,6 +84,10 @@ pub struct SandboxSpec {
     /// Flow policy applied to that network.
     #[serde(default)]
     pub net_policy: NetPolicy,
+    /// Fd number of the tap-handoff socketpair end inherited from the
+    /// agent, which runs the presto-pasta forwarder for the netns.
+    #[serde(default)]
+    pub net_fwd_fd: Option<i32>,
     /// Static emulator binary for foreign-system builds, bound at
     /// binfmt::INTERP_PATH and registered in a per-userns binfmt_misc
     /// instance.
@@ -173,6 +177,7 @@ pub fn prepare(
         // filled in by the agent, like the namespace and cgroup
         net_isolation: opts.net_isolation && a.fixed_output,
         net_policy: opts.net_policy.clone(),
+        net_fwd_fd: None,
         emulator: opts.emulator.map(Path::to_path_buf),
         deny_read: opts.secrets.to_vec(),
         recursive_nix: opts.recursive_nix,

@@ -12,22 +12,32 @@
 //! stage, spawned here.
 
 use std::fs;
-use std::os::fd::{AsFd, OwnedFd};
+use std::io::IoSliceMut;
+use std::mem::MaybeUninit;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
+use rustix::event::{PollFd, PollFlags, poll};
+use rustix::io::{FdFlags, fcntl_setfd};
 use rustix::net::sockopt::socket_peercred;
+use rustix::net::{
+    AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendFlags, SocketFlags,
+    SocketType, recvmsg, send, socketpair,
+};
 use rustix::process::getuid;
-use rustix::process::{Gid, Uid};
+use rustix::process::{Gid, Pid, PidfdFlags, Uid, pidfd_open};
 use rustix::thread::{
     LinkNameSpaceType, move_into_link_name_space, set_thread_gid, set_thread_uid,
 };
 use sandbox_proto::agent::StartRequest;
 
 use super::{Build, Options, cgroup};
+use crate::netpolicy::NetPolicy;
 use crate::worker::sandbox::{self, SandboxSpec};
 use crate::worker::userns::{self, UsernsHolder};
 
@@ -141,7 +151,30 @@ pub(super) fn spawn_builder(
         cgroup::set_memory_max(cg, bytes)?;
     }
     sandbox::prepare_root(&mut spec).context("creating the sandbox root skeleton")?;
+    // Isolated network builds hand their tap fd back over this
+    // socketpair to the forwarder thread spawned below.
+    let net_fwd = if spec.net_isolation && spec.network {
+        let (ours, theirs) = socketpair(
+            AddressFamily::UNIX,
+            SocketType::DGRAM,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .context("creating the tap handoff socketpair")?;
+        // The setup stage inherits its end across the exec.
+        fcntl_setfd(&theirs, FdFlags::empty()).context("clearing close-on-exec")?;
+        spec.net_fwd_fd = Some(theirs.as_raw_fd());
+        Some((ours, theirs))
+    } else {
+        None
+    };
     let (child, spec_w) = sandbox::spawn(&spec, log)?;
+    if let Some((ours, theirs)) = net_fwd {
+        drop(theirs);
+        let policy = spec.net_policy.clone();
+        let build_pid = child.id();
+        std::thread::spawn(move || net_forward(&ours, policy, build_pid));
+    }
     // The setup stage waits for the spec on stdin; move it into the
     // build cgroup first so its cgroup namespace is rooted there.
     if let Some(cg) = &spec.cgroup {
@@ -151,6 +184,51 @@ pub(super) fn spawn_builder(
         sandbox::send_spec_to(&spec, w)?;
     }
     Ok((child, Some(spec.root)))
+}
+
+/// Per-build network forwarder: receive the tap fd the setup stage
+/// created inside its netns, run the presto-pasta datapath on it and
+/// stop it (letting the netns go away) once the build process dies.
+fn net_forward(sock: &OwnedFd, policy: NetPolicy, build_pid: u32) {
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut cmsg = RecvAncillaryBuffer::new(&mut space);
+    let mut buf = [0u8; 8];
+    let mut iov = [IoSliceMut::new(&mut buf)];
+    if recvmsg(sock, &mut iov, &mut cmsg, RecvFlags::empty()).is_err() {
+        return;
+    }
+    let Some(RecvAncillaryMessage::ScmRights(mut fds)) = cmsg.drain().next() else {
+        // The build died before creating the tap; nothing to forward.
+        return;
+    };
+    let Some(tap) = fds.next() else { return };
+    let net = presto_pasta::Config {
+        allow_flow: Some(Arc::new(move |d: &presto_pasta::FlowDst| {
+            policy.allows(d.proto, d.ip, d.port)
+        })),
+        ..presto_pasta::Config::default()
+    };
+    let mut presto = presto_pasta::Presto::new(net, tap);
+    let Ok(shutdown) = presto.shutdown_handle() else {
+        return;
+    };
+    let datapath = std::thread::spawn(move || {
+        if let Err(e) = presto.run() {
+            tracing::warn!("presto-pasta datapath exited: {e}");
+        }
+    });
+    // Readiness ack: the setup stage waits for this before building.
+    if send(sock, b"ok", SendFlags::empty()).is_ok()
+        && let Some(pid) = Pid::from_raw(build_pid.cast_signed())
+        && let Ok(pidfd) = pidfd_open(pid, PidfdFlags::empty())
+    {
+        let mut pfds = [PollFd::new(&pidfd, PollFlags::IN)];
+        while poll(&mut pfds, None).is_err() {}
+    }
+    // Dropping the handle stops the datapath. That closes the tap fd
+    // and lets the build netns go away.
+    drop(shutdown);
+    let _ = datapath.join();
 }
 
 /// Make outputs readable for the worker. Files of a namespace build
