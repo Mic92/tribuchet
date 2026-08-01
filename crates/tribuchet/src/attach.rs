@@ -26,7 +26,7 @@ use crate::proto::{
 
 pub fn run(build_json: &Path, socket: &Path) -> Result<()> {
     let build = BuildJson::load(build_json)?;
-    let rt = crate::rt::runtime("trib-attach")?;
+    let rt = crate::rt::runtime("trib-attach").context("creating the tokio runtime")?;
     let code = rt.block_on(run_async(build, socket.to_owned(), build_json.to_owned()))?;
     // Unix exposes only the low 8 bits of the exit status; never let a
     // nonzero code collapse to an observed 0.

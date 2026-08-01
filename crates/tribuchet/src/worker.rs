@@ -266,7 +266,7 @@ fn request_job() -> WorkerMessage {
 }
 
 pub fn run(opts: WorkerConfig) -> Result<()> {
-    let rt = crate::rt::runtime("trib-worker")?;
+    let rt = crate::rt::runtime("trib-worker").context("creating the tokio runtime")?;
     rt.block_on(run_async(opts))
 }
 
