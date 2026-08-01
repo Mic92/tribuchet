@@ -119,12 +119,12 @@ fn main() -> anyhow::Result<()> {
             worker_uid,
             uid_base,
             dedicated_uid,
-        } => worker::agent::run(&worker::agent::Options {
+        } => Ok(worker::agent::run(&worker::agent::Options {
             socket,
             state_dir,
             worker_uid,
             uid_base,
             dedicated_uid,
-        }),
+        })?),
     }
 }
