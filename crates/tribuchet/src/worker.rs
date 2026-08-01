@@ -32,7 +32,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
 use harmonia_store_remote::DaemonClient;
 use harmonia_utils_signature::SecretKey;
 use tokio::sync::{Semaphore, mpsc};
@@ -48,10 +47,77 @@ use resume::{
 };
 
 use crate::config::{Auth, WorkerConfig};
+use crate::errors::chain;
 use crate::proto::{
     BuildAssignment, BuildResult, Heartbeat, MissingPaths, Register, RequestJob, Resumed,
     WorkerMessage, hub_message, worker_hub_client::WorkerHubClient, worker_message,
 };
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("{msg}")]
+    Context {
+        msg: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    #[error("{0}")]
+    Msg(String),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Grpc(#[from] tonic::Status),
+    #[error(transparent)]
+    Transport(#[from] tonic::transport::Error),
+    #[error("hub connection lost")]
+    HubGone,
+    #[error("hub connection lost")]
+    Send(#[from] tokio::sync::mpsc::error::SendError<WorkerMessage>),
+    #[error(transparent)]
+    Framing(#[from] sandbox_proto::framing::Error),
+    #[error(transparent)]
+    Sandbox(#[from] sandbox::Error),
+    #[cfg(target_os = "linux")]
+    #[error(transparent)]
+    AgentSpawn(#[from] agent_spawn::Error),
+    #[error(transparent)]
+    Secret(#[from] crate::fsutil::Error),
+    #[error(transparent)]
+    TmpDir(#[from] crate::tmpdir::Error),
+    #[error(transparent)]
+    Nar(#[from] crate::nar::Error),
+    #[error(transparent)]
+    PathInfo(#[from] crate::store::PathInfoError),
+    #[error(transparent)]
+    StoreDb(#[from] harmonia_store_db::Error),
+    #[error(transparent)]
+    Db(#[from] rusqlite::Error),
+    #[error(transparent)]
+    StorePath(#[from] harmonia_store_path::ParseStorePathError),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Join(#[from] tokio::task::JoinError),
+    #[cfg(target_os = "macos")]
+    #[error(transparent)]
+    Fmt(#[from] std::fmt::Error),
+}
+
+type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Wraps any error with a message describing the failed step.
+fn err_ctx<E: Into<Box<dyn std::error::Error + Send + Sync>>>(
+    msg: impl Into<String>,
+) -> impl FnOnce(E) -> Error {
+    |source| Error::Context {
+        msg: msg.into(),
+        source: source.into(),
+    }
+}
+
+fn err_msg(m: impl Into<String>) -> Error {
+    Error::Msg(m.into())
+}
 
 /// Connection to the local nix-daemon; one per active build so its
 /// temp roots live exactly as long as the build.
@@ -206,15 +272,15 @@ fn load_signing_key(state_dir: &Path) -> Result<SecretKey> {
             .trim()
             .parse::<SecretKey>()
             .map_err(|e| {
-                anyhow::anyhow!(
+                err_msg(format!(
                     "{}: {e}; expected Nix secret key format (name:base64); \
                      delete the file to generate a fresh key",
                     path.display()
-                )
+                ))
             })
     } else {
         let key = SecretKey::generate(format!("{}-1", hostname()))
-            .map_err(|e| anyhow::anyhow!("generating signing key: {e}"))?;
+            .map_err(|e| err_msg(format!("generating signing key: {e}")))?;
         crate::fsutil::write_secret(&path, format!("{key}\n").as_bytes())?;
         Ok(key)
     }
@@ -266,7 +332,7 @@ fn request_job() -> WorkerMessage {
 }
 
 pub fn run(opts: WorkerConfig) -> Result<()> {
-    let rt = crate::rt::runtime("trib-worker").context("creating the tokio runtime")?;
+    let rt = crate::rt::runtime("trib-worker").map_err(err_ctx("creating the tokio runtime"))?;
     rt.block_on(run_async(opts))
 }
 
@@ -292,11 +358,14 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
         None => option_env!("TRIBUCHET_BIN_SH").map(PathBuf::from),
     };
     if opts.spawn_agents > 0 {
-        anyhow::ensure!(cfg!(target_os = "linux"), "spawn-agents requires Linux");
-        anyhow::ensure!(
-            opts.agent_sockets.is_empty(),
-            "agent-sockets and spawn-agents are mutually exclusive"
-        );
+        if !cfg!(target_os = "linux") {
+            return Err(err_msg("spawn-agents requires Linux"));
+        }
+        if !opts.agent_sockets.is_empty() {
+            return Err(err_msg(
+                "agent-sockets and spawn-agents are mutually exclusive",
+            ));
+        }
         #[cfg(target_os = "linux")]
         {
             opts.agent_sockets =
@@ -305,10 +374,9 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
     }
     // Every build runs on one agent, so the agent list bounds
     // concurrency.
-    anyhow::ensure!(
-        !opts.agent_sockets.is_empty(),
-        "agent-sockets must list at least one build agent"
-    );
+    if opts.agent_sockets.is_empty() {
+        return Err(err_msg("agent-sockets must list at least one build agent"));
+    }
     opts.max_jobs = opts
         .max_jobs
         .min(u32::try_from(opts.agent_sockets.len()).unwrap_or(u32::MAX));
@@ -322,13 +390,16 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
     let mut emulators = HashMap::new();
     for (system, path) in &opts.emulate {
         if !cfg!(target_os = "linux") {
-            anyhow::bail!("emulate requires Linux (binfmt_misc)");
+            return Err(err_msg("emulate requires Linux (binfmt_misc)"));
         }
         if binfmt::register_line(system).is_none() {
-            anyhow::bail!("emulate {system}: no binfmt magic known");
+            return Err(err_msg(format!("emulate {system}: no binfmt magic known")));
         }
         if !path.is_file() {
-            anyhow::bail!("emulate {system}: {} not found", path.display());
+            return Err(err_msg(format!(
+                "emulate {system}: {} not found",
+                path.display()
+            )));
         }
         if !opts.systems.contains(system) {
             opts.systems.push(system.clone());
@@ -402,11 +473,11 @@ async fn session(
     if matches!(opts.auth, Auth::Mtls) {
         let tls = ClientTlsConfig::new()
             .ca_certificate(Certificate::from_pem(
-                fs::read(&opts.ca_cert).context("reading CA cert")?,
+                fs::read(&opts.ca_cert).map_err(err_ctx("reading CA cert"))?,
             ))
             .identity(Identity::from_pem(
-                fs::read(&opts.cert).context("reading worker cert")?,
-                fs::read(&opts.key).context("reading worker key")?,
+                fs::read(&opts.cert).map_err(err_ctx("reading worker cert"))?,
+                fs::read(&opts.key).map_err(err_ctx("reading worker key"))?,
             ));
         endpoint = endpoint.tls_config(tls)?;
     }
@@ -420,7 +491,7 @@ async fn session(
         .initial_connection_window_size(Some(crate::chunkio::H2_CONNECTION_WINDOW))
         .connect()
         .await
-        .context("connecting to hub")?;
+        .map_err(err_ctx("connecting to hub"))?;
     let mut client = WorkerHubClient::new(channel)
         .max_decoding_message_size(crate::proto::MAX_MSG_SIZE)
         .max_encoding_message_size(crate::proto::MAX_MSG_SIZE);
@@ -492,7 +563,7 @@ async fn session_loop(
                 continue;
             }
             m = inbound.message() => {
-                m?.ok_or_else(|| anyhow::anyhow!("hub closed the session"))?
+                m?.ok_or_else(|| err_msg("hub closed the session"))?
             }
         };
         let Some(m) = m.msg else { continue };
@@ -610,7 +681,7 @@ async fn handle_cancel(
     tracing::info!(id = c.build_id, "hub cancelled the build");
     if let Some(build) = active.remove(&c.build_id) {
         build.abort().await;
-        fail_build(out_tx, &c.build_id, &anyhow::anyhow!("build cancelled")).await?;
+        fail_build(out_tx, &c.build_id, &err_msg("build cancelled")).await?;
     } else {
         // Only flag builds that are still running: a key flagged for
         // an already-finished build would never be consumed and would
@@ -707,7 +778,7 @@ async fn abort_active(
     active: &mut HashMap<String, ActiveBuild>,
     id: &str,
     out_tx: &mpsc::Sender<WorkerMessage>,
-    e: &anyhow::Error,
+    e: &Error,
 ) -> Result<()> {
     if let Some(build) = active.remove(id) {
         build.abort().await;
@@ -719,19 +790,20 @@ async fn abort_active(
 async fn fail_build(
     out_tx: &mpsc::Sender<WorkerMessage>,
     build_id: &str,
-    err: &anyhow::Error,
+    err: &Error,
 ) -> Result<()> {
-    tracing::error!(id = build_id, "build setup failed: {err:#}");
+    let err = chain(err);
+    tracing::error!(id = build_id, "build setup failed: {err}");
     out_tx
         .send(msg(worker_message::Msg::Result(BuildResult {
             build_id: build_id.into(),
             exit_code: 1,
             outputs: vec![],
             extras: vec![],
-            error: format!("{err:#}"),
+            error: err,
         })))
         .await
-        .map_err(|_| anyhow::anyhow!("hub connection lost"))
+        .map_err(|_| Error::HubGone)
 }
 
 #[cfg(test)]

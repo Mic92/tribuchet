@@ -11,19 +11,17 @@ use std::sync::atomic::{self, Ordering};
 use std::time::{Duration, Instant};
 use std::{fs, io};
 
-#[cfg(target_os = "macos")]
-use anyhow::bail;
-use anyhow::{Context, Result};
 use harmonia_utils_signature::SecretKey;
 use tokio::sync::mpsc;
 
 use super::{ActiveBuild, pack_outputs_and_extras, unix_now};
+use crate::errors::chain;
 use crate::proto::WorkerMessage;
 #[cfg(target_os = "macos")]
 use crate::worker::caps::requires_uid_range;
 use crate::worker::logtail::tail_log;
 use crate::worker::resume::{FinishedBuild, ResumeState};
-use crate::worker::{WorkerCtx, agents, sandbox};
+use crate::worker::{Result, WorkerCtx, agents, err_ctx, err_msg, sandbox};
 
 impl ActiveBuild {
     /// Lease a per-uid agent and run the build there. The agent
@@ -39,13 +37,14 @@ impl ActiveBuild {
     ) -> Result<FinishedBuild> {
         #[cfg(target_os = "macos")]
         if requires_uid_range(&self.assignment.env) {
-            bail!("the uid-range feature is only supported on Linux workers");
+            return Err(err_msg(
+                "the uid-range feature is only supported on Linux workers",
+            ));
         }
-        let socket = self
-            .ctx
-            .agents
-            .acquire()
-            .context("no free build agent (max-jobs exceeds the agent count?)")?;
+        let socket =
+            self.ctx.agents.acquire().ok_or_else(|| {
+                err_msg("no free build agent (max-jobs exceeds the agent count?)")
+            })?;
         let result = self.execute_on_agent(&socket, out_tx, signing_key, timeout);
         self.ctx.agents.release(socket);
         result
@@ -116,7 +115,7 @@ impl ActiveBuild {
             spec.root = build
                 .scratch_dir
                 .parent()
-                .context("agent scratch dir has no parent")?
+                .ok_or_else(|| err_msg("agent scratch dir has no parent"))?
                 .join("root");
         }
 
@@ -218,7 +217,11 @@ pub(in crate::worker) fn supervise_agent(
             if let Some(r) = ctx.abort_reason(&st.dedupe_key, &log_path, timed_out) {
                 aborted = Some(r);
                 if let Err(e) = agents::kill(socket, &st.build_id) {
-                    tracing::warn!(id = st.build_id, "killing the build via its agent: {e:#}");
+                    tracing::warn!(
+                        id = st.build_id,
+                        "killing the build via its agent: {}",
+                        chain(&e)
+                    );
                 }
             }
         }
@@ -227,7 +230,7 @@ pub(in crate::worker) fn supervise_agent(
     let code = match waiter.join() {
         Ok(Ok(code)) => code,
         Ok(Err(e)) => {
-            aborted.get_or_insert(format!("agent connection lost: {e:#}"));
+            aborted.get_or_insert(format!("agent connection lost: {}", chain(&e)));
             1
         }
         Err(_) => {
@@ -253,7 +256,7 @@ pub(in crate::worker) fn supervise_agent(
         let remaining = Duration::from_secs(st.deadline_unix.saturating_sub(unix_now()));
         let deadline = Instant::now() + remaining.max(Duration::from_mins(10));
         let packed = agents::finish(socket, &st.build_id)
-            .context("finishing the build on its agent")
+            .map_err(err_ctx("finishing the build on its agent"))
             .and_then(|()| {
                 tokio::runtime::Handle::current().block_on(pack_outputs_and_extras(
                     &dir,
@@ -266,13 +269,13 @@ pub(in crate::worker) fn supervise_agent(
             });
         match packed {
             Ok((o, e)) => (0, String::new(), o, e),
-            Err(e) => (1, format!("{e:#}"), vec![], vec![]),
+            Err(e) => (1, chain(&e), vec![], vec![]),
         }
     };
     // The agent removes its scratch dir and the scratch outputs
     // (packing above already read them) and forgets the build.
     if let Err(e) = agents::cleanup(socket, &st.build_id) {
-        tracing::warn!(id = st.build_id, "agent cleanup failed: {e:#}");
+        tracing::warn!(id = st.build_id, "agent cleanup failed: {}", chain(&e));
     }
     FinishedBuild {
         exit_code,
