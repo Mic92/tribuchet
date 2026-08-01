@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
 use harmonia_store_path::StoreDir;
 use harmonia_store_remote::{DaemonClient, DaemonStore};
 use harmonia_utils_signature::SecretKey;
@@ -15,8 +14,9 @@ use tokio::sync::mpsc;
 use super::build::ActiveBuild;
 use super::build::{LogMirror, supervise_agent};
 use super::logtail::LogTail;
-use super::{DaemonConn, WorkerCtx, msg, sandbox};
+use super::{DaemonConn, Result, WorkerCtx, err_msg, msg, sandbox};
 use crate::chunkio::CHUNK_SIZE;
+use crate::errors::chain;
 use crate::proto::{
     BuildResult, ExtraPath, NarTransfer, OutputSignature, PathInfoMsg, WorkerMessage, nar_transfer,
     worker_message,
@@ -55,7 +55,11 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>, signing_key: &Arc<SecretK
             match super::agents::AgentBuild::adopt(&socket, &st.build_id) {
                 Ok((build, _)) => (socket, build),
                 Err(e) => {
-                    tracing::warn!(id = st.build_id, "re-adopting build from its agent: {e:#}");
+                    tracing::warn!(
+                        id = st.build_id,
+                        "re-adopting build from its agent: {}",
+                        chain(&e)
+                    );
                     ctx.agents.release(socket);
                     super::remove_build_dir(&dir);
                     continue;
@@ -114,7 +118,7 @@ pub(super) fn sweep_orphaned_agent_builds(ctx: &Arc<WorkerCtx>) {
             Ok(Some(id)) => id,
             Ok(None) => continue,
             Err(e) => {
-                tracing::warn!("querying agent {}: {e:#}", socket.display());
+                tracing::warn!("querying agent {}: {}", socket.display(), chain(&e));
                 continue;
             }
         };
@@ -126,7 +130,7 @@ pub(super) fn sweep_orphaned_agent_builds(ctx: &Arc<WorkerCtx>) {
         tokio::task::spawn_blocking(move || {
             let _ = super::agents::kill(&socket, &id);
             if let Err(e) = super::agents::cleanup(&socket, &id) {
-                tracing::warn!(id, "orphaned build cleanup failed: {e:#}");
+                tracing::warn!(id, "orphaned build cleanup failed: {}", chain(&e));
             }
             ctx.agents.release(socket);
         });
@@ -169,7 +173,10 @@ async fn re_root_inputs(spec: &sandbox::SandboxSpec) -> Option<DaemonConn> {
     let mut daemon = match DaemonClient::builder().connect_daemon().await {
         Ok(d) => d,
         Err(e) => {
-            tracing::warn!("connecting to nix-daemon for adopted-build GC roots: {e:#}");
+            tracing::warn!(
+                "connecting to nix-daemon for adopted-build GC roots: {}",
+                chain(&e)
+            );
             return None;
         }
     };
@@ -178,7 +185,7 @@ async fn re_root_inputs(spec: &sandbox::SandboxSpec) -> Option<DaemonConn> {
             continue;
         };
         if let Err(e) = daemon.add_temp_root(&sp).await {
-            tracing::warn!(path, "re-adding GC root: {e:#}");
+            tracing::warn!(path, "re-adding GC root: {}", chain(&e));
         }
     }
     Some(daemon)
@@ -361,12 +368,13 @@ pub(super) fn execute_to_finished(
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         build.execute(out_tx, signing_key, timeout)
     }))
-    .unwrap_or_else(|_| Err(anyhow::anyhow!("build execution panicked")))
+    .unwrap_or_else(|_| Err(err_msg("build execution panicked")))
     .unwrap_or_else(|e| {
-        tracing::error!("build execution failed: {e:#}");
+        let e = chain(&e);
+        tracing::error!("build execution failed: {e}");
         FinishedBuild {
             exit_code: 1,
-            error: format!("{e:#}"),
+            error: e,
             outputs: vec![],
             extras: vec![],
             dir: build.dir.clone(),
@@ -506,7 +514,8 @@ pub(super) fn try_deliver(ctx: &Arc<WorkerCtx>, key: &str) {
         Err(e) => {
             tracing::warn!(
                 id = build_id,
-                "result delivery failed, keeping for resume: {e:#}"
+                "result delivery failed, keeping for resume: {}",
+                chain(&e)
             );
         }
     }

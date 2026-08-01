@@ -8,7 +8,6 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{Context, Result, bail};
 use harmonia_store_path::{StoreDir, StorePath, StorePathSet};
 use harmonia_store_path_info::{UnkeyedValidPathInfo, ValidPathInfo};
 use harmonia_store_remote::{DaemonClient, DaemonStore};
@@ -18,8 +17,9 @@ use tokio::sync::mpsc;
 
 use super::pins;
 use super::resume::{PackedExtra, PackedOutput};
-use super::{DaemonConn, WorkerCtx, sandbox, unix_now};
+use super::{DaemonConn, Result, WorkerCtx, err_ctx, err_msg, sandbox, unix_now};
 use crate::chunkio::ChannelReader;
+use crate::errors::chain;
 use crate::nar;
 use crate::proto::{BuildAssignment, NarTransfer, PathInfoMsg, nar_transfer};
 use crate::store::{STORE_DIR, parse_path_info, topo_order, valid_store_path};
@@ -47,10 +47,10 @@ pub(super) enum StagingStatus {
 /// macOS deleted) on the host.
 pub(super) fn validate_assignment(a: &BuildAssignment) -> Result<()> {
     if a.build_id.len() != 32 || !a.build_id.bytes().all(|b| b.is_ascii_hexdigit()) {
-        bail!("invalid build id {:?}", a.build_id);
+        return Err(err_msg(format!("invalid build id {:?}", a.build_id)));
     }
     if !a.builder.starts_with('/') {
-        bail!("builder must be an absolute path");
+        return Err(err_msg("builder must be an absolute path"));
     }
     let tmp = Path::new(&a.tmp_dir_in_sandbox);
     if !tmp.is_absolute()
@@ -58,11 +58,14 @@ pub(super) fn validate_assignment(a: &BuildAssignment) -> Result<()> {
             .components()
             .any(|c| !matches!(c, Component::RootDir | Component::Normal(_)))
     {
-        bail!("invalid tmpDirInSandbox {:?}", a.tmp_dir_in_sandbox);
+        return Err(err_msg(format!(
+            "invalid tmpDirInSandbox {:?}",
+            a.tmp_dir_in_sandbox
+        )));
     }
     for p in a.outputs.values() {
         if !valid_store_path(STORE_DIR, p) {
-            bail!("invalid output path {p:?}");
+            return Err(err_msg(format!("invalid output path {p:?}")));
         }
         // macOS builds write into /nix/store and cleanup deletes the
         // output, so a pre-existing path would be tampered with and
@@ -71,7 +74,9 @@ pub(super) fn validate_assignment(a: &BuildAssignment) -> Result<()> {
         // rejecting it would break re-dispatch of a path already valid
         // here (e.g. a fixed-output derivation built before).
         if cfg!(target_os = "macos") && fs::symlink_metadata(p).is_ok() {
-            bail!("output path {p} already exists on this worker");
+            return Err(err_msg(format!(
+                "output path {p} already exists on this worker"
+            )));
         }
     }
     Ok(())
@@ -122,7 +127,7 @@ async fn add_temp_root(daemon: &mut DaemonConn, path: &str, sp: &StorePath) -> R
     daemon
         .add_temp_root(sp)
         .await
-        .with_context(|| format!("adding temp root for {path}"))
+        .map_err(err_ctx(format!("adding temp root for {path}")))
 }
 
 /// Drive one AddToStoreNar: hub chunks -> zstd decode -> daemon. The
@@ -144,7 +149,7 @@ async fn import_nar(
     let limited = tokio::io::BufReader::new(dec.take(info.info.nar_size));
     conn.add_to_store_nar(info, limited, false, true)
         .await
-        .map_err(|e| anyhow::anyhow!("importing {} via the daemon: {e}", info.path))?;
+        .map_err(|e| err_msg(format!("importing {} via the daemon: {e}", info.path)))?;
     Ok(())
 }
 
@@ -177,7 +182,7 @@ impl ActiveBuild {
         let mut daemon = DaemonClient::builder()
             .connect_daemon()
             .await
-            .context("connecting to the local nix-daemon")?;
+            .map_err(err_ctx("connecting to the local nix-daemon"))?;
         let mut parsed = Vec::with_capacity(offered.len());
         let mut set = StorePathSet::new();
         for p in offered {
@@ -186,7 +191,7 @@ impl ActiveBuild {
             // (signing key, TLS key) mounted into a sandbox.
             let sp: StorePath = store_dir
                 .parse(p)
-                .with_context(|| format!("offered path {p:?} is not a store path"))?;
+                .map_err(err_ctx(format!("offered path {p:?} is not a store path")))?;
             set.insert(sp.clone());
             parsed.push((p, sp));
         }
@@ -207,7 +212,7 @@ impl ActiveBuild {
             {
                 Ok(plan) => Some(plan),
                 Err(e) => {
-                    tracing::debug!("store db unavailable, pinning all inputs: {e:#}");
+                    tracing::debug!("store db unavailable, pinning all inputs: {}", chain(&e));
                     None
                 }
             }
@@ -223,7 +228,7 @@ impl ActiveBuild {
         let mut valid = daemon
             .query_valid_paths(&set, false)
             .await
-            .context("querying valid paths")?;
+            .map_err(err_ctx("querying valid paths"))?;
         // If the database called a path valid but the daemon does not,
         // a GC raced our snapshot and the pinned closure roots may no
         // longer cover everything. Root every path and re-check, which
@@ -242,7 +247,7 @@ impl ActiveBuild {
             valid = daemon
                 .query_valid_paths(&set, false)
                 .await
-                .context("re-querying valid paths")?;
+                .map_err(err_ctx("re-querying valid paths"))?;
         }
         let mut missing = Vec::new();
         // One check-and-insert under the lock, so of several builds
@@ -286,16 +291,19 @@ impl ActiveBuild {
 
     pub(super) fn feed_path_info(&mut self, pi: &PathInfoMsg) -> Result<()> {
         let Some(slot) = self.pending.get_mut(&pi.store_path) else {
-            bail!("hub sent path info for unrequested path {}", pi.store_path);
+            return Err(err_msg(format!(
+                "hub sent path info for unrequested path {}",
+                pi.store_path
+            )));
         };
         if pi.nar_size > MAX_NAR_BYTES {
-            bail!(
+            return Err(err_msg(format!(
                 "input {} exceeds the {MAX_NAR_BYTES} byte NAR limit",
                 pi.store_path
-            );
+            )));
         }
         *slot =
-            Some(parse_path_info(pi).with_context(|| format!("path info for {}", pi.store_path))?);
+            Some(parse_path_info(pi).map_err(err_ctx(format!("path info for {}", pi.store_path)))?);
         Ok(())
     }
 
@@ -307,17 +315,27 @@ impl ActiveBuild {
         {
             // Start a new import; the hub streams one path at a time.
             if self.importer.is_some() {
-                bail!("hub interleaved NAR transfers for different paths");
+                return Err(err_msg("hub interleaved NAR transfers for different paths"));
             }
             let info = match self.pending.remove(&n.store_path) {
                 Some(Some(info)) => info,
-                Some(None) => bail!("hub sent NAR before path info for {}", n.store_path),
-                None => bail!("hub sent NAR for unrequested path {}", n.store_path),
+                Some(None) => {
+                    return Err(err_msg(format!(
+                        "hub sent NAR before path info for {}",
+                        n.store_path
+                    )));
+                }
+                None => {
+                    return Err(err_msg(format!(
+                        "hub sent NAR for unrequested path {}",
+                        n.store_path
+                    )));
+                }
             };
             let mut conn = self
                 .daemon
                 .take()
-                .context("daemon connection missing (no negotiation?)")?;
+                .ok_or_else(|| err_msg("daemon connection missing (no negotiation?)"))?;
             let (tx, rx) = mpsc::channel::<bytes::Bytes>(8);
             let task = tokio::spawn(async move {
                 let res = import_nar(&mut conn, &info, rx).await;
@@ -345,7 +363,10 @@ impl ActiveBuild {
             self.daemon = Some(conn);
             res?;
             if send_failed {
-                bail!("input import ended early for {}", n.store_path);
+                return Err(err_msg(format!(
+                    "input import ended early for {}",
+                    n.store_path
+                )));
             }
             self.deregister(&n.store_path);
             self.inputs.push(n.store_path);
@@ -363,7 +384,7 @@ impl ActiveBuild {
             let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
             let task = tokio::task::spawn_blocking(move || -> Result<()> {
                 let dec = zstd::stream::read::Decoder::new(ChannelReader::new(rx))?;
-                unpack_tmp_dir(dec, &dest).context("unpacking the tmp dir")
+                unpack_tmp_dir(dec, &dest).map_err(err_ctx("unpacking the tmp dir"))
             });
             (tx, task)
         });
@@ -373,7 +394,7 @@ impl ActiveBuild {
             let err = task
                 .await?
                 .err()
-                .unwrap_or_else(|| anyhow::anyhow!("tmp dir unpacker exited early"));
+                .unwrap_or_else(|| err_msg("tmp dir unpacker exited early"));
             return Err(err);
         }
         if t.eof {
@@ -391,13 +412,17 @@ impl ActiveBuild {
     /// invalid are re-requested instead of failing the build.
     pub(super) async fn complete_staging(&mut self) -> Result<StagingStatus> {
         if !self.tmp_dir_done {
-            bail!("hub signalled staging completion before the tmp dir arrived");
+            return Err(err_msg(
+                "hub signalled staging completion before the tmp dir arrived",
+            ));
         }
         if self.importer.is_some() {
-            bail!("staging round ended during an input NAR transfer");
+            return Err(err_msg("staging round ended during an input NAR transfer"));
         }
         if let Some(p) = self.pending.keys().next() {
-            bail!("hub never sent a NAR for requested input {p}");
+            return Err(err_msg(format!(
+                "hub never sent a NAR for requested input {p}"
+            )));
         }
         if self.deferred.is_empty() {
             return Ok(StagingStatus::Ready);
@@ -410,11 +435,11 @@ impl ActiveBuild {
         let daemon = self
             .daemon
             .as_mut()
-            .context("daemon connection missing (no negotiation?)")?;
+            .ok_or_else(|| err_msg("daemon connection missing (no negotiation?)"))?;
         let valid = daemon
             .query_valid_paths(&set, false)
             .await
-            .context("re-checking inputs another build was importing")?;
+            .map_err(err_ctx("re-checking inputs another build was importing"))?;
         let mut still_missing = Vec::new();
         for p in std::mem::take(&mut self.deferred) {
             if valid.contains(&store_dir.parse(&p)?) {
@@ -427,10 +452,10 @@ impl ActiveBuild {
             return Ok(StagingStatus::Ready);
         }
         if self.resend_rounds >= MAX_RESEND_ROUNDS {
-            bail!(
+            return Err(err_msg(format!(
                 "input {} was expected from another build's import but never became valid",
                 still_missing[0]
-            );
+            )));
         }
         self.resend_rounds += 1;
         // This build imports them itself now: claim and expect them.
@@ -478,7 +503,7 @@ async fn pack_outputs_and_extras(
 ) -> Result<(Vec<PackedOutput>, Vec<PackedExtra>)> {
     let extra_candidates = if spec.recursive_nix {
         query_all_valid_paths().await.unwrap_or_else(|e| {
-            tracing::warn!(id = build_id, "queryAllValidPaths failed: {e:#}");
+            tracing::warn!(id = build_id, "queryAllValidPaths failed: {}", chain(&e));
             BTreeSet::new()
         })
     } else {
@@ -504,7 +529,7 @@ async fn pack_outputs_and_extras(
         )
         .await
         .unwrap_or_else(|e| {
-            tracing::warn!(id = build_id, "packing extras failed: {e:#}");
+            tracing::warn!(id = build_id, "packing extras failed: {}", chain(&e));
             Vec::new()
         })
     } else {
@@ -519,11 +544,11 @@ async fn query_all_valid_paths() -> Result<BTreeSet<harmonia_store_path::StorePa
     let mut daemon = DaemonClient::builder()
         .connect_daemon()
         .await
-        .context("connecting to the local nix-daemon")?;
+        .map_err(err_ctx("connecting to the local nix-daemon"))?;
     let set = daemon
         .query_all_valid_paths()
         .await
-        .context("queryAllValidPaths")?;
+        .map_err(err_ctx("queryAllValidPaths"))?;
     Ok(set.into_iter().collect())
 }
 
@@ -554,7 +579,7 @@ async fn pack_outputs(
         // lstat: a symlink output whose target only resolves inside
         // the sandbox is still a valid output.
         if host_path.symlink_metadata().is_err() {
-            bail!("builder did not produce output {scratch}");
+            return Err(err_msg(format!("builder did not produce output {scratch}")));
         }
         let nar_file = dir.join(format!("{}.nar.zst", store_base(scratch)));
         let self_path = harmonia_store_path::StorePath::from_base_path(store_base(scratch)).ok();
@@ -566,7 +591,7 @@ async fn pack_outputs(
             deadline,
         )
         .await
-        .with_context(|| format!("packing output {scratch}"))?;
+        .map_err(err_ctx(format!("packing output {scratch}")))?;
         let sig =
             signing_key.sign(format!("{scratch}:{}", hex::encode(&res.nar_sha256)).as_bytes());
         packed.push(PackedOutput {
@@ -634,7 +659,7 @@ async fn pack_extras(
             deadline,
         )
         .await
-        .with_context(|| format!("packing extra {path}"))?;
+        .map_err(err_ctx(format!("packing extra {path}")))?;
         // Daemon NAR layout is deterministic, so its recorded
         // nar_size matches the bytes we just hashed.
         let nar_size = info.nar_size;
@@ -685,23 +710,23 @@ async fn extra_closure(
     let mut daemon = DaemonClient::builder()
         .connect_daemon()
         .await
-        .context("connecting to the local nix-daemon")?;
+        .map_err(err_ctx("connecting to the local nix-daemon"))?;
     let mut infos: HashMap<String, UnkeyedValidPathInfo> = HashMap::new();
     while let Some(path) = queue.pop() {
         if infos.contains_key(&path) {
             continue;
         }
         let sp = StorePath::from_base_path(store_base(&path))
-            .with_context(|| format!("parsing extra path {path}"))?;
+            .map_err(err_ctx(format!("parsing extra path {path}")))?;
         daemon
             .add_temp_root(&sp)
             .await
-            .with_context(|| format!("temp-rooting {path}"))?;
+            .map_err(err_ctx(format!("temp-rooting {path}")))?;
         let info = daemon
             .query_path_info(&sp)
             .await
-            .with_context(|| format!("queryPathInfo {path}"))?
-            .ok_or_else(|| anyhow::anyhow!("extra {path} vanished from store"))?;
+            .map_err(err_ctx(format!("queryPathInfo {path}")))?
+            .ok_or_else(|| err_msg(format!("extra {path} vanished from store")))?;
         for r in &info.references {
             let r = r.to_absolute_path(store_dir).to_string_lossy().into_owned();
             if !known.contains(r.as_str()) {

@@ -110,7 +110,7 @@ fn main() -> anyhow::Result<()> {
             let mut cfg: config::WorkerConfig = config::load(&config)?;
             cfg.apply_env_overrides();
             tracing::info!(?cfg, "worker configuration");
-            worker::run(cfg)
+            Ok(worker::run(cfg)?)
         }
         Command::Ca { action } => Ok(ca::run(action)?),
         Command::Agent {

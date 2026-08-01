@@ -14,7 +14,6 @@ use std::sync::Mutex;
 #[cfg(target_os = "macos")]
 use std::fmt::Write as _;
 
-use anyhow::{Context, Result, bail};
 #[cfg(target_os = "macos")]
 use sandbox_proto::agent::SCRATCH_DIR_PARAM;
 use sandbox_proto::agent::{
@@ -23,13 +22,17 @@ use sandbox_proto::agent::{
 };
 use sandbox_proto::framing;
 
+use super::{Result, err_ctx, err_msg};
+
 /// SBPL string literal escaping: a quote or backslash in an
 /// interpolated path must not terminate the literal and inject
 /// profile directives.
 #[cfg(target_os = "macos")]
 fn sb_escape(s: &str) -> Result<String> {
     if s.bytes().any(|b| b.is_ascii_control()) {
-        bail!("control character in sandbox profile path {s:?}");
+        return Err(err_msg(format!(
+            "control character in sandbox profile path {s:?}"
+        )));
     }
     Ok(s.replace('\\', "\\\\").replace('"', "\\\""))
 }
@@ -155,7 +158,7 @@ impl AgentBuild {
         )?;
         let (reply, fds) = framing::recv_reply(&conn)?;
         let reply::Reply::Start(reply) = reply else {
-            bail!("unexpected agent reply {reply:?}");
+            return Err(err_msg(format!("unexpected agent reply {reply:?}")));
         };
         Ok(Self {
             conn,
@@ -178,7 +181,7 @@ impl AgentBuild {
         )?;
         let (reply, fds) = framing::recv_reply(&conn)?;
         let reply::Reply::Adopt(reply) = reply else {
-            bail!("unexpected agent reply {reply:?}");
+            return Err(err_msg(format!("unexpected agent reply {reply:?}")));
         };
         let build = Self {
             conn,
@@ -193,22 +196,24 @@ impl AgentBuild {
     pub(super) fn wait_exit(&self) -> Result<i32> {
         let (reply, _) = framing::recv_reply(&self.conn)?;
         let reply::Reply::Exit(notice) = reply else {
-            bail!("unexpected agent reply {reply:?}");
+            return Err(err_msg(format!("unexpected agent reply {reply:?}")));
         };
         Ok(notice.exit_code)
     }
 }
 
 fn connect(socket: &Path) -> Result<UnixStream> {
-    UnixStream::connect(socket)
-        .with_context(|| format!("connecting to the build agent at {}", socket.display()))
+    UnixStream::connect(socket).map_err(err_ctx(format!(
+        "connecting to the build agent at {}",
+        socket.display()
+    )))
 }
 
 fn log_fd(fds: Vec<std::os::fd::OwnedFd>) -> Result<fs::File> {
     Ok(fs::File::from(
         fds.into_iter()
             .next()
-            .context("agent reply without a log fd")?,
+            .ok_or_else(|| err_msg("agent reply without a log fd"))?,
     ))
 }
 
@@ -226,7 +231,7 @@ pub(super) fn current_build(socket: &Path) -> Result<Option<String>> {
     framing::send_call(&conn, call::Call::Status(StatusRequest {}), &[])?;
     let (reply, _) = framing::recv_reply(&conn)?;
     let reply::Reply::Status(reply) = reply else {
-        bail!("unexpected agent reply {reply:?}");
+        return Err(err_msg(format!("unexpected agent reply {reply:?}")));
     };
     Ok(reply.current)
 }
