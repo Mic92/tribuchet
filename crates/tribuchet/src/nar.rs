@@ -5,26 +5,46 @@
 //! Nix's narHash, keeping us interoperable with caches and signatures.
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
 use futures_util::StreamExt as _;
+use harmonia_file_nar::archive::NarWriteError;
 use tokio::sync::mpsc;
 
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("packing {path}")]
+    Pack {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("writing NAR")]
+    Write(#[source] std::io::Error),
+    #[error("unpacking into {path}")]
+    Unpack {
+        path: PathBuf,
+        #[source]
+        source: NarWriteError,
+    },
+}
+
 /// Serialize the filesystem object at `path` as a NAR into `w`.
-pub async fn pack(path: &Path, w: &mut impl Write) -> Result<()> {
+pub async fn pack(path: &Path, w: &mut impl Write) -> Result<(), Error> {
     let mut stream = harmonia_file_nar::archive::NarByteStream::new(path.to_path_buf());
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.with_context(|| format!("packing {}", path.display()))?;
-        w.write_all(&chunk)?;
+        let chunk = chunk.map_err(|source| Error::Pack {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        w.write_all(&chunk).map_err(Error::Write)?;
     }
     Ok(())
 }
 
 /// Restore a zstd-compressed NAR arriving as byte chunks on `rx` at
 /// `dest` (must not exist). Ends when the sender closes the channel.
-pub async fn unpack_zstd_chunks(rx: mpsc::Receiver<Vec<u8>>, dest: &Path) -> Result<()> {
-    use harmonia_file_nar::archive::NarWriteError;
+pub async fn unpack_zstd_chunks(rx: mpsc::Receiver<Vec<u8>>, dest: &Path) -> Result<(), Error> {
     let chunks = tokio_stream::wrappers::ReceiverStream::new(rx)
         .map(|c| Ok::<_, std::io::Error>(bytes::Bytes::from(c)));
     let dec = async_compression::tokio::bufread::ZstdDecoder::new(
@@ -38,12 +58,16 @@ pub async fn unpack_zstd_chunks(rx: mpsc::Receiver<Vec<u8>>, dest: &Path) -> Res
     });
     harmonia_file_nar::archive::restore(events, dest)
         .await
-        .with_context(|| format!("unpacking into {}", dest.display()))
+        .map_err(|source| Error::Unpack {
+            path: dest.to_path_buf(),
+            source,
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Result;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
@@ -57,7 +81,7 @@ mod tests {
             tx.send(chunk.to_vec()).await?;
         }
         drop(tx);
-        unpack_zstd_chunks(rx, dest).await
+        Ok(unpack_zstd_chunks(rx, dest).await?)
     }
 
     /// Round-trip a tree with the cases NAR distinguishes: regular

@@ -18,26 +18,45 @@ pub fn valid_store_path(store_dir: &str, path: &str) -> bool {
     dir.parse::<harmonia_store_path::StorePath>(path).is_ok()
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("parsing path info {field}")]
+pub struct PathInfoError {
+    field: &'static str,
+    #[source]
+    source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+fn field<E: std::error::Error + Send + Sync + 'static>(
+    field: &'static str,
+) -> impl Fn(E) -> PathInfoError {
+    move |source| PathInfoError {
+        field,
+        source: Box::new(source),
+    }
+}
+
 /// Wire metadata -> daemon ValidPathInfo.
 pub fn parse_path_info(
     msg: &crate::proto::PathInfoMsg,
-) -> anyhow::Result<harmonia_store_path_info::ValidPathInfo> {
+) -> Result<harmonia_store_path_info::ValidPathInfo, PathInfoError> {
     use harmonia_store_path::StoreDir;
     use harmonia_store_path_info::{NarHash, UnkeyedValidPathInfo, ValidPathInfo};
     use std::collections::BTreeSet;
     let store_dir = StoreDir::default();
     Ok(ValidPathInfo {
-        path: store_dir.parse(&msg.store_path)?,
+        path: store_dir.parse(&msg.store_path).map_err(field("path"))?,
         info: UnkeyedValidPathInfo {
             deriver: (!msg.deriver.is_empty())
                 .then(|| store_dir.parse(&msg.deriver))
-                .transpose()?,
-            nar_hash: NarHash::from_slice(&msg.nar_sha256)?,
+                .transpose()
+                .map_err(field("deriver"))?,
+            nar_hash: NarHash::from_slice(&msg.nar_sha256).map_err(field("nar hash"))?,
             references: msg
                 .references
                 .iter()
                 .map(|r| store_dir.parse(r))
-                .collect::<Result<BTreeSet<_>, _>>()?,
+                .collect::<Result<BTreeSet<_>, _>>()
+                .map_err(field("references"))?,
             registration_time: None,
             nar_size: msg.nar_size,
             ultimate: false,
@@ -45,8 +64,12 @@ pub fn parse_path_info(
                 .signatures
                 .iter()
                 .map(|s| s.parse())
-                .collect::<Result<BTreeSet<_>, _>>()?,
-            ca: (!msg.ca.is_empty()).then(|| msg.ca.parse()).transpose()?,
+                .collect::<Result<BTreeSet<_>, _>>()
+                .map_err(field("signatures"))?,
+            ca: (!msg.ca.is_empty())
+                .then(|| msg.ca.parse())
+                .transpose()
+                .map_err(field("content address"))?,
             store_dir,
         },
     })

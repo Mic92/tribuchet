@@ -28,7 +28,7 @@ pub enum CaAction {
 }
 
 fn write_private(path: &Path, data: &str) -> Result<()> {
-    crate::fsutil::write_secret(path, data.as_bytes())
+    crate::fsutil::write_secret(path, data.as_bytes()).map_err(Into::into)
 }
 
 /// Issued names become file names and certificate SANs; restrict them

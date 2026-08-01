@@ -6,8 +6,21 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("reading {path}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("parsing build.json")]
+    Parse(#[from] serde_json::Error),
+    #[error("unsupported build.json version {0}")]
+    UnsupportedVersion(u32),
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -27,12 +40,14 @@ pub struct BuildJson {
 }
 
 impl BuildJson {
-    pub fn load(path: &Path) -> Result<Self> {
-        let data =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let parsed: Self = serde_json::from_str(&data).context("parsing build.json")?;
+    pub fn load(path: &Path) -> Result<Self, Error> {
+        let data = std::fs::read_to_string(path).map_err(|source| Error::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let parsed: Self = serde_json::from_str(&data)?;
         if parsed.version != 1 {
-            bail!("unsupported build.json version {}", parsed.version);
+            return Err(Error::UnsupportedVersion(parsed.version));
         }
         Ok(parsed)
     }

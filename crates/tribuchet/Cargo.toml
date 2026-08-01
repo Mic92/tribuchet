@@ -10,6 +10,7 @@ clap.workspace = true
 hex.workspace = true
 hyper-util.workspace = true
 prost.workspace = true
+thiserror.workspace = true
 rand.workspace = true
 rcgen.workspace = true
 serde.workspace = true
