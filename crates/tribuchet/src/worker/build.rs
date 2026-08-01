@@ -23,7 +23,7 @@ use crate::chunkio::ChannelReader;
 use crate::nar;
 use crate::proto::{BuildAssignment, NarTransfer, PathInfoMsg, nar_transfer};
 use crate::store::{STORE_DIR, parse_path_info, topo_order, valid_store_path};
-use crate::tmptar::unpack_tmp_dir_archive;
+use crate::tmpdir::unpack_tmp_dir;
 
 /// Cap on a single NAR transfer in either direction; a `truncate -s 1P
 /// $out` build would otherwise tie up the worker and fill its disk.
@@ -104,7 +104,7 @@ pub(super) struct ActiveBuild {
     deferred: Vec<String>,
     /// Paths this build claimed in `WorkerCtx::staging_inflight`.
     registered: HashSet<String>,
-    /// True once the tmp dir archive finished unpacking.
+    /// True once the tmp dir stream finished unpacking.
     tmp_dir_done: bool,
     resend_rounds: u8,
     /// Daemon connection; carries this build's temp roots, so it must
@@ -154,7 +154,7 @@ impl ActiveBuild {
         if dir.exists() {
             fs::remove_dir_all(&dir)?;
         }
-        fs::create_dir_all(dir.join("top"))?;
+        fs::create_dir_all(dir.join("top/build"))?;
         Ok(Self {
             assignment,
             dir,
@@ -359,15 +359,15 @@ impl ActiveBuild {
         t: crate::proto::TmpDirArchive,
     ) -> Result<StagingStatus> {
         let (tx, _) = self.tmp_unpacker.get_or_insert_with(|| {
-            let dest = self.dir.join("top");
+            let dest = self.dir.join("top/build");
             let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
             let task = tokio::task::spawn_blocking(move || -> Result<()> {
                 let dec = zstd::stream::read::Decoder::new(ChannelReader::new(rx))?;
-                unpack_tmp_dir_archive(dec, &dest).context("unpacking tmp dir archive")
+                unpack_tmp_dir(dec, &dest).context("unpacking the tmp dir")
             });
             (tx, task)
         });
-        if !t.zstd_tar_chunk.is_empty() && tx.send(t.zstd_tar_chunk).await.is_err() {
+        if !t.zstd_chunk.is_empty() && tx.send(t.zstd_chunk).await.is_err() {
             // The unpacker only stops early on error; report that error.
             let (_, task) = self.tmp_unpacker.take().unwrap();
             let err = task

@@ -25,18 +25,16 @@ use sandbox_proto::agent::{
 };
 use sandbox_proto::framing;
 
-use crate::tmptar::unpack_tmp_dir_archive;
+use crate::tmpdir::unpack_tmp_dir;
 
-/// Unpack the zstd-compressed tmp dir archive into the scratch root
-/// and make sure the build dir exists even for an empty archive.
-/// Files belong to whoever runs this: the agent on the direct-exec
-/// and macOS paths, in-ns root through the userns helper on the Linux
-/// namespace path.
-fn stage_scratch(tar: impl std::io::Read, scratch_root: &Path, build_dir: &Path) -> Result<()> {
-    let dec = zstd::stream::read::Decoder::new(tar)?;
-    unpack_tmp_dir_archive(dec, scratch_root).context("unpacking tmp dir archive")?;
+/// Unpack the zstd-compressed tmp dir stream into the build dir,
+/// creating it even for an empty stream. Files belong to whoever runs
+/// this: the agent on the direct-exec and macOS paths, in-ns root
+/// through the userns helper on the Linux namespace path.
+fn stage_scratch(pack: impl std::io::Read, build_dir: &Path) -> Result<()> {
     fs::create_dir_all(build_dir)?;
-    Ok(())
+    let dec = zstd::stream::read::Decoder::new(pack)?;
+    unpack_tmp_dir(dec, build_dir).context("unpacking the tmp dir")
 }
 
 #[cfg(target_os = "linux")]
@@ -190,7 +188,7 @@ fn handle_start(
         "invalid build id {:?}",
         req.build_id
     );
-    let tmp_tar = fds.into_iter().next().context("missing tmp dir tar fd")?;
+    let tmp_pack = fds.into_iter().next().context("missing tmp dir fd")?;
     // The lock is held until the build is registered: a losing
     // concurrent Start gets Busy without ever spawning anything.
     let (build_dir, log, exit, pid) = {
@@ -206,8 +204,8 @@ fn handle_start(
         let build_dir = scratch_root.join("build");
         let _ = fs::remove_dir_all(&scratch_root);
         fs::create_dir_all(&scratch_root)?;
-        platform::stage_tmp_dir(&agent.confinement, &scratch_root, &build_dir, tmp_tar)
-            .context("staging the tmp dir archive")?;
+        platform::stage_tmp_dir(&agent.confinement, &scratch_root, &build_dir, tmp_pack)
+            .context("staging the tmp dir")?;
 
         let log_path = scratch_root.join("build.log");
         let log_w = fs::File::create(&log_path)?;

@@ -5,7 +5,7 @@
 //!   submissions replay buffered events and then follow live
 //! - queues per system type; submitters block until a worker is free
 //! - serves the WorkerHub gRPC service over mTLS; workers dial in
-//! - reads input store paths and topTmpDir directly from local disk
+//! - reads input store paths directly from local disk
 //! - verifies worker output signatures while relaying compressed chunks
 
 use std::collections::HashMap;

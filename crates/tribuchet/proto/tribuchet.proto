@@ -43,7 +43,7 @@ message HubMessage {
     // Input closure of an assigned build; worker answers MissingPaths.
     PathOffer path_offer = 2;
     NarTransfer nar = 3;
-    // topTmpDir contents (structured attrs, passAsFile files).
+    // Build tmp dir contents (structured attrs, passAsFile files).
     TmpDirArchive tmp_dir = 4;
     CancelBuild cancel = 5;
     // Nix db metadata for an input path, sent before its NarTransfer
@@ -152,8 +152,18 @@ message NarTransfer {
 
 message TmpDirArchive {
   string build_id = 1;
-  bytes zstd_tar_chunk = 2;
+  bytes zstd_chunk = 2;
   bool eof = 3;
+}
+
+// One regular file of the client's build tmp dir, as
+// u32-length-prefixed messages inside the zstd stream carried by
+// TmpDirChunk / TmpDirArchive. Nix only puts plain non-executable
+// files there, so a file is a basename plus contents and the unpacker
+// fixes the modes.
+message TmpDirFile {
+  string name = 1; // basename, no "/"
+  bytes data = 2;
 }
 
 message LogChunk {
@@ -201,14 +211,14 @@ message OutputSignature {
 // Local service between `tribuchet attach` and the hub, served on a unix
 // socket. The hub is colocated with nix-daemon, so it reads input store
 // paths directly from disk. Attach sends the request metadata followed
-// by its tarred topTmpDir contents, so the hub never reads the
+// by its packed build tmp dir contents, so the hub never reads the
 // client's build directory.
 service AttachHub {
   rpc Build(stream BuildMessage) returns (stream AttachEvent);
 }
 
-// Client-streamed submission: the BuildRequest, then the zstd tar of
-// the client's topTmpDir, terminated by an eof chunk.
+// Client-streamed submission: the BuildRequest, then TmpDirFile
+// chunks terminated by an eof chunk.
 message BuildMessage {
   oneof msg {
     BuildRequest request = 1;
@@ -217,7 +227,7 @@ message BuildMessage {
 }
 
 message TmpDirChunk {
-  bytes zstd_tar_chunk = 1;
+  bytes zstd_chunk = 1;
   bool eof = 2;
 }
 

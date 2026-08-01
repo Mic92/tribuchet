@@ -57,10 +57,11 @@ async fn run_async(build: BuildJson, socket: PathBuf, build_json_path: PathBuf) 
         store_dir: build.store_dir,
         fixed_output,
     };
-    // Archived once and resent verbatim on every reconnect attempt.
-    let tmp_dir_tar = tokio::task::spawn_blocking({
-        let dir = build.top_tmp_dir.clone();
-        move || crate::tmptar::tar_zstd_dir(&dir)
+    // Packed once and resent verbatim on every reconnect attempt.
+    // Nix places everything the builder consumes in topTmpDir/build.
+    let tmp_dir_pack = tokio::task::spawn_blocking({
+        let dir = build.top_tmp_dir.join("build");
+        move || crate::tmpdir::pack_zstd_dir(&dir)
     })
     .await??;
     let expected_outputs: Vec<String> = req.outputs.values().cloned().collect();
@@ -74,7 +75,15 @@ async fn run_async(build: BuildJson, socket: PathBuf, build_json_path: PathBuf) 
     // instead of building twice.
     let mut attempts = 0u32;
     loop {
-        match attempt_build(&req, &tmp_dir_tar, &socket, &expected_outputs, &top_tmp_dir).await? {
+        match attempt_build(
+            &req,
+            &tmp_dir_pack,
+            &socket,
+            &expected_outputs,
+            &top_tmp_dir,
+        )
+        .await?
+        {
             Outcome::Done(code) => return Ok(code),
             Outcome::Retry(e) => {
                 attempts += 1;
@@ -112,20 +121,17 @@ async fn connect(socket: &Path) -> Result<tonic::transport::Channel> {
         .context("connecting to hub socket")
 }
 
-/// The submission stream: the request, then the tmp dir archive with
+/// The submission stream: the request, then the tmp dir entries with
 /// its eof marker.
-fn submission(req: &BuildRequest, tmp_dir_tar: &[u8]) -> Vec<BuildMessage> {
-    let tmp_dir = |zstd_tar_chunk: Vec<u8>, eof| BuildMessage {
-        msg: Some(build_message::Msg::TmpDir(TmpDirChunk {
-            zstd_tar_chunk,
-            eof,
-        })),
+fn submission(req: &BuildRequest, tmp_dir_pack: &[u8]) -> Vec<BuildMessage> {
+    let tmp_dir = |zstd_chunk: Vec<u8>, eof| BuildMessage {
+        msg: Some(build_message::Msg::TmpDir(TmpDirChunk { zstd_chunk, eof })),
     };
     let mut msgs = vec![BuildMessage {
         msg: Some(build_message::Msg::Request(req.clone())),
     }];
     msgs.extend(
-        tmp_dir_tar
+        tmp_dir_pack
             .chunks(crate::chunkio::CHUNK_SIZE)
             .map(|c| tmp_dir(c.to_vec(), false)),
     );
@@ -135,7 +141,7 @@ fn submission(req: &BuildRequest, tmp_dir_tar: &[u8]) -> Vec<BuildMessage> {
 
 async fn attempt_build(
     req: &BuildRequest,
-    tmp_dir_tar: &[u8],
+    tmp_dir_pack: &[u8],
     socket: &Path,
     expected_outputs: &[String],
     top_tmp_dir: &Path,
@@ -154,7 +160,7 @@ async fn attempt_build(
     ready_marker()?;
 
     let mut stream = match client
-        .build(tokio_stream::iter(submission(req, tmp_dir_tar)))
+        .build(tokio_stream::iter(submission(req, tmp_dir_pack)))
         .await
     {
         Ok(s) => s.into_inner(),
