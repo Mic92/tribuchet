@@ -6,15 +6,12 @@
 
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::fd::{AsFd, OwnedFd};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::fd::AsFd;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail, ensure};
-use nix::fcntl::OFlag;
-use nix::sys::stat;
-use nix::{dir, fcntl};
 use prost::Message;
+use rustix::fs::{Dir, FileType, Mode, OFlags, fchmod, open, openat};
 
 use crate::proto::TmpDirFile;
 
@@ -48,22 +45,23 @@ fn read_file(r: &mut impl Read) -> Result<Option<TmpDirFile>> {
 /// else (subdirectories, symlinks, the recursive-nix socket) is
 /// skipped.
 pub fn pack_zstd_dir(path: &Path) -> Result<Vec<u8>> {
-    let dir = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags((OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW).bits())
-        .open(path)
-        .with_context(|| format!("opening build dir {}", path.display()))?;
+    let dir = open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .with_context(|| format!("opening build dir {}", path.display()))?;
     let mut enc = zstd::stream::write::Encoder::new(Vec::new(), 3)?;
     // List through fdopendir on a dup of the handle instead of
     // re-resolving the path (and instead of /proc/self/fd, which is
     // Linux-only and unreliable on macOS).
-    let mut listing = dir::Dir::from_fd(OwnedFd::from(dir.try_clone()?))?;
-    // Collect names up front: dir::Entry borrows the iterator.
+    let listing = Dir::read_from(&dir)?;
+    // Collect names up front so the directory handle is free for openat.
     let mut names = Vec::new();
-    for res in listing.iter() {
+    for res in listing {
         let entry = res?;
         let bytes = entry.file_name().to_bytes();
-        if bytes == b"." || bytes == b".." || entry.file_type() != Some(dir::Type::File) {
+        if bytes == b"." || bytes == b".." || entry.file_type() != FileType::RegularFile {
             continue;
         }
         let Ok(name) = std::str::from_utf8(bytes) else {
@@ -74,11 +72,11 @@ pub fn pack_zstd_dir(path: &Path) -> Result<Vec<u8>> {
     for name in names {
         // O_NOFOLLOW: a listing entry swapped for a symlink fails the open.
         // O_NONBLOCK: a swapped-in fifo cannot stall attach.
-        let mut fd: fs::File = fcntl::openat(
-            dir.as_fd(),
+        let mut fd: fs::File = openat(
+            &dir,
             name.as_str(),
-            OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
-            stat::Mode::empty(),
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
         )?
         .into();
         if !fd.metadata()?.is_file() {
@@ -97,27 +95,23 @@ pub fn pack_zstd_dir(path: &Path) -> Result<Vec<u8>> {
 /// land outside the destination.
 pub(crate) fn unpack_tmp_dir(reader: impl Read, dest: &Path) -> Result<()> {
     let dest = fs::File::open(dest).context("opening tmp dir destination")?;
-    let mode = stat::Mode::from_bits_truncate(0o644);
+    let mode = Mode::from_bits_truncate(0o644);
     // Bounds a decompression bomb. Real tmp dir contents are tiny.
     let mut reader = reader.take(MAX_UNPACKED);
     while let Some(f) = read_file(&mut reader)? {
         if f.name.is_empty() || f.name == "." || f.name == ".." || f.name.contains('/') {
             bail!("invalid tmp dir file name {:?}", f.name);
         }
-        let file: fs::File = fcntl::openat(
+        let file: fs::File = openat(
             dest.as_fd(),
             f.name.as_str(),
-            OFlag::O_WRONLY
-                | OFlag::O_CREAT
-                | OFlag::O_TRUNC
-                | OFlag::O_NOFOLLOW
-                | OFlag::O_CLOEXEC,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             mode,
         )?
         .into();
         (&file).write_all(&f.data)?;
         // the umask at create time may have masked bits off
-        stat::fchmod(file.as_fd(), mode)?;
+        fchmod(&file, mode)?;
     }
     ensure!(
         reader.limit() > 0,

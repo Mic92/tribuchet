@@ -4,12 +4,16 @@
 //! carry fds, hence the separate protocol.
 
 use std::io::{IoSlice, IoSliceMut, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::mem::MaybeUninit;
+use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 
 use anyhow::{Context, Result, bail, ensure};
-use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, sendmsg};
 use prost::Message;
+use rustix::net::{
+    RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
+    SendAncillaryMessage, SendFlags, recvmsg, sendmsg,
+};
 
 use crate::agent::{self, call, reply};
 
@@ -22,9 +26,20 @@ fn send_message(sock: &UnixStream, body: &impl Message, fds: &[RawFd]) -> Result
     let mut buf = (u32::try_from(body.len())?).to_le_bytes().to_vec();
     buf.extend_from_slice(&body);
     let iov = [IoSlice::new(&buf)];
-    let cmsg = [ControlMessage::ScmRights(fds)];
-    let sent = sendmsg::<()>(sock.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None)
-        .context("sending message")?;
+    // SAFETY: the caller keeps the fds open for the duration of the call.
+    let borrowed: Vec<BorrowedFd> = fds
+        .iter()
+        .map(|fd| unsafe { BorrowedFd::borrow_raw(*fd) })
+        .collect();
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(8))];
+    let mut cmsg = SendAncillaryBuffer::new(&mut space);
+    if !borrowed.is_empty() {
+        ensure!(
+            cmsg.push(SendAncillaryMessage::ScmRights(&borrowed)),
+            "too many fds for one message"
+        );
+    }
+    let sent = sendmsg(sock, &iov, &mut cmsg, SendFlags::empty()).context("sending message")?;
     if sent < buf.len() {
         (&mut &*sock).write_all(&buf[sent..])?;
     }
@@ -36,25 +51,17 @@ fn send_message(sock: &UnixStream, body: &impl Message, fds: &[RawFd]) -> Result
 /// queued.
 fn recv_message<M: Message + Default>(sock: &UnixStream) -> Result<(M, Vec<OwnedFd>)> {
     let mut len_buf = [0u8; 4];
-    let mut cmsg_buf = nix::cmsg_space!([RawFd; 8]);
+    let mut cmsg_buf = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(8))];
     // The first read also collects the attached fds.
     let (n, fds) = {
         let mut iov = [IoSliceMut::new(&mut len_buf)];
-        let msg = recvmsg::<()>(
-            sock.as_raw_fd(),
-            &mut iov,
-            Some(&mut cmsg_buf),
-            MsgFlags::empty(),
-        )
-        .context("receiving message")?;
+        let mut cmsg = RecvAncillaryBuffer::new(&mut cmsg_buf);
+        let msg =
+            recvmsg(sock, &mut iov, &mut cmsg, RecvFlags::empty()).context("receiving message")?;
         let mut fds = Vec::new();
-        for c in msg.cmsgs()? {
-            if let ControlMessageOwned::ScmRights(received) = c {
-                fds.extend(
-                    received
-                        .into_iter()
-                        .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }),
-                );
+        for c in cmsg.drain() {
+            if let RecvAncillaryMessage::ScmRights(received) = c {
+                fds.extend(received);
             }
         }
         (msg.bytes, fds)
@@ -125,6 +132,7 @@ pub fn recv_reply(sock: &UnixStream) -> Result<(reply::Reply, Vec<OwnedFd>)> {
 mod tests {
     use super::*;
     use crate::agent::{AdoptRequest, ERROR_BUSY, StartReply};
+    use std::os::fd::AsRawFd;
 
     #[test]
     fn call_roundtrip_with_fds() {

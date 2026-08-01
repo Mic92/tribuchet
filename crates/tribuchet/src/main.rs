@@ -87,6 +87,11 @@ fn main() -> anyhow::Result<()> {
     if std::env::args().nth(1).as_deref() == Some(worker::agent::FS_HELPER_ARG) {
         worker::agent::fs_helper_stage();
     }
+    // And for the agent's userns holder child.
+    #[cfg(target_os = "linux")]
+    if std::env::args().nth(1).as_deref() == Some(worker::USERNS_HOLD_ARG) {
+        worker::userns_hold_stage();
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),

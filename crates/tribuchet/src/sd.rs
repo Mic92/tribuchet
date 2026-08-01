@@ -4,10 +4,10 @@
 //! respective service manager, so plain CLI runs are unaffected.
 
 use std::net::TcpListener;
-use std::os::fd::{FromRawFd as _, RawFd};
+use std::os::fd::{BorrowedFd, FromRawFd as _, RawFd};
 
 use anyhow::{Context, Result, bail};
-use nix::sys::socket;
+use rustix::net::{AddressFamily, getsockname};
 
 /// Listeners handed over by systemd socket activation, classified by
 /// address family. Holding the listening sockets in systemd keeps them
@@ -43,9 +43,8 @@ impl ActivatedSockets {
     /// Take ownership of one activated listener fd, classified by
     /// address family.
     fn adopt(&mut self, fd: RawFd) -> Result<()> {
-        use socket::AddressFamily;
         match socket_family(fd)? {
-            Some(AddressFamily::Inet | AddressFamily::Inet6) => {
+            AddressFamily::INET | AddressFamily::INET6 => {
                 if self.tcp.is_some() {
                     bail!("more than one activated TCP socket");
                 }
@@ -54,7 +53,7 @@ impl ActivatedSockets {
                 l.set_nonblocking(true)?;
                 self.tcp = Some(l);
             }
-            Some(AddressFamily::Unix) => {
+            AddressFamily::UNIX => {
                 if self.unix.is_some() {
                     bail!("more than one activated unix socket");
                 }
@@ -93,7 +92,7 @@ pub fn launchd_unix_listener(name: &str) -> Result<Option<std::os::unix::net::Un
     let Some(fd) = launchd_socket_fds(name)?.into_iter().next() else {
         return Ok(None);
     };
-    if socket_family(fd)? != Some(socket::AddressFamily::Unix) {
+    if socket_family(fd)? != AddressFamily::UNIX {
         bail!("launchd socket {name} is not a unix socket");
     }
     // Safety: launchd passed this fd for us to own.
@@ -134,11 +133,11 @@ fn launchd_socket_fds(name: &str) -> Result<Vec<RawFd>> {
     Ok(out)
 }
 
-fn socket_family(fd: RawFd) -> Result<Option<socket::AddressFamily>> {
-    use socket::SockaddrLike;
-    let addr: socket::SockaddrStorage =
-        socket::getsockname(fd).with_context(|| format!("getsockname on activated fd {fd}"))?;
-    Ok(addr.family())
+fn socket_family(fd: RawFd) -> Result<AddressFamily> {
+    // SAFETY: the service manager passed this fd; it stays open here.
+    let sockfd = unsafe { BorrowedFd::borrow_raw(fd) };
+    let addr = getsockname(sockfd).with_context(|| format!("getsockname on activated fd {fd}"))?;
+    Ok(addr.address_family())
 }
 
 /// Tell systemd (Type=notify) that startup finished. Restarts become

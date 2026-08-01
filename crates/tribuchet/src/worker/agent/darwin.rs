@@ -109,7 +109,7 @@ pub(super) fn own_uid_pids() -> Vec<i32> {
     // From <libproc.h>; the libc crate binds proc_listpids but not the
     // filter constants.
     const PROC_UID_ONLY: u32 = 2;
-    let uid = nix::unistd::getuid().as_raw();
+    let uid = rustix::process::getuid().as_raw();
     // Sized generously instead of the size-probe round trip: the uid
     // runs one build plus the agent, and a truncated list only means
     // the next sweep iteration picks up the rest.

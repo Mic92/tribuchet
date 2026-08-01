@@ -25,6 +25,8 @@ use std::process::{Child, Command, Stdio};
 
 #[cfg(target_os = "linux")]
 use anyhow::{Context, Result};
+#[cfg(target_os = "linux")]
+use rustix::pipe::{PipeFlags, pipe_with};
 
 #[cfg(target_os = "linux")]
 use super::binfmt;
@@ -83,6 +85,10 @@ pub struct SandboxSpec {
     /// Flow policy applied to that network.
     #[serde(default)]
     pub net_policy: NetPolicy,
+    /// Fd number of the tap-handoff socketpair end inherited from the
+    /// agent, which runs the presto-pasta forwarder for the netns.
+    #[serde(default)]
+    pub net_fwd_fd: Option<i32>,
     /// Static emulator binary for foreign-system builds, bound at
     /// binfmt::INTERP_PATH and registered in a per-userns binfmt_misc
     /// instance.
@@ -172,6 +178,7 @@ pub fn prepare(
         // filled in by the agent, like the namespace and cgroup
         net_isolation: opts.net_isolation && a.fixed_output,
         net_policy: opts.net_policy.clone(),
+        net_fwd_fd: None,
         emulator: opts.emulator.map(Path::to_path_buf),
         deny_read: opts.secrets.to_vec(),
         recursive_nix: opts.recursive_nix,
@@ -223,8 +230,7 @@ fn build_command(spec: &SandboxSpec) -> Result<(Command, Option<OwnedFd>)> {
     // O_CLOEXEC: a write end inherited by a concurrently spawned
     // sibling build would keep the spec read from ever seeing EOF.
     if platform::SPEC_VIA_STDIN {
-        let (r, w) =
-            nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).context("creating spec pipe")?;
+        let (r, w) = pipe_with(PipeFlags::CLOEXEC).context("creating spec pipe")?;
         cmd.stdin(Stdio::from(fs::File::from(r)));
         return Ok((cmd, Some(w)));
     }

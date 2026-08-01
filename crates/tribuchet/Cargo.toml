@@ -40,13 +40,17 @@ harmonia-store-db.workspace = true
 rusqlite.workspace = true
 harmonia-store-remote.workspace = true
 harmonia-store-ref-scan.workspace = true
+rustix.workspace = true
 sd-notify = "0.5.0"
 tempfile.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # User-mode NAT datapath for fixed-output build network isolation.
-presto-pasta = "0.0.6"
-rustix.workspace = true
+presto-pasta = "0.0.8"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# getpeereid on the agent socket needs nix's socket module.
+nix = { workspace = true, features = ["socket"] }
 
 [features]
 # Gates the NixOS e2e harness (tests/e2e.rs). It drives VMs over the test

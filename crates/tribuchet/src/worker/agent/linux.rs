@@ -12,17 +12,31 @@
 //! stage, spawned here.
 
 use std::fs;
-use std::os::fd::OwnedFd;
+use std::io::IoSliceMut;
+use std::mem::MaybeUninit;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
-use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+use rustix::io::{FdFlags, fcntl_setfd};
+use rustix::net::sockopt::socket_peercred;
+use rustix::net::{
+    AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendFlags, SocketFlags,
+    SocketType, recvmsg, send, socketpair,
+};
+use rustix::process::getuid;
+use rustix::process::{Gid, Pid, PidfdFlags, Uid, pidfd_open};
+use rustix::thread::{
+    LinkNameSpaceType, move_into_link_name_space, set_thread_gid, set_thread_uid,
+};
 use sandbox_proto::agent::StartRequest;
 
 use super::{Build, Options, cgroup};
+use crate::netpolicy::NetPolicy;
 use crate::worker::sandbox::{self, SandboxSpec};
 use crate::worker::userns::{self, UsernsHolder};
 
@@ -62,7 +76,9 @@ impl Confinement {
 
     /// The userns holder must survive the kill sweep.
     pub(super) fn exempt_pid(&self) -> Option<i32> {
-        self.userns.as_ref().map(|ns| ns.holder.pid().as_raw())
+        self.userns
+            .as_ref()
+            .and_then(|ns| i32::try_from(ns.holder.pid()).ok())
     }
 }
 
@@ -134,7 +150,30 @@ pub(super) fn spawn_builder(
         cgroup::set_memory_max(cg, bytes)?;
     }
     sandbox::prepare_root(&mut spec).context("creating the sandbox root skeleton")?;
+    // Isolated network builds hand their tap fd back over this
+    // socketpair to the forwarder thread spawned below.
+    let net_fwd = if spec.net_isolation && spec.network {
+        let (ours, theirs) = socketpair(
+            AddressFamily::UNIX,
+            SocketType::DGRAM,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .context("creating the tap handoff socketpair")?;
+        // The setup stage inherits its end across the exec.
+        fcntl_setfd(&theirs, FdFlags::empty()).context("clearing close-on-exec")?;
+        spec.net_fwd_fd = Some(theirs.as_raw_fd());
+        Some((ours, theirs))
+    } else {
+        None
+    };
     let (child, spec_w) = sandbox::spawn(&spec, log)?;
+    if let Some((ours, theirs)) = net_fwd {
+        drop(theirs);
+        let policy = spec.net_policy.clone();
+        let build_pid = child.id();
+        std::thread::spawn(move || net_forward(&ours, policy, build_pid));
+    }
     // The setup stage waits for the spec on stdin; move it into the
     // build cgroup first so its cgroup namespace is rooted there.
     if let Some(cg) = &spec.cgroup {
@@ -144,6 +183,45 @@ pub(super) fn spawn_builder(
         sandbox::send_spec_to(&spec, w)?;
     }
     Ok((child, Some(spec.root)))
+}
+
+/// Per-build network forwarder: receive the tap fd the setup stage
+/// created inside its netns, run the presto-pasta datapath on it and
+/// stop it (letting the netns go away) once the build process dies.
+fn net_forward(sock: &OwnedFd, policy: NetPolicy, build_pid: u32) {
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut cmsg = RecvAncillaryBuffer::new(&mut space);
+    let mut buf = [0u8; 8];
+    let mut iov = [IoSliceMut::new(&mut buf)];
+    if recvmsg(sock, &mut iov, &mut cmsg, RecvFlags::empty()).is_err() {
+        return;
+    }
+    let Some(RecvAncillaryMessage::ScmRights(mut fds)) = cmsg.drain().next() else {
+        // The build died before creating the tap; nothing to forward.
+        return;
+    };
+    let Some(tap) = fds.next() else { return };
+    let net = presto_pasta::Config {
+        allow_flow: Some(Arc::new(move |d: &presto_pasta::FlowDst| {
+            policy.allows(d.proto, d.ip, d.port)
+        })),
+        ..presto_pasta::Config::default()
+    };
+    let mut presto = presto_pasta::Presto::new(net, tap);
+    // A pidfd stops the datapath (closing the tap fd and with it the
+    // build netns) once the build process dies.
+    if let Some(pid) = Pid::from_raw(build_pid.cast_signed())
+        && let Ok(pidfd) = pidfd_open(pid, PidfdFlags::empty())
+    {
+        presto.stop_on(pidfd);
+    }
+    // Readiness ack: the setup stage waits for this before building.
+    if send(sock, b"ok", SendFlags::empty()).is_err() {
+        return;
+    }
+    if let Err(e) = presto.run() {
+        tracing::warn!("presto-pasta datapath exited: {e}");
+    }
 }
 
 /// Make outputs readable for the worker. Files of a namespace build
@@ -221,13 +299,13 @@ pub fn fs_helper_stage() -> ! {
         let mut args = std::env::args_os().skip(2);
         let ns = fs::File::open(args.next().context("missing userns path")?)?;
         let op = args.next().context("missing op")?;
-        nix::sched::setns(ns, nix::sched::CloneFlags::CLONE_NEWUSER)
+        move_into_link_name_space(ns.as_fd(), Some(LinkNameSpaceType::User))
             .context("joining the agent user namespace")?;
         if op.to_str() == Some("unpack") {
             // Become in-ns root so the unpacked files belong to the
             // uid block instead of the agent's unmapped uid.
-            nix::unistd::setgid(nix::unistd::Gid::from_raw(0)).context("setgid 0 in the ns")?;
-            nix::unistd::setuid(nix::unistd::Uid::from_raw(0)).context("setuid 0 in the ns")?;
+            set_thread_gid(Gid::from_raw(0)).context("setgid 0 in the ns")?;
+            set_thread_uid(Uid::from_raw(0)).context("setuid 0 in the ns")?;
             let build_dir = PathBuf::from(args.next().context("missing build dir")?);
             return super::stage_scratch(std::io::stdin(), &build_dir);
         }
@@ -319,7 +397,7 @@ pub(super) fn activated_unix_listener() -> Result<Option<UnixListener>> {
 }
 
 pub(super) fn peer_uid(conn: &UnixStream) -> Result<u32> {
-    Ok(getsockopt(conn, PeerCredentials)?.uid())
+    Ok(socket_peercred(conn)?.uid.as_raw())
 }
 
 /// Whether the build cgroup's memory.max OOM-killed the build.
@@ -338,7 +416,7 @@ pub(super) fn oom_killed(confinement: &Confinement, build_id: &str) -> bool {
 
 /// Pids whose real uid is this uid, from /proc.
 pub(super) fn own_uid_pids() -> Vec<i32> {
-    let uid = nix::unistd::getuid().as_raw();
+    let uid = getuid().as_raw();
     let Ok(entries) = fs::read_dir("/proc") else {
         tracing::warn!("reading /proc failed, kill sweep degraded to the process group");
         return Vec::new();

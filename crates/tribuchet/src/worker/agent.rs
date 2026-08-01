@@ -19,6 +19,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
+use rustix::process::{Pid, Signal, getuid, kill_process, kill_process_group};
 use sandbox_proto::agent::{
     AdoptReply, AdoptRequest, CleanupRequest, ERROR_BUSY, ERROR_UNKNOWN_BUILD, Empty, ExitNotice,
     FinishRequest, KillRequest, StartReply, StartRequest, StatusReply, call, reply,
@@ -97,11 +98,8 @@ struct Agent {
 
 impl Agent {
     fn kill_sweep(&self, pgid: Option<i32>) {
-        if let Some(pgid) = pgid {
-            let _ = nix::sys::signal::killpg(
-                nix::unistd::Pid::from_raw(pgid),
-                nix::sys::signal::Signal::SIGKILL,
-            );
+        if let Some(pgid) = pgid.and_then(Pid::from_raw) {
+            let _ = kill_process_group(pgid, Signal::KILL);
         }
         if self.dedicated_uid {
             kill_own_uid_processes(self.confinement.exempt_pid());
@@ -122,14 +120,12 @@ pub fn run(opts: &Options) -> Result<()> {
             .state_dir
             .canonicalize()
             .with_context(|| format!("canonicalizing state dir {}", opts.state_dir.display()))?,
-        worker_uid: opts
-            .worker_uid
-            .unwrap_or_else(|| nix::unistd::getuid().as_raw()),
+        worker_uid: opts.worker_uid.unwrap_or_else(|| getuid().as_raw()),
         confinement,
         current: Mutex::new(None),
         dedicated_uid: activated || opts.dedicated_uid,
     });
-    tracing::info!(uid = nix::unistd::getuid().as_raw(), "agent listening");
+    tracing::info!(uid = getuid().as_raw(), "agent listening");
     for conn in listener.incoming() {
         let conn = conn.context("accepting connection")?;
         let agent = agent.clone();
@@ -416,11 +412,8 @@ fn kill_own_uid_processes(exempt: Option<i32>) {
         if others.is_empty() {
             return;
         }
-        for pid in &others {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(*pid),
-                nix::sys::signal::Signal::SIGKILL,
-            );
+        for pid in others.iter().copied().filter_map(Pid::from_raw) {
+            let _ = kill_process(pid, Signal::KILL);
         }
         if Instant::now() > deadline {
             tracing::warn!(?others, "own-uid processes survived the kill sweep");

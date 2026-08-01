@@ -6,8 +6,8 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-nix.workspace = true
 prost.workspace = true
+rustix = { workspace = true, features = ["net"] }
 
 [build-dependencies]
 prost-build.workspace = true

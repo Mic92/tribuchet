@@ -564,7 +564,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1504,14 +1504,14 @@ checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 
 [[package]]
 name = "presto-pasta"
-version = "0.0.6"
+version = "0.0.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5dfe9de109b9e194f1d5151c51524147cfc82e08bfa9c9662d3b8c0997f629f"
+checksum = "83ffb2775a4be7d535fafbcb48fdd803fa6e05669148ee5badd4376c432377a2"
 dependencies = [
  "foldhash 0.2.0",
  "io-uring",
  "libc",
- "nix",
+ "rustix",
 ]
 
 [[package]]
@@ -1780,7 +1780,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1838,9 +1838,9 @@ name = "sandbox-proto"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "nix",
  "prost",
  "prost-build",
+ "rustix",
 ]
 
 [[package]]
@@ -2064,7 +2064,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2582,7 +2582,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
