@@ -24,7 +24,6 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
 #[cfg(target_os = "linux")]
-use anyhow::{Context, Result};
 #[cfg(target_os = "linux")]
 use rustix::pipe::{PipeFlags, pipe_with};
 
@@ -140,13 +139,36 @@ pub struct PrepareOpts<'a> {
     pub nix_daemon_socket: Option<&'a Path>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error("{step}")]
+    Step {
+        step: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("sending sandbox spec")]
+    SendSpec(#[source] serde_json::Error),
+    #[error("no binfmt magic known for system {0}")]
+    UnknownBinfmt(String),
+}
+
+fn step<E: Into<std::io::Error>>(step: impl Into<String>) -> impl FnOnce(E) -> Error {
+    |source| Error::Step {
+        step: step.into(),
+        source: source.into(),
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub fn prepare(
     a: &BuildAssignment,
     dir: &Path,
     inputs: &[String],
     opts: &PrepareOpts,
-) -> Result<SandboxSpec> {
+) -> Result<SandboxSpec, Error> {
     let build_dir = dir.join("top").join("build");
     fs::create_dir_all(&build_dir)?;
     let mut spec = SandboxSpec {
@@ -214,7 +236,7 @@ pub fn prepare(
 /// The prepared sandbox as a spawnable command plus the write end of
 /// the pipe carrying the serialized spec to the setup stage's stdin.
 #[cfg(target_os = "linux")]
-fn build_command(spec: &SandboxSpec) -> Result<(Command, Option<OwnedFd>)> {
+fn build_command(spec: &SandboxSpec) -> Result<(Command, Option<OwnedFd>), Error> {
     let mut cmd = platform::command(spec)?;
     // Own process group, so orphaned builder children can be killed
     // after the builder exits.
@@ -230,7 +252,7 @@ fn build_command(spec: &SandboxSpec) -> Result<(Command, Option<OwnedFd>)> {
     // O_CLOEXEC: a write end inherited by a concurrently spawned
     // sibling build would keep the spec read from ever seeing EOF.
     if platform::SPEC_VIA_STDIN {
-        let (r, w) = pipe_with(PipeFlags::CLOEXEC).context("creating spec pipe")?;
+        let (r, w) = pipe_with(PipeFlags::CLOEXEC).map_err(step("creating spec pipe"))?;
         cmd.stdin(Stdio::from(fs::File::from(r)));
         return Ok((cmd, Some(w)));
     }
@@ -244,21 +266,21 @@ fn build_command(spec: &SandboxSpec) -> Result<(Command, Option<OwnedFd>)> {
 /// write end must be filled with `send_spec_to` once the spec is
 /// complete (the setup stage blocks on stdin until then).
 #[cfg(target_os = "linux")]
-pub fn spawn(spec: &SandboxSpec, log: &fs::File) -> Result<(Child, Option<OwnedFd>)> {
+pub fn spawn(spec: &SandboxSpec, log: &fs::File) -> Result<(Child, Option<OwnedFd>), Error> {
     let (mut cmd, spec_w) = build_command(spec)?;
     cmd.stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log.try_clone()?));
     let child = cmd
         .spawn()
-        .with_context(|| format!("spawning builder {}", spec.builder))?;
+        .map_err(step(format!("spawning builder {}", spec.builder)))?;
     Ok((child, spec_w))
 }
 
 /// Write the serialized spec into the setup stage's stdin pipe. Call
 /// after the lease filled in the cgroup.
 #[cfg(target_os = "linux")]
-pub fn send_spec_to(spec: &SandboxSpec, w: OwnedFd) -> Result<()> {
-    serde_json::to_writer(fs::File::from(w), spec).context("sending sandbox spec")
+pub fn send_spec_to(spec: &SandboxSpec, w: OwnedFd) -> Result<(), Error> {
+    serde_json::to_writer(fs::File::from(w), spec).map_err(Error::SendSpec)
 }
 
 #[cfg(target_os = "linux")]
@@ -271,6 +293,7 @@ mod platform;
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use anyhow::Result;
 
     fn min_assignment() -> crate::proto::BuildAssignment {
         crate::proto::BuildAssignment {

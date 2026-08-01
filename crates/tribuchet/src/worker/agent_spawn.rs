@@ -9,13 +9,36 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, ensure};
+use crate::errors::chain;
 use rustix::process::{Gid, Uid};
 use rustix::process::{geteuid, getuid};
 use rustix::thread::{set_thread_groups, set_thread_res_gid, set_thread_res_uid};
 
 /// Size of each agent's mapped uid block.
 const UID_BLOCK: u32 = 65536;
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error("{step}")]
+    Step {
+        step: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("spawn-agents must be at least 1")]
+    ZeroCount,
+    #[error("agent socket {0} did not come up")]
+    SocketTimeout(PathBuf),
+}
+
+fn step(step: impl Into<String>) -> impl FnOnce(std::io::Error) -> Error {
+    |source| Error::Step {
+        step: step.into(),
+        source,
+    }
+}
 
 /// One spawned agent slot.
 struct Slot {
@@ -29,9 +52,11 @@ struct Slot {
 
 /// Spawn `count` agents under `<state_dir>/agents` and return their
 /// socket paths once they accept connections.
-pub fn spawn(state_dir: &Path, count: u32, uid_base: Option<u32>) -> Result<Vec<PathBuf>> {
-    ensure!(count > 0, "spawn-agents must be at least 1");
-    let exe = std::env::current_exe().context("resolving the worker binary")?;
+pub fn spawn(state_dir: &Path, count: u32, uid_base: Option<u32>) -> Result<Vec<PathBuf>, Error> {
+    if count == 0 {
+        return Err(Error::ZeroCount);
+    }
+    let exe = std::env::current_exe().map_err(step("resolving the worker binary"))?;
     let root = geteuid().is_root();
     let uid_base = match (uid_base, root) {
         (Some(b), true) => Some(b),
@@ -57,7 +82,7 @@ pub fn spawn(state_dir: &Path, count: u32, uid_base: Option<u32>) -> Result<Vec<
         };
         if let Some(uid) = slot.uid {
             std::os::unix::fs::chown(&dir, Some(uid), Some(uid))
-                .with_context(|| format!("chowning {}", dir.display()))?;
+                .map_err(step(format!("chowning {}", dir.display())))?;
         }
         let _ = fs::remove_file(&slot.socket);
         sockets.push(slot.socket.clone());
@@ -82,14 +107,14 @@ fn supervise(exe: &Path, slot: &Slot) {
         match run_once(exe, slot) {
             Ok(status) => tracing::info!(socket = %slot.socket.display(), %status, "agent exited"),
             Err(e) => {
-                tracing::warn!(socket = %slot.socket.display(), "starting agent: {e:#}");
+                tracing::warn!(socket = %slot.socket.display(), "starting agent: {}", chain(&e));
                 std::thread::sleep(Duration::from_secs(1));
             }
         }
     }
 }
 
-fn run_once(exe: &Path, slot: &Slot) -> Result<std::process::ExitStatus> {
+fn run_once(exe: &Path, slot: &Slot) -> Result<std::process::ExitStatus, Error> {
     let mut cmd = Command::new(exe);
     cmd.arg("agent")
         .arg("--socket")
@@ -107,9 +132,9 @@ fn run_once(exe: &Path, slot: &Slot) -> Result<std::process::ExitStatus> {
         unsafe { cmd.pre_exec(move || confine_to(uid)) };
     }
     cmd.spawn()
-        .with_context(|| format!("spawning {}", exe.display()))?
+        .map_err(step(format!("spawning {}", exe.display())))?
         .wait()
-        .context("waiting for the agent")
+        .map_err(step("waiting for the agent"))
 }
 
 /// Switch the child to the agent uid while keeping the capabilities
@@ -145,18 +170,16 @@ fn confine_to(uid: u32) -> std::io::Result<()> {
 }
 
 /// Wait until every agent socket accepts a connection.
-fn wait_for_sockets(sockets: &[PathBuf]) -> Result<()> {
+fn wait_for_sockets(sockets: &[PathBuf]) -> Result<(), Error> {
     let deadline = Instant::now() + Duration::from_secs(30);
     for socket in sockets {
         loop {
             if UnixStream::connect(socket).is_ok() {
                 break;
             }
-            ensure!(
-                Instant::now() < deadline,
-                "agent socket {} did not come up",
-                socket.display()
-            );
+            if Instant::now() >= deadline {
+                return Err(Error::SocketTimeout(socket.clone()));
+            }
             std::thread::sleep(Duration::from_millis(100));
         }
     }

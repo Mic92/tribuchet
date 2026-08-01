@@ -1,6 +1,5 @@
 //! Linux sandbox implementation: namespaces, bind mounts, pivot_root.
 
-use anyhow::{Context, Result};
 use nix::unistd;
 
 use rustix::fs::{Mode, StatVfsMountFlags, statvfs};
@@ -53,7 +52,9 @@ const SIOCSIFFLAGS: Opcode = 0x8914;
 /// nodes) for a spec whose scratch paths the caller filled in. Runs on
 /// the worker for its own builds and in the build agent for leased
 /// ones.
-pub fn prepare_root(spec: &mut SandboxSpec) -> Result<()> {
+use super::{Error, step};
+
+pub fn prepare_root(spec: &mut SandboxSpec) -> Result<(), Error> {
     let root = &spec.root;
     write_skeleton(spec)?;
     populate_dev(root, &mut spec.binds_dev)?;
@@ -80,7 +81,7 @@ pub fn prepare_root(spec: &mut SandboxSpec) -> Result<()> {
 /// Sandbox root skeleton: directories, /etc files, /dev symlinks. Runs
 /// on the on-disk root in the worker and again on a leased build's
 /// in-namespace tmpfs root.
-fn write_skeleton(spec: &SandboxSpec) -> Result<()> {
+fn write_skeleton(spec: &SandboxSpec) -> Result<(), Error> {
     let root = &spec.root;
     for sub in [
         "nix/store",
@@ -147,7 +148,7 @@ fn write_skeleton(spec: &SandboxSpec) -> Result<()> {
 /// Mount points for the cwd, bind targets and symlinked store inputs
 /// inside the sandbox root. Like `write_skeleton`, runs in the worker
 /// and again on a leased build's tmpfs root.
-fn create_mount_points(spec: &SandboxSpec) -> Result<()> {
+fn create_mount_points(spec: &SandboxSpec) -> Result<(), Error> {
     // The shipped tmp dir is mounted at the request's sandbox build
     // dir; pre-create the mount point inside the private root.
     fs::create_dir_all(
@@ -184,7 +185,7 @@ fn create_mount_points(spec: &SandboxSpec) -> Result<()> {
             fs::create_dir_all(parent)?;
         }
         std::os::unix::fs::symlink(target, &link)
-            .with_context(|| format!("creating symlink input {}", link.display()))?;
+            .map_err(step(format!("creating symlink input {}", link.display())))?;
     }
     Ok(())
 }
@@ -193,7 +194,7 @@ fn create_mount_points(spec: &SandboxSpec) -> Result<()> {
 /// copies (impossible in a leased user namespace anyway). The mounts
 /// are read-only, so a sandbox mapping a host uid that owns a node
 /// cannot chmod/chown it; device I/O is unaffected by MS_RDONLY.
-fn populate_dev(root: &Path, binds_dev: &mut Vec<(PathBuf, PathBuf)>) -> Result<()> {
+fn populate_dev(root: &Path, binds_dev: &mut Vec<(PathBuf, PathBuf)>) -> Result<(), Error> {
     let mut devices = vec!["null", "zero", "full", "random", "urandom", "tty"];
     // Nix's `kvm` system feature (VM builds, NixOS tests).
     if Path::new("/dev/kvm").exists() {
@@ -207,17 +208,17 @@ fn populate_dev(root: &Path, binds_dev: &mut Vec<(PathBuf, PathBuf)>) -> Result<
     Ok(())
 }
 
-pub fn command(spec: &SandboxSpec) -> Result<Command> {
+pub fn command(spec: &SandboxSpec) -> Result<Command, Error> {
     create_mount_points(spec)?;
 
     if spec.emulator.is_some() && binfmt::register_line(&spec.system).is_none() {
-        anyhow::bail!("no binfmt magic known for system {}", spec.system);
+        return Err(Error::UnknownBinfmt(spec.system.clone()));
     }
 
     // see setup_stage() for why builds re-exec this binary. Resolve it
     // in the worker: the reaper execs this argv, and it outlives worker
     // reloads, so it must not resolve the binary in its own context.
-    let exe = std::env::current_exe().context("resolving worker binary path")?;
+    let exe = std::env::current_exe().map_err(step("resolving worker binary path"))?;
     let mut cmd = Command::new(exe);
     cmd.arg(SETUP_STAGE_ARG);
     Ok(cmd)
