@@ -149,7 +149,7 @@ pub(super) fn dedupe_key(req: &BuildRequest) -> String {
 
 fn new_id() -> String {
     let mut buf = [0u8; 16];
-    rand::RngExt::fill(&mut rand::rng(), &mut buf);
+    getrandom::fill(&mut buf).expect("read system randomness");
     hex::encode(buf)
 }
 
