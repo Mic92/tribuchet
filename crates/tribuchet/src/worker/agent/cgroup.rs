@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, thiserror::Error)]
-pub(super) enum Error {
+pub(crate) enum Error {
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("{step}")]
