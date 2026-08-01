@@ -8,7 +8,6 @@ use std::mem::MaybeUninit;
 use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 
-use anyhow::{Context, Result, bail, ensure};
 use prost::Message;
 use rustix::net::{
     RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
@@ -21,9 +20,38 @@ use crate::agent::{self, call, reply};
 /// this is a corrupted length prefix, not a real message.
 const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("{step}")]
+    Io {
+        step: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("message length {0} out of range")]
+    LengthOutOfRange(usize),
+    #[error("too many fds for one message")]
+    TooManyFds,
+    #[error("connection closed")]
+    ConnectionClosed,
+    #[error("decoding message")]
+    Decode(#[from] prost::DecodeError),
+    #[error("{0} without a payload")]
+    MissingPayload(&'static str),
+    #[error("peer error: {0}")]
+    Peer(String),
+}
+
+type Result<T> = std::result::Result<T, Error>;
+
+fn ioerr(step: &'static str) -> impl Fn(std::io::Error) -> Error {
+    move |source| Error::Io { step, source }
+}
+
 fn send_message(sock: &UnixStream, body: &impl Message, fds: &[RawFd]) -> Result<()> {
     let body = body.encode_to_vec();
-    let mut buf = (u32::try_from(body.len())?).to_le_bytes().to_vec();
+    let len = u32::try_from(body.len()).map_err(|_| Error::LengthOutOfRange(body.len()))?;
+    let mut buf = len.to_le_bytes().to_vec();
     buf.extend_from_slice(&body);
     let iov = [IoSlice::new(&buf)];
     // SAFETY: the caller keeps the fds open for the duration of the call.
@@ -33,15 +61,16 @@ fn send_message(sock: &UnixStream, body: &impl Message, fds: &[RawFd]) -> Result
         .collect();
     let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(8))];
     let mut cmsg = SendAncillaryBuffer::new(&mut space);
-    if !borrowed.is_empty() {
-        ensure!(
-            cmsg.push(SendAncillaryMessage::ScmRights(&borrowed)),
-            "too many fds for one message"
-        );
+    if !borrowed.is_empty() && !cmsg.push(SendAncillaryMessage::ScmRights(&borrowed)) {
+        return Err(Error::TooManyFds);
     }
-    let sent = sendmsg(sock, &iov, &mut cmsg, SendFlags::empty()).context("sending message")?;
+    let sent = sendmsg(sock, &iov, &mut cmsg, SendFlags::empty())
+        .map_err(std::io::Error::from)
+        .map_err(ioerr("sending message"))?;
     if sent < buf.len() {
-        (&mut &*sock).write_all(&buf[sent..])?;
+        (&mut &*sock)
+            .write_all(&buf[sent..])
+            .map_err(ioerr("sending message"))?;
     }
     Ok(())
 }
@@ -56,8 +85,9 @@ fn recv_message<M: Message + Default>(sock: &UnixStream) -> Result<(M, Vec<Owned
     let (n, fds) = {
         let mut iov = [IoSliceMut::new(&mut len_buf)];
         let mut cmsg = RecvAncillaryBuffer::new(&mut cmsg_buf);
-        let msg =
-            recvmsg(sock, &mut iov, &mut cmsg, RecvFlags::empty()).context("receiving message")?;
+        let msg = recvmsg(sock, &mut iov, &mut cmsg, RecvFlags::empty())
+            .map_err(std::io::Error::from)
+            .map_err(ioerr("receiving message"))?;
         let mut fds = Vec::new();
         for c in cmsg.drain() {
             if let RecvAncillaryMessage::ScmRights(received) = c {
@@ -67,18 +97,20 @@ fn recv_message<M: Message + Default>(sock: &UnixStream) -> Result<(M, Vec<Owned
         (msg.bytes, fds)
     };
     if n == 0 {
-        bail!("connection closed");
+        return Err(Error::ConnectionClosed);
     }
     (&mut &*sock)
         .read_exact(&mut len_buf[n..])
-        .context("receiving message")?;
+        .map_err(ioerr("receiving message"))?;
     let len = u32::from_le_bytes(len_buf) as usize;
-    ensure!(len <= MAX_MESSAGE, "message length {len} out of range");
+    if len > MAX_MESSAGE {
+        return Err(Error::LengthOutOfRange(len));
+    }
     let mut data = vec![0u8; len];
     (&mut &*sock)
         .read_exact(&mut data)
-        .context("receiving message")?;
-    let value = M::decode(data.as_slice()).context("decoding message")?;
+        .map_err(ioerr("receiving message"))?;
+    let value = M::decode(data.as_slice())?;
     Ok((value, fds))
 }
 
@@ -112,7 +144,7 @@ pub fn send_error(sock: &UnixStream, error: &str) -> Result<()> {
 /// Socket errors, a closed connection, or a malformed call.
 pub fn recv_call(sock: &UnixStream) -> Result<(call::Call, Vec<OwnedFd>)> {
     let (msg, fds): (agent::Call, _) = recv_message(sock)?;
-    Ok((msg.call.context("call without a payload")?, fds))
+    Ok((msg.call.ok_or(Error::MissingPayload("call"))?, fds))
 }
 
 /// Receive a reply; an error reply becomes an `Err`.
@@ -122,8 +154,8 @@ pub fn recv_call(sock: &UnixStream) -> Result<(call::Call, Vec<OwnedFd>)> {
 /// reply from the peer.
 pub fn recv_reply(sock: &UnixStream) -> Result<(reply::Reply, Vec<OwnedFd>)> {
     let (msg, fds): (agent::Reply, _) = recv_message(sock)?;
-    match msg.reply.context("reply without a payload")? {
-        reply::Reply::Error(e) => bail!("peer error: {e}"),
+    match msg.reply.ok_or(Error::MissingPayload("reply"))? {
+        reply::Reply::Error(e) => Err(Error::Peer(e)),
         r => Ok((r, fds)),
     }
 }

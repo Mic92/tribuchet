@@ -166,6 +166,7 @@ fn handle(agent: &Arc<Agent>, conn: &UnixStream) -> Result<()> {
         call::Call::Status(_) => {
             let current = agent.current.lock().unwrap().as_ref().map(|b| b.id.clone());
             framing::send_reply(conn, reply::Reply::Status(StatusReply { current }), &[])
+                .map_err(Into::into)
         }
         call::Call::Kill(req) => handle_kill(agent, conn, &req),
         call::Call::Finish(req) => handle_finish(agent, conn, &req),
@@ -190,7 +191,7 @@ fn handle_start(
     let (build_dir, log, exit, pid) = {
         let mut current = agent.current.lock().unwrap();
         if current.is_some() {
-            return framing::send_error(conn, ERROR_BUSY);
+            return Ok(framing::send_error(conn, ERROR_BUSY)?);
         }
         // A previous build's leftovers (missed by its kill sweep) must
         // not tamper with this one. The uid holds nothing else.
@@ -241,7 +242,7 @@ fn handle_adopt(agent: &Arc<Agent>, conn: &UnixStream, req: &AdoptRequest) -> Re
             Some(b) if b.id == req.build_id => {
                 (b.pid, b.dir.clone(), b.scratch_root.clone(), b.exit.clone())
             }
-            _ => return framing::send_error(conn, ERROR_UNKNOWN_BUILD),
+            _ => return Ok(framing::send_error(conn, ERROR_UNKNOWN_BUILD)?),
         }
     };
     let log = fs::File::open(scratch_root.join("build.log"))?;
@@ -266,11 +267,11 @@ fn handle_kill(agent: &Arc<Agent>, conn: &UnixStream, req: &KillRequest) -> Resu
         let current = agent.current.lock().unwrap();
         match current.as_ref() {
             Some(b) if b.id == req.build_id => b.pid,
-            _ => return framing::send_error(conn, ERROR_UNKNOWN_BUILD),
+            _ => return Ok(framing::send_error(conn, ERROR_UNKNOWN_BUILD)?),
         }
     };
     agent.kill_sweep(Some(pid));
-    framing::send_reply(conn, reply::Reply::Empty(Empty {}), &[])
+    framing::send_reply(conn, reply::Reply::Empty(Empty {}), &[]).map_err(Into::into)
 }
 
 fn handle_finish(agent: &Arc<Agent>, conn: &UnixStream, req: &FinishRequest) -> Result<()> {
@@ -278,11 +279,11 @@ fn handle_finish(agent: &Arc<Agent>, conn: &UnixStream, req: &FinishRequest) -> 
         let current = agent.current.lock().unwrap();
         match current.as_ref() {
             Some(b) if b.id == req.build_id => (b.outputs.clone(), b.sandbox_root.clone()),
-            _ => return framing::send_error(conn, ERROR_UNKNOWN_BUILD),
+            _ => return Ok(framing::send_error(conn, ERROR_UNKNOWN_BUILD)?),
         }
     };
     platform::finish(&agent.confinement, root.as_deref(), &outputs);
-    framing::send_reply(conn, reply::Reply::Empty(Empty {}), &[])
+    framing::send_reply(conn, reply::Reply::Empty(Empty {}), &[]).map_err(Into::into)
 }
 
 fn handle_cleanup(agent: &Arc<Agent>, conn: &UnixStream, req: &CleanupRequest) -> Result<()> {
@@ -290,7 +291,7 @@ fn handle_cleanup(agent: &Arc<Agent>, conn: &UnixStream, req: &CleanupRequest) -
         let mut current = agent.current.lock().unwrap();
         match current.as_ref() {
             Some(b) if b.id == req.build_id => current.take().unwrap(),
-            _ => return framing::send_error(conn, ERROR_UNKNOWN_BUILD),
+            _ => return Ok(framing::send_error(conn, ERROR_UNKNOWN_BUILD)?),
         }
     };
     agent.kill_sweep(Some(build.pid));
@@ -389,13 +390,13 @@ fn notify_exit(conn: &UnixStream, exit: &(Mutex<Option<i32>>, Condvar)) -> Resul
     while code.is_none() {
         code = exit.1.wait(code).unwrap();
     }
-    framing::send_reply(
+    Ok(framing::send_reply(
         conn,
         reply::Reply::Exit(ExitNotice {
             exit_code: code.unwrap(),
         }),
         &[],
-    )
+    )?)
 }
 
 /// Kill every process of the agent's uid except the agent itself and

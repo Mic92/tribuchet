@@ -1837,10 +1837,10 @@ dependencies = [
 name = "sandbox-proto"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "prost",
  "prost-build",
  "rustix",
+ "thiserror",
 ]
 
 [[package]]
