@@ -25,6 +25,7 @@ use std::process::{Child, Command, Stdio};
 
 #[cfg(target_os = "linux")]
 use anyhow::{Context, Result};
+#[cfg(target_os = "linux")]
 use rustix::pipe::{PipeFlags, pipe_with};
 
 #[cfg(target_os = "linux")]
