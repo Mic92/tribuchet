@@ -5,8 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-anyhow.workspace = true
 prost.workspace = true
+thiserror.workspace = true
 rustix = { workspace = true, features = ["net"] }
 
 [build-dependencies]
