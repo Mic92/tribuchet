@@ -36,6 +36,7 @@ mod relay;
 mod state;
 mod submit;
 
+use crate::errors::chain;
 use metrics::Metrics;
 use relay::{WorkerStaging, run_job, send};
 use state::{HubState, WorkerCaps};
@@ -208,7 +209,7 @@ impl crate::proto::worker_hub_server::WorkerHub for WorkerSvc {
                 return Err(Status::unauthenticated("no peer address"));
             };
             let who = crate::tailscale::whois(socket, addr).await.map_err(|e| {
-                tracing::warn!(%addr, "tailscale whois failed: {e:#}");
+                tracing::warn!(%addr, "tailscale whois failed: {}", chain(&e));
                 Status::unauthenticated("peer is not on the tailnet")
             })?;
             if !allowed_tags.is_empty() && !who.tags.iter().any(|t| allowed_tags.contains(t)) {
