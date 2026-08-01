@@ -9,7 +9,6 @@ use std::io::{self, Read, Write};
 use std::os::fd::AsFd;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail, ensure};
 use prost::Message;
 use rustix::fs::{Dir, FileType, Mode, OFlags, fchmod, open, openat};
 
@@ -18,15 +17,42 @@ use crate::proto::TmpDirFile;
 /// Upper bound on the whole unpacked stream.
 const MAX_UNPACKED: u64 = 1024 * 1024 * 1024;
 
-fn write_file(w: &mut impl Write, file: &TmpDirFile) -> Result<()> {
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error("opening build dir {path}")]
+    OpenDir {
+        path: std::path::PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("opening tmp dir destination")]
+    OpenDest(#[source] io::Error),
+    #[error("tmp dir file too large")]
+    FileTooLarge,
+    #[error("truncated tmp dir file")]
+    Truncated,
+    #[error("decoding tmp dir file")]
+    Decode(#[from] prost::DecodeError),
+    #[error("non-UTF-8 name in the build tmp dir")]
+    NonUtf8Name,
+    #[error("invalid tmp dir file name {0:?}")]
+    InvalidName(String),
+    #[error("tmp dir stream exceeds {MAX_UNPACKED} bytes")]
+    StreamTooLarge,
+}
+
+fn write_file(w: &mut impl Write, file: &TmpDirFile) -> Result<(), Error> {
     let body = file.encode_to_vec();
-    w.write_all(&u32::try_from(body.len())?.to_le_bytes())?;
+    let len = u32::try_from(body.len()).map_err(|_| Error::FileTooLarge)?;
+    w.write_all(&len.to_le_bytes())?;
     w.write_all(&body)?;
     Ok(())
 }
 
 /// The next file, or `None` at a clean end of the stream.
-fn read_file(r: &mut impl Read) -> Result<Option<TmpDirFile>> {
+fn read_file(r: &mut impl Read) -> Result<Option<TmpDirFile>, Error> {
     let mut len = [0u8; 4];
     match r.read_exact(&mut len) {
         Ok(()) => {}
@@ -37,35 +63,40 @@ fn read_file(r: &mut impl Read) -> Result<Option<TmpDirFile>> {
     // Grow as data arrives: a lying prefix cannot force a huge allocation.
     let mut body = Vec::new();
     r.take(len).read_to_end(&mut body)?;
-    ensure!(body.len() as u64 == len, "truncated tmp dir file");
+    if body.len() as u64 != len {
+        return Err(Error::Truncated);
+    }
     Ok(Some(TmpDirFile::decode(body.as_slice())?))
 }
 
 /// zstd stream of the regular files directly inside `path`. Anything
 /// else (subdirectories, symlinks, the recursive-nix socket) is
 /// skipped.
-pub fn pack_zstd_dir(path: &Path) -> Result<Vec<u8>> {
+pub fn pack_zstd_dir(path: &Path) -> Result<Vec<u8>, Error> {
     let dir = open(
         path,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .with_context(|| format!("opening build dir {}", path.display()))?;
+    .map_err(|e| Error::OpenDir {
+        path: path.to_path_buf(),
+        source: e.into(),
+    })?;
     let mut enc = zstd::stream::write::Encoder::new(Vec::new(), 3)?;
     // List through fdopendir on a dup of the handle instead of
     // re-resolving the path (and instead of /proc/self/fd, which is
     // Linux-only and unreliable on macOS).
-    let listing = Dir::read_from(&dir)?;
+    let listing = Dir::read_from(&dir).map_err(io::Error::from)?;
     // Collect names up front so the directory handle is free for openat.
     let mut names = Vec::new();
     for res in listing {
-        let entry = res?;
+        let entry = res.map_err(io::Error::from)?;
         let bytes = entry.file_name().to_bytes();
         if bytes == b"." || bytes == b".." || entry.file_type() != FileType::RegularFile {
             continue;
         }
         let Ok(name) = std::str::from_utf8(bytes) else {
-            bail!("non-UTF-8 name in the build tmp dir");
+            return Err(Error::NonUtf8Name);
         };
         names.push(name.to_owned());
     }
@@ -77,7 +108,8 @@ pub fn pack_zstd_dir(path: &Path) -> Result<Vec<u8>> {
             name.as_str(),
             OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
             Mode::empty(),
-        )?
+        )
+        .map_err(io::Error::from)?
         .into();
         if !fd.metadata()?.is_file() {
             continue;
@@ -93,40 +125,44 @@ pub fn pack_zstd_dir(path: &Path) -> Result<Vec<u8>> {
 /// is created with mode 0644 via openat + O_NOFOLLOW on the
 /// destination's fd, and names must be plain basenames, so nothing can
 /// land outside the destination.
-pub(crate) fn unpack_tmp_dir(reader: impl Read, dest: &Path) -> Result<()> {
-    let dest = fs::File::open(dest).context("opening tmp dir destination")?;
+pub(crate) fn unpack_tmp_dir(reader: impl Read, dest: &Path) -> Result<(), Error> {
+    let dest = fs::File::open(dest).map_err(Error::OpenDest)?;
     let mode = Mode::from_bits_truncate(0o644);
     // Bounds a decompression bomb. Real tmp dir contents are tiny.
     let mut reader = reader.take(MAX_UNPACKED);
     while let Some(f) = read_file(&mut reader)? {
         if f.name.is_empty() || f.name == "." || f.name == ".." || f.name.contains('/') {
-            bail!("invalid tmp dir file name {:?}", f.name);
+            return Err(Error::InvalidName(f.name));
         }
         let file: fs::File = openat(
             dest.as_fd(),
             f.name.as_str(),
             OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             mode,
-        )?
+        )
+        .map_err(io::Error::from)?
         .into();
         (&file).write_all(&f.data)?;
         // the umask at create time may have masked bits off
-        fchmod(&file, mode)?;
+        fchmod(&file, mode).map_err(io::Error::from)?;
     }
-    ensure!(
-        reader.limit() > 0,
-        "tmp dir stream exceeds {MAX_UNPACKED} bytes"
-    );
+    if reader.limit() == 0 {
+        return Err(Error::StreamTooLarge);
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Result;
     use std::collections::HashMap;
 
     fn unpack_zstd(archive: &[u8], dest: &Path) -> Result<()> {
-        unpack_tmp_dir(zstd::stream::read::Decoder::new(archive)?, dest)
+        Ok(unpack_tmp_dir(
+            zstd::stream::read::Decoder::new(archive)?,
+            dest,
+        )?)
     }
 
     fn entries(archive: &[u8]) -> HashMap<String, Vec<u8>> {

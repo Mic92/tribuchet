@@ -90,7 +90,7 @@ pub(super) fn confine(cmd: &mut Command, req: &StartRequest, build_dir: &str) ->
 /// launchd-held listener (socket named "agent" in the plist), or None
 /// when not launchd-activated.
 pub(super) fn activated_unix_listener() -> Result<Option<UnixListener>> {
-    crate::sd::launchd_unix_listener("agent")
+    Ok(crate::sd::launchd_unix_listener("agent")?)
 }
 
 pub(super) fn peer_uid(conn: &UnixStream) -> Result<u32> {

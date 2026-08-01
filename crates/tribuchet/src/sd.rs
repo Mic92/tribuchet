@@ -6,8 +6,33 @@
 use std::net::TcpListener;
 use std::os::fd::{BorrowedFd, FromRawFd as _, RawFd};
 
-use anyhow::{Context, Result, bail};
 use rustix::net::{AddressFamily, getsockname};
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("inspecting LISTEN_FDS")]
+    ListenFds(#[source] std::io::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error("more than one activated TCP socket")]
+    MultipleTcp,
+    #[error("more than one activated unix socket")]
+    MultipleUnix,
+    #[error("activated socket fd {fd} has unsupported family {family:?}")]
+    UnsupportedFamily { fd: RawFd, family: AddressFamily },
+    #[error("getsockname on activated fd {fd}")]
+    Sockname {
+        fd: RawFd,
+        #[source]
+        source: rustix::io::Errno,
+    },
+    #[cfg(target_os = "macos")]
+    #[error("launch_activate_socket({0})")]
+    LaunchActivate(String, #[source] std::io::Error),
+    #[cfg(target_os = "macos")]
+    #[error("launchd socket {0} is not a unix socket")]
+    LaunchdNotUnix(String),
+}
 
 /// Listeners handed over by systemd socket activation, classified by
 /// address family. Holding the listening sockets in systemd keeps them
@@ -20,9 +45,9 @@ pub struct ActivatedSockets {
 }
 
 /// Claim activated sockets, at most one TCP and one unix listener.
-pub fn activated_sockets() -> Result<ActivatedSockets> {
+pub fn activated_sockets() -> Result<ActivatedSockets, Error> {
     let mut out = ActivatedSockets::default();
-    for fd in sd_notify::listen_fds().context("inspecting LISTEN_FDS")? {
+    for fd in sd_notify::listen_fds().map_err(Error::ListenFds)? {
         out.adopt(fd)?;
     }
     #[cfg(target_os = "macos")]
@@ -42,11 +67,11 @@ pub fn activated_sockets() -> Result<ActivatedSockets> {
 impl ActivatedSockets {
     /// Take ownership of one activated listener fd, classified by
     /// address family.
-    fn adopt(&mut self, fd: RawFd) -> Result<()> {
+    fn adopt(&mut self, fd: RawFd) -> Result<(), Error> {
         match socket_family(fd)? {
             AddressFamily::INET | AddressFamily::INET6 => {
                 if self.tcp.is_some() {
-                    bail!("more than one activated TCP socket");
+                    return Err(Error::MultipleTcp);
                 }
                 // Safety: the service manager passed this fd for us to own.
                 let l = unsafe { TcpListener::from_raw_fd(fd) };
@@ -55,14 +80,14 @@ impl ActivatedSockets {
             }
             AddressFamily::UNIX => {
                 if self.unix.is_some() {
-                    bail!("more than one activated unix socket");
+                    return Err(Error::MultipleUnix);
                 }
                 // Safety: the service manager passed this fd for us to own.
                 let l = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
                 l.set_nonblocking(true)?;
                 self.unix = Some(l);
             }
-            family => bail!("activated socket fd {fd} has unsupported family {family:?}"),
+            family => return Err(Error::UnsupportedFamily { fd, family }),
         }
         Ok(())
     }
@@ -75,7 +100,7 @@ impl ActivatedSockets {
 /// No-op when not launched by launchd or the plist declares no
 /// sockets.
 #[cfg(target_os = "macos")]
-fn launchd_sockets(out: &mut ActivatedSockets) -> Result<()> {
+fn launchd_sockets(out: &mut ActivatedSockets) -> Result<(), Error> {
     for name in ["attach", "workers"] {
         for fd in launchd_socket_fds(name)? {
             out.adopt(fd)?;
@@ -87,13 +112,15 @@ fn launchd_sockets(out: &mut ActivatedSockets) -> Result<()> {
 /// The blocking unix listener launchd holds under `name` in the
 /// plist's `Sockets` dictionary, or None when not launchd-activated.
 #[cfg(target_os = "macos")]
-pub fn launchd_unix_listener(name: &str) -> Result<Option<std::os::unix::net::UnixListener>> {
+pub fn launchd_unix_listener(
+    name: &str,
+) -> Result<Option<std::os::unix::net::UnixListener>, Error> {
     use std::os::fd::FromRawFd as _;
     let Some(fd) = launchd_socket_fds(name)?.into_iter().next() else {
         return Ok(None);
     };
     if socket_family(fd)? != AddressFamily::UNIX {
-        bail!("launchd socket {name} is not a unix socket");
+        return Err(Error::LaunchdNotUnix(name.to_owned()));
     }
     // Safety: launchd passed this fd for us to own.
     Ok(Some(unsafe {
@@ -104,7 +131,7 @@ pub fn launchd_unix_listener(name: &str) -> Result<Option<std::os::unix::net::Un
 /// Fds launchd holds under `name`, empty when not running under
 /// launchd or the plist declares no such socket.
 #[cfg(target_os = "macos")]
-fn launchd_socket_fds(name: &str) -> Result<Vec<RawFd>> {
+fn launchd_socket_fds(name: &str) -> Result<Vec<RawFd>, Error> {
     unsafe extern "C" {
         fn launch_activate_socket(
             name: *const libc::c_char,
@@ -120,8 +147,10 @@ fn launchd_socket_fds(name: &str) -> Result<Vec<RawFd>> {
         0 => {}
         libc::ESRCH | libc::ENOENT => return Ok(Vec::new()),
         _ => {
-            return Err(std::io::Error::from_raw_os_error(rc))
-                .with_context(|| format!("launch_activate_socket({name})"));
+            return Err(Error::LaunchActivate(
+                name.to_owned(),
+                std::io::Error::from_raw_os_error(rc),
+            ));
         }
     }
     if fds.is_null() || cnt == 0 {
@@ -133,10 +162,10 @@ fn launchd_socket_fds(name: &str) -> Result<Vec<RawFd>> {
     Ok(out)
 }
 
-fn socket_family(fd: RawFd) -> Result<AddressFamily> {
+fn socket_family(fd: RawFd) -> Result<AddressFamily, Error> {
     // SAFETY: the service manager passed this fd; it stays open here.
     let sockfd = unsafe { BorrowedFd::borrow_raw(fd) };
-    let addr = getsockname(sockfd).with_context(|| format!("getsockname on activated fd {fd}"))?;
+    let addr = getsockname(sockfd).map_err(|source| Error::Sockname { fd, source })?;
     Ok(addr.address_family())
 }
 

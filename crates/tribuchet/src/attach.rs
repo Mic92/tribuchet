@@ -295,7 +295,10 @@ async fn handle_output_chunk(
     let (tx, _) = unpackers.entry(out.store_path.clone()).or_insert_with(|| {
         let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
         let tmp = unpack_temp_path(&out.store_path);
-        let task = tokio::spawn(async move { nar::unpack_zstd_chunks(rx, &tmp).await });
+        let task =
+            tokio::spawn(
+                async move { nar::unpack_zstd_chunks(rx, &tmp).await.map_err(Into::into) },
+            );
         (tx, task)
     });
     if !out.zstd_nar_chunk.is_empty() && tx.send(out.zstd_nar_chunk).await.is_err() {
