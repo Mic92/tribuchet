@@ -10,7 +10,7 @@ hex.workspace = true
 hyper-util.workspace = true
 prost.workspace = true
 thiserror.workspace = true
-rand.workspace = true
+getrandom.workspace = true
 rcgen.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -42,7 +42,6 @@ harmonia-store-remote.workspace = true
 harmonia-store-ref-scan.workspace = true
 rustix.workspace = true
 sd-notify = "0.5.0"
-tempfile.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # User-mode NAT datapath for fixed-output build network isolation.
@@ -62,6 +61,7 @@ name = "e2e"
 required-features = ["e2e"]
 
 [dev-dependencies]
+tempfile.workspace = true
 
 [build-dependencies]
 tonic-prost-build.workspace = true
