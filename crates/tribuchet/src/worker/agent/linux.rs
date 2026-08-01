@@ -67,7 +67,9 @@ impl Confinement {
 
     /// The userns holder must survive the kill sweep.
     pub(super) fn exempt_pid(&self) -> Option<i32> {
-        self.userns.as_ref().map(|ns| ns.holder.pid().as_raw())
+        self.userns
+            .as_ref()
+            .map(|ns| ns.holder.pid().as_raw_nonzero().get())
     }
 }
 
@@ -275,7 +277,7 @@ impl Userns {
     fn create(uid_base: u32) -> Result<Self> {
         let (holder, fd) = UsernsHolder::new().context("creating the agent user namespace")?;
         let map = format!("0 {uid_base} {UID_COUNT}");
-        let pid = holder.pid();
+        let pid = holder.pid().as_raw_nonzero();
         fs::write(format!("/proc/{pid}/uid_map"), &map)
             .context("writing the agent uid_map, which needs ambient CAP_SETUID")?;
         fs::write(format!("/proc/{pid}/gid_map"), &map)

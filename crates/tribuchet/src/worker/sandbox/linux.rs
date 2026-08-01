@@ -2,7 +2,6 @@
 
 use anyhow::{Context, Result};
 use nix::errno::Errno;
-use nix::sys::wait;
 use nix::unistd;
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::fs::{Mode, StatVfsMountFlags, statvfs};
@@ -18,9 +17,10 @@ use rustix::net::{
     socket_with, socketpair,
 };
 use rustix::process::{
-    DumpableBehavior, Gid, Pid, PidfdFlags, Resource, Rlimit, Uid, getgid, getrlimit, getuid,
-    pidfd_open, pivot_root, set_dumpable_behavior, setrlimit, umask,
+    DumpableBehavior, Gid, Pid, PidfdFlags, Resource, Rlimit, Uid, WaitOptions, getgid, getpid,
+    getrlimit, getuid, pidfd_open, pivot_root, set_dumpable_behavior, setrlimit, umask, waitpid,
 };
+use rustix::stdio::dup2_stdin;
 use rustix::system::{setdomainname, sethostname};
 use rustix::thread::{
     LinkNameSpaceType, UnshareFlags, move_into_link_name_space, set_thread_gid, set_thread_groups,
@@ -244,7 +244,7 @@ pub fn setup_stage() -> ! {
         let spec: SandboxSpec = serde_json::from_str(&json).map_err(io::Error::other)?;
         // The builder gets /dev/null as stdin, like under Nix.
         let null = fs::File::open("/dev/null")?;
-        unistd::dup2_stdin(&null).map_err(ioerr("dup2 stdin"))?;
+        dup2_stdin(&null).map_err(rerr("dup2 stdin"))?;
         // Pre-open the error and exit-status files: the fds keep
         // working after pivot_root detaches the host filesystem, a
         // path would not.
@@ -382,7 +382,7 @@ struct NetHelper {
 /// single-uid user namespace. The helper exits when the build process
 /// (its parent) dies, watched via a pidfd.
 fn fork_net_helper(policy: NetPolicy) -> io::Result<NetHelper> {
-    let target = unistd::getpid();
+    let target = getpid();
     let (ours, theirs) = socketpair(
         AddressFamily::UNIX,
         SocketType::DGRAM,
@@ -406,11 +406,8 @@ fn fork_net_helper(policy: NetPolicy) -> io::Result<NetHelper> {
 /// Helper body: receive the tap fd, drop privileges, start the
 /// datapath, acknowledge readiness, then wait for the build process
 /// to die.
-fn net_helper(sock: &OwnedFd, build_pid: unistd::Pid, policy: NetPolicy) -> i32 {
-    let Some(pid) = Pid::from_raw(build_pid.as_raw()) else {
-        return 1;
-    };
-    let Ok(pidfd) = pidfd_open(pid, PidfdFlags::empty()) else {
+fn net_helper(sock: &OwnedFd, build_pid: Pid, policy: NetPolicy) -> i32 {
+    let Ok(pidfd) = pidfd_open(build_pid, PidfdFlags::empty()) else {
         return 1;
     };
     let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
@@ -547,7 +544,7 @@ fn fork_into_pid_ns(status_file: &fs::File) -> io::Result<bool> {
         unistd::ForkResult::Child => Ok(true),
         unistd::ForkResult::Parent { child } => {
             use std::io::Write;
-            use wait::{WaitStatus, waitpid};
+            let child = Pid::from_raw(child.as_raw());
             // Drop every inherited fd except the status file: the
             // long-lived shim must not hold the log pipes (or the
             // setup error file) open for the build's whole lifetime.
@@ -560,10 +557,16 @@ fn fork_into_pid_ns(status_file: &fs::File) -> io::Result<bool> {
                 libc::syscall(libc::SYS_close_range, keep + 1, libc::c_uint::MAX, 0);
             }
             let code = loop {
-                match waitpid(child, None) {
-                    Ok(WaitStatus::Exited(_, code)) => break code,
-                    Ok(WaitStatus::Signaled(_, sig, _)) => break 128 + sig as i32,
-                    Ok(_) | Err(Errno::EINTR) => {}
+                match waitpid(child, WaitOptions::empty()) {
+                    Ok(Some((_, status))) => {
+                        if let Some(code) = status.exit_status() {
+                            break code;
+                        }
+                        if let Some(sig) = status.terminating_signal() {
+                            break 128 + sig;
+                        }
+                    }
+                    Ok(None) | Err(Rerrno::INTR) => {}
                     Err(_) => break 1,
                 }
             };

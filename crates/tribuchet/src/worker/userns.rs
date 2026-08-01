@@ -6,7 +6,10 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use rustix::io::{FdFlags, fcntl_setfd};
+use rustix::event::pause;
+use rustix::io::{FdFlags, fcntl_setfd, read, write};
+use rustix::pipe::pipe;
+use rustix::process::{Pid, Signal, WaitOptions, kill_process, waitpid};
 use rustix::thread::{UnshareFlags, unshare_unsafe};
 
 /// A forked child that unshared an unmapped user namespace and blocks;
@@ -16,39 +19,42 @@ use rustix::thread::{UnshareFlags, unshare_unsafe};
 /// holds the child open: a concurrently forked sibling would inherit
 /// the write end and keep it (and us) waiting forever.
 pub(in crate::worker) struct UsernsHolder {
-    child: nix::unistd::Pid,
+    child: Pid,
 }
 
 impl UsernsHolder {
     pub(in crate::worker) fn new() -> Result<(Self, OwnedFd)> {
         use nix::unistd::{self, ForkResult};
-        let (sync_r, sync_w) = unistd::pipe()?;
+        let (sync_r, sync_w) = pipe()?;
         match unsafe { unistd::fork() }? {
             ForkResult::Child => {
                 // SAFETY: only a namespace flag; no fd-table, fs or VM sharing changes.
                 if unsafe { unshare_unsafe(UnshareFlags::NEWUSER) }.is_err() {
                     unsafe { libc::_exit(1) }
                 }
-                let _ = unistd::write(&sync_w, b"u");
+                let _ = write(&sync_w, b"u");
                 loop {
-                    unistd::pause();
+                    pause();
                 }
             }
             ForkResult::Parent { child } => {
+                let child = Pid::from_raw(child.as_raw()).expect("fork returned pid 0");
                 drop(sync_w);
-                if unistd::read(&sync_r, &mut [0u8; 1]) != Ok(1) {
-                    let _ = nix::sys::wait::waitpid(child, None);
+                let mut byte = [0u8; 1];
+                if read(&sync_r, &mut byte[..]) != Ok(1) {
+                    let _ = waitpid(Some(child), WaitOptions::empty());
                     bail!("child failed to unshare a user namespace");
                 }
                 let holder = (|| {
-                    let userns = fs::File::open(format!("/proc/{child}/ns/user"))
-                        .map(OwnedFd::from)
-                        .context("opening the child user namespace")?;
+                    let userns =
+                        fs::File::open(format!("/proc/{}/ns/user", child.as_raw_nonzero()))
+                            .map(OwnedFd::from)
+                            .context("opening the child user namespace")?;
                     Ok((Self { child }, userns))
                 })();
                 if holder.is_err() {
-                    let _ = nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGKILL);
-                    let _ = nix::sys::wait::waitpid(child, None);
+                    let _ = kill_process(child, Signal::KILL);
+                    let _ = waitpid(Some(child), WaitOptions::empty());
                 }
                 holder
             }
@@ -56,15 +62,15 @@ impl UsernsHolder {
     }
 
     /// Pid of the pausing child, for /proc/<pid>/{uid_map,gid_map}.
-    pub(in crate::worker) fn pid(&self) -> nix::unistd::Pid {
+    pub(in crate::worker) fn pid(&self) -> Pid {
         self.child
     }
 }
 
 impl Drop for UsernsHolder {
     fn drop(&mut self) {
-        let _ = nix::sys::signal::kill(self.child, nix::sys::signal::Signal::SIGKILL);
-        let _ = nix::sys::wait::waitpid(self.child, None);
+        let _ = kill_process(self.child, Signal::KILL);
+        let _ = waitpid(Some(self.child), WaitOptions::empty());
     }
 }
 
