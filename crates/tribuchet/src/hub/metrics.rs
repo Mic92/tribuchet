@@ -6,10 +6,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::state::HubState;
+use crate::errors::{Result, err_ctx};
 
 /// Monotonic build lifecycle counters. Gauges (queue depth, connected
 /// workers) are read straight from the live state at scrape time.
@@ -169,10 +169,12 @@ fn render_workers(out: &mut String, state: &HubState) {
 /// exits. A scrape is a single short request/response, so each
 /// connection is handled inline and then dropped.
 pub(super) async fn serve(state: Arc<HubState>, addr: String) -> Result<()> {
-    let parsed: std::net::SocketAddr = addr.parse().context("parsing metrics-listen address")?;
+    let parsed: std::net::SocketAddr = addr
+        .parse()
+        .map_err(err_ctx("parsing metrics-listen address"))?;
     let listener = tokio::net::TcpListener::bind(parsed)
         .await
-        .with_context(|| format!("binding metrics-listen address {addr}"))?;
+        .map_err(err_ctx(format!("binding metrics-listen address {addr}")))?;
     tracing::info!(%addr, "metrics endpoint listening");
     loop {
         let (mut sock, _) = match listener.accept().await {

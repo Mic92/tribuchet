@@ -16,12 +16,13 @@ use tokio::sync::mpsc;
 
 use super::{ActiveBuild, pack_outputs_and_extras, unix_now};
 use crate::errors::chain;
+use crate::errors::{Result, err_ctx, err_msg};
 use crate::proto::WorkerMessage;
 #[cfg(target_os = "macos")]
 use crate::worker::caps::requires_uid_range;
 use crate::worker::logtail::tail_log;
 use crate::worker::resume::{FinishedBuild, ResumeState};
-use crate::worker::{Result, WorkerCtx, agents, err_ctx, err_msg, sandbox};
+use crate::worker::{WorkerCtx, agents, sandbox};
 
 impl ActiveBuild {
     /// Lease a per-uid agent and run the build there. The agent

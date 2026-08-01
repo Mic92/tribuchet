@@ -14,9 +14,10 @@ use tokio::sync::mpsc;
 use super::build::ActiveBuild;
 use super::build::{LogMirror, supervise_agent};
 use super::logtail::LogTail;
-use super::{DaemonConn, Result, WorkerCtx, err_msg, msg, sandbox};
+use super::{DaemonConn, WorkerCtx, msg, sandbox};
 use crate::chunkio::CHUNK_SIZE;
 use crate::errors::chain;
+use crate::errors::{Result, err_msg};
 use crate::proto::{
     BuildResult, ExtraPath, NarTransfer, OutputSignature, PathInfoMsg, WorkerMessage, nar_transfer,
     worker_message,

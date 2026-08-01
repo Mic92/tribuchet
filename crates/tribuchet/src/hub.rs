@@ -14,7 +14,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
 use harmonia_utils_signature::PublicKey;
 use nix::unistd::Group;
 use rustix::fs::Mode;
@@ -36,7 +35,7 @@ mod relay;
 mod state;
 mod submit;
 
-use crate::errors::chain;
+use crate::errors::{Result, chain, err_ctx, err_msg};
 use metrics::Metrics;
 use relay::{WorkerStaging, run_job, send};
 use state::{HubState, WorkerCaps};
@@ -365,14 +364,13 @@ async fn worker_loop(
             // the worker (or its replacement) can resume the build by
             // dedupe key, or another worker can start over.
             if out_tx.is_closed() && job.attempts < MAX_JOB_ATTEMPTS {
-                tracing::warn!(
-                    id = job.id,
-                    "worker session lost; requeueing build: {err:#}"
-                );
+                let err = chain(&err);
+                tracing::warn!(id = job.id, "worker session lost; requeueing build: {err}");
                 Metrics::inc(&state.metrics.requeued);
                 state.requeue(job).await;
             } else {
-                tracing::warn!(id = job.id, "build failed: {err:#}");
+                let err = chain(&err);
+                tracing::warn!(id = job.id, "build failed: {err}");
                 Metrics::inc(&state.metrics.failed);
                 // The worker session is still up: it may hold a
                 // half-staged or running build (and its job credit) for
@@ -387,9 +385,7 @@ async fn worker_loop(
                     }),
                 )
                 .await;
-                job.replay
-                    .publish(attach_event::Event::Error(format!("{err:#}")))
-                    .await;
+                job.replay.publish(attach_event::Event::Error(err)).await;
                 state.finish(&job).await;
             }
         });
@@ -415,13 +411,16 @@ fn bind_attach_socket(socket: &Path) -> Result<tokio::net::UnixListener> {
     // Refuse to replace the socket of a live hub: unlinking it would
     // leave all new attaches with ECONNREFUSED while the old hub runs.
     if std::os::unix::net::UnixStream::connect(socket).is_ok() {
-        bail!("another hub is already serving {}", socket.display());
+        return Err(err_msg(format!(
+            "another hub is already serving {}",
+            socket.display()
+        )));
     }
     let _ = fs::remove_file(socket);
     let Ok(Some(group)) = Group::from_name("nixbld") else {
-        bail!(
-            "group nixbld not found; refusing to serve a hub socket without a group to restrict it to"
-        );
+        return Err(err_msg(
+            "group nixbld not found; refusing to serve a hub socket without a group to restrict it to",
+        ));
     };
     let old_umask = umask(Mode::from_bits_truncate(0o117));
     let uds = tokio::net::UnixListener::bind(socket);
@@ -443,18 +442,21 @@ fn bind_attach_socket(socket: &Path) -> Result<tokio::net::UnixListener> {
 #[cfg(target_os = "macos")]
 fn check_attach_socket_dir(socket: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
-    let Some(group) = Group::from_name("nixbld")? else {
-        bail!(
-            "group nixbld not found; refusing to serve a hub socket without a group to restrict it to"
-        );
+    let Some(group) = Group::from_name("nixbld").map_err(err_ctx("looking up group nixbld"))?
+    else {
+        return Err(err_msg(
+            "group nixbld not found; refusing to serve a hub socket without a group to restrict it to",
+        ));
     };
-    let dir = socket.parent().context("attach socket has no parent")?;
+    let dir = socket
+        .parent()
+        .ok_or_else(|| err_msg("attach socket has no parent"))?;
     let meta = fs::metadata(dir)?;
     if meta.gid() != group.gid.as_raw() || meta.mode() & 0o007 != 0 {
-        bail!(
+        return Err(err_msg(format!(
             "{} must be group nixbld with no access for others to restrict the attach socket",
             dir.display()
-        );
+        )));
     }
     Ok(())
 }
@@ -473,7 +475,7 @@ fn load_trusted_keys(config_dir: &Path) -> Result<Option<Arc<Vec<PublicKey>>>> {
                     continue;
                 }
                 keys.push(line.parse::<PublicKey>().map_err(|e| {
-                    anyhow::anyhow!("bad key in trusted-signing-keys: {line}: {e}")
+                    err_msg(format!("bad key in trusted-signing-keys: {line}: {e}"))
                 })?);
             }
             tracing::info!(count = keys.len(), "worker signing keys pinned");
@@ -487,7 +489,7 @@ fn load_trusted_keys(config_dir: &Path) -> Result<Option<Arc<Vec<PublicKey>>>> {
             );
             Ok(None)
         }
-        Err(e) => Err(e).context("reading trusted-signing-keys"),
+        Err(e) => Err(err_ctx("reading trusted-signing-keys")(e)),
     }
 }
 
@@ -499,11 +501,12 @@ fn configure_auth(
         Auth::Mtls => {
             let ca_dir = config_dir.join("ca");
             let identity = Identity::from_pem(
-                fs::read(ca_dir.join("hub.crt")).context("reading hub.crt")?,
-                fs::read(ca_dir.join("hub.key")).context("reading hub.key")?,
+                fs::read(ca_dir.join("hub.crt")).map_err(err_ctx("reading hub.crt"))?,
+                fs::read(ca_dir.join("hub.key")).map_err(err_ctx("reading hub.key"))?,
             );
-            let ca =
-                Certificate::from_pem(fs::read(ca_dir.join("ca.crt")).context("reading ca.crt")?);
+            let ca = Certificate::from_pem(
+                fs::read(ca_dir.join("ca.crt")).map_err(err_ctx("reading ca.crt"))?,
+            );
             (
                 Some(ServerTlsConfig::new().identity(identity).client_ca_root(ca)),
                 PeerAuth::Mtls,
@@ -527,7 +530,7 @@ fn configure_auth(
 }
 
 pub fn run(cfg: crate::config::HubConfig) -> Result<()> {
-    let rt = crate::rt::runtime("trib-hub").context("creating the tokio runtime")?;
+    let rt = crate::rt::runtime("trib-hub").map_err(err_ctx("creating the tokio runtime"))?;
     rt.block_on(run_async(cfg))
 }
 
@@ -548,17 +551,18 @@ async fn run_async(cfg: crate::config::HubConfig) -> Result<()> {
     // ECONNREFUSED), otherwise we bind ourselves.
     let activated = crate::sd::activated_sockets()?;
     let tcp = match activated.tcp {
-        Some(l) => tokio::net::TcpListener::from_std(l).context("adopting activated TCP socket")?,
+        Some(l) => tokio::net::TcpListener::from_std(l)
+            .map_err(err_ctx("adopting activated TCP socket"))?,
         // Bind TCP eagerly: a second hub instance must fail here on
         // EADDRINUSE *before* it clobbers the live hub's unix socket
         // below.
         None => tokio::net::TcpListener::bind(
             listen
                 .parse::<std::net::SocketAddr>()
-                .context("parsing listen address")?,
+                .map_err(err_ctx("parsing listen address"))?,
         )
         .await
-        .context("binding worker listen address")?,
+        .map_err(err_ctx("binding worker listen address"))?,
     };
     let mut builder = Server::builder();
     if let Some(tls) = tls {
@@ -590,7 +594,8 @@ async fn run_async(cfg: crate::config::HubConfig) -> Result<()> {
         Some(l) => {
             #[cfg(target_os = "macos")]
             check_attach_socket_dir(socket)?;
-            tokio::net::UnixListener::from_std(l).context("adopting activated unix socket")?
+            tokio::net::UnixListener::from_std(l)
+                .map_err(err_ctx("adopting activated unix socket"))?
         }
         None => bind_attach_socket(socket)?,
     };
@@ -610,7 +615,8 @@ async fn run_async(cfg: crate::config::HubConfig) -> Result<()> {
         let state = state.clone();
         tokio::spawn(async move {
             if let Err(e) = metrics::serve(state, metrics_addr).await {
-                tracing::error!("metrics endpoint stopped: {e:#}");
+                let e = chain(&e);
+                tracing::error!("metrics endpoint stopped: {e}");
             }
         });
     }
@@ -620,8 +626,8 @@ async fn run_async(cfg: crate::config::HubConfig) -> Result<()> {
     crate::sd::spawn_watchdog();
     let servers = async {
         tokio::try_join!(
-            async { worker_server.await.context("worker gRPC server") },
-            async { attach_server.await.context("attach gRPC server") },
+            async { worker_server.await.map_err(err_ctx("worker gRPC server")) },
+            async { attach_server.await.map_err(err_ctx("attach gRPC server")) },
         )
     };
     // No drain on SIGTERM: hub state is reconstructed by the
