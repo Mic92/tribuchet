@@ -18,11 +18,13 @@ use rustix::net::{
     socket_with, socketpair,
 };
 use rustix::process::{
-    DumpableBehavior, Pid, PidfdFlags, Resource, Rlimit, getgid, getrlimit, getuid, pidfd_open,
-    pivot_root, set_dumpable_behavior, setrlimit, umask,
+    DumpableBehavior, Gid, Pid, PidfdFlags, Resource, Rlimit, Uid, getgid, getrlimit, getuid,
+    pidfd_open, pivot_root, set_dumpable_behavior, setrlimit, umask,
 };
 use rustix::system::{setdomainname, sethostname};
-use rustix::thread::{LinkNameSpaceType, move_into_link_name_space};
+use rustix::thread::{
+    LinkNameSpaceType, move_into_link_name_space, set_thread_gid, set_thread_groups, set_thread_uid,
+};
 use std::ffi::CString;
 use std::fs;
 use std::io;
@@ -631,9 +633,11 @@ fn setup(p: &SetupParams) -> io::Result<()> {
     move_into_link_name_space(ns.as_fd(), Some(LinkNameSpaceType::User))
         .map_err(rerr("joining leased userns"))?;
     unshare(flags & !CloneFlags::CLONE_NEWUSER).map_err(ioerr("unshare"))?;
-    unistd::setgroups(&[]).map_err(ioerr("setgroups"))?;
-    unistd::setgid(unistd::Gid::from_raw(0)).map_err(ioerr("setgid"))?;
-    unistd::setuid(unistd::Uid::from_raw(0)).map_err(ioerr("setuid"))?;
+    // Per-thread credential calls: the setns/unshare above already
+    // require a single-threaded process, so they cover the whole one.
+    set_thread_groups(&[]).map_err(rerr("setgroups"))?;
+    set_thread_gid(Gid::from_raw(0)).map_err(rerr("setgid"))?;
+    set_thread_uid(Uid::from_raw(0)).map_err(rerr("setuid"))?;
     // The setuid from the unmapped worker uid cleared the dumpable
     // flag, which makes /proc/self inodes root-owned and would reject
     // the nested userns map writes below; the userns still confines
@@ -728,7 +732,7 @@ fn mount_filesystems(p: &SetupParams) -> io::Result<()> {
 
     mount(
         "tmpfs",
-        &root.join("dev/shm"),
+        root.join("dev/shm"),
         "tmpfs",
         nosuid_nodev,
         c"mode=1777",
@@ -736,7 +740,7 @@ fn mount_filesystems(p: &SetupParams) -> io::Result<()> {
     .map_err(rerr("mounting /dev/shm"))?;
     mount(
         "devpts",
-        &root.join("dev/pts"),
+        root.join("dev/pts"),
         "devpts",
         MountFlags::NOSUID | MountFlags::NOEXEC,
         c"newinstance,mode=0620,ptmxmode=0666",
@@ -748,7 +752,7 @@ fn mount_filesystems(p: &SetupParams) -> io::Result<()> {
     // PID (and /proc/<pid>/root, a chroot escape).
     mount(
         "proc",
-        &root.join("proc"),
+        root.join("proc"),
         "proc",
         MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC,
         None,
@@ -761,7 +765,7 @@ fn mount_filesystems(p: &SetupParams) -> io::Result<()> {
     if p.uid_count > 1 {
         mount(
             "sysfs",
-            &root.join("sys"),
+            root.join("sys"),
             "sysfs",
             MountFlags::empty(),
             None,
@@ -773,7 +777,7 @@ fn mount_filesystems(p: &SetupParams) -> io::Result<()> {
         // the cgroup namespace makes the build's own cgroup the root
         mount(
             "cgroup2",
-            &root.join("sys/fs/cgroup"),
+            root.join("sys/fs/cgroup"),
             "cgroup2",
             MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC,
             None,
