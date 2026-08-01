@@ -8,6 +8,7 @@ use nix::unistd;
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::fs::{Mode, StatVfsMountFlags, statvfs};
 use rustix::io::Errno as Rerrno;
+use rustix::ioctl::{Opcode, Setter, ioctl, opcode};
 use rustix::mount::{
     MountFlags, MountPropagationFlags, MoveMountFlags, OpenTreeFlags, UnmountFlags, mount,
     mount_bind_recursive, mount_change, mount_remount, move_mount, open_tree, unmount,
@@ -46,12 +47,10 @@ const NET_IFNAME: &str = "eth0";
 const IFF_TAP: i16 = 0x0002;
 const IFF_NO_PI: i16 = 0x1000;
 const IFF_VNET_HDR: i16 = 0x4000;
-
-nix::ioctl_write_ptr_bad!(
-    tun_set_iff,
-    nix::request_code_write!(b'T', 202, std::mem::size_of::<libc::c_int>()),
-    libc::ifreq
-);
+// linux/if_tun.h: _IOW('T', 202, int), taking a struct ifreq pointer
+const TUNSETIFF: Opcode = opcode::write::<libc::c_int>(b'T', 202);
+// linux/sockios.h
+const SIOCSIFFLAGS: Opcode = 0x8914;
 
 /// Create the sandbox root skeleton (directories, /etc files, /dev
 /// nodes) for a spec whose scratch paths the caller filled in. Runs on
@@ -476,7 +475,7 @@ fn open_tap(name: &str) -> io::Result<OwnedFd> {
             name.len().min(ifr.ifr_name.len() - 1),
         );
         ifr.ifr_ifru.ifru_flags = IFF_TAP | IFF_NO_PI | IFF_VNET_HDR;
-        tun_set_iff(file.as_raw_fd(), &raw const ifr).map_err(ioerr("TUNSETIFF"))?;
+        ioctl(&file, Setter::<TUNSETIFF, libc::ifreq>::new(ifr)).map_err(rerr("TUNSETIFF"))?;
     }
     Ok(OwnedFd::from(file))
 }
@@ -531,9 +530,7 @@ fn loopback_up() -> io::Result<()> {
         {
             ifr.ifr_ifru.ifru_flags = (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
         }
-        if libc::ioctl(fd.as_raw_fd(), libc::SIOCSIFFLAGS, &ifr) < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        ioctl(&fd, Setter::<SIOCSIFFLAGS, libc::ifreq>::new(ifr)).map_err(rerr("SIOCSIFFLAGS"))?;
     }
     Ok(())
 }
