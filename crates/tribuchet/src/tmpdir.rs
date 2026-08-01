@@ -155,7 +155,7 @@ pub(crate) fn unpack_tmp_dir(reader: impl Read, dest: &Path) -> Result<(), Error
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::Result;
+    type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
     use std::collections::HashMap;
 
     fn unpack_zstd(archive: &[u8], dest: &Path) -> Result<()> {

@@ -293,7 +293,7 @@ mod platform;
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use anyhow::Result;
+    type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
     fn min_assignment() -> crate::proto::BuildAssignment {
         crate::proto::BuildAssignment {
