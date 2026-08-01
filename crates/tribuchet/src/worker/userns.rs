@@ -1,76 +1,72 @@
-//! The Linux build agent's user namespace: an unshare-and-pause
-//! holder child keeps it alive for the agent's lifetime.
+//! The Linux build agent's user namespace: a re-exec'd holder child
+//! (unshared via pre_exec) keeps it alive for the agent's lifetime.
 
 use std::fs;
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use rustix::event::pause;
-use rustix::io::{FdFlags, fcntl_setfd, read, write};
-use rustix::pipe::pipe;
-use rustix::process::{Pid, Signal, WaitOptions, kill_process, waitpid};
+use rustix::io::{FdFlags, fcntl_setfd};
 use rustix::thread::{UnshareFlags, unshare_unsafe};
 
-/// A forked child that unshared an unmapped user namespace and blocks;
-/// killed on drop (the returned fd keeps the namespace alive). Forks
-/// because unshare(CLONE_NEWUSER) fails with EINVAL in a multithreaded
-/// process; the child runs only async-signal-safe syscalls. No pipe
-/// holds the child open: a concurrently forked sibling would inherit
-/// the write end and keep it (and us) waiting forever.
+/// Argv marker for the re-exec'd holder child.
+pub const USERNS_HOLD_ARG: &str = "__userns_hold";
+
+/// The holder child's whole job: block until killed.
+pub fn hold_stage() -> ! {
+    loop {
+        pause();
+    }
+}
+
+/// A re-exec'd child that unshared an unmapped user namespace in
+/// pre_exec and blocks; killed on drop (the returned fd keeps the
+/// namespace alive). A separate process is needed because
+/// unshare(CLONE_NEWUSER) fails with EINVAL in the multithreaded
+/// agent; a pre_exec failure surfaces as the spawn error.
 pub(in crate::worker) struct UsernsHolder {
-    child: Pid,
+    child: Child,
 }
 
 impl UsernsHolder {
     pub(in crate::worker) fn new() -> Result<(Self, OwnedFd)> {
-        use nix::unistd::{self, ForkResult};
-        let (sync_r, sync_w) = pipe()?;
-        match unsafe { unistd::fork() }? {
-            ForkResult::Child => {
-                // SAFETY: only a namespace flag; no fd-table, fs or VM sharing changes.
-                if unsafe { unshare_unsafe(UnshareFlags::NEWUSER) }.is_err() {
-                    unsafe { libc::_exit(1) }
-                }
-                let _ = write(&sync_w, b"u");
-                loop {
-                    pause();
-                }
-            }
-            ForkResult::Parent { child } => {
-                let child = Pid::from_raw(child.as_raw()).expect("fork returned pid 0");
-                drop(sync_w);
-                let mut byte = [0u8; 1];
-                if read(&sync_r, &mut byte[..]) != Ok(1) {
-                    let _ = waitpid(Some(child), WaitOptions::empty());
-                    bail!("child failed to unshare a user namespace");
-                }
-                let holder = (|| {
-                    let userns =
-                        fs::File::open(format!("/proc/{}/ns/user", child.as_raw_nonzero()))
-                            .map(OwnedFd::from)
-                            .context("opening the child user namespace")?;
-                    Ok((Self { child }, userns))
-                })();
-                if holder.is_err() {
-                    let _ = kill_process(child, Signal::KILL);
-                    let _ = waitpid(Some(child), WaitOptions::empty());
-                }
-                holder
+        let exe = std::env::current_exe().context("resolving current executable")?;
+        let mut cmd = Command::new(exe);
+        cmd.arg(USERNS_HOLD_ARG)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: a single async-signal-safe syscall; only a namespace flag.
+        unsafe {
+            cmd.pre_exec(|| unshare_unsafe(UnshareFlags::NEWUSER).map_err(Into::into));
+        }
+        let mut child = cmd.spawn().context("spawning the userns holder")?;
+        let userns = fs::File::open(format!("/proc/{}/ns/user", child.id()))
+            .map(OwnedFd::from)
+            .context("opening the child user namespace");
+        match userns {
+            Ok(userns) => Ok((Self { child }, userns)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                Err(e)
             }
         }
     }
 
-    /// Pid of the pausing child, for /proc/<pid>/{uid_map,gid_map}.
-    pub(in crate::worker) fn pid(&self) -> Pid {
-        self.child
+    /// Pid of the holder child, for /proc/<pid>/{uid_map,gid_map}.
+    pub(in crate::worker) fn pid(&self) -> u32 {
+        self.child.id()
     }
 }
 
 impl Drop for UsernsHolder {
     fn drop(&mut self) {
-        let _ = kill_process(self.child, Signal::KILL);
-        let _ = waitpid(Some(self.child), WaitOptions::empty());
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 

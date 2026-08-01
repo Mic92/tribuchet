@@ -23,6 +23,8 @@ mod resume;
 pub mod sandbox;
 #[cfg(target_os = "linux")]
 mod userns;
+#[cfg(target_os = "linux")]
+pub use userns::{USERNS_HOLD_ARG, hold_stage as userns_hold_stage};
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
