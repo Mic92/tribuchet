@@ -67,7 +67,7 @@ pub async fn unpack_zstd_chunks(rx: mpsc::Receiver<Vec<u8>>, dest: &Path) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::Result;
+    type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
