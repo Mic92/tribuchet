@@ -2,7 +2,6 @@
 
 use anyhow::{Context, Result};
 use nix::errno::Errno;
-use nix::sched::{CloneFlags, unshare};
 use nix::sys::wait;
 use nix::unistd;
 use rustix::event::{PollFd, PollFlags, poll};
@@ -24,7 +23,8 @@ use rustix::process::{
 };
 use rustix::system::{setdomainname, sethostname};
 use rustix::thread::{
-    LinkNameSpaceType, move_into_link_name_space, set_thread_gid, set_thread_groups, set_thread_uid,
+    LinkNameSpaceType, UnshareFlags, move_into_link_name_space, set_thread_gid, set_thread_groups,
+    set_thread_uid, unshare_unsafe,
 };
 use std::ffi::CString;
 use std::fs;
@@ -429,7 +429,8 @@ fn net_helper(sock: &OwnedFd, build_pid: unistd::Pid, policy: NetPolicy) -> i32 
     // only needs the tap fd and outbound sockets.
     let uid = getuid().as_raw();
     let gid = getgid().as_raw();
-    let confined = unshare(CloneFlags::CLONE_NEWUSER).is_ok()
+    // SAFETY: only namespace flags; no fd-table, fs or VM sharing changes.
+    let confined = unsafe { unshare_unsafe(UnshareFlags::NEWUSER) }.is_ok()
         && fs::write("/proc/self/setgroups", "deny").is_ok()
         && fs::write("/proc/self/uid_map", format!("{uid} {uid} 1")).is_ok()
         && fs::write("/proc/self/gid_map", format!("{gid} {gid} 1")).is_ok();
@@ -596,16 +597,16 @@ struct SetupParams<'a> {
 }
 
 fn setup(p: &SetupParams) -> io::Result<()> {
-    let mut flags = CloneFlags::CLONE_NEWUSER
-        | CloneFlags::CLONE_NEWNS
-        | CloneFlags::CLONE_NEWPID
-        | CloneFlags::CLONE_NEWIPC
-        | CloneFlags::CLONE_NEWUTS;
+    let mut flags = UnshareFlags::NEWUSER
+        | UnshareFlags::NEWNS
+        | UnshareFlags::NEWPID
+        | UnshareFlags::NEWIPC
+        | UnshareFlags::NEWUTS;
     // Network builds keep the host namespace only without isolation;
     // with it they get a private one plus user-mode NAT.
     let private_net = !p.network || p.net_isolation;
     if private_net {
-        flags |= CloneFlags::CLONE_NEWNET;
+        flags |= UnshareFlags::NEWNET;
     }
     // Forked before the leased userns is joined, so the helper stays
     // outside the sandbox as the worker uid.
@@ -618,7 +619,7 @@ fn setup(p: &SetupParams) -> io::Result<()> {
         // Cgroup namespace rooted at the just-entered build cgroup:
         // the cgroup2 mount below then exposes only the build's own
         // delegated subtree (usable by nspawn inside the sandbox).
-        flags |= CloneFlags::CLONE_NEWCGROUP;
+        flags |= UnshareFlags::NEWCGROUP;
     }
     // The agent already wrote the maps of its namespace; join it
     // (allowed: this uid owns it) and unshare the rest inside. Then
@@ -629,7 +630,8 @@ fn setup(p: &SetupParams) -> io::Result<()> {
         .map_err(|e| io::Error::other(format!("opening leased userns: {e}")))?;
     move_into_link_name_space(ns.as_fd(), Some(LinkNameSpaceType::User))
         .map_err(rerr("joining leased userns"))?;
-    unshare(flags & !CloneFlags::CLONE_NEWUSER).map_err(ioerr("unshare"))?;
+    // SAFETY: only namespace flags; no fd-table, fs or VM sharing changes.
+    unsafe { unshare_unsafe(flags & !UnshareFlags::NEWUSER) }.map_err(rerr("unshare"))?;
     // Per-thread credential calls: the setns/unshare above already
     // require a single-threaded process, so they cover the whole one.
     set_thread_groups(&[]).map_err(rerr("setgroups"))?;
@@ -678,7 +680,8 @@ fn setup(p: &SetupParams) -> io::Result<()> {
     // (any binfmt registration above already ran as root). uid-range
     // builds keep in-ns root: container payloads need it.
     if p.uid_count == 1 {
-        unshare(CloneFlags::CLONE_NEWUSER).map_err(ioerr("nested unshare"))?;
+        // SAFETY: only namespace flags; no fd-table, fs or VM sharing changes.
+        unsafe { unshare_unsafe(UnshareFlags::NEWUSER) }.map_err(rerr("nested unshare"))?;
         fs::write("/proc/self/setgroups", "deny").map_err(werr("nested setgroups"))?;
         fs::write("/proc/self/uid_map", "1000 0 1").map_err(werr("nested uid_map"))?;
         fs::write("/proc/self/gid_map", "100 0 1").map_err(werr("nested gid_map"))?;

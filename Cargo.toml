@@ -17,7 +17,7 @@ clap = { version = "4", features = ["derive"] }
 hex = "0.4"
 hyper-util = "0.1"
 rustix = { version = "1", features = ["event", "fs", "mount", "net", "pipe", "process", "system", "thread"] }
-nix = { version = "0.31", features = ["process", "sched", "signal", "user"] }
+nix = { version = "0.31", features = ["process", "signal", "user"] }
 libc = "0.2"
 prost = "0.14"
 rand = "0.10"

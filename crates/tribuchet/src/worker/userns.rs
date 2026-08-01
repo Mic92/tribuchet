@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use rustix::io::{FdFlags, fcntl_setfd};
+use rustix::thread::{UnshareFlags, unshare_unsafe};
 
 /// A forked child that unshared an unmapped user namespace and blocks;
 /// killed on drop (the returned fd keeps the namespace alive). Forks
@@ -24,7 +25,8 @@ impl UsernsHolder {
         let (sync_r, sync_w) = unistd::pipe()?;
         match unsafe { unistd::fork() }? {
             ForkResult::Child => {
-                if nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWUSER).is_err() {
+                // SAFETY: only a namespace flag; no fd-table, fs or VM sharing changes.
+                if unsafe { unshare_unsafe(UnshareFlags::NEWUSER) }.is_err() {
                     unsafe { libc::_exit(1) }
                 }
                 let _ = unistd::write(&sync_w, b"u");
