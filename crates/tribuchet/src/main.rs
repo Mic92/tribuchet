@@ -3,6 +3,7 @@ mod build_json;
 mod ca;
 mod chunkio;
 mod config;
+mod errors;
 mod fsutil;
 mod hub;
 mod nar;
@@ -111,7 +112,7 @@ fn main() -> anyhow::Result<()> {
             tracing::info!(?cfg, "worker configuration");
             worker::run(cfg)
         }
-        Command::Ca { action } => ca::run(action),
+        Command::Ca { action } => Ok(ca::run(action)?),
         Command::Agent {
             socket,
             state_dir,

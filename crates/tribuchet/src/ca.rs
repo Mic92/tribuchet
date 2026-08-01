@@ -8,9 +8,24 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
 use clap::Subcommand;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Rcgen(#[from] rcgen::Error),
+    #[error(transparent)]
+    Secret(#[from] crate::fsutil::Error),
+    #[error("reading {0}")]
+    Read(&'static str, #[source] std::io::Error),
+    #[error("invalid certificate name {0:?}")]
+    InvalidName(String),
+    #[error("{0} already exists; refusing to overwrite key material")]
+    Exists(PathBuf),
+}
 
 #[derive(Subcommand)]
 pub enum CaAction {
@@ -27,14 +42,14 @@ pub enum CaAction {
     },
 }
 
-fn write_private(path: &Path, data: &str) -> Result<()> {
-    crate::fsutil::write_secret(path, data.as_bytes()).map_err(Into::into)
+fn write_private(path: &Path, data: &str) -> Result<(), Error> {
+    Ok(crate::fsutil::write_secret(path, data.as_bytes())?)
 }
 
 /// Issued names become file names and certificate SANs; restrict them
 /// to a single hostname-like component so `../x` cannot escape the CA
 /// dir and `ca` cannot clobber the root key.
-fn validate_name(name: &str) -> Result<()> {
+fn validate_name(name: &str) -> Result<(), Error> {
     if name.is_empty()
         || name == "ca"
         || !name
@@ -42,17 +57,14 @@ fn validate_name(name: &str) -> Result<()> {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
         || name.starts_with('.')
     {
-        anyhow::bail!("invalid certificate name {name:?}");
+        return Err(Error::InvalidName(name.to_owned()));
     }
     Ok(())
 }
 
-fn refuse_overwrite(path: &Path) -> Result<()> {
+fn refuse_overwrite(path: &Path) -> Result<(), Error> {
     if path.exists() {
-        anyhow::bail!(
-            "{} already exists; refusing to overwrite key material",
-            path.display()
-        );
+        return Err(Error::Exists(path.to_path_buf()));
     }
     Ok(())
 }
@@ -63,7 +75,7 @@ fn validity(params: &mut CertificateParams, days: i64) {
     params.not_after = now + time::Duration::days(days);
 }
 
-pub fn run(action: CaAction) -> Result<()> {
+pub fn run(action: CaAction) -> Result<(), Error> {
     match action {
         CaAction::Init { dir } => {
             fs::create_dir_all(&dir)?;
@@ -84,9 +96,10 @@ pub fn run(action: CaAction) -> Result<()> {
             refuse_overwrite(&dir.join(format!("{name}.key")))?;
             refuse_overwrite(&dir.join(format!("{name}.crt")))?;
             let ca_key = KeyPair::from_pem(
-                &fs::read_to_string(dir.join("ca.key")).context("reading ca.key")?,
+                &fs::read_to_string(dir.join("ca.key")).map_err(|e| Error::Read("ca.key", e))?,
             )?;
-            let ca_pem = fs::read_to_string(dir.join("ca.crt")).context("reading ca.crt")?;
+            let ca_pem =
+                fs::read_to_string(dir.join("ca.crt")).map_err(|e| Error::Read("ca.crt", e))?;
             let issuer = Issuer::from_ca_cert_pem(&ca_pem, ca_key)?;
 
             let key = KeyPair::generate()?;

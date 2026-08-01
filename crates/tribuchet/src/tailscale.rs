@@ -12,9 +12,32 @@
 use std::net::SocketAddr;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("connecting to tailscaled at {path}")]
+    Connect {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error("parsing whois response for {addr}")]
+    Parse {
+        addr: SocketAddr,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("malformed HTTP response from tailscaled")]
+    MalformedResponse,
+    #[error("non-utf8 HTTP head")]
+    NonUtf8Head,
+    #[error("tailscaled whois: {0}")]
+    Status(String),
+}
 
 #[derive(Debug)]
 pub struct WhoIs {
@@ -41,10 +64,13 @@ struct Node {
 /// Resolve `addr` against the local tailscaled. The LocalAPI on Linux
 /// is an HTTP/1.1 server on a unix socket; access control is the
 /// socket's file mode, so no Authorization header is needed.
-pub async fn whois(socket: &Path, addr: SocketAddr) -> Result<WhoIs> {
+pub async fn whois(socket: &Path, addr: SocketAddr) -> Result<WhoIs, Error> {
     let mut s = tokio::net::UnixStream::connect(socket)
         .await
-        .with_context(|| format!("connecting to tailscaled at {}", socket.display()))?;
+        .map_err(|source| Error::Connect {
+            path: socket.to_path_buf(),
+            source,
+        })?;
     // Host header is a fixed sentinel the daemon expects; the path
     // takes the full ip:port so tailscaled can match the exact
     // 4-tuple it NATed. The Go client percent-encodes the addr; do
@@ -60,8 +86,8 @@ pub async fn whois(socket: &Path, addr: SocketAddr) -> Result<WhoIs> {
     let mut buf = Vec::new();
     s.read_to_end(&mut buf).await?;
     let body = http_body(&buf)?;
-    let resp: Resp = serde_json::from_slice(body)
-        .with_context(|| format!("parsing whois response for {addr}"))?;
+    let resp: Resp =
+        serde_json::from_slice(body).map_err(|source| Error::Parse { addr, source })?;
     Ok(WhoIs {
         node_name: resp
             .node
@@ -92,15 +118,15 @@ fn encode_addr(addr: SocketAddr) -> String {
 /// Split status line / headers from body and check for 200. The
 /// request is HTTP/1.0, so the body is delimited by connection close
 /// and never chunked.
-fn http_body(buf: &[u8]) -> Result<&[u8]> {
+fn http_body(buf: &[u8]) -> Result<&[u8], Error> {
     let sep = buf
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
-        .context("malformed HTTP response from tailscaled")?;
-    let head = std::str::from_utf8(&buf[..sep]).context("non-utf8 HTTP head")?;
+        .ok_or(Error::MalformedResponse)?;
+    let head = std::str::from_utf8(&buf[..sep]).map_err(|_| Error::NonUtf8Head)?;
     let status = head.lines().next().unwrap_or_default();
     if !status.contains(" 200 ") {
-        bail!("tailscaled whois: {status}");
+        return Err(Error::Status(status.to_owned()));
     }
     Ok(&buf[sep + 4..])
 }

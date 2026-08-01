@@ -7,8 +7,23 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
 use serde::Deserialize;
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("reading config file {path}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("parsing config file {path}")]
+    Parse {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+}
 
 /// How the worker listener authenticates peers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -22,10 +37,15 @@ pub enum Auth {
     Tailscale,
 }
 
-pub fn load<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading config file {}", path.display()))?;
-    toml::from_str(&text).with_context(|| format!("parsing config file {}", path.display()))
+pub fn load<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Error> {
+    let text = std::fs::read_to_string(path).map_err(|source| Error::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    toml::from_str(&text).map_err(|source| Error::Parse {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 #[derive(Debug, Deserialize)]
