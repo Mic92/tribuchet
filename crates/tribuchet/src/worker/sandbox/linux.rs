@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use nix::errno::Errno;
 use nix::mount::{MntFlags, MsFlags, mount, umount2};
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sched::{CloneFlags, unshare};
 use nix::sys::resource::{Resource, getrlimit, setrlimit};
 use nix::sys::socket::{
@@ -14,12 +15,15 @@ use nix::unistd::{self, pivot_root, sethostname};
 use std::ffi::CString;
 use std::fs;
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::{SandboxSpec, binfmt};
 use crate::netpolicy::NetPolicy;
+use rustix::mount::{MoveMountFlags, OpenTreeFlags, move_mount, open_tree};
+use rustix::process::{Pid, PidfdFlags, pidfd_open};
+use rustix::system::setdomainname;
 
 // Interface name for the presto-pasta tap inside the build netns.
 // Addressing (link-local guest/gateway, DNS forwarded on the gateway
@@ -354,6 +358,10 @@ fn werr(step: &'static str) -> impl Fn(io::Error) -> io::Error {
     move |e| io::Error::other(format!("{step}: {e}"))
 }
 
+fn werr2(step: &'static str) -> impl Fn(rustix::io::Errno) -> io::Error {
+    move |e| io::Error::other(format!("{step}: {e}"))
+}
+
 struct NetHelper {
     sock: OwnedFd,
 }
@@ -390,10 +398,12 @@ fn fork_net_helper(policy: NetPolicy) -> io::Result<NetHelper> {
 /// datapath, acknowledge readiness, then wait for the build process
 /// to die.
 fn net_helper(sock: &OwnedFd, build_pid: unistd::Pid, policy: NetPolicy) -> i32 {
-    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, build_pid.as_raw(), 0) };
-    if pidfd < 0 {
+    let Some(pid) = Pid::from_raw(build_pid.as_raw()) else {
         return 1;
-    }
+    };
+    let Ok(pidfd) = pidfd_open(pid, PidfdFlags::empty()) else {
+        return 1;
+    };
     let mut cmsg = nix::cmsg_space!([RawFd; 1]);
     let mut buf = [0u8; 8];
     let mut iov = [io::IoSliceMut::new(&mut buf)];
@@ -440,13 +450,8 @@ fn net_helper(sock: &OwnedFd, build_pid: unistd::Pid, policy: NetPolicy) -> i32 
     });
     // Exit (and release the tap, letting the netns go away) once the
     // build process is gone.
-    let mut pfd = libc::pollfd {
-        #[expect(clippy::cast_possible_truncation, reason = "pidfds are small")]
-        fd: pidfd as libc::c_int,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    while unsafe { libc::poll(&raw mut pfd, 1, -1) } < 0 {}
+    let mut pfds = [PollFd::new(pidfd.as_fd(), PollFlags::POLLIN)];
+    while poll(&mut pfds, PollTimeout::NONE).is_err() {}
     0
 }
 
@@ -503,11 +508,14 @@ impl NetHelper {
 /// `lo` down; builders that talk to 127.0.0.1 (test suites) would
 /// otherwise fail, unlike under Nix's own sandbox.
 fn loopback_up() -> io::Result<()> {
+    let fd = nix::sys::socket::socket(
+        AddressFamily::Inet,
+        SockType::Datagram,
+        SockFlag::SOCK_CLOEXEC,
+        None,
+    )
+    .map_err(ioerr("socket"))?;
     unsafe {
-        let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
         let mut ifr: libc::ifreq = std::mem::zeroed();
         // ifr_name is [c_char; _]; c_char's signedness is target-dependent,
         // so write the bytes via a u8 pointer instead of an `as` cast.
@@ -516,11 +524,8 @@ fn loopback_up() -> io::Result<()> {
         {
             ifr.ifr_ifru.ifru_flags = (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
         }
-        let res = libc::ioctl(fd, libc::SIOCSIFFLAGS, &ifr);
-        let err = io::Error::last_os_error();
-        libc::close(fd);
-        if res < 0 {
-            return Err(err);
+        if libc::ioctl(fd.as_raw_fd(), libc::SIOCSIFFLAGS, &ifr) < 0 {
+            return Err(io::Error::last_os_error());
         }
     }
     Ok(())
@@ -630,9 +635,7 @@ fn setup(p: &SetupParams) -> io::Result<()> {
     nix::sys::prctl::set_dumpable(true).map_err(ioerr("set dumpable"))?;
     sethostname("localhost").map_err(ioerr("sethostname"))?;
     // "(none)" is the kernel default; fixed like Nix for determinism
-    if unsafe { libc::setdomainname(c"(none)".as_ptr(), 6) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
+    setdomainname(b"(none)").map_err(werr2("setdomainname"))?;
     if private_net {
         loopback_up().map_err(werr("bringing lo up"))?;
     }
@@ -786,49 +789,27 @@ fn mount_filesystems(p: &SetupParams) -> io::Result<()> {
 fn tmpfs_root(p: &SetupParams) -> io::Result<()> {
     let root = p.root;
     let none: Option<&str> = None;
-    let store = open_tree(&root.join("nix/store")).map_err(ioerr("detaching scratch store"))?;
+    // Detach the scratch store as a floating bind mount so it survives
+    // the tmpfs mount over the root, then reattach it (new mount API).
+    let store = open_tree(
+        rustix::fs::CWD,
+        root.join("nix/store"),
+        OpenTreeFlags::OPEN_TREE_CLONE | OpenTreeFlags::OPEN_TREE_CLOEXEC,
+    )
+    .map_err(werr2("detaching scratch store"))?;
     mount(Some("tmpfs"), root, Some("tmpfs"), MsFlags::empty(), none)
         .map_err(ioerr("mounting tmpfs root"))?;
     write_skeleton(p.spec)
         .and_then(|()| create_mount_points(p.spec))
         .map_err(|e| io::Error::other(format!("populating tmpfs root: {e:#}")))?;
-    move_mount(store.as_fd(), &root.join("nix/store")).map_err(ioerr("attaching scratch store"))
-}
-
-/// Detach a directory as a floating bind mount (new mount API; raw
-/// syscall, the nix crate has no wrapper yet).
-fn open_tree(path: &Path) -> nix::Result<OwnedFd> {
-    use std::os::unix::ffi::OsStrExt;
-    let c = CString::new(path.as_os_str().as_bytes()).map_err(|_| Errno::EINVAL)?;
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_open_tree,
-            libc::AT_FDCWD,
-            c.as_ptr(),
-            libc::OPEN_TREE_CLONE | libc::OPEN_TREE_CLOEXEC,
-        )
-    };
-    let fd = Errno::result(fd)?;
-    let fd = RawFd::try_from(fd).map_err(|_| Errno::EBADF)?;
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-/// Attach a floating mount from `open_tree` at `target`.
-fn move_mount(from: BorrowedFd, target: &Path) -> nix::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x4;
-    let c = CString::new(target.as_os_str().as_bytes()).map_err(|_| Errno::EINVAL)?;
-    let ret = unsafe {
-        libc::syscall(
-            libc::SYS_move_mount,
-            from.as_raw_fd(),
-            c"".as_ptr(),
-            libc::AT_FDCWD,
-            c.as_ptr(),
-            MOVE_MOUNT_F_EMPTY_PATH,
-        )
-    };
-    Errno::result(ret).map(drop)
+    move_mount(
+        store.as_fd(),
+        "",
+        rustix::fs::CWD,
+        root.join("nix/store"),
+        MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
+    )
+    .map_err(werr2("attaching scratch store"))
 }
 
 /// Fresh per-userns binfmt_misc instance (kernel 6.7+) so emulated

@@ -16,8 +16,8 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"
 hyper-util = "0.1"
-rustix = { version = "1", features = ["thread"] }
-nix = { version = "0.31", features = ["dir", "mount", "sched", "user", "fs", "hostname", "signal", "process", "resource", "socket", "uio"] }
+rustix = { version = "1", features = ["fs", "mount", "process", "system", "thread"] }
+nix = { version = "0.31", features = ["dir", "mount", "sched", "user", "fs", "hostname", "signal", "poll", "process", "resource", "socket", "uio"] }
 libc = "0.2"
 prost = "0.14"
 rand = "0.10"
