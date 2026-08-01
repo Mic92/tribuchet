@@ -1504,14 +1504,14 @@ checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 
 [[package]]
 name = "presto-pasta"
-version = "0.0.7"
+version = "0.0.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fa0e8ee3442ce12368ac0b4d687fee0c161108739e09b3e2b8a6b923667e1d0"
+checksum = "83ffb2775a4be7d535fafbcb48fdd803fa6e05669148ee5badd4376c432377a2"
 dependencies = [
  "foldhash 0.2.0",
  "io-uring",
  "libc",
- "nix",
+ "rustix",
 ]
 
 [[package]]

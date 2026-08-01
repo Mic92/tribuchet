@@ -46,7 +46,7 @@ tempfile.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # User-mode NAT datapath for fixed-output build network isolation.
-presto-pasta = "0.0.7"
+presto-pasta = "0.0.8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # getpeereid on the agent socket needs nix's socket module.

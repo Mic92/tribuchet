@@ -22,7 +22,6 @@ use std::process::{Child, Command};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
-use rustix::event::{PollFd, PollFlags, poll};
 use rustix::io::{FdFlags, fcntl_setfd};
 use rustix::net::sockopt::socket_peercred;
 use rustix::net::{
@@ -209,26 +208,20 @@ fn net_forward(sock: &OwnedFd, policy: NetPolicy, build_pid: u32) {
         ..presto_pasta::Config::default()
     };
     let mut presto = presto_pasta::Presto::new(net, tap);
-    let Ok(shutdown) = presto.shutdown_handle() else {
-        return;
-    };
-    let datapath = std::thread::spawn(move || {
-        if let Err(e) = presto.run() {
-            tracing::warn!("presto-pasta datapath exited: {e}");
-        }
-    });
-    // Readiness ack: the setup stage waits for this before building.
-    if send(sock, b"ok", SendFlags::empty()).is_ok()
-        && let Some(pid) = Pid::from_raw(build_pid.cast_signed())
+    // A pidfd stops the datapath (closing the tap fd and with it the
+    // build netns) once the build process dies.
+    if let Some(pid) = Pid::from_raw(build_pid.cast_signed())
         && let Ok(pidfd) = pidfd_open(pid, PidfdFlags::empty())
     {
-        let mut pfds = [PollFd::new(&pidfd, PollFlags::IN)];
-        while poll(&mut pfds, None).is_err() {}
+        presto.stop_on(pidfd);
     }
-    // Dropping the handle stops the datapath. That closes the tap fd
-    // and lets the build netns go away.
-    drop(shutdown);
-    let _ = datapath.join();
+    // Readiness ack: the setup stage waits for this before building.
+    if send(sock, b"ok", SendFlags::empty()).is_err() {
+        return;
+    }
+    if let Err(e) = presto.run() {
+        tracing::warn!("presto-pasta datapath exited: {e}");
+    }
 }
 
 /// Make outputs readable for the worker. Files of a namespace build
