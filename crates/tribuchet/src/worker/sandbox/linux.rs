@@ -286,17 +286,8 @@ fn enter_and_exec(
         .ok_or_else(|| io::Error::other("sandbox spec lacks a leased user namespace"))?;
     setup(&SetupParams {
         spec,
-        root: &spec.root,
-        system: &spec.system,
         binfmt_line: binfmt_line.as_deref(),
-        net_isolation: spec.net_isolation,
         leased_userns,
-        build_dir: &spec.build_dir,
-        binds: &spec.binds_ro,
-        binds_dev: &spec.binds_dev,
-        cwd: &spec.cwd,
-        network: spec.network,
-        has_cgroup: spec.cgroup.is_some(),
         uid_count,
         status_file,
     })?;
@@ -368,13 +359,6 @@ fn rerr(step: &'static str) -> impl Fn(Rerrno) -> io::Error {
     move |e| io::Error::other(format!("{step}: {e}"))
 }
 
-/// Socketpair end to the agent's per-build forwarder thread, which
-/// runs the presto-pasta datapath on the tap fd sent over it (see
-/// [`NetHelper::attach`]).
-struct NetHelper {
-    sock: OwnedFd,
-}
-
 /// Open the tap device inside the just-created netns.
 fn open_tap(name: &str) -> io::Result<OwnedFd> {
     let file = std::fs::OpenOptions::new()
@@ -396,33 +380,32 @@ fn open_tap(name: &str) -> io::Result<OwnedFd> {
     Ok(OwnedFd::from(file))
 }
 
-impl NetHelper {
-    /// Called after unshare: create and configure the tap in the new
-    /// netns, hand its fd to the agent and wait until the datapath
-    /// runs. The local tap fd is closed afterwards; the agent's copy
-    /// keeps the interface carrier up.
-    fn attach(self) -> io::Result<()> {
-        let net = presto_pasta::Config::default();
-        let tap = open_tap(NET_IFNAME)?;
-        presto_pasta::netdev::configure(NET_IFNAME, &net)?;
-        let fds = [tap.as_fd()];
-        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
-        let mut cmsg = SendAncillaryBuffer::new(&mut space);
-        cmsg.push(SendAncillaryMessage::ScmRights(&fds));
-        sendmsg(
-            &self.sock,
-            &[io::IoSlice::new(b"tap")],
-            &mut cmsg,
-            SendFlags::empty(),
-        )
-        .map_err(rerr("sending tap fd"))?;
-        let mut ack = [0u8; 2];
-        match recv(&self.sock, &mut ack, RecvFlags::empty()) {
-            Ok((n, _)) if n > 0 => Ok(()),
-            _ => Err(io::Error::other(
-                "the agent failed to start the presto-pasta datapath",
-            )),
-        }
+/// Called after unshare: create and configure the tap in the new
+/// netns, hand its fd to the agent's forwarder over `sock` and wait
+/// until the datapath runs.
+/// The local tap fd is closed afterwards
+/// because the agent's copy keeps the interface carrier up.
+fn attach_net(sock: &OwnedFd) -> io::Result<()> {
+    let net = presto_pasta::Config::default();
+    let tap = open_tap(NET_IFNAME)?;
+    presto_pasta::netdev::configure(NET_IFNAME, &net)?;
+    let fds = [tap.as_fd()];
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut cmsg = SendAncillaryBuffer::new(&mut space);
+    cmsg.push(SendAncillaryMessage::ScmRights(&fds));
+    sendmsg(
+        sock,
+        &[io::IoSlice::new(b"tap")],
+        &mut cmsg,
+        SendFlags::empty(),
+    )
+    .map_err(rerr("sending tap fd"))?;
+    let mut ack = [0u8; 2];
+    match recv(sock, &mut ack, RecvFlags::empty()) {
+        Ok((n, _)) if n > 0 => Ok(()),
+        _ => Err(io::Error::other(
+            "the agent failed to start the presto-pasta datapath",
+        )),
     }
 }
 
@@ -497,18 +480,9 @@ fn fork_into_pid_ns(status_file: &fs::File) -> io::Result<bool> {
 
 struct SetupParams<'a> {
     spec: &'a SandboxSpec,
-    root: &'a Path,
-    system: &'a str,
     binfmt_line: Option<&'a str>,
-    net_isolation: bool,
     /// The agent's pre-mapped user namespace to join.
     leased_userns: &'a Path,
-    build_dir: &'a Path,
-    binds: &'a [(PathBuf, PathBuf)],
-    binds_dev: &'a [(PathBuf, PathBuf)],
-    cwd: &'a str,
-    network: bool,
-    has_cgroup: bool,
     /// Uids mapped in the lease (1 or 65536).
     uid_count: u32,
     /// Pre-opened file the PID-1 shim writes the builder's exit code
@@ -517,6 +491,7 @@ struct SetupParams<'a> {
 }
 
 fn setup(p: &SetupParams) -> io::Result<()> {
+    let spec = p.spec;
     let mut flags = UnshareFlags::NEWUSER
         | UnshareFlags::NEWNS
         | UnshareFlags::NEWPID
@@ -524,26 +499,23 @@ fn setup(p: &SetupParams) -> io::Result<()> {
         | UnshareFlags::NEWUTS;
     // Network builds keep the host namespace only without isolation;
     // with it they get a private one plus user-mode NAT.
-    let private_net = !p.network || p.net_isolation;
+    let private_net = !spec.network || spec.net_isolation;
     if private_net {
         flags |= UnshareFlags::NEWNET;
     }
     // The agent runs the datapath. This end of the tap-handoff
     // socketpair was inherited across the setup stage's exec.
-    let net_helper = if p.net_isolation && p.network {
-        let fd = p
-            .spec
+    let net_fwd = if spec.net_isolation && spec.network {
+        let fd = spec
             .net_fwd_fd
             .ok_or_else(|| io::Error::other("sandbox spec lacks the tap handoff fd"))?;
         // SAFETY: the fd was opened by the agent for this handoff and
         // nothing else in the setup stage owns it.
-        Some(NetHelper {
-            sock: unsafe { OwnedFd::from_raw_fd(fd) },
-        })
+        Some(unsafe { OwnedFd::from_raw_fd(fd) })
     } else {
         None
     };
-    if p.has_cgroup {
+    if spec.cgroup.is_some() {
         // Cgroup namespace rooted at the just-entered build cgroup:
         // the cgroup2 mount below then exposes only the build's own
         // delegated subtree (usable by nspawn inside the sandbox).
@@ -576,8 +548,8 @@ fn setup(p: &SetupParams) -> io::Result<()> {
     if private_net {
         loopback_up().map_err(werr("bringing lo up"))?;
     }
-    if let Some(helper) = net_helper {
-        helper.attach()?;
+    if let Some(sock) = net_fwd {
+        attach_net(&sock)?;
     }
 
     // CLONE_NEWPID only applies to children: fork so the builder
@@ -590,17 +562,17 @@ fn setup(p: &SetupParams) -> io::Result<()> {
 
     // pivot_root + detach the old root: unlike a bare chroot, the
     // host filesystem is no longer reachable in this namespace.
-    std::env::set_current_dir(p.root).map_err(werr("chdir to root"))?;
+    std::env::set_current_dir(&spec.root).map_err(werr("chdir to root"))?;
     pivot_root(".", ".").map_err(rerr("pivot_root"))?;
     unmount(".", UnmountFlags::DETACH).map_err(rerr("detaching old root"))?;
     std::env::set_current_dir("/").map_err(werr("chdir /"))?;
-    std::env::set_current_dir(p.cwd)
-        .map_err(|e| io::Error::other(format!("chdir {}: {e}", p.cwd)))?;
+    std::env::set_current_dir(&spec.cwd)
+        .map_err(|e| io::Error::other(format!("chdir {}: {e}", spec.cwd)))?;
 
     if let Some(line) = p.binfmt_line {
         register_binfmt(line)?;
     }
-    apply_process_limits(p.system)?;
+    apply_process_limits(&spec.system)?;
 
     // The build became in-ns root when joining the namespace;
     // single-uid builds must not run the builder with sandbox root's
@@ -621,7 +593,7 @@ fn setup(p: &SetupParams) -> io::Result<()> {
 /// binds and the pseudo-filesystems the builder expects. Runs in the
 /// PID-1 child after fork, before pivot_root.
 fn mount_filesystems(p: &SetupParams) -> io::Result<()> {
-    let root = p.root;
+    let root = &p.spec.root;
     mount_change(
         "/",
         MountPropagationFlags::REC | MountPropagationFlags::PRIVATE,
@@ -650,13 +622,18 @@ fn mount_filesystems(p: &SetupParams) -> io::Result<()> {
     // sandbox must not chmod/chown the host nodes (writing *to* a char
     // device works regardless of MS_RDONLY).
     let nosuid_nodev = MountFlags::NOSUID | MountFlags::NODEV;
-    for (src, dst) in p.binds {
+    for (src, dst) in &p.spec.binds_ro {
         bind_one(src, dst, true, nosuid_nodev)?;
     }
-    for (src, dst) in p.binds_dev {
+    for (src, dst) in &p.spec.binds_dev {
         bind_one(src, dst, true, MountFlags::NOSUID)?;
     }
-    bind_one(p.build_dir, Path::new(p.cwd), false, nosuid_nodev)?;
+    bind_one(
+        &p.spec.build_dir,
+        Path::new(&p.spec.cwd),
+        false,
+        nosuid_nodev,
+    )?;
 
     mount(
         "tmpfs",
@@ -701,7 +678,7 @@ fn mount_filesystems(p: &SetupParams) -> io::Result<()> {
         .map_err(rerr("mounting /sys"))?;
     }
 
-    if p.has_cgroup {
+    if p.spec.cgroup.is_some() {
         // the cgroup namespace makes the build's own cgroup the root
         mount(
             "cgroup2",
@@ -721,7 +698,7 @@ fn mount_filesystems(p: &SetupParams) -> io::Result<()> {
 /// chown it like under a root worker. Only the scratch store stays on
 /// disk: outputs must survive the namespace.
 fn tmpfs_root(p: &SetupParams) -> io::Result<()> {
-    let root = p.root;
+    let root = &p.spec.root;
     // Detach the scratch store as a floating bind mount, reattached below.
     let store = open_tree(
         rustix::fs::CWD,
