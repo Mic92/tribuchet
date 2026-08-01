@@ -12,14 +12,19 @@
 //! stage, spawned here.
 
 use std::fs;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
 use anyhow::{Context, Result, bail, ensure};
-use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+use rustix::net::sockopt::socket_peercred;
+use rustix::process::getuid;
+use rustix::process::{Gid, Uid};
+use rustix::thread::{
+    LinkNameSpaceType, move_into_link_name_space, set_thread_gid, set_thread_uid,
+};
 use sandbox_proto::agent::StartRequest;
 
 use super::{Build, Options, cgroup};
@@ -221,13 +226,13 @@ pub fn fs_helper_stage() -> ! {
         let mut args = std::env::args_os().skip(2);
         let ns = fs::File::open(args.next().context("missing userns path")?)?;
         let op = args.next().context("missing op")?;
-        nix::sched::setns(ns, nix::sched::CloneFlags::CLONE_NEWUSER)
+        move_into_link_name_space(ns.as_fd(), Some(LinkNameSpaceType::User))
             .context("joining the agent user namespace")?;
         if op.to_str() == Some("unpack") {
             // Become in-ns root so the unpacked files belong to the
             // uid block instead of the agent's unmapped uid.
-            nix::unistd::setgid(nix::unistd::Gid::from_raw(0)).context("setgid 0 in the ns")?;
-            nix::unistd::setuid(nix::unistd::Uid::from_raw(0)).context("setuid 0 in the ns")?;
+            set_thread_gid(Gid::from_raw(0)).context("setgid 0 in the ns")?;
+            set_thread_uid(Uid::from_raw(0)).context("setuid 0 in the ns")?;
             let build_dir = PathBuf::from(args.next().context("missing build dir")?);
             return super::stage_scratch(std::io::stdin(), &build_dir);
         }
@@ -319,7 +324,7 @@ pub(super) fn activated_unix_listener() -> Result<Option<UnixListener>> {
 }
 
 pub(super) fn peer_uid(conn: &UnixStream) -> Result<u32> {
-    Ok(getsockopt(conn, PeerCredentials)?.uid())
+    Ok(socket_peercred(conn)?.uid.as_raw())
 }
 
 /// Whether the build cgroup's memory.max OOM-killed the build.
@@ -338,7 +343,7 @@ pub(super) fn oom_killed(confinement: &Confinement, build_id: &str) -> bool {
 
 /// Pids whose real uid is this uid, from /proc.
 pub(super) fn own_uid_pids() -> Vec<i32> {
-    let uid = nix::unistd::getuid().as_raw();
+    let uid = getuid().as_raw();
     let Ok(entries) = fs::read_dir("/proc") else {
         tracing::warn!("reading /proc failed, kill sweep degraded to the process group");
         return Vec::new();

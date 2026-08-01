@@ -5,9 +5,8 @@ use std::fs;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
 
-use nix::fcntl::{FcntlArg, FdFlag, fcntl};
-
 use anyhow::{Context, Result, bail};
+use rustix::io::{FdFlags, fcntl_setfd};
 
 /// A forked child that unshared an unmapped user namespace and blocks;
 /// killed on drop (the returned fd keeps the namespace alive). Forks
@@ -74,8 +73,7 @@ impl Drop for UsernsHolder {
 /// children.
 pub(in crate::worker) fn inherited_ns(userns: &OwnedFd) -> Result<(OwnedFd, PathBuf)> {
     let dup = userns.try_clone().context("duplicating the userns fd")?;
-    fcntl(&dup, FcntlArg::F_SETFD(FdFlag::empty()))
-        .context("clearing close-on-exec on the userns fd")?;
+    fcntl_setfd(&dup, FdFlags::empty()).context("clearing close-on-exec on the userns fd")?;
     let path = format!("/proc/self/fd/{}", dup.as_raw_fd()).into();
     Ok((dup, path))
 }

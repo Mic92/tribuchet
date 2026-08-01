@@ -25,6 +25,7 @@ use std::process::{Child, Command, Stdio};
 
 #[cfg(target_os = "linux")]
 use anyhow::{Context, Result};
+use rustix::pipe::{PipeFlags, pipe_with};
 
 #[cfg(target_os = "linux")]
 use super::binfmt;
@@ -223,8 +224,7 @@ fn build_command(spec: &SandboxSpec) -> Result<(Command, Option<OwnedFd>)> {
     // O_CLOEXEC: a write end inherited by a concurrently spawned
     // sibling build would keep the spec read from ever seeing EOF.
     if platform::SPEC_VIA_STDIN {
-        let (r, w) =
-            nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).context("creating spec pipe")?;
+        let (r, w) = pipe_with(PipeFlags::CLOEXEC).context("creating spec pipe")?;
         cmd.stdin(Stdio::from(fs::File::from(r)));
         return Ok((cmd, Some(w)));
     }

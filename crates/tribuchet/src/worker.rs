@@ -188,10 +188,13 @@ fn loadavg1() -> f64 {
 }
 
 fn hostname() -> String {
-    nix::unistd::gethostname()
-        .ok()
-        .and_then(|h| h.into_string().ok())
-        .unwrap_or_else(|| "worker".into())
+    let uname = rustix::system::uname();
+    let nodename = uname.nodename().to_string_lossy();
+    if nodename.is_empty() {
+        "worker".into()
+    } else {
+        nodename.into_owned()
+    }
 }
 
 fn load_signing_key(state_dir: &Path) -> Result<SecretKey> {

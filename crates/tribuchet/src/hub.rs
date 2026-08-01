@@ -16,8 +16,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use harmonia_utils_signature::PublicKey;
-use nix::sys::stat;
 use nix::unistd::Group;
+use rustix::fs::Mode;
+use rustix::process::umask;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig, server::TcpConnectInfo};
@@ -421,9 +422,9 @@ fn bind_attach_socket(socket: &Path) -> Result<tokio::net::UnixListener> {
             "group nixbld not found; refusing to serve a hub socket without a group to restrict it to"
         );
     };
-    let old_umask = stat::umask(stat::Mode::from_bits_truncate(0o117));
+    let old_umask = umask(Mode::from_bits_truncate(0o117));
     let uds = tokio::net::UnixListener::bind(socket);
-    stat::umask(old_umask);
+    umask(old_umask);
     let uds = uds?;
     {
         use std::os::unix::fs::PermissionsExt;

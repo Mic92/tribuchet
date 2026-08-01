@@ -10,6 +10,9 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
+use rustix::process::{Gid, Uid};
+use rustix::process::{geteuid, getuid};
+use rustix::thread::{set_thread_groups, set_thread_res_gid, set_thread_res_uid};
 
 /// Size of each agent's mapped uid block.
 const UID_BLOCK: u32 = 65536;
@@ -29,7 +32,7 @@ struct Slot {
 pub fn spawn(state_dir: &Path, count: u32, uid_base: Option<u32>) -> Result<Vec<PathBuf>> {
     ensure!(count > 0, "spawn-agents must be at least 1");
     let exe = std::env::current_exe().context("resolving the worker binary")?;
-    let root = nix::unistd::geteuid().is_root();
+    let root = geteuid().is_root();
     let uid_base = match (uid_base, root) {
         (Some(b), true) => Some(b),
         (Some(_), false) => {
@@ -94,7 +97,7 @@ fn run_once(exe: &Path, slot: &Slot) -> Result<std::process::ExitStatus> {
         .arg("--state-dir")
         .arg(&slot.state_dir)
         .arg("--worker-uid")
-        .arg(nix::unistd::getuid().as_raw().to_string());
+        .arg(getuid().as_raw().to_string());
     if let Some(base) = slot.uid_base {
         cmd.arg("--uid-base").arg(base.to_string());
     }
@@ -118,14 +121,11 @@ fn confine_to(uid: u32) -> std::io::Result<()> {
         set_keep_capabilities,
     };
     let keep = CapabilitySet::SETUID | CapabilitySet::SETGID | CapabilitySet::CHOWN;
-    let (u, g) = (
-        nix::unistd::Uid::from_raw(uid),
-        nix::unistd::Gid::from_raw(uid),
-    );
-    nix::unistd::setgroups(&[g]).map_err(std::io::Error::from)?;
+    let (u, g) = (Uid::from_raw(uid), Gid::from_raw(uid));
+    set_thread_groups(&[g])?;
     set_keep_capabilities(true)?;
-    nix::unistd::setresgid(g, g, g).map_err(std::io::Error::from)?;
-    nix::unistd::setresuid(u, u, u).map_err(std::io::Error::from)?;
+    set_thread_res_gid(g, g, g)?;
+    set_thread_res_uid(u, u, u)?;
     set_capabilities(
         None,
         CapabilitySets {

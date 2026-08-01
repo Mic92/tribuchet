@@ -2,28 +2,37 @@
 
 use anyhow::{Context, Result};
 use nix::errno::Errno;
-use nix::mount::{MntFlags, MsFlags, mount, umount2};
-use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sched::{CloneFlags, unshare};
-use nix::sys::resource::{Resource, getrlimit, setrlimit};
-use nix::sys::socket::{
-    AddressFamily, ControlMessage, ControlMessageOwned, MsgFlags, SockFlag, SockType, recv,
-    recvmsg, sendmsg, socketpair,
+use nix::sys::wait;
+use nix::unistd;
+use rustix::event::{PollFd, PollFlags, poll};
+use rustix::fs::{Mode, StatVfsMountFlags, statvfs};
+use rustix::io::Errno as Rerrno;
+use rustix::mount::{
+    MountFlags, MountPropagationFlags, MoveMountFlags, OpenTreeFlags, UnmountFlags, mount,
+    mount_bind_recursive, mount_change, mount_remount, move_mount, open_tree, unmount,
 };
-use nix::sys::{prctl, stat, wait};
-use nix::unistd::{self, pivot_root, sethostname};
+use rustix::net::{
+    AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
+    SendAncillaryMessage, SendFlags, SocketFlags, SocketType, recv, recvmsg, send, sendmsg,
+    socket_with, socketpair,
+};
+use rustix::process::{
+    DumpableBehavior, Pid, PidfdFlags, Resource, Rlimit, getgid, getrlimit, getuid, pidfd_open,
+    pivot_root, set_dumpable_behavior, setrlimit, umask,
+};
+use rustix::system::{setdomainname, sethostname};
+use rustix::thread::{LinkNameSpaceType, move_into_link_name_space};
 use std::ffi::CString;
 use std::fs;
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::mem::MaybeUninit;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::{SandboxSpec, binfmt};
 use crate::netpolicy::NetPolicy;
-use rustix::mount::{MoveMountFlags, OpenTreeFlags, move_mount, open_tree};
-use rustix::process::{Pid, PidfdFlags, pidfd_open};
-use rustix::system::setdomainname;
 
 // Interface name for the presto-pasta tap inside the build netns.
 // Addressing (link-local guest/gateway, DNS forwarded on the gateway
@@ -320,28 +329,27 @@ fn enter_and_exec(
     unistd::execve(&prog, &args, &env).map_err(ioerr("exec builder"))
 }
 
-fn existing_mount_flags(target: &Path) -> io::Result<MsFlags> {
-    use nix::sys::statvfs::{FsFlags, statvfs};
+fn existing_mount_flags(target: &Path) -> io::Result<MountFlags> {
     // statvfs on the bound target fails for some source mounts (ENXIO on a
     // unix socket, ENOENT on an envfs/FUSE mount like NixOS's /bin); the
     // parent describes the same mount, so fall back to it.
     let st = match statvfs(target) {
         Ok(st) => st,
-        Err(Errno::ENXIO | Errno::ENOENT) => {
+        Err(Rerrno::NXIO | Rerrno::NOENT) => {
             let parent = target.parent().unwrap_or(target);
-            statvfs(parent).map_err(ioerr("statvfs"))?
+            statvfs(parent).map_err(rerr("statvfs"))?
         }
-        Err(e) => return Err(ioerr("statvfs")(e)),
+        Err(e) => return Err(rerr("statvfs")(e)),
     };
-    let f = st.flags();
-    let mut flags = MsFlags::empty();
+    let f = st.f_flag;
+    let mut flags = MountFlags::empty();
     for (fs, ms) in [
-        (FsFlags::ST_NOSUID, MsFlags::MS_NOSUID),
-        (FsFlags::ST_NODEV, MsFlags::MS_NODEV),
-        (FsFlags::ST_NOEXEC, MsFlags::MS_NOEXEC),
-        (FsFlags::ST_NOATIME, MsFlags::MS_NOATIME),
-        (FsFlags::ST_NODIRATIME, MsFlags::MS_NODIRATIME),
-        (FsFlags::ST_RELATIME, MsFlags::MS_RELATIME),
+        (StatVfsMountFlags::NOSUID, MountFlags::NOSUID),
+        (StatVfsMountFlags::NODEV, MountFlags::NODEV),
+        (StatVfsMountFlags::NOEXEC, MountFlags::NOEXEC),
+        (StatVfsMountFlags::NOATIME, MountFlags::NOATIME),
+        (StatVfsMountFlags::NODIRATIME, MountFlags::NODIRATIME),
+        (StatVfsMountFlags::RELATIME, MountFlags::RELATIME),
     ] {
         if f.contains(fs) {
             flags |= ms;
@@ -358,7 +366,7 @@ fn werr(step: &'static str) -> impl Fn(io::Error) -> io::Error {
     move |e| io::Error::other(format!("{step}: {e}"))
 }
 
-fn werr2(step: &'static str) -> impl Fn(rustix::io::Errno) -> io::Error {
+fn rerr(step: &'static str) -> impl Fn(Rerrno) -> io::Error {
     move |e| io::Error::other(format!("{step}: {e}"))
 }
 
@@ -375,12 +383,12 @@ struct NetHelper {
 fn fork_net_helper(policy: NetPolicy) -> io::Result<NetHelper> {
     let target = unistd::getpid();
     let (ours, theirs) = socketpair(
-        AddressFamily::Unix,
-        SockType::Datagram,
+        AddressFamily::UNIX,
+        SocketType::DGRAM,
+        SocketFlags::CLOEXEC,
         None,
-        SockFlag::SOCK_CLOEXEC,
     )
-    .map_err(ioerr("socketpair"))?;
+    .map_err(rerr("socketpair"))?;
     match unsafe { unistd::fork() }.map_err(ioerr("fork net helper"))? {
         unistd::ForkResult::Child => {
             drop(ours);
@@ -404,27 +412,22 @@ fn net_helper(sock: &OwnedFd, build_pid: unistd::Pid, policy: NetPolicy) -> i32 
     let Ok(pidfd) = pidfd_open(pid, PidfdFlags::empty()) else {
         return 1;
     };
-    let mut cmsg = nix::cmsg_space!([RawFd; 1]);
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut cmsg = RecvAncillaryBuffer::new(&mut space);
     let mut buf = [0u8; 8];
     let mut iov = [io::IoSliceMut::new(&mut buf)];
-    let Ok(msg) = recvmsg::<()>(
-        sock.as_raw_fd(),
-        &mut iov,
-        Some(&mut cmsg),
-        MsgFlags::empty(),
-    ) else {
+    if recvmsg(sock, &mut iov, &mut cmsg, RecvFlags::empty()).is_err() {
         return 1;
-    };
-    let Ok(mut cmsgs) = msg.cmsgs() else { return 1 };
-    let Some(ControlMessageOwned::ScmRights(fds)) = cmsgs.next() else {
+    }
+    let Some(RecvAncillaryMessage::ScmRights(mut fds)) = cmsg.drain().next() else {
         // build process died before creating the tap; nothing to do
         return 1;
     };
-    let tap = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    let Some(tap) = fds.next() else { return 1 };
     // Confine the helper to its own self-mapped user namespace; it
     // only needs the tap fd and outbound sockets.
-    let uid = unistd::getuid().as_raw();
-    let gid = unistd::getgid().as_raw();
+    let uid = getuid().as_raw();
+    let gid = getgid().as_raw();
     let confined = unshare(CloneFlags::CLONE_NEWUSER).is_ok()
         && fs::write("/proc/self/setgroups", "deny").is_ok()
         && fs::write("/proc/self/uid_map", format!("{uid} {uid} 1")).is_ok()
@@ -440,7 +443,7 @@ fn net_helper(sock: &OwnedFd, build_pid: unistd::Pid, policy: NetPolicy) -> i32 
     };
     let presto = presto_pasta::Presto::new(net, tap);
     // Readiness ack: the sandbox side waits for this before building.
-    if nix::sys::socket::send(sock.as_raw_fd(), b"ok", MsgFlags::empty()).is_err() {
+    if send(sock, b"ok", SendFlags::empty()).is_err() {
         return 1;
     }
     std::thread::spawn(move || {
@@ -450,8 +453,8 @@ fn net_helper(sock: &OwnedFd, build_pid: unistd::Pid, policy: NetPolicy) -> i32 
     });
     // Exit (and release the tap, letting the netns go away) once the
     // build process is gone.
-    let mut pfds = [PollFd::new(pidfd.as_fd(), PollFlags::POLLIN)];
-    while poll(&mut pfds, PollTimeout::NONE).is_err() {}
+    let mut pfds = [PollFd::new(&pidfd, PollFlags::IN)];
+    while poll(&mut pfds, None).is_err() {}
     0
 }
 
@@ -485,18 +488,20 @@ impl NetHelper {
         let net = presto_pasta::Config::default();
         let tap = open_tap(NET_IFNAME)?;
         presto_pasta::netdev::configure(NET_IFNAME, &net)?;
-        let fds = [tap.as_raw_fd()];
-        sendmsg::<()>(
-            self.sock.as_raw_fd(),
+        let fds = [tap.as_fd()];
+        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+        let mut cmsg = SendAncillaryBuffer::new(&mut space);
+        cmsg.push(SendAncillaryMessage::ScmRights(&fds));
+        sendmsg(
+            &self.sock,
             &[io::IoSlice::new(b"tap")],
-            &[ControlMessage::ScmRights(&fds)],
-            MsgFlags::empty(),
-            None,
+            &mut cmsg,
+            SendFlags::empty(),
         )
-        .map_err(ioerr("sending tap fd"))?;
+        .map_err(rerr("sending tap fd"))?;
         let mut ack = [0u8; 2];
-        match recv(self.sock.as_raw_fd(), &mut ack, MsgFlags::empty()) {
-            Ok(n) if n > 0 => Ok(()),
+        match recv(&self.sock, &mut ack, RecvFlags::empty()) {
+            Ok((n, _)) if n > 0 => Ok(()),
             _ => Err(io::Error::other(
                 "presto-pasta helper failed to start the datapath",
             )),
@@ -508,13 +513,13 @@ impl NetHelper {
 /// `lo` down; builders that talk to 127.0.0.1 (test suites) would
 /// otherwise fail, unlike under Nix's own sandbox.
 fn loopback_up() -> io::Result<()> {
-    let fd = nix::sys::socket::socket(
-        AddressFamily::Inet,
-        SockType::Datagram,
-        SockFlag::SOCK_CLOEXEC,
+    let fd = socket_with(
+        AddressFamily::INET,
+        SocketType::DGRAM,
+        SocketFlags::CLOEXEC,
         None,
     )
-    .map_err(ioerr("socket"))?;
+    .map_err(rerr("socket"))?;
     unsafe {
         let mut ifr: libc::ifreq = std::mem::zeroed();
         // ifr_name is [c_char; _]; c_char's signedness is target-dependent,
@@ -623,7 +628,8 @@ fn setup(p: &SetupParams) -> io::Result<()> {
     // mapped credentials.
     let ns = fs::File::open(p.leased_userns)
         .map_err(|e| io::Error::other(format!("opening leased userns: {e}")))?;
-    nix::sched::setns(ns, CloneFlags::CLONE_NEWUSER).map_err(ioerr("joining leased userns"))?;
+    move_into_link_name_space(ns.as_fd(), Some(LinkNameSpaceType::User))
+        .map_err(rerr("joining leased userns"))?;
     unshare(flags & !CloneFlags::CLONE_NEWUSER).map_err(ioerr("unshare"))?;
     unistd::setgroups(&[]).map_err(ioerr("setgroups"))?;
     unistd::setgid(unistd::Gid::from_raw(0)).map_err(ioerr("setgid"))?;
@@ -632,10 +638,10 @@ fn setup(p: &SetupParams) -> io::Result<()> {
     // flag, which makes /proc/self inodes root-owned and would reject
     // the nested userns map writes below; the userns still confines
     // ptrace, so restore it.
-    nix::sys::prctl::set_dumpable(true).map_err(ioerr("set dumpable"))?;
-    sethostname("localhost").map_err(ioerr("sethostname"))?;
+    set_dumpable_behavior(DumpableBehavior::Dumpable).map_err(rerr("set dumpable"))?;
+    sethostname(b"localhost").map_err(rerr("sethostname"))?;
     // "(none)" is the kernel default; fixed like Nix for determinism
-    setdomainname(b"(none)").map_err(werr2("setdomainname"))?;
+    setdomainname(b"(none)").map_err(rerr("setdomainname"))?;
     if private_net {
         loopback_up().map_err(werr("bringing lo up"))?;
     }
@@ -654,8 +660,8 @@ fn setup(p: &SetupParams) -> io::Result<()> {
     // pivot_root + detach the old root: unlike a bare chroot, the
     // host filesystem is no longer reachable in this namespace.
     std::env::set_current_dir(p.root).map_err(werr("chdir to root"))?;
-    pivot_root(".", ".").map_err(ioerr("pivot_root"))?;
-    umount2(".", MntFlags::MNT_DETACH).map_err(ioerr("detaching old root"))?;
+    pivot_root(".", ".").map_err(rerr("pivot_root"))?;
+    unmount(".", UnmountFlags::DETACH).map_err(rerr("detaching old root"))?;
     std::env::set_current_dir("/").map_err(werr("chdir /"))?;
     std::env::set_current_dir(p.cwd)
         .map_err(|e| io::Error::other(format!("chdir {}: {e}", p.cwd)))?;
@@ -684,30 +690,26 @@ fn setup(p: &SetupParams) -> io::Result<()> {
 /// PID-1 child after fork, before pivot_root.
 fn mount_filesystems(p: &SetupParams) -> io::Result<()> {
     let root = p.root;
-    let none: Option<&str> = None;
-    mount(none, "/", none, MsFlags::MS_REC | MsFlags::MS_PRIVATE, none)
-        .map_err(ioerr("making / private"))?;
+    mount_change(
+        "/",
+        MountPropagationFlags::REC | MountPropagationFlags::PRIVATE,
+    )
+    .map_err(rerr("making / private"))?;
     tmpfs_root(p)?;
 
-    let bind_one = |src: &Path, dst: &Path, ro: bool, extra: MsFlags| -> io::Result<()> {
+    let bind_one = |src: &Path, dst: &Path, ro: bool, extra: MountFlags| -> io::Result<()> {
         let target = root.join(dst.strip_prefix("/").unwrap_or(dst));
-        mount(
-            Some(src),
-            &target,
-            none,
-            MsFlags::MS_BIND | MsFlags::MS_REC,
-            none,
-        )
-        .map_err(|e| io::Error::other(format!("binding {}: {e}", src.display())))?;
+        mount_bind_recursive(src, &target)
+            .map_err(|e| io::Error::other(format!("binding {}: {e}", src.display())))?;
         // In a user namespace, a bind mount keeps its source's
         // locked flags (nosuid, nodev, ...); a remount that drops
         // any of them fails with EPERM, so carry them over.
         let locked = existing_mount_flags(&target)?;
-        let mut remount = MsFlags::MS_BIND | MsFlags::MS_REMOUNT | locked | extra;
+        let mut remount = MountFlags::BIND | locked | extra;
         if ro {
-            remount |= MsFlags::MS_RDONLY;
+            remount |= MountFlags::RDONLY;
         }
-        mount(none, &target, none, remount, none)
+        mount_remount(&target, remount, "")
             .map_err(|e| io::Error::other(format!("remounting {}: {e}", src.display())))?;
         Ok(())
     };
@@ -715,68 +717,68 @@ fn mount_filesystems(p: &SetupParams) -> io::Result<()> {
     // must not expose writable host files, device binds because the
     // sandbox must not chmod/chown the host nodes (writing *to* a char
     // device works regardless of MS_RDONLY).
-    let nosuid_nodev = MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
+    let nosuid_nodev = MountFlags::NOSUID | MountFlags::NODEV;
     for (src, dst) in p.binds {
         bind_one(src, dst, true, nosuid_nodev)?;
     }
     for (src, dst) in p.binds_dev {
-        bind_one(src, dst, true, MsFlags::MS_NOSUID)?;
+        bind_one(src, dst, true, MountFlags::NOSUID)?;
     }
     bind_one(p.build_dir, Path::new(p.cwd), false, nosuid_nodev)?;
 
     mount(
-        Some("tmpfs"),
+        "tmpfs",
         &root.join("dev/shm"),
-        Some("tmpfs"),
+        "tmpfs",
         nosuid_nodev,
-        Some("mode=1777"),
+        c"mode=1777",
     )
-    .map_err(ioerr("mounting /dev/shm"))?;
+    .map_err(rerr("mounting /dev/shm"))?;
     mount(
-        Some("devpts"),
+        "devpts",
         &root.join("dev/pts"),
-        Some("devpts"),
-        MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
-        Some("newinstance,mode=0620,ptmxmode=0666"),
+        "devpts",
+        MountFlags::NOSUID | MountFlags::NOEXEC,
+        c"newinstance,mode=0620,ptmxmode=0666",
     )
-    .map_err(ioerr("mounting /dev/pts"))?;
+    .map_err(rerr("mounting /dev/pts"))?;
 
     // Inside the fresh PID namespace this shows only the build's own
     // processes; the old host-/proc bind fallback exposed every host
     // PID (and /proc/<pid>/root, a chroot escape).
     mount(
-        Some("proc"),
+        "proc",
         &root.join("proc"),
-        Some("proc"),
-        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
-        none,
+        "proc",
+        MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC,
+        None,
     )
-    .map_err(ioerr("mounting /proc"))?;
+    .map_err(rerr("mounting /proc"))?;
 
     // Like Nix: uid-range builds get a real sysfs (the userns owns
     // its netns, so the kernel allows it); container managers fail
     // without one ("VFS: Mount too revealing").
     if p.uid_count > 1 {
         mount(
-            Some("sysfs"),
+            "sysfs",
             &root.join("sys"),
-            Some("sysfs"),
-            MsFlags::empty(),
-            none,
+            "sysfs",
+            MountFlags::empty(),
+            None,
         )
-        .map_err(ioerr("mounting /sys"))?;
+        .map_err(rerr("mounting /sys"))?;
     }
 
     if p.has_cgroup {
         // the cgroup namespace makes the build's own cgroup the root
         mount(
-            Some("cgroup2"),
+            "cgroup2",
             &root.join("sys/fs/cgroup"),
-            Some("cgroup2"),
-            MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
-            none,
+            "cgroup2",
+            MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC,
+            None,
         )
-        .map_err(ioerr("mounting /sys/fs/cgroup"))?;
+        .map_err(rerr("mounting /sys/fs/cgroup"))?;
     }
     Ok(())
 }
@@ -788,17 +790,15 @@ fn mount_filesystems(p: &SetupParams) -> io::Result<()> {
 /// disk: outputs must survive the namespace.
 fn tmpfs_root(p: &SetupParams) -> io::Result<()> {
     let root = p.root;
-    let none: Option<&str> = None;
-    // Detach the scratch store as a floating bind mount so it survives
-    // the tmpfs mount over the root, then reattach it (new mount API).
+    // Detach the scratch store as a floating bind mount, reattached below.
     let store = open_tree(
         rustix::fs::CWD,
         root.join("nix/store"),
         OpenTreeFlags::OPEN_TREE_CLONE | OpenTreeFlags::OPEN_TREE_CLOEXEC,
     )
-    .map_err(werr2("detaching scratch store"))?;
-    mount(Some("tmpfs"), root, Some("tmpfs"), MsFlags::empty(), none)
-        .map_err(ioerr("mounting tmpfs root"))?;
+    .map_err(rerr("detaching scratch store"))?;
+    mount("tmpfs", root, "tmpfs", MountFlags::empty(), None)
+        .map_err(rerr("mounting tmpfs root"))?;
     write_skeleton(p.spec)
         .and_then(|()| create_mount_points(p.spec))
         .map_err(|e| io::Error::other(format!("populating tmpfs root: {e:#}")))?;
@@ -809,20 +809,20 @@ fn tmpfs_root(p: &SetupParams) -> io::Result<()> {
         root.join("nix/store"),
         MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
     )
-    .map_err(werr2("attaching scratch store"))
+    .map_err(rerr("attaching scratch store"))
 }
 
 /// Fresh per-userns binfmt_misc instance (kernel 6.7+) so emulated
 /// builds bind their interpreter without touching the host registry.
 fn register_binfmt(line: &str) -> io::Result<()> {
     mount(
-        Some("binfmt_misc"),
+        "binfmt_misc",
         "/proc/sys/fs/binfmt_misc",
-        Some("binfmt_misc"),
-        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
-        None::<&str>,
+        "binfmt_misc",
+        MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC,
+        None,
     )
-    .map_err(ioerr(
+    .map_err(rerr(
         "mounting binfmt_misc (emulated builds need kernel 6.7+)",
     ))?;
     fs::write("/proc/sys/fs/binfmt_misc/register", line).map_err(werr("registering binfmt entry"))
@@ -837,12 +837,26 @@ fn register_binfmt(line: &str) -> io::Result<()> {
 /// hard limits (e.g. GitHub-hosted runners cap RLIMIT_CORE) would
 /// EPERM.
 fn apply_process_limits(system: &str) -> io::Result<()> {
-    let (_, hard) = getrlimit(Resource::RLIMIT_NPROC).map_err(ioerr("getrlimit NPROC"))?;
-    let limit = hard.min(4096);
-    setrlimit(Resource::RLIMIT_NPROC, limit, limit).map_err(ioerr("setting RLIMIT_NPROC"))?;
-    let (_, hard) = getrlimit(Resource::RLIMIT_CORE).map_err(ioerr("getrlimit CORE"))?;
-    setrlimit(Resource::RLIMIT_CORE, 0, hard).map_err(ioerr("setting RLIMIT_CORE"))?;
-    stat::umask(stat::Mode::from_bits_truncate(0o022));
+    let hard = getrlimit(Resource::Nproc).maximum;
+    let limit = Some(hard.unwrap_or(u64::MAX).min(4096));
+    setrlimit(
+        Resource::Nproc,
+        Rlimit {
+            current: limit,
+            maximum: limit,
+        },
+    )
+    .map_err(rerr("setting RLIMIT_NPROC"))?;
+    let hard = getrlimit(Resource::Core).maximum;
+    setrlimit(
+        Resource::Core,
+        Rlimit {
+            current: Some(0),
+            maximum: hard,
+        },
+    )
+    .map_err(rerr("setting RLIMIT_CORE"))?;
+    umask(Mode::from_bits_truncate(0o022));
     // PER_LINUX32 is a base persona, not a flag bit; nix's Persona
     // bitflags truncate it, so do the read/modify/write via raw libc.
     let base: libc::c_ulong = if matches!(
@@ -856,7 +870,7 @@ fn apply_process_limits(system: &str) -> io::Result<()> {
     unsafe {
         libc::personality(base | 0x0004_0000 /* ADDR_NO_RANDOMIZE */)
     };
-    prctl::set_no_new_privs().map_err(ioerr("PR_SET_NO_NEW_PRIVS"))
+    rustix::thread::set_no_new_privs(true).map_err(rerr("PR_SET_NO_NEW_PRIVS"))
 }
 
 pub fn setup_error_file(root: &Path) -> PathBuf {
