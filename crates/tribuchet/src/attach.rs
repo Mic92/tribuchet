@@ -11,13 +11,13 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
 use hyper_util::rt::TokioIo;
 use tokio::sync::mpsc;
 use tonic::transport::{Endpoint, Uri};
 use tower::service_fn;
 
 use crate::build_json::BuildJson;
+use crate::errors::{Error, Result, chain, err_ctx, err_msg};
 use crate::nar;
 use crate::proto::{
     BuildMessage, BuildRequest, TmpDirChunk, attach_event, attach_hub_client::AttachHubClient,
@@ -26,7 +26,7 @@ use crate::proto::{
 
 pub fn run(build_json: &Path, socket: &Path) -> Result<()> {
     let build = BuildJson::load(build_json)?;
-    let rt = crate::rt::runtime("trib-attach").context("creating the tokio runtime")?;
+    let rt = crate::rt::runtime("trib-attach").map_err(err_ctx("creating the tokio runtime"))?;
     let code = rt.block_on(run_async(build, socket.to_owned(), build_json.to_owned()))?;
     // Unix exposes only the low 8 bits of the exit status; never let a
     // nonzero code collapse to an observed 0.
@@ -88,9 +88,12 @@ async fn run_async(build: BuildJson, socket: PathBuf, build_json_path: PathBuf) 
             Outcome::Retry(e) => {
                 attempts += 1;
                 if attempts > RECONNECT_ATTEMPTS {
-                    return Err(e.context("giving up reconnecting to the hub"));
+                    return Err(err_ctx("giving up reconnecting to the hub")(e));
                 }
-                eprintln!("tribuchet: hub connection lost ({e:#}); reconnecting");
+                eprintln!(
+                    "tribuchet: hub connection lost ({}); reconnecting",
+                    chain(&e)
+                );
                 tokio::time::sleep(RECONNECT_DELAY).await;
             }
         }
@@ -101,7 +104,7 @@ enum Outcome {
     Done(i32),
     /// Transport-level failure: hub restarting or briefly unreachable.
     /// Build failures never take this path.
-    Retry(anyhow::Error),
+    Retry(Error),
 }
 
 /// gRPC channel over the hub's local unix socket; tonic only knows
@@ -118,7 +121,7 @@ async fn connect(socket: &Path) -> Result<tonic::transport::Channel> {
             }
         }))
         .await
-        .context("connecting to hub socket")
+        .map_err(err_ctx("connecting to hub socket"))
 }
 
 /// The submission stream: the request, then the tmp dir entries with
@@ -165,11 +168,9 @@ async fn attempt_build(
     {
         Ok(s) => s.into_inner(),
         Err(e) if retryable(&e) => {
-            return Ok(Outcome::Retry(
-                anyhow::Error::new(e).context("submitting build"),
-            ));
+            return Ok(Outcome::Retry(err_ctx("submitting build")(e)));
         }
-        Err(e) => return Err(e).context("submitting build"),
+        Err(e) => return Err(err_ctx("submitting build")(e)),
     };
 
     let mut unpackers: HashMap<String, Unpacker> = HashMap::default();
@@ -184,19 +185,17 @@ async fn attempt_build(
             // away; clean up partial output trees and resubmit.
             Ok(None) => {
                 cleanup_unpackers(&mut unpackers).await;
-                return Ok(Outcome::Retry(anyhow::anyhow!(
-                    "hub closed event stream without a result"
+                return Ok(Outcome::Retry(err_msg(
+                    "hub closed event stream without a result",
                 )));
             }
             Err(e) if retryable(&e) => {
                 cleanup_unpackers(&mut unpackers).await;
-                return Ok(Outcome::Retry(
-                    anyhow::Error::new(e).context("event stream"),
-                ));
+                return Ok(Outcome::Retry(err_ctx("event stream")(e)));
             }
             Err(e) => {
                 cleanup_unpackers(&mut unpackers).await;
-                return Err(e).context("build event stream");
+                return Err(err_ctx("build event stream")(e));
             }
         };
         match ev.event {
@@ -223,7 +222,7 @@ async fn attempt_build(
             }
             Some(attach_event::Event::ExitCode(code)) => {
                 if !unpackers.is_empty() {
-                    bail!("hub closed build with unfinished output transfers");
+                    return Err(err_msg("hub closed build with unfinished output transfers"));
                 }
                 if code == 0 && !added_paths.is_empty() {
                     write_result_json(top_tmp_dir, &added_paths)?;
@@ -232,7 +231,7 @@ async fn attempt_build(
             }
             Some(attach_event::Event::Error(e)) => {
                 cleanup_unpackers(&mut unpackers).await;
-                bail!("remote build failed: {e}");
+                return Err(err_msg(format!("remote build failed: {e}")));
             }
             None => {}
         }
@@ -290,7 +289,10 @@ async fn handle_output_chunk(
     out: crate::proto::OutputNar,
 ) -> Result<()> {
     if !expected.contains(&out.store_path) {
-        bail!("hub sent unexpected output {}", out.store_path);
+        return Err(err_msg(format!(
+            "hub sent unexpected output {}",
+            out.store_path
+        )));
     }
     let (tx, _) = unpackers.entry(out.store_path.clone()).or_insert_with(|| {
         let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
@@ -307,9 +309,9 @@ async fn handle_output_chunk(
         let err = task
             .await?
             .err()
-            .unwrap_or_else(|| anyhow::anyhow!("unpacker exited before eof"));
+            .unwrap_or_else(|| err_msg("unpacker exited before eof"));
         remove_tree(&unpack_temp_path(&out.store_path));
-        return Err(err.context(format!("unpacking output {}", out.store_path)));
+        return Err(err_ctx(format!("unpacking output {}", out.store_path))(err));
     }
     if out.eof {
         let (tx, task) = unpackers.remove(&out.store_path).unwrap();
@@ -322,8 +324,10 @@ async fn handle_output_chunk(
         // A pre-reconnect attempt may have placed this output
         // already; the re-delivered NAR replaces it.
         remove_tree(Path::new(&out.store_path));
-        std::fs::rename(&tmp, &out.store_path)
-            .with_context(|| format!("moving output into place at {}", out.store_path))?;
+        std::fs::rename(&tmp, &out.store_path).map_err(err_ctx(format!(
+            "moving output into place at {}",
+            out.store_path
+        )))?;
         tracing::debug!(path = out.store_path, "output unpacked");
     }
     Ok(())
@@ -335,7 +339,7 @@ fn write_result_json(top_tmp_dir: &Path, added: &BTreeSet<String>) -> Result<()>
     let path = top_tmp_dir.join("result.json");
     let body = serde_json::json!({ "addedPaths": added });
     std::fs::write(&path, serde_json::to_vec(&body)?)
-        .with_context(|| format!("writing {}", path.display()))
+        .map_err(err_ctx(format!("writing {}", path.display())))
 }
 
 /// Stop in-flight unpackers and drop their partial temp trees.

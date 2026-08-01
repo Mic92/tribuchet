@@ -22,7 +22,7 @@ use sandbox_proto::agent::{
 };
 use sandbox_proto::framing;
 
-use super::{Result, err_ctx, err_msg};
+use crate::errors::{Result, err_ctx, err_msg};
 
 /// SBPL string literal escaping: a quote or backslash in an
 /// interpolated path must not terminate the literal and inject

@@ -12,7 +12,7 @@
 
 pub mod agent;
 #[cfg(target_os = "linux")]
-mod agent_spawn;
+pub(crate) mod agent_spawn;
 mod agents;
 pub mod binfmt;
 mod build;
@@ -47,77 +47,11 @@ use resume::{
 };
 
 use crate::config::{Auth, WorkerConfig};
-use crate::errors::chain;
+use crate::errors::{Error, Result, chain, err_ctx, err_msg};
 use crate::proto::{
     BuildAssignment, BuildResult, Heartbeat, MissingPaths, Register, RequestJob, Resumed,
     WorkerMessage, hub_message, worker_hub_client::WorkerHubClient, worker_message,
 };
-
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("{msg}")]
-    Context {
-        msg: String,
-        #[source]
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-    #[error("{0}")]
-    Msg(String),
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-    #[error(transparent)]
-    Grpc(#[from] tonic::Status),
-    #[error(transparent)]
-    Transport(#[from] tonic::transport::Error),
-    #[error("hub connection lost")]
-    HubGone,
-    #[error("hub connection lost")]
-    Send(#[from] tokio::sync::mpsc::error::SendError<WorkerMessage>),
-    #[error(transparent)]
-    Framing(#[from] sandbox_proto::framing::Error),
-    #[error(transparent)]
-    Sandbox(#[from] sandbox::Error),
-    #[cfg(target_os = "linux")]
-    #[error(transparent)]
-    AgentSpawn(#[from] agent_spawn::Error),
-    #[error(transparent)]
-    Secret(#[from] crate::fsutil::Error),
-    #[error(transparent)]
-    TmpDir(#[from] crate::tmpdir::Error),
-    #[error(transparent)]
-    Nar(#[from] crate::nar::Error),
-    #[error(transparent)]
-    PathInfo(#[from] crate::store::PathInfoError),
-    #[error(transparent)]
-    StoreDb(#[from] harmonia_store_db::Error),
-    #[error(transparent)]
-    Db(#[from] rusqlite::Error),
-    #[error(transparent)]
-    StorePath(#[from] harmonia_store_path::ParseStorePathError),
-    #[error(transparent)]
-    Json(#[from] serde_json::Error),
-    #[error(transparent)]
-    Join(#[from] tokio::task::JoinError),
-    #[cfg(target_os = "macos")]
-    #[error(transparent)]
-    Fmt(#[from] std::fmt::Error),
-}
-
-type Result<T, E = Error> = std::result::Result<T, E>;
-
-/// Wraps any error with a message describing the failed step.
-fn err_ctx<E: Into<Box<dyn std::error::Error + Send + Sync>>>(
-    msg: impl Into<String>,
-) -> impl FnOnce(E) -> Error {
-    |source| Error::Context {
-        msg: msg.into(),
-        source: source.into(),
-    }
-}
-
-fn err_msg(m: impl Into<String>) -> Error {
-    Error::Msg(m.into())
-}
 
 /// Connection to the local nix-daemon; one per active build so its
 /// temp roots live exactly as long as the build.
@@ -802,8 +736,8 @@ async fn fail_build(
             extras: vec![],
             error: err,
         })))
-        .await
-        .map_err(|_| Error::HubGone)
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]

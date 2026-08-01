@@ -76,7 +76,17 @@ enum Command {
     },
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("tribuchet: {}", errors::chain(&e));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<(), errors::Error> {
     // Builds re-exec this binary as the sandbox setup stage; divert
     // before clap and tracing touch anything.
     #[cfg(target_os = "linux")]
@@ -110,7 +120,7 @@ fn main() -> anyhow::Result<()> {
             let mut cfg: config::WorkerConfig = config::load(&config)?;
             cfg.apply_env_overrides();
             tracing::info!(?cfg, "worker configuration");
-            Ok(worker::run(cfg)?)
+            worker::run(cfg)
         }
         Command::Ca { action } => Ok(ca::run(action)?),
         Command::Agent {

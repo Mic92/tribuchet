@@ -6,13 +6,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
 use harmonia_utils_signature::{PublicKey, Signature};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tonic::Status;
 
 use super::state::{HubState, Job};
+use crate::errors::{Result, err_ctx, err_msg};
 use crate::proto::{
     BuildAssignment, BuildResult, CancelBuild, ExtraPath, HubMessage, NarTransfer, OutputNar,
     OutputSignature, PathInfoMsg, PathOffer, ResultAck, StagingComplete, TmpDirArchive,
@@ -47,7 +47,7 @@ pub(super) async fn send(
     out_tx
         .send(Ok(HubMessage { msg: Some(msg) }))
         .await
-        .map_err(|_| anyhow::anyhow!("worker connection lost"))
+        .map_err(|_| err_msg("worker connection lost"))
 }
 
 pub(super) async fn run_job(
@@ -110,10 +110,12 @@ pub(super) async fn run_job(
                 publish_worker_failure(state, out_tx, job, &res).await?;
                 return Ok(());
             }
-            other => bail!(
-                "unexpected worker message while negotiating paths: {}",
-                msg_name(&other)
-            ),
+            other => {
+                return Err(err_msg(format!(
+                    "unexpected worker message while negotiating paths: {}",
+                    msg_name(&other)
+                )));
+            }
         }
     };
     tracing::info!(
@@ -136,7 +138,7 @@ fn validate_missing(offered_paths: &[String], requested: Vec<String>) -> Result<
     let mut seen = HashSet::new();
     for p in requested {
         if !offered.contains(&p) {
-            bail!("worker requested unoffered path {p}");
+            return Err(err_msg(format!("worker requested unoffered path {p}")));
         }
         if seen.insert(p.clone()) {
             missing.push(p);
@@ -232,7 +234,7 @@ pub(super) async fn recv(
     in_rx
         .recv()
         .await
-        .ok_or_else(|| anyhow::anyhow!("worker disconnected or went silent"))
+        .ok_or_else(|| err_msg("worker disconnected or went silent"))
 }
 
 /// Nix db metadata for input paths, in wire form, queried over the
@@ -273,15 +275,15 @@ async fn query_path_info_chunk(
     let mut guard = pool
         .acquire()
         .await
-        .context("connecting to the local nix-daemon")?;
+        .map_err(err_ctx("connecting to the local nix-daemon"))?;
     let mut out = Vec::with_capacity(paths.len());
     for p in paths {
         let sp: StorePath = store_dir.parse(p)?;
         let info = guard
             .execute(|c| c.query_path_info(&sp))
             .await
-            .with_context(|| format!("querying path info for {p}"))?
-            .with_context(|| format!("{p} is not a valid path in the local store"))?;
+            .map_err(err_ctx(format!("querying path info for {p}")))?
+            .ok_or_else(|| err_msg(format!("{p} is not a valid path in the local store")))?;
         out.push(PathInfoMsg {
             build_id: String::new(), // filled in by the caller
             store_path: p.clone(),
@@ -340,7 +342,7 @@ async fn stream_store_path(
         // runtime workers.
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
-            .context("building NAR pack runtime")?;
+            .map_err(err_ctx("building NAR pack runtime"))?;
         rt.block_on(async move {
             let nar = harmonia_file_nar::archive::NarByteStream::new(PathBuf::from(&path));
             let mut enc = async_compression::tokio::bufread::ZstdEncoder::with_quality(
@@ -352,7 +354,7 @@ async fn stream_store_path(
                 let n = enc
                     .read(&mut buf)
                     .await
-                    .with_context(|| format!("packing {path}"))?;
+                    .map_err(err_ctx(format!("packing {path}")))?;
                 if n == 0 {
                     break;
                 }
@@ -474,7 +476,7 @@ fn verify_set(
         let signature: Signature = out
             .signature
             .parse()
-            .context("malformed output signature")?;
+            .map_err(err_ctx("malformed output signature"))?;
         pending.insert(
             out.store_path,
             OutputVerify {
@@ -485,7 +487,9 @@ fn verify_set(
     }
     for scratch in requested.values() {
         if !pending.contains_key(scratch) {
-            bail!("worker result is missing output {scratch}");
+            return Err(err_msg(format!(
+                "worker result is missing output {scratch}"
+            )));
         }
     }
     if pending.len() != requested.len() {
@@ -493,7 +497,9 @@ fn verify_set(
             .keys()
             .filter(|p| !requested.values().any(|o| o == *p))
             .collect();
-        bail!("worker result contains unrequested outputs: {extra:?}");
+        return Err(err_msg(format!(
+            "worker result contains unrequested outputs: {extra:?}"
+        )));
     }
     Ok(pending)
 }
@@ -518,17 +524,20 @@ fn start_extras(
     for extra in reported {
         let info = extra
             .info
-            .ok_or_else(|| anyhow::anyhow!("extra without PathInfo"))?;
+            .ok_or_else(|| err_msg("extra without PathInfo"))?;
         let path = info.store_path.clone();
         let sig: Signature = extra
             .signature
             .parse()
-            .context("malformed extra signature")?;
+            .map_err(err_ctx("malformed extra signature"))?;
         let envelope = format!("{}:{}", path, hex::encode(&info.nar_sha256));
         if !vkey.verify(envelope.as_bytes(), &sig) {
-            bail!("signature verification failed for extra {path}");
+            return Err(err_msg(format!(
+                "signature verification failed for extra {path}"
+            )));
         }
-        let parsed = crate::store::parse_path_info(&info).context("parsing extra PathInfo")?;
+        let parsed =
+            crate::store::parse_path_info(&info).map_err(err_ctx("parsing extra PathInfo"))?;
         let (tx, rx) = mpsc::channel::<bytes::Bytes>(8);
         let pool = state.daemon_pool.clone();
         let task = tokio::spawn(async move { import_extra(&pool, parsed, rx).await });
@@ -548,7 +557,7 @@ async fn import_extra(
     let mut guard = pool
         .acquire()
         .await
-        .context("connecting to the local nix-daemon")?;
+        .map_err(err_ctx("connecting to the local nix-daemon"))?;
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(Ok::<_, io::Error>);
     let reader = tokio_util::io::StreamReader::new(stream);
     let dec =
@@ -557,7 +566,7 @@ async fn import_extra(
     guard
         .execute(|c| c.add_to_store_nar(&info, limited, false, true))
         .await
-        .map_err(|e| anyhow::anyhow!("registering extra {} via daemon: {e}", info.path))
+        .map_err(|e| err_msg(format!("registering extra {} via daemon: {e}", info.path)))
 }
 
 async fn relay_output_chunk(
@@ -583,7 +592,10 @@ async fn relay_output_chunk(
         let hash = verify.decoder.into_inner().hasher.finalize();
         let msg = format!("{}:{}", n.store_path, hex::encode(hash));
         if !vkey.verify(msg.as_bytes(), &verify.signature) {
-            bail!("signature verification failed for {}", n.store_path);
+            return Err(err_msg(format!(
+                "signature verification failed for {}",
+                n.store_path
+            )));
         }
         replay
             .publish(attach_event::Event::Output(OutputNar {
@@ -609,7 +621,7 @@ async fn relay_extra_chunk(
         // take(nar_size) and drops rx once done.
         let extra = extras.remove(&n.store_path).unwrap();
         extra.task.await??;
-        bail!("excess extra chunks for {}", n.store_path);
+        return Err(err_msg(format!("excess extra chunks for {}", n.store_path)));
     }
     if n.eof {
         let extra = extras.remove(&n.store_path).unwrap();
@@ -645,7 +657,10 @@ async fn publish_worker_failure(
     // Unix exposes only the low 8 bits to the parent; a nonzero
     // multiple of 256 would look like success.
     if !(1..=255).contains(&res.exit_code) {
-        bail!("worker sent invalid exit code {}", res.exit_code);
+        return Err(err_msg(format!(
+            "worker sent invalid exit code {}",
+            res.exit_code
+        )));
     }
     if !res.error.is_empty() {
         job.replay
@@ -733,7 +748,9 @@ async fn relay_build(
             worker_message::Msg::MissingPaths(m) if !awaiting_outputs => {
                 resend_rounds += 1;
                 if resend_rounds > MAX_RESEND_ROUNDS {
-                    bail!("worker requested input re-sends more than {MAX_RESEND_ROUNDS} times");
+                    return Err(err_msg(format!(
+                        "worker requested input re-sends more than {MAX_RESEND_ROUNDS} times"
+                    )));
                 }
                 let missing = validate_missing(&job.req.input_paths, m.store_paths)?;
                 tracing::info!(
@@ -746,7 +763,7 @@ async fn relay_build(
             }
             worker_message::Msg::Result(res) => {
                 if awaiting_outputs {
-                    bail!("worker sent a duplicate build result");
+                    return Err(err_msg("worker sent a duplicate build result"));
                 }
                 if res.exit_code != 0 {
                     publish_worker_failure(state, out_tx, job, &res).await?;
@@ -766,14 +783,22 @@ async fn relay_build(
                 } else if extras.contains_key(&n.store_path) {
                     relay_extra_chunk(&mut extras, &job.replay, n).await?;
                 } else {
-                    bail!("worker sent unexpected store path {}", n.store_path);
+                    return Err(err_msg(format!(
+                        "worker sent unexpected store path {}",
+                        n.store_path
+                    )));
                 }
                 if pending.is_empty() && extras.is_empty() {
                     finish_relay(state, out_tx, &job.replay, job).await;
                     return Ok(true);
                 }
             }
-            other => bail!("unexpected worker message: {}", msg_name(&other)),
+            other => {
+                return Err(err_msg(format!(
+                    "unexpected worker message: {}",
+                    msg_name(&other)
+                )));
+            }
         }
     }
 }

@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use super::Result;
+use crate::errors::Result;
 pub(super) use harmonia_store_db::StoreDb;
 use rusqlite::OptionalExtension;
 

@@ -17,9 +17,10 @@ use tokio::sync::mpsc;
 
 use super::pins;
 use super::resume::{PackedExtra, PackedOutput};
-use super::{DaemonConn, Result, WorkerCtx, err_ctx, err_msg, sandbox, unix_now};
+use super::{DaemonConn, WorkerCtx, sandbox, unix_now};
 use crate::chunkio::ChannelReader;
 use crate::errors::chain;
+use crate::errors::{Result, err_ctx, err_msg};
 use crate::nar;
 use crate::proto::{BuildAssignment, NarTransfer, PathInfoMsg, nar_transfer};
 use crate::store::{STORE_DIR, parse_path_info, topo_order, valid_store_path};
