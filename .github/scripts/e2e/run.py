@@ -210,6 +210,7 @@ def fetch_artifact(name: str, dest: str) -> None:
         r = subprocess.run(
             ["gh", "run", "download", run_id, "-n", name, "-D", dest],
             capture_output=True,
+            check=False,
         )
         return r.returncode == 0
 
@@ -224,6 +225,7 @@ def gh_api(path: str) -> Any | None:
         ["gh", "api", f"repos/{os.environ['GITHUB_REPOSITORY']}/{path}"],
         capture_output=True,
         text=True,
+        check=False,
     )
     if r.returncode != 0:
         return None
