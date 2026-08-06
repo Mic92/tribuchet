@@ -217,7 +217,6 @@ async fn attempt_build(
                 if let Some((tx, task)) = unpackers.remove(&path) {
                     drop(tx);
                     let _ = task.await;
-                    remove_tree(&unpack_temp_path(&path));
                 }
             }
             Some(attach_event::Event::ExitCode(code)) => {
@@ -270,19 +269,14 @@ fn ready_marker() -> Result<()> {
 /// (chunk sender, unpack task) for one in-flight output transfer.
 type Unpacker = (mpsc::Sender<Vec<u8>>, tokio::task::JoinHandle<Result<()>>);
 
-fn unpack_temp_path(store_path: &str) -> PathBuf {
-    let path = Path::new(store_path);
-    let base = path.file_name().unwrap_or_default().to_string_lossy();
-    path.with_file_name(format!(".tribuchet-tmp-{base}"))
-}
-
 fn remove_tree(path: &Path) {
     let _ = std::fs::remove_dir_all(path);
     let _ = std::fs::remove_file(path);
 }
 
-/// Unpack to a temp sibling, renamed into place at eof: the scratch
-/// path never holds a partial tree.
+/// Unpack directly into the output path. Nix holds the path lock and
+/// deletes invalid leftovers before the next builder run; a killed
+/// attach leaves nothing behind that Nix does not already clean up.
 async fn handle_output_chunk(
     unpackers: &mut HashMap<String, Unpacker>,
     expected: &[String],
@@ -296,10 +290,13 @@ async fn handle_output_chunk(
     }
     let (tx, _) = unpackers.entry(out.store_path.clone()).or_insert_with(|| {
         let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
-        let tmp = unpack_temp_path(&out.store_path);
+        let dest = PathBuf::from(&out.store_path);
+        // An earlier attempt in this process may have left a partial
+        // tree here; the re-delivered NAR replaces it.
+        remove_tree(&dest);
         let task =
             tokio::spawn(
-                async move { nar::unpack_zstd_chunks(rx, &tmp).await.map_err(Into::into) },
+                async move { nar::unpack_zstd_chunks(rx, &dest).await.map_err(Into::into) },
             );
         (tx, task)
     });
@@ -310,24 +307,12 @@ async fn handle_output_chunk(
             .await?
             .err()
             .unwrap_or_else(|| err_msg("unpacker exited before eof"));
-        remove_tree(&unpack_temp_path(&out.store_path));
         return Err(err_ctx(format!("unpacking output {}", out.store_path))(err));
     }
     if out.eof {
         let (tx, task) = unpackers.remove(&out.store_path).unwrap();
         drop(tx);
-        let tmp = unpack_temp_path(&out.store_path);
-        if let Err(e) = task.await? {
-            remove_tree(&tmp);
-            return Err(e);
-        }
-        // A pre-reconnect attempt may have placed this output
-        // already; the re-delivered NAR replaces it.
-        remove_tree(Path::new(&out.store_path));
-        std::fs::rename(&tmp, &out.store_path).map_err(err_ctx(format!(
-            "moving output into place at {}",
-            out.store_path
-        )))?;
+        task.await??;
         tracing::debug!(path = out.store_path, "output unpacked");
     }
     Ok(())
@@ -342,12 +327,72 @@ fn write_result_json(top_tmp_dir: &Path, added: &BTreeSet<String>) -> Result<()>
         .map_err(err_ctx(format!("writing {}", path.display())))
 }
 
-/// Stop in-flight unpackers and drop their partial temp trees.
+/// Stop in-flight unpackers; partial trees stay at the output paths
+/// and are removed before the next unpack of the same path.
 async fn cleanup_unpackers(unpackers: &mut HashMap<String, Unpacker>) {
-    for (store_path, (tx, task)) in unpackers.drain() {
+    for (_, (tx, task)) in unpackers.drain() {
         drop(tx);
-        task.abort();
         let _ = task.await;
-        remove_tree(&unpack_temp_path(&store_path));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::OutputNar;
+
+    /// zstd-compressed NAR of a single regular file, as the hub streams it.
+    async fn zstd_nar_of_file(dir: &Path, body: &[u8]) -> Vec<u8> {
+        let src = dir.join("src");
+        std::fs::write(&src, body).unwrap();
+        let mut nar = Vec::new();
+        nar::pack(&src, &mut nar).await.unwrap();
+        zstd::encode_all(&nar[..], 3).unwrap()
+    }
+
+    async fn deliver(
+        unpackers: &mut HashMap<String, Unpacker>,
+        out: &str,
+        chunk: Vec<u8>,
+    ) -> Result<()> {
+        let expected = vec![out.to_owned()];
+        handle_output_chunk(
+            unpackers,
+            &expected,
+            OutputNar {
+                store_path: out.to_owned(),
+                zstd_nar_chunk: chunk,
+                eof: false,
+            },
+        )
+        .await?;
+        handle_output_chunk(
+            unpackers,
+            &expected,
+            OutputNar {
+                store_path: out.to_owned(),
+                zstd_nar_chunk: Vec::new(),
+                eof: true,
+            },
+        )
+        .await
+    }
+
+    /// Regression: a leftover tree at the output path (earlier attempt in
+    /// this process) must be replaced, not fail with EEXIST.
+    #[tokio::test]
+    async fn replaces_existing_output_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        let out_str = out.to_string_lossy().into_owned();
+        std::fs::create_dir(&out).unwrap();
+        std::fs::write(out.join("stale"), b"junk").unwrap();
+
+        let chunk = zstd_nar_of_file(dir.path(), b"fresh").await;
+        let mut unpackers = HashMap::default();
+        deliver(&mut unpackers, &out_str, chunk).await.unwrap();
+
+        assert!(unpackers.is_empty());
+        assert_eq!(std::fs::read(&out).unwrap(), b"fresh");
     }
 }
