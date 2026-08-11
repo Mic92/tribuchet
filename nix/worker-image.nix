@@ -36,7 +36,7 @@ dockerTools.buildLayeredImage {
     nixConf
   ];
   extraCommands = ''
-    mkdir -p tmp var/lib/tribuchet etc/tribuchet nix/var/nix
+    mkdir -p tmp var/lib/tribuchet/worker etc/tribuchet nix/var/nix
   '';
   config = {
     Entrypoint = [ entrypoint ];

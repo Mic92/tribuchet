@@ -124,9 +124,9 @@ struct Build {
     id: String,
     /// Builder pid, also its process group.
     pid: i32,
-    /// Scratch dir the build runs in (`<state>/<id>/build`).
+    /// Scratch dir the build runs in (`<state>/scratch/build`).
     dir: PathBuf,
-    /// Whole per-build tree removed by Cleanup (`<state>/<id>`).
+    /// Whole per-build tree removed by Cleanup (`<state>/scratch`).
     scratch_root: PathBuf,
     /// Private sandbox root under the scratch dir (Linux namespace
     /// builds); outputs land below it instead of at their store paths.
@@ -255,7 +255,9 @@ fn handle_start(
         // not tamper with this one. The uid holds nothing else.
         agent.kill_sweep(None);
 
-        let scratch_root = agent.state_dir.join(&req.build_id);
+        // Fixed short name keeps in-sandbox socket paths within
+        // sun_path limits. Identity lives in agent memory.
+        let scratch_root = agent.state_dir.join("scratch");
         let build_dir = scratch_root.join("build");
         let _ = fs::remove_dir_all(&scratch_root);
         fs::create_dir_all(&scratch_root)?;

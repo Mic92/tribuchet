@@ -32,7 +32,7 @@ let
   attachDir = lib.escapeShellArg (dirOf (toString hub.socketPath));
   agentUser = i: "_tribuchetbld${toString i}";
   agentSocket = i: "/var/run/tribuchet/agents/${toString i}.sock";
-  agentStateDir = i: "/var/lib/tribuchet-agents/${toString i}";
+  agentStateDir = i: "/var/lib/tribuchet/a${toString i}";
   # nixbld gid: build users must be able to create their outputs in
   # the group-writable /nix/store.
   nixbldGid = 350;
@@ -74,7 +74,7 @@ in
     };
     socketPath = lib.mkOption {
       type = lib.types.path;
-      default = "/var/lib/tribuchet-hub/attach.sock";
+      default = "/var/lib/tribuchet/hub/attach.sock";
       description = ''
         Unix socket `tribuchet attach` (Nix's external builder)
         connects to. Its directory is made root:nixbld 0750 at
@@ -108,7 +108,7 @@ in
     };
     stateDir = lib.mkOption {
       type = lib.types.path;
-      default = "/var/lib/tribuchet";
+      default = "/var/lib/tribuchet/worker";
       description = "State directory: TLS material, build dirs, exec symlink.";
     };
     agents = lib.mkOption {
