@@ -1,6 +1,5 @@
 //! Unix socket bind/connect that tolerate paths beyond the sun_path
-//! limit by chdir'ing into the parent and using the bare filename,
-//! like Nix does. The process-global chdir is guarded by a lock.
+//! limit by chdir'ing into the parent, like Nix does.
 
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
