@@ -270,7 +270,7 @@ in
         for f in ["worker.crt", "worker.key", "ca.crt"]:
             pem = hub.succeed(f"cat /root/ca/{f}")
             worker.succeed(f"cat > /var/lib/tribuchet/tls/{f} << 'PEMEOF'\n{pem}PEMEOF")
-        worker.succeed("chown -R tribuchet:tribuchet /var/lib/tribuchet")
+        worker.succeed("chown -R tribuchet:tribuchet /var/lib/tribuchet/tls")
 
     with subtest("worker registers at hub over mTLS"):
         hub.succeed("systemctl start tribuchet-hub.socket")

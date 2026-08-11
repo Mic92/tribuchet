@@ -30,7 +30,7 @@ let
     i:
     pkgs.writeShellScript "tribuchet-agent-${toString i}" ''
       exec ${lib.getExe' worker.package "tribuchet"} agent \
-        --state-dir /var/lib/${agentUser i} \
+        --state-dir /var/lib/tribuchet/a${toString i} \
         --uid-base ${toString (worker.agentUidBase + (i - 1) * 65536)} \
         --worker-uid "$(${lib.getExe' pkgs.coreutils "id"} -u tribuchet)"
     '';
@@ -370,7 +370,7 @@ in
             ExecStart = agentStart i;
             User = agentUser i;
             Group = agentUser i;
-            StateDirectory = agentUser i;
+            StateDirectory = "tribuchet/a${toString i}";
             # Traverse-only for the worker and the uid block: the
             # per-build scratch dirs under it are world-writable for
             # the block, but their names are unguessable build ids and
@@ -416,7 +416,7 @@ in
               ExecStart = "${lib.getExe' worker.package "tribuchet"} worker --config /etc/tribuchet/worker.toml";
               # Running builds live in the agent services and are
               # re-adopted by the next worker instance.
-              StateDirectory = "tribuchet";
+              StateDirectory = "tribuchet/worker";
               Environment = [
                 "RUST_LOG=info"
               ]

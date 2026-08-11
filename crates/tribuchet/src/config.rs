@@ -225,7 +225,7 @@ impl WorkerConfig {
 }
 
 fn default_state_dir() -> PathBuf {
-    "/var/lib/tribuchet".into()
+    "/var/lib/tribuchet/worker".into()
 }
 fn default_ca_cert() -> PathBuf {
     "/var/lib/tribuchet/tls/ca.crt".into()
@@ -275,7 +275,7 @@ mod tests {
         assert_eq!(cfg.hub, "https://hub:7437");
         assert_eq!(cfg.max_jobs, 2);
         assert_eq!(cfg.build_timeout_secs, 24 * 3600);
-        assert_eq!(cfg.state_dir, PathBuf::from("/var/lib/tribuchet"));
+        assert_eq!(cfg.state_dir, PathBuf::from("/var/lib/tribuchet/worker"));
         assert_eq!(
             cfg.emulate.get("aarch64-linux"),
             Some(&PathBuf::from("/nix/store/x-qemu/bin/qemu-aarch64"))
