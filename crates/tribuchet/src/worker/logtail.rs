@@ -51,6 +51,13 @@ impl LogCursor {
         })
     }
 
+    fn persist_offset(&self) {
+        let tmp = self.dir.join("log.offset.tmp");
+        if std::fs::write(&tmp, self.sent.to_string()).is_ok() {
+            let _ = std::fs::rename(&tmp, self.dir.join("log.offset"));
+        }
+    }
+
     /// Read to EOF and persist the offset after every accepted
     /// chunk. Returns false when `emit` rejects a chunk or the file
     /// breaks.
@@ -65,7 +72,7 @@ impl LogCursor {
                         return false;
                     }
                     self.sent += n as u64;
-                    let _ = std::fs::write(self.dir.join("log.offset"), self.sent.to_string());
+                    self.persist_offset();
                 }
             }
         }
