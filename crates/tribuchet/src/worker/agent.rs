@@ -113,6 +113,7 @@ pub struct Options {
     pub worker_uid: Option<u32>,
     /// First uid of this agent's 65536-uid block (Linux). Without it
     /// builds run without a pre-mapped user namespace.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub uid_base: Option<u32>,
     /// The agent owns its uid even without socket activation, so it
     /// kill-sweeps the uid and exits after each build.

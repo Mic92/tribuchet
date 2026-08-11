@@ -204,6 +204,7 @@ pub struct WorkerConfig {
     /// and maps the 65536-uid block starting at base+i*65536. Needs a
     /// root worker. If unset, builds share the worker uid.
     #[serde(default)]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub agent_uid_base: Option<u32>,
 }
 

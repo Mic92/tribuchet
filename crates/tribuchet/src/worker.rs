@@ -60,6 +60,7 @@ type DaemonConn = DaemonClient<tokio::net::unix::OwnedReadHalf, tokio::net::unix
 /// Per-process context threaded through builds.
 struct WorkerCtx {
     state_dir: PathBuf,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     sandbox_bin_sh: Option<PathBuf>,
     /// Files a build must never read even where DAC would allow it
     /// (macOS Seatbelt deny rules; Linux relies on the mount namespace).
@@ -74,8 +75,10 @@ struct WorkerCtx {
     emulators: HashMap<String, PathBuf>,
     /// Fixed-output builds get a private netns with the presto-pasta
     /// user-mode NAT (Linux workers with /dev/net/tun).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fod_isolation: bool,
     /// Flow policy for that network, from the fod-network setting.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fod_network: crate::netpolicy::NetPolicy,
     max_silent_time: Duration,
     max_log_size: u64,
