@@ -5,14 +5,14 @@
 //! sending Start. The agent unpacks the tmp dir, confines the forked
 //! child (seatbelt on macOS) and execs the builder as its own
 //! (non-worker) uid. The builder is the agent's child, so builds
-//! survive worker restarts and the agent holds the log and exit
-//! status until the worker adopts them. The protocol lives in
+//! survive worker restarts and the agent holds the exit status until
+//! the worker adopts it. The build log goes to a worker-provided fd.
+//! The protocol lives in
 //! crates/sandbox-proto/proto/agent.proto.
 
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
@@ -241,13 +241,12 @@ fn handle_start(
     if req.build_id.len() != 32 || !req.build_id.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(msg(format!("invalid build id {:?}", req.build_id)));
     }
-    let tmp_pack = fds
-        .into_iter()
-        .next()
-        .ok_or_else(|| msg("missing tmp dir fd"))?;
+    let mut fds = fds.into_iter();
+    let tmp_pack = fds.next().ok_or_else(|| msg("missing tmp dir fd"))?;
+    let log_w = fs::File::from(fds.next().ok_or_else(|| msg("missing log fd"))?);
     // The lock is held until the build is registered: a losing
     // concurrent Start gets Busy without ever spawning anything.
-    let (build_dir, log, exit, pid) = {
+    let (build_dir, exit, pid) = {
         let mut current = agent.current.lock().unwrap();
         if current.is_some() {
             return Ok(framing::send_error(conn, ERROR_BUSY)?);
@@ -263,13 +262,17 @@ fn handle_start(
         platform::stage_tmp_dir(&agent.confinement, &scratch_root, &build_dir, tmp_pack)
             .map_err(|e| Error::StageTmpDir(Box::new(e)))?;
 
-        let log_path = scratch_root.join("build.log");
-        let log_w = fs::File::create(&log_path)?;
         let (child, sandbox_root) =
             platform::spawn_builder(&agent.confinement, &req, &scratch_root, &build_dir, &log_w)?;
         let pid = child.id().cast_signed();
         let exit = Arc::new((Mutex::new(None), Condvar::new()));
-        reap_on_exit(agent.clone(), req.build_id.clone(), child, exit.clone());
+        reap_on_exit(
+            agent.clone(),
+            req.build_id.clone(),
+            child,
+            log_w,
+            exit.clone(),
+        );
         *current = Some(Build {
             id: req.build_id.clone(),
             pid,
@@ -279,8 +282,7 @@ fn handle_start(
             outputs: req.outputs,
             exit: exit.clone(),
         });
-        // The worker only needs to read the log.
-        (build_dir, fs::File::open(&log_path)?, exit, pid)
+        (build_dir, exit, pid)
     };
     tracing::info!(id = req.build_id, pid, "builder started");
     framing::send_reply(
@@ -289,22 +291,19 @@ fn handle_start(
             pid,
             scratch_dir: build_dir.to_string_lossy().into_owned(),
         }),
-        &[log.as_raw_fd()],
+        &[],
     )?;
     notify_exit(conn, &exit)
 }
 
 fn handle_adopt(agent: &Arc<Agent>, conn: &UnixStream, req: &AdoptRequest) -> Result<(), Error> {
-    let (pid, build_dir, scratch_root, exit) = {
+    let (pid, build_dir, exit) = {
         let current = agent.current.lock().unwrap();
         match current.as_ref() {
-            Some(b) if b.id == req.build_id => {
-                (b.pid, b.dir.clone(), b.scratch_root.clone(), b.exit.clone())
-            }
+            Some(b) if b.id == req.build_id => (b.pid, b.dir.clone(), b.exit.clone()),
             _ => return Ok(framing::send_error(conn, ERROR_UNKNOWN_BUILD)?),
         }
     };
-    let log = fs::File::open(scratch_root.join("build.log"))?;
     let exit_code = *exit.0.lock().unwrap();
     framing::send_reply(
         conn,
@@ -313,7 +312,7 @@ fn handle_adopt(agent: &Arc<Agent>, conn: &UnixStream, req: &AdoptRequest) -> Re
             scratch_dir: build_dir.to_string_lossy().into_owned(),
             exit_code,
         }),
-        &[log.as_raw_fd()],
+        &[],
     )?;
     if exit_code.is_some() {
         return Ok(());
@@ -419,6 +418,7 @@ fn reap_on_exit(
     agent: Arc<Agent>,
     build_id: String,
     mut child: std::process::Child,
+    mut log: fs::File,
     exit: Arc<(Mutex<Option<i32>>, Condvar)>,
 ) {
     std::thread::spawn(move || {
@@ -431,13 +431,7 @@ fn reap_on_exit(
         };
         if platform::oom_killed(&agent.confinement, &build_id) {
             tracing::warn!(id = build_id, "builder killed by the build memory limit");
-            let log = agent.state_dir.join(&build_id).join("build.log");
-            let _ = fs::OpenOptions::new()
-                .append(true)
-                .open(log)
-                .and_then(|mut f| {
-                    f.write_all(b"tribuchet: builder killed by the build memory limit\n")
-                });
+            let _ = log.write_all(b"tribuchet: builder killed by the build memory limit\n");
         }
         tracing::info!(code, "builder exited");
         *exit.0.lock().unwrap() = Some(code);
