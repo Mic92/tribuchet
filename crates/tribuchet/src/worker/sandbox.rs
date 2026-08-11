@@ -143,18 +143,22 @@ pub struct PrepareOpts<'a> {
 pub enum Error {
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[cfg(target_os = "linux")]
     #[error("{step}")]
     Step {
         step: String,
         #[source]
         source: std::io::Error,
     },
+    #[cfg(target_os = "linux")]
     #[error("sending sandbox spec")]
     SendSpec(#[source] serde_json::Error),
+    #[cfg(target_os = "linux")]
     #[error("no binfmt magic known for system {0}")]
     UnknownBinfmt(String),
 }
 
+#[cfg(target_os = "linux")]
 fn step<E: Into<std::io::Error>>(step: impl Into<String>) -> impl FnOnce(E) -> Error {
     |source| Error::Step {
         step: step.into(),
