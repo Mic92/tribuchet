@@ -205,7 +205,7 @@ fn listener(socket: Option<&Path>) -> Result<(UnixListener, bool), Error> {
     }
     let path = socket.ok_or_else(|| msg("no activated socket and no --socket given"))?;
     let _ = fs::remove_file(path);
-    let l = UnixListener::bind(path).map_err(step(format!("binding {}", path.display())))?;
+    let l = crate::sockpath::bind(path).map_err(step(format!("binding {}", path.display())))?;
     Ok((l, false))
 }
 

@@ -206,7 +206,7 @@ impl AgentBuild {
 }
 
 fn connect(socket: &Path) -> Result<UnixStream> {
-    UnixStream::connect(socket).map_err(err_ctx(format!(
+    crate::sockpath::connect(socket).map_err(err_ctx(format!(
         "connecting to the build agent at {}",
         socket.display()
     )))
