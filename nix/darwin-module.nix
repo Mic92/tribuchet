@@ -26,7 +26,11 @@ let
   execLink = "${cfg.stateDir}/exec";
   label = "org.nixos.tribuchet-worker";
   format = pkgs.formats.toml { };
-  agentIds = lib.range 1 cfg.agents;
+  # One per-uid build agent per concurrent build. With max-jobs unset
+  # the worker uses min(cores, agents). Smaller ceiling than Linux
+  # since each agent needs a hidden user account.
+  agentCount = cfg.settings.max-jobs or 32;
+  agentIds = lib.range 1 agentCount;
   # launchd cannot set a socket group and the rootless hub cannot
   # chown the socket, so this directory carries the nixbld restriction.
   attachDir = lib.escapeShellArg (dirOf (toString hub.socketPath));
@@ -40,7 +44,6 @@ let
     {
       state-dir = toString cfg.stateDir;
       agent-sockets = map agentSocket agentIds;
-      max-jobs = cfg.agents;
     }
     // cfg.settings
   );
@@ -110,15 +113,6 @@ in
       type = lib.types.path;
       default = "/var/lib/tribuchet/worker";
       description = "State directory: TLS material, build dirs, exec symlink.";
-    };
-    agents = lib.mkOption {
-      type = lib.types.ints.positive;
-      default = 4;
-      description = ''
-        Number of per-uid build agents. Bounds concurrent builds and
-        sets the worker's max-jobs (overridable via `settings`, but
-        never above the agent count).
-      '';
     };
     uid = lib.mkOption {
       type = lib.types.int;

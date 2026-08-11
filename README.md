@@ -149,7 +149,9 @@ Import `tribuchet.nixosModules.default` (flake input
     enable = true;
     settings = {
       hub = "https://hub.example.org:7437";
-      max-jobs = 4;
+      # Concurrent builds. Defaults to the core count at runtime, up
+      # to 64 (32 on darwin). Set explicitly to go beyond or below.
+      # max-jobs = 128;
     };
   };
 }
