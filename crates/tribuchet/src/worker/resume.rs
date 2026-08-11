@@ -12,7 +12,7 @@ use harmonia_utils_signature::SecretKey;
 use tokio::sync::mpsc;
 
 use super::build::ActiveBuild;
-use super::build::{LogMirror, supervise_agent};
+use super::build::supervise_agent;
 use super::logtail::LogTail;
 use super::{DaemonConn, WorkerCtx, msg, sandbox};
 use crate::chunkio::CHUNK_SIZE;
@@ -91,13 +91,7 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>, signing_key: &Arc<SecretK
             let key = st.dedupe_key.clone();
             let fin = {
                 let (socket, build) = agent;
-                // Keep mirroring the agent-side log into dir/build.log
-                // so replay and abort heuristics see fresh data.
-                let mirror = LogMirror::start(&build.log, dir.join("build.log")).ok();
                 let fin = supervise_agent(&ctx, &st, dir, &socket, build, &signing_key);
-                if let Some(m) = mirror {
-                    m.stop();
-                }
                 ctx.agents.release(socket);
                 fin
             };

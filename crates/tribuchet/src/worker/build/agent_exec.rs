@@ -5,11 +5,11 @@
 //! Linux the serialized sandbox spec the agent runs the setup stage
 //! with.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{self, Ordering};
 use std::time::{Duration, Instant};
-use std::{fs, io};
 
 use harmonia_utils_signature::SecretKey;
 use tokio::sync::mpsc;
@@ -97,11 +97,19 @@ impl ActiveBuild {
             outputs: outputs.clone(),
             memory_max_bytes: self.ctx.build_memory_max_bytes,
         };
+        // The builder writes dir/build.log directly through this fd.
+        // Tailing, replay and the abort heuristics read the same file.
+        let log_w = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.dir.join("build.log"))?;
         let build = agents::AgentBuild::start(
             socket,
             &req,
             &fs::File::open(self.dir.join("top.tmpdir.zst"))?,
+            &log_w,
         )?;
+        drop(log_w);
         tracing::info!(
             id = a.build_id,
             pid = build.pid,
@@ -120,10 +128,6 @@ impl ActiveBuild {
                 .join("root");
         }
 
-        // Mirror the agent-side log into dir/build.log so the
-        // path-based tailing, replay and resume machinery keeps
-        // working across worker restarts.
-        let mirror = LogMirror::start(&build.log, self.dir.join("build.log"))?;
         let log_done = Arc::new(atomic::AtomicBool::new(false));
         let tailer = {
             let tx = out_tx.clone();
@@ -153,9 +157,6 @@ impl ActiveBuild {
             build,
             signing_key,
         );
-        // The mirror is drained before the tailer's final read so no
-        // trailing log lines are lost.
-        mirror.stop();
         log_done.store(true, Ordering::Relaxed);
         let _ = tailer.join();
         Ok(fin)
@@ -285,63 +286,5 @@ pub(in crate::worker) fn supervise_agent(
         extras,
         dir,
         finished_at: Instant::now(),
-    }
-}
-
-/// Background thread appending everything the agent writes to its log
-/// fd into the build dir's build.log, feeding the path-based tailing,
-/// replay and resume machinery.
-pub(in crate::worker) struct LogMirror {
-    done: Arc<atomic::AtomicBool>,
-    thread: std::thread::JoinHandle<()>,
-}
-
-impl LogMirror {
-    /// Start mirroring `log` into `dest_path`, appending where a
-    /// previous worker generation's mirror left off.
-    pub(in crate::worker) fn start(log: &fs::File, dest_path: PathBuf) -> Result<Self> {
-        let mut src = log.try_clone()?;
-        let done = Arc::new(atomic::AtomicBool::new(false));
-        let thread = {
-            let done = done.clone();
-            std::thread::spawn(move || {
-                use std::io::{Read as _, Seek as _, Write as _};
-                let Ok(mut dest) = fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&dest_path)
-                else {
-                    return;
-                };
-                let already = dest.metadata().map_or(0, |m| m.len());
-                if src.seek(io::SeekFrom::Start(already)).is_err() {
-                    return;
-                }
-                let mut buf = [0u8; 8192];
-                loop {
-                    match src.read(&mut buf) {
-                        Ok(0) => {
-                            if done.load(Ordering::Relaxed) {
-                                return;
-                            }
-                            std::thread::sleep(Duration::from_millis(200));
-                        }
-                        Ok(n) => {
-                            if dest.write_all(&buf[..n]).is_err() {
-                                return;
-                            }
-                        }
-                        Err(_) => return,
-                    }
-                }
-            })
-        };
-        Ok(Self { done, thread })
-    }
-
-    /// Drain what is still buffered agent-side, then stop.
-    pub(in crate::worker) fn stop(self) {
-        self.done.store(true, Ordering::Relaxed);
-        let _ = self.thread.join();
     }
 }
