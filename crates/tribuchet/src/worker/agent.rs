@@ -255,8 +255,7 @@ fn handle_start(
         // not tamper with this one. The uid holds nothing else.
         agent.kill_sweep(None);
 
-        // Fixed short name keeps in-sandbox socket paths within
-        // sun_path limits. Identity lives in agent memory.
+        // Short fixed name keeps sandbox socket paths within sun_path.
         let scratch_root = agent.state_dir.join("scratch");
         let build_dir = scratch_root.join("build");
         let _ = fs::remove_dir_all(&scratch_root);

@@ -98,7 +98,6 @@ impl ActiveBuild {
             memory_max_bytes: self.ctx.build_memory_max_bytes,
         };
         // The builder writes dir/build.log directly through this fd.
-        // Tailing, replay and the abort heuristics read the same file.
         let log_w = fs::OpenOptions::new()
             .create(true)
             .append(true)

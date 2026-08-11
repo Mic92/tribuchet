@@ -24,9 +24,8 @@ impl LogTail {
     }
 }
 
-/// Read position in a build dir's build.log. It is persisted as
-/// log.offset so resumed sessions and later worker generations
-/// continue where the previous tailer stopped.
+/// Read position in build.log, persisted as log.offset so resumed
+/// sessions continue where the previous tailer stopped.
 struct LogCursor {
     file: std::fs::File,
     dir: PathBuf,
@@ -34,8 +33,8 @@ struct LogCursor {
 }
 
 impl LogCursor {
-    /// Open build.log at the persisted offset. A missing file means
-    /// the build never started a builder, so there is no cursor.
+    /// Open build.log at the persisted offset. `None` when the build
+    /// never started a builder.
     fn open(dir: &Path) -> Option<Self> {
         use std::io::Seek;
         let mut file = std::fs::File::open(dir.join("build.log")).ok()?;
@@ -58,9 +57,8 @@ impl LogCursor {
         }
     }
 
-    /// Read to EOF and persist the offset after every accepted
-    /// chunk. Returns false when `emit` rejects a chunk or the file
-    /// breaks.
+    /// Read to EOF, persisting the offset after each accepted chunk.
+    /// False when `emit` rejects a chunk or the file breaks.
     fn drain(&mut self, mut emit: impl FnMut(Vec<u8>) -> bool) -> bool {
         let mut buf = [0u8; 8192];
         loop {
@@ -79,9 +77,8 @@ impl LogCursor {
     }
 }
 
-/// Stream `dir`'s build.log to `out_tx` as LogChunks for `build_id`.
-/// Keeps polling past EOF until `done()` reports that nothing more
-/// can arrive.
+/// Stream `dir`'s build.log to `out_tx` as LogChunks, polling past
+/// EOF until `done()`.
 pub(super) fn tail_log(
     dir: &Path,
     build_id: &str,

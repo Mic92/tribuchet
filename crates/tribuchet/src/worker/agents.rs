@@ -145,10 +145,8 @@ pub(super) struct AgentBuild {
 }
 
 impl AgentBuild {
-    /// Start a build on the agent behind `socket`. Two fds are
-    /// passed along: `tmp_pack` carries the zstd entry stream of the
-    /// build's tmp dir and `log` becomes the builder's stdout and
-    /// stderr.
+    /// Start a build on the agent behind `socket`. The fds carry the
+    /// packed tmp dir and the builder's stdout/stderr.
     pub(super) fn start(
         socket: &Path,
         req: &StartRequest,

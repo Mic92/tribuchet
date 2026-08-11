@@ -26,18 +26,17 @@ let
   agentCount = worker.settings.max-jobs or 64;
   agentIds = lib.range 1 agentCount;
   agentUser = i: "tribuchet-agent-${toString i}";
+  agentInstance = i: "tribuchet-agent@${toString i}";
   forEachAgent = f: lib.listToAttrs (map (i: lib.nameValuePair (agentUser i) (f i)) agentIds);
   agentSocket = i: "/run/tribuchet/agents/${toString i}.sock";
   # ExecStart cannot resolve the worker's uid, which the agent needs
-  # for its peer-uid check.
-  agentStart =
-    i:
-    pkgs.writeShellScript "tribuchet-agent-${toString i}" ''
-      exec ${lib.getExe' worker.package "tribuchet"} agent \
-        --state-dir /var/lib/tribuchet/a${toString i} \
-        --uid-base ${toString (worker.agentUidBase + (i - 1) * 65536)} \
-        --worker-uid "$(${lib.getExe' pkgs.coreutils "id"} -u tribuchet)"
-    '';
+  # for its peer-uid check. Takes the instance number as $1.
+  agentStart = pkgs.writeShellScript "tribuchet-agent" ''
+    exec ${lib.getExe' worker.package "tribuchet"} agent \
+      --state-dir "/var/lib/tribuchet/a$1" \
+      --uid-base "$(( ${toString worker.agentUidBase} + ($1 - 1) * 65536 ))" \
+      --worker-uid "$(${lib.getExe' pkgs.coreutils "id"} -u tribuchet)"
+  '';
   hubToml = format.generate "hub.toml" (
     {
       socket = toString hub.socketPath;
@@ -349,22 +348,32 @@ in
       # socket, the agent starts on the first connection and exits
       # after each build's Cleanup. The socket mode is open because
       # the agent itself only accepts connections from the worker uid.
-      systemd.sockets = forEachAgent (i: {
-        wantedBy = [ "sockets.target" ];
-        listenStreams = [ (agentSocket i) ];
-        socketConfig.SocketMode = "0666";
-      });
+      systemd.sockets = {
+        "tribuchet-agent@" = {
+          listenStreams = [ "/run/tribuchet/agents/%i.sock" ];
+          socketConfig.SocketMode = "0666";
+        };
+      }
+      // lib.listToAttrs (
+        map (
+          i:
+          lib.nameValuePair (agentInstance i) {
+            overrideStrategy = "asDropin";
+            wantedBy = [ "sockets.target" ];
+          }
+        ) agentIds
+      );
 
-      systemd.services =
-        forEachAgent (i: {
+      systemd.services = {
+        "tribuchet-agent@" = {
           # Exiting after every build is the agent's normal lifecycle,
           # not a crash loop.
           unitConfig.StartLimitIntervalSec = 0;
           serviceConfig = {
-            ExecStart = agentStart i;
-            User = agentUser i;
-            Group = agentUser i;
-            StateDirectory = "tribuchet/a${toString i}";
+            ExecStart = "${agentStart} %i";
+            User = "tribuchet-agent-%i";
+            Group = "tribuchet-agent-%i";
+            StateDirectory = "tribuchet/a%i";
             # Traverse-only for the worker and the uid block: the
             # per-build scratch dirs under it are world-writable for
             # the block, but their names are unguessable build ids and
@@ -393,39 +402,38 @@ in
             LimitNOFILE = 1048576;
             Environment = "RUST_LOG=info";
           };
-        })
-        // {
-          tribuchet-worker = {
-            wantedBy = [ "multi-user.target" ];
-            # the agent sockets must exist before the worker leases builds
-            wants = map (i: "${agentUser i}.socket") agentIds;
-            after = map (i: "${agentUser i}.socket") agentIds;
-            restartTriggers = [ workerToml ];
-            serviceConfig = {
-              Type = "notify";
-              LoadCredential = lib.optional (worker.keyFile != null) "worker-key:${worker.keyFile}";
-              User = "tribuchet";
-              Group = "tribuchet";
-              WatchdogSec = "30";
-              ExecStart = "${lib.getExe' worker.package "tribuchet"} worker --config /etc/tribuchet/worker.toml";
-              # Running builds live in the agent services and are
-              # re-adopted by the next worker instance.
-              StateDirectory = "tribuchet/worker";
-              Environment = [
-                "RUST_LOG=info"
-              ]
-              ++ lib.optional (worker.keyFile != null) "TRIBUCHET_KEY=%d/worker-key";
-              # the worker itself only stages inputs and packs outputs;
-              # store writes go through the nix-daemon socket
-              NoNewPrivileges = true;
-              PrivateTmp = true;
-              ProtectHome = true;
-              ProtectSystem = "strict";
-              RestrictSUIDSGID = true;
-              Restart = "on-failure";
-            };
+        };
+        tribuchet-worker = {
+          wantedBy = [ "multi-user.target" ];
+          # the agent sockets must exist before the worker leases builds
+          wants = map (i: "${agentInstance i}.socket") agentIds;
+          after = map (i: "${agentInstance i}.socket") agentIds;
+          restartTriggers = [ workerToml ];
+          serviceConfig = {
+            Type = "notify";
+            LoadCredential = lib.optional (worker.keyFile != null) "worker-key:${worker.keyFile}";
+            User = "tribuchet";
+            Group = "tribuchet";
+            WatchdogSec = "30";
+            ExecStart = "${lib.getExe' worker.package "tribuchet"} worker --config /etc/tribuchet/worker.toml";
+            # Running builds live in the agent services and are
+            # re-adopted by the next worker instance.
+            StateDirectory = "tribuchet/worker";
+            Environment = [
+              "RUST_LOG=info"
+            ]
+            ++ lib.optional (worker.keyFile != null) "TRIBUCHET_KEY=%d/worker-key";
+            # the worker itself only stages inputs and packs outputs;
+            # store writes go through the nix-daemon socket
+            NoNewPrivileges = true;
+            PrivateTmp = true;
+            ProtectHome = true;
+            ProtectSystem = "strict";
+            RestrictSUIDSGID = true;
+            Restart = "on-failure";
           };
         };
+      };
     })
   ];
 }
