@@ -3,7 +3,6 @@
 //! slot, supervises it and restarts it after it exits.
 
 use std::fs;
-use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -174,7 +173,7 @@ fn wait_for_sockets(sockets: &[PathBuf]) -> Result<(), Error> {
     let deadline = Instant::now() + Duration::from_secs(30);
     for socket in sockets {
         loop {
-            if UnixStream::connect(socket).is_ok() {
+            if crate::sockpath::connect(socket).is_ok() {
                 break;
             }
             if Instant::now() >= deadline {

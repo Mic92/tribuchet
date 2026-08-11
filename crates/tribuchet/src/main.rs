@@ -11,6 +11,7 @@ mod netpolicy;
 mod proto;
 mod rt;
 mod sd;
+mod sockpath;
 mod store;
 mod tailscale;
 mod tmpdir;
