@@ -72,7 +72,14 @@ impl Replay {
         let mut inner = self.inner.lock().await;
         // try_send: a subscriber that stopped reading is dropped (its
         // attach errors out) instead of buffering unboundedly.
-        inner.subs.retain(|tx| tx.try_send(Ok(ev.clone())).is_ok());
+        inner.subs.retain(|tx| match tx.try_send(Ok(ev.clone())) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!("dropping attach subscriber that fell too far behind");
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        });
         if inner.overflowed {
             return;
         }
