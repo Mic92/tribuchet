@@ -849,7 +849,7 @@ impl<W: Write> Write for TeeScanner<'_, W> {
 
 #[path = "build/agent_exec.rs"]
 mod agent_exec;
-pub(super) use agent_exec::{LogMirror, supervise_agent};
+pub(super) use agent_exec::supervise_agent;
 
 #[cfg(test)]
 mod tests {

@@ -142,21 +142,26 @@ pub(super) struct AgentBuild {
     conn: UnixStream,
     pub(super) pid: i32,
     pub(super) scratch_dir: PathBuf,
-    /// Read handle on the agent-side log file.
-    pub(super) log: fs::File,
 }
 
 impl AgentBuild {
-    /// Start a build on the agent behind `socket`. `tmp_pack` is the
-    /// zstd entry stream of the build's tmp dir, passed as an fd.
-    pub(super) fn start(socket: &Path, req: &StartRequest, tmp_pack: &fs::File) -> Result<Self> {
+    /// Start a build on the agent behind `socket`. Two fds are
+    /// passed along: `tmp_pack` carries the zstd entry stream of the
+    /// build's tmp dir and `log` becomes the builder's stdout and
+    /// stderr.
+    pub(super) fn start(
+        socket: &Path,
+        req: &StartRequest,
+        tmp_pack: &fs::File,
+        log: &fs::File,
+    ) -> Result<Self> {
         let conn = connect(socket)?;
         framing::send_call(
             &conn,
             call::Call::Start(Box::new(req.clone())),
-            &[tmp_pack.as_raw_fd()],
+            &[tmp_pack.as_raw_fd(), log.as_raw_fd()],
         )?;
-        let (reply, fds) = framing::recv_reply(&conn)?;
+        let (reply, _fds) = framing::recv_reply(&conn)?;
         let reply::Reply::Start(reply) = reply else {
             return Err(err_msg(format!("unexpected agent reply {reply:?}")));
         };
@@ -164,7 +169,6 @@ impl AgentBuild {
             conn,
             pid: reply.pid,
             scratch_dir: PathBuf::from(reply.scratch_dir),
-            log: log_fd(fds)?,
         })
     }
 
@@ -179,7 +183,7 @@ impl AgentBuild {
             }),
             &[],
         )?;
-        let (reply, fds) = framing::recv_reply(&conn)?;
+        let (reply, _fds) = framing::recv_reply(&conn)?;
         let reply::Reply::Adopt(reply) = reply else {
             return Err(err_msg(format!("unexpected agent reply {reply:?}")));
         };
@@ -187,7 +191,6 @@ impl AgentBuild {
             conn,
             pid: reply.pid,
             scratch_dir: PathBuf::from(reply.scratch_dir),
-            log: log_fd(fds)?,
         };
         Ok((build, reply.exit_code))
     }
@@ -207,14 +210,6 @@ fn connect(socket: &Path) -> Result<UnixStream> {
         "connecting to the build agent at {}",
         socket.display()
     )))
-}
-
-fn log_fd(fds: Vec<std::os::fd::OwnedFd>) -> Result<fs::File> {
-    Ok(fs::File::from(
-        fds.into_iter()
-            .next()
-            .ok_or_else(|| err_msg("agent reply without a log fd"))?,
-    ))
 }
 
 /// Fire a control call that replies with an empty message.
@@ -271,7 +266,6 @@ pub(super) fn cleanup(socket: &Path, build_id: &str) -> Result<()> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::io::Read;
 
     /// A dev-mode agent (self-bound socket, same uid) plus a staged
     /// tmp dir pack for it, shared by the tests below.
@@ -341,13 +335,16 @@ mod tests {
             ),
             vec![output.to_string_lossy().into_owned()],
         );
-        let build = AgentBuild::start(&socket, &req, &fs::File::open(&pack_path)?)?;
+        let log_path = dir.path().join("build.log");
+        let log_w = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
+        let build = AgentBuild::start(&socket, &req, &fs::File::open(&pack_path)?, &log_w)?;
         assert!(build.pid > 0);
         assert_eq!(build.wait_exit()?, 0);
 
-        let mut log = String::new();
-        let mut log_file = build.log;
-        log_file.read_to_string(&mut log)?;
+        let log = fs::read_to_string(&log_path)?;
         assert!(log.contains("built"), "log: {log}");
 
         let (_, exit) = AgentBuild::adopt(&socket, build_id)?;
@@ -399,7 +396,11 @@ mod tests {
             outputs.clone(),
         );
         req.profile = seatbelt_profile(&outputs, &[secret], false)?;
-        let build = AgentBuild::start(&socket, &req, &fs::File::open(&pack_path)?)?;
+        let log_w = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir_path.join("build.log"))?;
+        let build = AgentBuild::start(&socket, &req, &fs::File::open(&pack_path)?, &log_w)?;
         assert_eq!(build.wait_exit()?, 0);
         assert!(!outside.exists());
         finish(&socket, build_id)?;
