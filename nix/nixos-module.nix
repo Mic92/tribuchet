@@ -20,7 +20,11 @@ let
   worker = config.services.tribuchet-worker;
   defaultPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
   format = pkgs.formats.toml { };
-  agentIds = lib.range 1 worker.agents;
+  # One per-uid build agent per concurrent build. With max-jobs unset
+  # the worker uses min(cores, agents), so provision a generous
+  # ceiling. Idle agents are socket-activated and cost nothing.
+  agentCount = worker.settings.max-jobs or 64;
+  agentIds = lib.range 1 agentCount;
   agentUser = i: "tribuchet-agent-${toString i}";
   forEachAgent = f: lib.listToAttrs (map (i: lib.nameValuePair (agentUser i) (f i)) agentIds);
   agentSocket = i: "/run/tribuchet/agents/${toString i}.sock";
@@ -45,7 +49,6 @@ let
   workerToml = format.generate "worker.toml" (
     {
       agent-sockets = map agentSocket agentIds;
-      max-jobs = worker.agents;
     }
     // worker.settings
   );
@@ -185,15 +188,6 @@ in
         LoadCredential so it may stay root-owned (e.g. a sops secret).
         Passed to the worker via TRIBUCHET_KEY; leave `settings.key`
         unset when using this.
-      '';
-    };
-    agents = lib.mkOption {
-      type = lib.types.ints.positive;
-      default = 4;
-      description = ''
-        Number of per-uid build agents. Bounds concurrent builds and
-        sets the worker's max-jobs (overridable via `settings`, but
-        never above the agent count).
       '';
     };
     agentUidBase = lib.mkOption {
