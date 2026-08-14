@@ -48,16 +48,16 @@ const TUNSETIFF: Opcode = opcode::write::<libc::c_int>(b'T', 202);
 // linux/sockios.h
 const SIOCSIFFLAGS: Opcode = 0x8914;
 
-/// Create the sandbox root skeleton (directories, /etc files, /dev
-/// nodes) for a spec whose scratch paths the caller filled in. Runs on
-/// the worker for its own builds and in the build agent for leased
-/// ones.
 use super::{Error, step};
 
+/// Prepare the on-disk sandbox root and finalize the spec. Only the
+/// scratch store is created on disk because outputs must survive the
+/// namespace. The rest of the root lives on the in-namespace tmpfs,
+/// so nothing stale persists across builds.
 pub fn prepare_root(spec: &mut SandboxSpec) -> Result<(), Error> {
     let root = &spec.root;
-    write_skeleton(spec)?;
-    populate_dev(root, &mut spec.binds_dev)?;
+    fs::create_dir_all(root.join("nix/store"))?;
+    dev_binds(&mut spec.binds_dev);
     if spec.network {
         // Host CA bundle at the standard path for TLS fetches, like
         // Nix's fixed-output setup.
@@ -78,9 +78,8 @@ pub fn prepare_root(spec: &mut SandboxSpec) -> Result<(), Error> {
     Ok(())
 }
 
-/// Sandbox root skeleton: directories, /etc files, /dev symlinks. Runs
-/// on the on-disk root in the worker and again on a leased build's
-/// in-namespace tmpfs root.
+/// Sandbox root skeleton: directories, /etc files, /dev symlinks.
+/// Runs only on the build's in-namespace tmpfs root.
 fn write_skeleton(spec: &SandboxSpec) -> Result<(), Error> {
     let root = &spec.root;
     for sub in [
@@ -146,8 +145,8 @@ fn write_skeleton(spec: &SandboxSpec) -> Result<(), Error> {
 }
 
 /// Mount points for the cwd, bind targets and symlinked store inputs
-/// inside the sandbox root. Like `write_skeleton`, runs in the worker
-/// and again on a leased build's tmpfs root.
+/// inside the sandbox root. Like `write_skeleton`, runs only on the
+/// tmpfs root.
 fn create_mount_points(spec: &SandboxSpec) -> Result<(), Error> {
     // The shipped tmp dir is mounted at the request's sandbox build
     // dir; pre-create the mount point inside the private root.
@@ -194,7 +193,7 @@ fn create_mount_points(spec: &SandboxSpec) -> Result<(), Error> {
 /// copies (impossible in a leased user namespace anyway). The mounts
 /// are read-only, so a sandbox mapping a host uid that owns a node
 /// cannot chmod/chown it; device I/O is unaffected by MS_RDONLY.
-fn populate_dev(root: &Path, binds_dev: &mut Vec<(PathBuf, PathBuf)>) -> Result<(), Error> {
+fn dev_binds(binds_dev: &mut Vec<(PathBuf, PathBuf)>) {
     let mut devices = vec!["null", "zero", "full", "random", "urandom", "tty"];
     // Nix's `kvm` system feature (VM builds, NixOS tests).
     if Path::new("/dev/kvm").exists() {
@@ -202,15 +201,11 @@ fn populate_dev(root: &Path, binds_dev: &mut Vec<(PathBuf, PathBuf)>) -> Result<
     }
     for dev in devices {
         let host = PathBuf::from("/dev").join(dev);
-        fs::File::create(root.join("dev").join(dev))?;
         binds_dev.push((host.clone(), host));
     }
-    Ok(())
 }
 
 pub fn command(spec: &SandboxSpec) -> Result<Command, Error> {
-    create_mount_points(spec)?;
-
     if spec.emulator.is_some() && binfmt::register_line(&spec.system).is_none() {
         return Err(Error::UnknownBinfmt(spec.system.clone()));
     }
@@ -701,7 +696,6 @@ fn tmpfs_root(p: &SetupParams) -> io::Result<()> {
     mount("tmpfs", root, "tmpfs", MountFlags::empty(), None)
         .map_err(ioerr("mounting tmpfs root"))?;
     write_skeleton(p.spec)
-        .and_then(|()| create_mount_points(p.spec))
         .map_err(|e| io::Error::other(format!("populating tmpfs root: {e:#}")))?;
     move_mount(
         store.as_fd(),
@@ -710,7 +704,10 @@ fn tmpfs_root(p: &SetupParams) -> io::Result<()> {
         root.join("nix/store"),
         MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
     )
-    .map_err(ioerr("attaching scratch store"))
+    .map_err(ioerr("attaching scratch store"))?;
+    // After the store reattach, so store-input mount points land on
+    // the on-disk store instead of being hidden by it.
+    create_mount_points(p.spec).map_err(|e| io::Error::other(format!("mount points: {e:#}")))
 }
 
 /// Fresh per-userns binfmt_misc instance (kernel 6.7+) so emulated

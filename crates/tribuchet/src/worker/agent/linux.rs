@@ -241,6 +241,33 @@ pub(super) fn finish(confinement: &Confinement, root: Option<&Path>, outputs: &[
     }
 }
 
+/// Remove a stale scratch tree before a new build. Uid-block files
+/// need the userns helper, the agent-owned remainder a plain pass.
+/// Agent-owned entries never nest under uid-block ones, so one pass
+/// of each suffices.
+pub(super) fn clean_scratch(confinement: &Confinement, scratch_root: &Path) -> Result<(), Error> {
+    match fs::remove_dir_all(scratch_root) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) if confinement.userns.is_some() => {
+            run_in_userns(
+                confinement,
+                "remove",
+                std::slice::from_ref(&scratch_root.to_path_buf()),
+            )?;
+        }
+        Err(e) => return Err(e.into()),
+    }
+    match fs::remove_dir_all(scratch_root) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(msg(format!(
+            "stale scratch tree {} could not be removed: {e}",
+            scratch_root.display()
+        ))),
+    }
+}
+
 /// Remove a build's cgroup and scratch tree, plus stray outputs. A
 /// namespace build's tree contains uid-block files only deletable
 /// inside the userns; its outputs live under that tree.

@@ -59,6 +59,15 @@ pub(super) fn finish(_confinement: &Confinement, _root: Option<&Path>, outputs: 
     }
 }
 
+/// Remove a stale scratch tree before a new build. The agent's own
+/// uid owns everything, so a plain removal suffices.
+pub(super) fn clean_scratch(_confinement: &Confinement, scratch_root: &Path) -> Result<(), Error> {
+    match fs::remove_dir_all(scratch_root) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
+}
+
 /// Remove the build's scratch tree and its store-path outputs; the
 /// sticky store dir lets the owning agent delete them.
 pub(super) fn cleanup(_confinement: &Confinement, build: &super::Build) {

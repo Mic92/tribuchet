@@ -259,7 +259,7 @@ fn handle_start(
         // Short fixed name keeps sandbox socket paths within sun_path.
         let scratch_root = agent.state_dir.join("scratch");
         let build_dir = scratch_root.join("build");
-        let _ = fs::remove_dir_all(&scratch_root);
+        platform::clean_scratch(&agent.confinement, &scratch_root)?;
         fs::create_dir_all(&scratch_root)?;
         platform::stage_tmp_dir(&agent.confinement, &scratch_root, &build_dir, tmp_pack)
             .map_err(|e| Error::StageTmpDir(Box::new(e)))?;
