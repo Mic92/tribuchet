@@ -727,14 +727,11 @@ fn register_binfmt(line: &str) -> io::Result<()> {
     fs::write("/proc/sys/fs/binfmt_misc/register", line).map_err(ioerr("registering binfmt entry"))
 }
 
-/// Match Nix's process environment: no core dumps in outputs, a
-/// predictable umask (output modes feed the NAR hash), 32-bit
-/// personality for 32-bit systems, no ASLR for determinism, no
-/// privilege gain via setuid binaries, and a fork-bomb-braking
-/// RLIMIT_NPROC. Hard limits are never raised: the child userns has no
-/// CAP_SYS_RESOURCE in the initial namespace, so a host with finite
-/// hard limits (e.g. GitHub-hosted runners cap RLIMIT_CORE) would
-/// EPERM.
+/// Match Nix's process environment so builds reproduce: output
+/// modes feed the NAR hash (umask) and ASLR breaks determinism.
+/// Hard limits are never raised: without CAP_SYS_RESOURCE in the
+/// initial namespace that EPERMs on hosts with finite hard limits
+/// (GitHub runners cap RLIMIT_CORE).
 fn apply_process_limits(system: &str) -> io::Result<()> {
     let hard = getrlimit(Resource::Nproc).maximum;
     let limit = Some(hard.unwrap_or(u64::MAX).min(4096));
