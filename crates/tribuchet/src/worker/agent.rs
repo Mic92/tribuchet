@@ -15,6 +15,7 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -183,14 +184,26 @@ pub fn run(opts: &Options) -> Result<(), Error> {
         dedicated_uid: activated || opts.dedicated_uid,
     });
     tracing::info!(uid = getuid().as_raw(), "agent listening");
+    let inflight = Arc::new(AtomicUsize::new(0));
     for conn in listener.incoming() {
         let conn = conn.map_err(step("accepting connection"))?;
         let agent = agent.clone();
+        let inflight = inflight.clone();
+        inflight.fetch_add(1, Ordering::SeqCst);
         std::thread::spawn(move || {
             if let Err(e) = handle(&agent, &conn) {
                 let e = chain(&e);
                 tracing::warn!("agent request failed: {e}");
                 let _ = framing::send_error(&conn, &e);
+            }
+            // The service manager re-activates on the next
+            // connection, including backlogged ones.
+            if activated
+                && inflight.fetch_sub(1, Ordering::SeqCst) == 1
+                && agent.current.lock().unwrap().is_none()
+            {
+                tracing::info!("no build held, exiting until the next activation");
+                std::process::exit(0);
             }
         });
     }
