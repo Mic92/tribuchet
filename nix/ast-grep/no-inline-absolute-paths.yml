@@ -1,0 +1,18 @@
+id: no-inline-absolute-paths
+message: "use a `use` import instead of an inline crate::/super::/std:: path"
+severity: error
+language: rust
+rule:
+  any:
+    - kind: scoped_identifier
+    - kind: scoped_type_identifier
+  regex: '^(crate|super|std|core|alloc)::'
+  not:
+    inside:
+      any:
+        - kind: use_declaration
+        - kind: scoped_identifier
+        - kind: scoped_type_identifier
+        - kind: scoped_use_list
+        - kind: visibility_modifier
+      stopBy: end
