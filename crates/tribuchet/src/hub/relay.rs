@@ -20,17 +20,15 @@ use super::metrics::Metrics;
 use super::state::{HubState, Job, Replay};
 use crate::errors::{Result, err_ctx, err_msg};
 use crate::proto::{
-    BuildAssignment, BuildResult, CancelBuild, ExtraPath, HubMessage, NarTransfer, OutputNar,
-    OutputSignature, PathOffer, ResultAck, attach_event, hub_message, nar_transfer, worker_message,
+    BuildAssignment, BuildResult, CancelBuild, ExtraPath, HubMessage, MAX_RESEND_ROUNDS,
+    NarTransfer, OutputNar, OutputSignature, PathOffer, ResultAck, attach_event, hub_message,
+    nar_transfer, worker_message,
 };
 use crate::store;
 
 /// How long a dispatched build may run with no attach client listening
 /// before the hub cancels it on the worker.
 const CANCEL_GRACE: Duration = Duration::from_secs(10);
-
-/// Cap on input resend rounds per build.
-const MAX_RESEND_ROUNDS: u32 = 3;
 
 /// Per-worker-session staging state: one build's inputs stream at a
 /// time. Dedup of shared inputs happens on the worker.
