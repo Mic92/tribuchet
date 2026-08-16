@@ -9,6 +9,15 @@
   programs.actionlint.enable = true;
   programs.shellcheck.enable = true;
 
+  settings.formatter.max-lines = {
+    command = "${pkgs.runtimeShell}";
+    options = [ "${./max-lines.sh}" ];
+    includes = [
+      "*.rs"
+      "*.nix"
+    ];
+  };
+
   settings.formatter.ast-grep = {
     command = "${pkgs.ast-grep}/bin/ast-grep";
     options = [ "scan" ];
