@@ -25,6 +25,7 @@ use super::submit::AttachSvc;
 use super::{PeerAuth, WorkerSvc};
 use crate::config::{Auth, HubConfig};
 use crate::errors::{Result, chain, err_ctx, err_msg};
+use crate::fsutil::io_ctx;
 use crate::proto::worker_hub_server::WorkerHubServer;
 use crate::proto::{MAX_MSG_SIZE, attach_hub_server};
 use crate::{chunkio, rt, sd};
@@ -37,7 +38,7 @@ use crate::{chunkio, rt, sd};
 /// the socket is never connectable by others, not even briefly.
 fn bind_attach_socket(socket: &Path) -> Result<tokio::net::UnixListener> {
     if let Some(parent) = socket.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(io_ctx("creating", parent))?;
     }
     // Refuse to replace the socket of a live hub: unlinking it would
     // leave all new attaches with ECONNREFUSED while the old hub runs.
@@ -58,8 +59,10 @@ fn bind_attach_socket(socket: &Path) -> Result<tokio::net::UnixListener> {
     umask(old_umask);
     let uds = uds?;
     {
-        unix_fs::chown(socket, None, Some(group.gid.as_raw()))?;
-        fs::set_permissions(socket, fs::Permissions::from_mode(0o660))?;
+        unix_fs::chown(socket, None, Some(group.gid.as_raw()))
+            .map_err(io_ctx("chowning", socket))?;
+        fs::set_permissions(socket, fs::Permissions::from_mode(0o660))
+            .map_err(io_ctx("setting permissions on", socket))?;
     }
     Ok(uds)
 }
@@ -80,7 +83,7 @@ fn check_attach_socket_dir(socket: &Path) -> Result<()> {
     let dir = socket
         .parent()
         .ok_or_else(|| err_msg("attach socket has no parent"))?;
-    let meta = fs::metadata(dir)?;
+    let meta = fs::metadata(dir).map_err(io_ctx("inspecting", dir))?;
     if meta.gid() != group.gid.as_raw() || meta.mode() & 0o007 != 0 {
         return Err(err_msg(format!(
             "{} must be group nixbld with no access for others to restrict the attach socket",

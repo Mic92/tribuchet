@@ -11,6 +11,8 @@ use super::{SandboxSpec, binfmt};
 
 use super::{Error, step};
 
+use crate::fsutil::io_ctx;
+
 #[path = "linux/stage.rs"]
 mod stage;
 pub use stage::setup_stage;
@@ -21,7 +23,8 @@ pub use stage::setup_stage;
 /// so nothing stale persists across builds.
 pub fn prepare_root(spec: &mut SandboxSpec) -> Result<(), Error> {
     let root = &spec.root;
-    fs::create_dir_all(root.join("nix/store"))?;
+    fs::create_dir_all(root.join("nix/store"))
+        .map_err(io_ctx("creating", &root.join("nix/store")))?;
     dev_binds(&mut spec.binds_dev);
     if spec.network {
         // Host CA bundle at the standard path for TLS fetches, like
@@ -37,7 +40,8 @@ pub fn prepare_root(spec: &mut SandboxSpec) -> Result<(), Error> {
     // into is opened up. The build dir is already owned by the leased
     // range; the group-restricted state dir keeps other users out.
     {
-        fs::set_permissions(root.join("nix/store"), fs::Permissions::from_mode(0o1777))?;
+        fs::set_permissions(root.join("nix/store"), fs::Permissions::from_mode(0o1777))
+            .map_err(io_ctx("setting permissions on", &root.join("nix/store")))?;
     }
     Ok(())
 }
@@ -57,7 +61,7 @@ fn write_skeleton(spec: &SandboxSpec) -> Result<(), Error> {
         "etc",
         "tmp",
     ] {
-        fs::create_dir_all(root.join(sub))?;
+        fs::create_dir_all(root.join(sub)).map_err(io_ctx("creating", &root.join(sub)))?;
     }
     fs::write(
         root.join("etc/passwd"),
@@ -91,7 +95,8 @@ fn write_skeleton(spec: &SandboxSpec) -> Result<(), Error> {
         )?;
         for f in ["services", "hosts"] {
             if let Ok(data) = fs::read(Path::new("/etc").join(f)) {
-                fs::write(root.join("etc").join(f), data)?;
+                fs::write(root.join("etc").join(f), data)
+                    .map_err(io_ctx("writing", &root.join("etc").join(f)))?;
             }
         }
         if spec.net_isolation {
@@ -100,9 +105,11 @@ fn write_skeleton(spec: &SandboxSpec) -> Result<(), Error> {
             // nameserver may be an unreachable loopback stub.
             let net = presto_pasta::Config::default();
             let conf = format!("nameserver {}\nnameserver {}\n", net.gateway4, net.gateway6);
-            fs::write(root.join("etc/resolv.conf"), conf)?;
+            fs::write(root.join("etc/resolv.conf"), conf)
+                .map_err(io_ctx("writing", &root.join("etc/resolv.conf")))?;
         } else if let Ok(data) = fs::read("/etc/resolv.conf") {
-            fs::write(root.join("etc/resolv.conf"), data)?;
+            fs::write(root.join("etc/resolv.conf"), data)
+                .map_err(io_ctx("writing", &root.join("etc/resolv.conf")))?;
         }
     }
     Ok(())
@@ -128,12 +135,12 @@ fn create_mount_points(spec: &SandboxSpec) -> Result<(), Error> {
             continue;
         }
         if src.is_dir() {
-            fs::create_dir_all(&target)?;
+            fs::create_dir_all(&target).map_err(io_ctx("creating", &target))?;
         } else {
             if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
+                fs::create_dir_all(parent).map_err(io_ctx("creating", parent))?;
             }
-            fs::File::create(&target)?;
+            fs::File::create(&target).map_err(io_ctx("creating", &target))?;
         }
     }
 
@@ -145,7 +152,7 @@ fn create_mount_points(spec: &SandboxSpec) -> Result<(), Error> {
             continue;
         }
         if let Some(parent) = link.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent).map_err(io_ctx("creating", parent))?;
         }
         symlink(target, &link)
             .map_err(step(format!("creating symlink input {}", link.display())))?;

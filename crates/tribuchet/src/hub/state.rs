@@ -15,6 +15,7 @@ use tonic::Status;
 
 use super::metrics::Metrics;
 use crate::config::NixConfig;
+use crate::fsutil::io_ctx;
 
 /// How long a build waits for a platform we expect to come back: the
 /// startup window in which workers re-register after a hub restart, and
@@ -136,11 +137,11 @@ fn render_nix_config(caps: &HashMap<u64, WorkerCaps>, cfg: &NixConfig) -> String
 fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
     {
-        let mut f = fs::File::create(&tmp)?;
+        let mut f = fs::File::create(&tmp).map_err(io_ctx("creating", &tmp))?;
         f.write_all(content.as_bytes())?;
         f.sync_all()?;
     }
-    fs::rename(&tmp, path)
+    fs::rename(&tmp, path).map_err(io_ctx("renaming into", path))
 }
 
 impl WorkerCaps {

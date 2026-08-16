@@ -19,6 +19,7 @@ use super::{DaemonConn, WorkerCtx, agents, msg, remove_build_dir, sandbox};
 use crate::chunkio::CHUNK_SIZE;
 use crate::errors::chain;
 use crate::errors::{Result, err_msg};
+use crate::fsutil::io_ctx;
 use crate::proto::{
     BuildResult, ExtraPath, NarTransfer, OutputSignature, PathInfoMsg, WorkerMessage, nar_transfer,
     worker_message,
@@ -433,7 +434,7 @@ fn stream_nar(
     store_path: &str,
     nar_file: &Path,
 ) -> Result<()> {
-    let mut f = fs::File::open(nar_file)?;
+    let mut f = fs::File::open(nar_file).map_err(io_ctx("opening", nar_file))?;
     let mut buf = vec![0u8; CHUNK_SIZE];
     loop {
         let n = f.read(&mut buf)?;

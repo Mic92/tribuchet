@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use super::{ActiveBuild, pack_outputs_and_extras, unix_now};
 use crate::errors::chain;
 use crate::errors::{Result, err_ctx, err_msg};
+use crate::fsutil::io_ctx;
 use crate::proto::WorkerMessage;
 use crate::tmpdir::pack_zstd_dir;
 #[cfg(target_os = "linux")]
@@ -109,7 +110,8 @@ impl ActiveBuild {
         let build = agents::AgentBuild::start(
             socket,
             &req,
-            &fs::File::open(self.dir.join("top.tmpdir.zst"))?,
+            &fs::File::open(self.dir.join("top.tmpdir.zst"))
+                .map_err(io_ctx("opening", &self.dir.join("top.tmpdir.zst")))?,
             &log_w,
         )?;
         drop(log_w);
@@ -151,7 +153,8 @@ impl ActiveBuild {
             deadline_unix: unix_now() + timeout.as_secs(),
             agent_socket: Some(socket.to_path_buf()),
         };
-        fs::write(self.dir.join("resume.json"), serde_json::to_vec(&resume)?)?;
+        fs::write(self.dir.join("resume.json"), serde_json::to_vec(&resume)?)
+            .map_err(io_ctx("writing", &self.dir.join("resume.json")))?;
         let fin = supervise_agent(
             &self.ctx,
             &resume,

@@ -31,6 +31,7 @@ use rustix::pipe::{PipeFlags, pipe_with};
 
 #[cfg(target_os = "linux")]
 use super::binfmt;
+use crate::fsutil::io_ctx;
 use crate::netpolicy::NetPolicy;
 #[cfg(target_os = "linux")]
 use crate::proto::BuildAssignment;
@@ -176,7 +177,7 @@ pub fn prepare(
     opts: &PrepareOpts,
 ) -> Result<SandboxSpec, Error> {
     let build_dir = dir.join("top").join("build");
-    fs::create_dir_all(&build_dir)?;
+    fs::create_dir_all(&build_dir).map_err(io_ctx("creating", &build_dir))?;
     let mut spec = SandboxSpec {
         builder: a.builder.clone(),
         system: a.system.clone(),

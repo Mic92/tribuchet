@@ -8,6 +8,7 @@
 //! mapped root uid; that chown is what the agent keeps CAP_CHOWN for.
 
 use crate::errors::{Result, err_ctx, err_msg};
+use crate::fsutil::io_ctx;
 use std::fs;
 use std::io;
 use std::os::unix::fs::chown;
@@ -91,7 +92,10 @@ pub(super) fn destroy(dir: &Path) -> Result<()> {
     let mut dirs = vec![dir.to_path_buf()];
     let mut i = 0;
     while i < dirs.len() {
-        for entry in fs::read_dir(&dirs[i])?.flatten() {
+        for entry in fs::read_dir(&dirs[i])
+            .map_err(io_ctx("listing", &dirs[i]))?
+            .flatten()
+        {
             if entry.file_type().is_ok_and(|t| t.is_dir()) {
                 dirs.push(entry.path());
             }

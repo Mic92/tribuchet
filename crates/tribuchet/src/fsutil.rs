@@ -21,6 +21,12 @@ fn step(step: &'static str, path: &Path) -> impl Fn(io::Error) -> Error {
     }
 }
 
+/// Prefix "step /path" onto an io::Error, preserving its ErrorKind;
+/// std's fs errors carry no path.
+pub fn io_ctx(step: &'static str, path: &Path) -> impl FnOnce(io::Error) -> io::Error {
+    move |e| io::Error::new(e.kind(), format!("{step} {}: {e}", path.display()))
+}
+
 /// Write a secret file atomically with mode 0600: created via a temp
 /// file so it is never world-readable (fs::write + chmod would race)
 /// and a torn write cannot leave a short key behind.

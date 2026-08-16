@@ -19,6 +19,7 @@ use super::{DaemonConn, WorkerCtx, unix_now};
 use crate::chunkio::ChannelReader;
 use crate::errors::chain;
 use crate::errors::{Result, err_ctx, err_msg};
+use crate::fsutil::io_ctx;
 use crate::proto::{
     BuildAssignment, MAX_NAR_BYTES, MAX_RESEND_ROUNDS, NarTransfer, PathInfoMsg, TmpDirArchive,
     nar_transfer,
@@ -148,9 +149,10 @@ impl ActiveBuild {
     pub(super) fn new(assignment: BuildAssignment, ctx: Arc<WorkerCtx>) -> Result<Self> {
         let dir = ctx.state_dir.join("builds").join(&assignment.build_id);
         if dir.exists() {
-            fs::remove_dir_all(&dir)?;
+            fs::remove_dir_all(&dir).map_err(io_ctx("removing", &dir))?;
         }
-        fs::create_dir_all(dir.join("top/build"))?;
+        fs::create_dir_all(dir.join("top/build"))
+            .map_err(io_ctx("creating", &dir.join("top/build")))?;
         Ok(Self {
             assignment,
             dir,
