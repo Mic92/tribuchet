@@ -159,8 +159,12 @@ async fn re_root_inputs(spec: &sandbox::SandboxSpec) -> Option<DaemonConn> {
         }
     };
     for path in &spec.store_inputs {
-        let Ok(sp) = store_dir.parse(path) else {
-            continue;
+        let sp = match store_dir.parse(path) {
+            Ok(sp) => sp,
+            Err(e) => {
+                tracing::warn!(path, "skipping GC root for unparsable input: {e}");
+                continue;
+            }
         };
         if let Err(e) = daemon.add_temp_root(&sp).await {
             tracing::warn!(path, "re-adding GC root: {}", chain(&e));
