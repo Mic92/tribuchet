@@ -11,13 +11,15 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tonic::Status;
 
-use super::state::{HubState, Job};
+use super::metrics::Metrics;
+use super::state::{HubState, Job, Replay};
 use crate::errors::{Result, err_ctx, err_msg};
 use crate::proto::{
     BuildAssignment, BuildResult, CancelBuild, ExtraPath, HubMessage, NarTransfer, OutputNar,
     OutputSignature, PathInfoMsg, PathOffer, ResultAck, StagingComplete, TmpDirArchive,
     attach_event, hub_message, nar_transfer, worker_message,
 };
+use crate::{chunkio, rt, store};
 
 /// How long a dispatched build may run with no attach client listening
 /// before the hub cancels it on the worker.
@@ -251,7 +253,7 @@ fn order_by_references(infos: Vec<PathInfoMsg>) -> Vec<PathInfoMsg> {
         .into_iter()
         .map(|i| (i.store_path.clone(), i))
         .collect();
-    crate::store::topo_order(roots, |p| {
+    store::topo_order(roots, |p| {
         nodes[p]
             .references
             .iter()
@@ -336,7 +338,7 @@ async fn stream_store_path(
     let path = store_path.to_string();
     let task = tokio::task::spawn_blocking(move || -> Result<()> {
         use tokio::io::AsyncReadExt as _;
-        crate::rt::name_current_thread("trib-pack");
+        rt::name_current_thread("trib-pack");
         // harmonia's NAR pack is async-only; drive it on a current-thread
         // runtime here so its blocking file reads stay off the shared
         // runtime workers.
@@ -349,7 +351,7 @@ async fn stream_store_path(
                 tokio_util::io::StreamReader::new(nar),
                 async_compression::Level::Precise(3),
             );
-            let mut buf = vec![0u8; crate::chunkio::CHUNK_SIZE];
+            let mut buf = vec![0u8; chunkio::CHUNK_SIZE];
             loop {
                 let n = enc
                     .read(&mut buf)
@@ -398,7 +400,7 @@ async fn stream_tmp_dir(
     tmp_dir_pack: &[u8],
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
 ) -> Result<()> {
-    for chunk in tmp_dir_pack.chunks(crate::chunkio::CHUNK_SIZE) {
+    for chunk in tmp_dir_pack.chunks(chunkio::CHUNK_SIZE) {
         send(
             out_tx,
             hub_message::Msg::TmpDir(TmpDirArchive {
@@ -536,8 +538,7 @@ fn start_extras(
                 "signature verification failed for extra {path}"
             )));
         }
-        let parsed =
-            crate::store::parse_path_info(&info).map_err(err_ctx("parsing extra PathInfo"))?;
+        let parsed = store::parse_path_info(&info).map_err(err_ctx("parsing extra PathInfo"))?;
         let (tx, rx) = mpsc::channel::<bytes::Bytes>(8);
         let pool = state.daemon_pool.clone();
         let task = tokio::spawn(async move { import_extra(&pool, parsed, rx).await });
@@ -572,7 +573,7 @@ async fn import_extra(
 async fn relay_output_chunk(
     vkey: &PublicKey,
     pending: &mut HashMap<String, OutputVerify>,
-    replay: &super::state::Replay,
+    replay: &Replay,
     n: &NarTransfer,
 ) -> Result<()> {
     let verify = pending.get_mut(&n.store_path).unwrap();
@@ -610,7 +611,7 @@ async fn relay_output_chunk(
 
 async fn relay_extra_chunk(
     extras: &mut HashMap<String, ExtraImport>,
-    replay: &super::state::Replay,
+    replay: &Replay,
     n: NarTransfer,
 ) -> Result<()> {
     let extra = extras.get_mut(&n.store_path).unwrap();
@@ -637,10 +638,10 @@ async fn relay_extra_chunk(
 async fn finish_relay(
     state: &HubState,
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
-    replay: &super::state::Replay,
+    replay: &Replay,
     job: &Job,
 ) {
-    super::metrics::Metrics::inc(&state.metrics.succeeded);
+    Metrics::inc(&state.metrics.succeeded);
     replay.publish(attach_event::Event::ExitCode(0)).await;
     ack_result(out_tx, job).await;
 }
@@ -669,7 +670,7 @@ async fn publish_worker_failure(
             ))
             .await;
     }
-    super::metrics::Metrics::inc(&state.metrics.failed);
+    Metrics::inc(&state.metrics.failed);
     job.replay
         .publish(attach_event::Event::ExitCode(res.exit_code))
         .await;

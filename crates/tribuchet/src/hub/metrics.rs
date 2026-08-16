@@ -3,6 +3,7 @@
 //! pulls in plenty and a scrape endpoint needs no routing.
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -169,7 +170,7 @@ fn render_workers(out: &mut String, state: &HubState) {
 /// exits. A scrape is a single short request/response, so each
 /// connection is handled inline and then dropped.
 pub(super) async fn serve(state: Arc<HubState>, addr: String) -> Result<()> {
-    let parsed: std::net::SocketAddr = addr
+    let parsed: SocketAddr = addr
         .parse()
         .map_err(err_ctx("parsing metrics-listen address"))?;
     let listener = tokio::net::TcpListener::bind(parsed)

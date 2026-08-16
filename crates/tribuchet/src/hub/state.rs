@@ -2,15 +2,17 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic;
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, Notify, mpsc};
 use tonic::Status;
 
+use super::metrics::Metrics;
 use crate::config::NixConfig;
 
 /// How long a build waits for a platform we expect to come back: the
@@ -183,7 +185,7 @@ pub(super) struct HubState {
     /// Connected workers' capabilities, keyed by a per-connection id;
     /// submissions no worker can serve fail fast instead of queueing
     /// forever.
-    pub(super) worker_caps: std::sync::Mutex<HashMap<u64, WorkerCaps>>,
+    pub(super) worker_caps: StdMutex<HashMap<u64, WorkerCaps>>,
     pub(super) next_worker_id: atomic::AtomicU64,
     /// Grace period before an unservable build is declined or failed.
     pub(super) worker_grace: Duration,
@@ -191,12 +193,12 @@ pub(super) struct HubState {
     /// ended: together they tell `expected_deadline` which platforms are
     /// still worth waiting for after a restart or a worker drop.
     pub(super) started_at: Instant,
-    pub(super) departed: std::sync::Mutex<Vec<(WorkerCaps, Instant)>>,
+    pub(super) departed: StdMutex<Vec<(WorkerCaps, Instant)>>,
     /// Woken when worker capabilities change so waiting submissions
     /// re-check servability without polling.
     pub(super) caps_changed: Notify,
     /// Build lifecycle counters scraped by the metrics endpoint.
-    pub(super) metrics: super::metrics::Metrics,
+    pub(super) metrics: Metrics,
     /// When set, the connected-worker set is mirrored to this nix.conf
     /// fragment on every register/deregister.
     pub(super) nix_config: Option<NixConfig>,
@@ -240,7 +242,7 @@ fn render_nix_config(caps: &HashMap<u64, WorkerCaps>, cfg: &NixConfig) -> String
     out
 }
 
-fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
+fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
     {
         let mut f = fs::File::create(&tmp)?;
@@ -274,13 +276,13 @@ impl HubState {
                 "/nix/var/nix/daemon-socket/socket",
                 harmonia_store_remote::PoolConfig::default(),
             ),
-            worker_caps: std::sync::Mutex::default(),
+            worker_caps: StdMutex::default(),
             next_worker_id: atomic::AtomicU64::default(),
             worker_grace,
             started_at: Instant::now(),
-            departed: std::sync::Mutex::default(),
+            departed: StdMutex::default(),
             caps_changed: Notify::default(),
-            metrics: super::metrics::Metrics::default(),
+            metrics: Metrics::default(),
             nix_config,
         }
     }

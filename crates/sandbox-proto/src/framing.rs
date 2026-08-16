@@ -3,10 +3,11 @@
 //! socket, with file descriptors attached via SCM_RIGHTS. gRPC cannot
 //! carry fds, hence the separate protocol.
 
-use std::io::{IoSlice, IoSliceMut, Read, Write};
+use std::io::{self, IoSlice, IoSliceMut, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::result;
 
 use prost::Message;
 use rustix::net::{
@@ -26,7 +27,7 @@ pub enum Error {
     Io {
         step: &'static str,
         #[source]
-        source: std::io::Error,
+        source: io::Error,
     },
     #[error("message length {0} out of range")]
     LengthOutOfRange(usize),
@@ -42,9 +43,9 @@ pub enum Error {
     Peer(String),
 }
 
-type Result<T> = std::result::Result<T, Error>;
+type Result<T> = result::Result<T, Error>;
 
-fn ioerr(step: &'static str) -> impl Fn(std::io::Error) -> Error {
+fn ioerr(step: &'static str) -> impl Fn(io::Error) -> Error {
     move |source| Error::Io { step, source }
 }
 
@@ -65,7 +66,7 @@ fn send_message(sock: &UnixStream, body: &impl Message, fds: &[RawFd]) -> Result
         return Err(Error::TooManyFds);
     }
     let sent = sendmsg(sock, &iov, &mut cmsg, SendFlags::empty())
-        .map_err(std::io::Error::from)
+        .map_err(io::Error::from)
         .map_err(ioerr("sending message"))?;
     if sent < buf.len() {
         (&mut &*sock)
@@ -86,7 +87,7 @@ fn recv_message<M: Message + Default>(sock: &UnixStream) -> Result<(M, Vec<Owned
         let mut iov = [IoSliceMut::new(&mut len_buf)];
         let mut cmsg = RecvAncillaryBuffer::new(&mut cmsg_buf);
         let msg = recvmsg(sock, &mut iov, &mut cmsg, RecvFlags::empty())
-            .map_err(std::io::Error::from)
+            .map_err(io::Error::from)
             .map_err(ioerr("receiving message"))?;
         let mut fds = Vec::new();
         for c in cmsg.drain() {
@@ -164,12 +165,14 @@ pub fn recv_reply(sock: &UnixStream) -> Result<(reply::Reply, Vec<OwnedFd>)> {
 mod tests {
     use super::*;
     use crate::agent::{AdoptRequest, ERROR_BUSY, StartReply};
+    use std::fs;
     use std::os::fd::AsRawFd;
+    use std::thread;
 
     #[test]
     fn call_roundtrip_with_fds() {
         let (a, b) = UnixStream::pair().unwrap();
-        let devnull = std::fs::File::open("/dev/null").unwrap();
+        let devnull = fs::File::open("/dev/null").unwrap();
         let request = AdoptRequest {
             build_id: "b1".into(),
         };
@@ -196,7 +199,7 @@ mod tests {
             build_id: build_id.clone(),
         };
         let sender = {
-            std::thread::spawn(move || {
+            thread::spawn(move || {
                 send_call(&a, call::Call::Adopt(request), &[]).unwrap();
                 send_reply(
                     &a,

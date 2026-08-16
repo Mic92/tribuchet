@@ -1,7 +1,9 @@
 //! The Linux build agent's user namespace: a re-exec'd holder child
 //! (unshared via pre_exec) keeps it alive for the agent's lifetime.
 
+use std::env;
 use std::fs;
+use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -16,10 +18,10 @@ use rustix::thread::{UnshareFlags, unshare_unsafe};
 pub struct Error {
     step: &'static str,
     #[source]
-    source: std::io::Error,
+    source: io::Error,
 }
 
-fn step<E: Into<std::io::Error>>(step: &'static str) -> impl FnOnce(E) -> Error {
+fn step<E: Into<io::Error>>(step: &'static str) -> impl FnOnce(E) -> Error {
     move |source| Error {
         step,
         source: source.into(),
@@ -47,7 +49,7 @@ pub(in crate::worker) struct UsernsHolder {
 
 impl UsernsHolder {
     pub(in crate::worker) fn new() -> Result<(Self, OwnedFd), Error> {
-        let exe = std::env::current_exe().map_err(step("resolving current executable"))?;
+        let exe = env::current_exe().map_err(step("resolving current executable"))?;
         let mut cmd = Command::new(exe);
         cmd.arg(USERNS_HOLD_ARG)
             .stdin(Stdio::null())

@@ -7,7 +7,8 @@
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::fd::AsFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::str;
 
 use prost::Message;
 use rustix::fs::{Dir, FileType, Mode, OFlags, fchmod, open, openat};
@@ -23,7 +24,7 @@ pub enum Error {
     Io(#[from] io::Error),
     #[error("opening build dir {path}")]
     OpenDir {
-        path: std::path::PathBuf,
+        path: PathBuf,
         #[source]
         source: io::Error,
     },
@@ -95,7 +96,7 @@ pub fn pack_zstd_dir(path: &Path) -> Result<Vec<u8>, Error> {
         if bytes == b"." || bytes == b".." || entry.file_type() != FileType::RegularFile {
             continue;
         }
-        let Ok(name) = std::str::from_utf8(bytes) else {
+        let Ok(name) = str::from_utf8(bytes) else {
             return Err(Error::NonUtf8Name);
         };
         names.push(name.to_owned());
@@ -155,7 +156,9 @@ pub(crate) fn unpack_tmp_dir(reader: impl Read, dest: &Path) -> Result<(), Error
 #[cfg(test)]
 mod tests {
     use super::*;
-    type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+    use std::os::unix::fs::symlink;
+    use std::{error, result};
+    type Result<T> = result::Result<T, Box<dyn error::Error>>;
     use std::collections::HashMap;
 
     fn unpack_zstd(archive: &[u8], dest: &Path) -> Result<()> {
@@ -192,7 +195,7 @@ mod tests {
         fs::write(dir.join(".attrs.json"), "{}").unwrap();
         let secret = tmp.path().join("secret");
         fs::write(&secret, "foreign-content").unwrap();
-        std::os::unix::fs::symlink(&secret, dir.join("link")).unwrap();
+        symlink(&secret, dir.join("link")).unwrap();
 
         let archive = pack_zstd_dir(&dir).unwrap();
         // symlinks are neither followed nor shipped
@@ -216,7 +219,7 @@ mod tests {
         let dir = tmp.path().join("build");
         fs::create_dir(&dir).unwrap();
         let link = tmp.path().join("link");
-        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        symlink(&dir, &link).unwrap();
         assert!(pack_zstd_dir(&link).is_err());
         assert!(pack_zstd_dir(&dir).is_ok());
     }
@@ -271,7 +274,7 @@ mod tests {
         let victim = outside.path().join("victim");
         fs::write(&victim, "x")?;
         let dest = tempfile::tempdir()?;
-        std::os::unix::fs::symlink(&victim, dest.path().join("evil"))?;
+        symlink(&victim, dest.path().join("evil"))?;
         let data = pack(&[TmpDirFile {
             name: "evil".into(),
             data: b"y".to_vec(),

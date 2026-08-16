@@ -29,8 +29,10 @@ pub use userns::{USERNS_HOLD_ARG, hold_stage as userns_hold_stage};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use harmonia_store_remote::DaemonClient;
 use harmonia_utils_signature::SecretKey;
@@ -48,10 +50,13 @@ use resume::{
 
 use crate::config::{Auth, WorkerConfig};
 use crate::errors::{Error, Result, chain, err_ctx, err_msg};
+use crate::netpolicy::NetPolicy;
 use crate::proto::{
-    BuildAssignment, BuildResult, Heartbeat, MissingPaths, Register, RequestJob, Resumed,
-    WorkerMessage, hub_message, worker_hub_client::WorkerHubClient, worker_message,
+    BuildAssignment, BuildResult, CancelBuild, Heartbeat, HubMessage, MAX_MSG_SIZE, MissingPaths,
+    Register, RequestJob, Resumed, WorkerMessage, hub_message, worker_hub_client::WorkerHubClient,
+    worker_message,
 };
+use crate::{chunkio, fsutil, rt, sd};
 
 /// Connection to the local nix-daemon; one per active build so its
 /// temp roots live exactly as long as the build.
@@ -79,7 +84,7 @@ struct WorkerCtx {
     fod_isolation: bool,
     /// Flow policy for that network, from the fod-network setting.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    fod_network: crate::netpolicy::NetPolicy,
+    fod_network: NetPolicy,
     max_silent_time: Duration,
     max_log_size: u64,
     /// memory.max for each build's cgroup.
@@ -161,7 +166,7 @@ impl WorkerCtx {
                     // An earlier resume's tailer feeds a dead session.
                     // Only flag it (no join): it may be waiting on the
                     // registry lock held right here.
-                    t.done.store(true, std::sync::atomic::Ordering::Relaxed);
+                    t.done.store(true, Ordering::Relaxed);
                 }
                 e.log_tail = Some(spawn_log_tail(
                     self.clone(),
@@ -218,7 +223,7 @@ fn load_signing_key(state_dir: &Path) -> Result<SecretKey> {
     } else {
         let key = SecretKey::generate(format!("{}-1", hostname()))
             .map_err(|e| err_msg(format!("generating signing key: {e}")))?;
-        crate::fsutil::write_secret(&path, format!("{key}\n").as_bytes())?;
+        fsutil::write_secret(&path, format!("{key}\n").as_bytes())?;
         Ok(key)
     }
 }
@@ -242,7 +247,7 @@ fn sweep_state_dir(state_dir: &Path) {
                 continue;
             }
             tracing::info!("removing stale build dir {}", dir.display());
-            crate::fsutil::remove_path_all(&dir);
+            fsutil::remove_path_all(&dir);
         }
     }
     // Input caching moved into the real /nix/store (daemon import);
@@ -250,13 +255,13 @@ fn sweep_state_dir(state_dir: &Path) {
     let legacy = state_dir.join("store");
     if legacy.symlink_metadata().is_ok() {
         tracing::info!("removing legacy input cache {}", legacy.display());
-        crate::fsutil::remove_path_all(&legacy);
+        fsutil::remove_path_all(&legacy);
     }
 }
 
 pub(crate) fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
 }
 
@@ -269,7 +274,7 @@ fn request_job() -> WorkerMessage {
 }
 
 pub fn run(opts: WorkerConfig) -> Result<()> {
-    let rt = crate::rt::runtime("trib-worker").map_err(err_ctx("creating the tokio runtime"))?;
+    let rt = rt::runtime("trib-worker").map_err(err_ctx("creating the tokio runtime"))?;
     rt.block_on(run_async(opts))
 }
 
@@ -365,8 +370,8 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
     // Ready once local setup is done, not once the hub answers: the
     // worker is designed to outlive hub outages, so a restart must not
     // hang in "activating" waiting for a hub that may be down.
-    crate::sd::notify_ready();
-    crate::sd::spawn_watchdog();
+    sd::notify_ready();
+    sd::spawn_watchdog();
     spawn_resumable_reaper(ctx.clone());
     spawn_handover();
     adopt_builds(&ctx, &signing_key).await;
@@ -375,7 +380,7 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
     // Reconnect with backoff: a hub restart must not drain the fleet.
     let mut backoff = Duration::from_secs(1);
     loop {
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         match session(&opts, &signing_key, &ctx).await {
             Ok(()) => unreachable!("session only returns on error"),
             Err(e) => tracing::warn!("hub session ended: {e:#}"),
@@ -395,9 +400,9 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
 /// re-adopts them.
 fn spawn_handover() {
     tokio::spawn(async {
-        crate::sd::stop_requested().await;
+        sd::stop_requested().await;
         tracing::info!("handover requested; exiting");
-        std::process::exit(0);
+        process::exit(0);
     });
 }
 
@@ -424,14 +429,14 @@ async fn session(
         .http2_keep_alive_interval(Duration::from_secs(30))
         .keep_alive_timeout(Duration::from_secs(20))
         .keep_alive_while_idle(true)
-        .initial_stream_window_size(Some(crate::chunkio::H2_STREAM_WINDOW))
-        .initial_connection_window_size(Some(crate::chunkio::H2_CONNECTION_WINDOW))
+        .initial_stream_window_size(Some(chunkio::H2_STREAM_WINDOW))
+        .initial_connection_window_size(Some(chunkio::H2_CONNECTION_WINDOW))
         .connect()
         .await
         .map_err(err_ctx("connecting to hub"))?;
     let mut client = WorkerHubClient::new(channel)
-        .max_decoding_message_size(crate::proto::MAX_MSG_SIZE)
-        .max_encoding_message_size(crate::proto::MAX_MSG_SIZE);
+        .max_decoding_message_size(MAX_MSG_SIZE)
+        .max_encoding_message_size(MAX_MSG_SIZE);
 
     let (out_tx, out_rx) = mpsc::channel::<WorkerMessage>(64);
     // Register must be the first message the hub reads; it fits in the
@@ -472,7 +477,7 @@ async fn session(
 }
 
 async fn session_loop(
-    inbound: &mut tonic::Streaming<crate::proto::HubMessage>,
+    inbound: &mut tonic::Streaming<HubMessage>,
     active: &mut HashMap<String, ActiveBuild>,
     out_tx: &mpsc::Sender<WorkerMessage>,
     signing_key: &Arc<SecretKey>,
@@ -610,7 +615,7 @@ async fn advance_staging(
 /// is the stable identity, the build_id the hub knows may predate a
 /// concurrent resume.
 async fn handle_cancel(
-    c: crate::proto::CancelBuild,
+    c: CancelBuild,
     active: &mut HashMap<String, ActiveBuild>,
     out_tx: &mpsc::Sender<WorkerMessage>,
     ctx: &Arc<WorkerCtx>,

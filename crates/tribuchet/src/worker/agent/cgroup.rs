@@ -8,25 +8,27 @@
 //! mapped root uid; that chown is what the agent keeps CAP_CHOWN for.
 
 use std::fs;
+use std::io;
 use std::os::unix::fs::chown;
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Error {
     #[error(transparent)]
-    Io(#[from] std::io::Error),
+    Io(#[from] io::Error),
     #[error("{step}")]
     Step {
         step: String,
         #[source]
-        source: std::io::Error,
+        source: io::Error,
     },
     #[error("cgroup did not drain")]
     DidNotDrain,
 }
 
-fn step(step: impl Into<String>) -> impl FnOnce(std::io::Error) -> Error {
+fn step(step: impl Into<String>) -> impl FnOnce(io::Error) -> Error {
     |source| Error::Step {
         step: step.into(),
         source,
@@ -94,7 +96,7 @@ pub(super) fn enter(dir: &Path, pid: i32, owner_uid: u32) -> Result<(), Error> {
 /// remove it, subgroups first (cgroup dirs can only be rmdir'd).
 pub(super) fn destroy(dir: &Path) -> Result<(), Error> {
     match fs::write(dir.join("cgroup.kill"), "1") {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         other => other.map_err(step("writing cgroup.kill"))?,
     }
     let deadline = Instant::now() + Duration::from_mins(1);
@@ -104,7 +106,7 @@ pub(super) fn destroy(dir: &Path) -> Result<(), Error> {
         if Instant::now() >= deadline {
             return Err(Error::DidNotDrain);
         }
-        std::thread::sleep(Duration::from_millis(50));
+        thread::sleep(Duration::from_millis(50));
     }
     let mut dirs = vec![dir.to_path_buf()];
     let mut i = 0;

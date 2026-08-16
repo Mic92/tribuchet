@@ -1,4 +1,5 @@
-use std::io::Write;
+use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
@@ -7,10 +8,10 @@ pub struct Error {
     step: &'static str,
     path: PathBuf,
     #[source]
-    source: std::io::Error,
+    source: io::Error,
 }
 
-fn step(step: &'static str, path: &Path) -> impl Fn(std::io::Error) -> Error {
+fn step(step: &'static str, path: &Path) -> impl Fn(io::Error) -> Error {
     let path = path.to_path_buf();
     move |source| Error {
         step,
@@ -25,8 +26,8 @@ fn step(step: &'static str, path: &Path) -> impl Fn(std::io::Error) -> Error {
 pub fn write_secret(path: &Path, data: &[u8]) -> Result<(), Error> {
     use std::os::unix::fs::OpenOptionsExt;
     let tmp = path.with_extension("tmp");
-    let _ = std::fs::remove_file(&tmp);
-    let mut f = std::fs::OpenOptions::new()
+    let _ = fs::remove_file(&tmp);
+    let mut f = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
@@ -34,18 +35,18 @@ pub fn write_secret(path: &Path, data: &[u8]) -> Result<(), Error> {
         .map_err(step("creating", &tmp))?;
     f.write_all(data).map_err(step("writing", &tmp))?;
     f.sync_all().map_err(step("syncing", &tmp))?;
-    std::fs::rename(&tmp, path).map_err(step("renaming into", path))?;
+    fs::rename(&tmp, path).map_err(step("renaming into", path))?;
     Ok(())
 }
 
 /// Remove whatever is at `path` without following a symlink at `path`.
 pub fn remove_path_all(path: &Path) {
-    match std::fs::symlink_metadata(path) {
+    match fs::symlink_metadata(path) {
         Ok(meta) if meta.is_dir() => {
-            let _ = std::fs::remove_dir_all(path);
+            let _ = fs::remove_dir_all(path);
         }
         Ok(_) => {
-            let _ = std::fs::remove_file(path);
+            let _ = fs::remove_file(path);
         }
         Err(_) => {}
     }

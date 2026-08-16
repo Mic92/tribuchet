@@ -3,6 +3,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
+use std::mem;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -22,7 +23,7 @@ use crate::chunkio::ChannelReader;
 use crate::errors::chain;
 use crate::errors::{Result, err_ctx, err_msg};
 use crate::nar;
-use crate::proto::{BuildAssignment, NarTransfer, PathInfoMsg, nar_transfer};
+use crate::proto::{BuildAssignment, NarTransfer, PathInfoMsg, TmpDirArchive, nar_transfer};
 use crate::store::{STORE_DIR, parse_path_info, topo_order, valid_store_path};
 use crate::tmpdir::unpack_tmp_dir;
 
@@ -376,10 +377,7 @@ impl ActiveBuild {
     }
 
     /// Reports staging progress; the tmp dir eof completes round one.
-    pub(super) async fn feed_tmp_dir(
-        &mut self,
-        t: crate::proto::TmpDirArchive,
-    ) -> Result<StagingStatus> {
+    pub(super) async fn feed_tmp_dir(&mut self, t: TmpDirArchive) -> Result<StagingStatus> {
         let (tx, _) = self.tmp_unpacker.get_or_insert_with(|| {
             let dest = self.dir.join("top/build");
             let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
@@ -442,7 +440,7 @@ impl ActiveBuild {
             .await
             .map_err(err_ctx("re-checking inputs another build was importing"))?;
         let mut still_missing = Vec::new();
-        for p in std::mem::take(&mut self.deferred) {
+        for p in mem::take(&mut self.deferred) {
             if valid.contains(&store_dir.parse(&p)?) {
                 self.inputs.push(p);
             } else {

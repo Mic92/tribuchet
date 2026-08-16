@@ -1,14 +1,18 @@
 //! Advertised system capabilities and feature probing.
 
 use std::collections::HashMap;
+use std::env::consts;
+use std::path::Path;
 
 use super::WorkerCtx;
+use crate::build_json::required_system_features;
 use crate::config::WorkerConfig;
+use crate::proto::SystemCaps;
 
 /// Nix's `uid-range` system feature: a full 65536-uid range with the
 /// builder as in-namespace root (containers, systemd-nspawn).
 pub(super) fn requires_uid_range(env: &HashMap<String, String>) -> bool {
-    crate::build_json::required_system_features(env)
+    required_system_features(env)
         .iter()
         .any(|f| f == "uid-range")
 }
@@ -26,7 +30,7 @@ fn local_features(native: bool, opts: &WorkerConfig) -> Vec<String> {
         "big-parallel".to_owned(),
     ];
     if cfg!(target_os = "linux") && native {
-        if std::path::Path::new("/dev/kvm").exists() {
+        if Path::new("/dev/kvm").exists() {
             features.push("kvm".to_owned());
         }
         features.push("uid-range".to_owned());
@@ -39,12 +43,12 @@ fn local_features(native: bool, opts: &WorkerConfig) -> Vec<String> {
 
 /// Per-system capability list for Register; native systems get the
 /// full feature set, emulated ones only the baseline.
-pub(super) fn system_caps(opts: &WorkerConfig, ctx: &WorkerCtx) -> Vec<crate::proto::SystemCaps> {
+pub(super) fn system_caps(opts: &WorkerConfig, ctx: &WorkerCtx) -> Vec<SystemCaps> {
     let native = local_features(true, opts);
     let emulated = local_features(false, opts);
     opts.systems
         .iter()
-        .map(|s| crate::proto::SystemCaps {
+        .map(|s| SystemCaps {
             system: s.clone(),
             features: if ctx.emulators.contains_key(s) {
                 emulated.clone()
@@ -56,8 +60,8 @@ pub(super) fn system_caps(opts: &WorkerConfig, ctx: &WorkerCtx) -> Vec<crate::pr
 }
 
 pub fn host_system() -> String {
-    let arch = std::env::consts::ARCH;
-    let os = match std::env::consts::OS {
+    let arch = consts::ARCH;
+    let os = match consts::OS {
         "macos" => "darwin",
         os => os,
     };

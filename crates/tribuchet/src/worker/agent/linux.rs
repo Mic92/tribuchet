@@ -12,14 +12,16 @@
 //! stage, spawned here.
 
 use std::fs;
-use std::io::IoSliceMut;
+use std::io::{self, IoSliceMut};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::process::{self, Stdio};
 use std::process::{Child, Command};
 use std::sync::Arc;
+use std::{env, slice, thread};
 
 use rustix::io::{FdFlags, fcntl_setfd};
 use rustix::net::sockopt::socket_peercred;
@@ -34,9 +36,10 @@ use rustix::thread::{
 };
 use sandbox_proto::agent::StartRequest;
 
-use super::{Build, Error, Options, cgroup, msg, step};
+use super::{Build, Error, Options, cgroup, make_readable, msg, spawn_plain, stage_scratch, step};
 use crate::errors::chain;
 use crate::netpolicy::NetPolicy;
+use crate::sd;
 use crate::worker::sandbox::{self, SandboxSpec};
 use crate::worker::userns::{self, UsernsHolder};
 
@@ -93,7 +96,7 @@ pub(super) fn stage_tmp_dir(
     pack: OwnedFd,
 ) -> Result<(), Error> {
     let Some(userns) = &confinement.userns else {
-        return super::stage_scratch(fs::File::from(pack), build_dir);
+        return stage_scratch(fs::File::from(pack), build_dir);
     };
     // The scratch root is agent-owned and the agent's uid is unmapped
     // in the namespace, so in-ns root could not create the build dir
@@ -101,14 +104,14 @@ pub(super) fn stage_tmp_dir(
     // deleting the agent's own files; the traverse-only state dir
     // hides the scratch root from other users.
     fs::set_permissions(scratch_root, fs::Permissions::from_mode(0o1777))?;
-    let exe = std::env::current_exe()?;
+    let exe = env::current_exe()?;
     let (_ns_fd, ns_path) = userns::inherited_ns(&userns.fd)?;
     let status = Command::new(exe)
         .arg(FS_HELPER_ARG)
         .arg(ns_path)
         .arg("unpack")
         .arg(build_dir)
-        .stdin(std::process::Stdio::from(fs::File::from(pack)))
+        .stdin(Stdio::from(fs::File::from(pack)))
         .status()?;
     if !status.success() {
         return Err(msg(format!("userns unpack helper exited with {status}")));
@@ -127,7 +130,7 @@ pub(super) fn spawn_builder(
     log: &fs::File,
 ) -> Result<(Child, Option<PathBuf>), Error> {
     let Some(sandbox_json) = &req.sandbox_json else {
-        return Ok((super::spawn_plain(req, build_dir, log)?, None));
+        return Ok((spawn_plain(req, build_dir, log)?, None));
     };
     let userns = confinement
         .userns
@@ -170,7 +173,7 @@ pub(super) fn spawn_builder(
         drop(theirs);
         let policy = spec.net_policy.clone();
         let build_pid = child.id();
-        std::thread::spawn(move || net_forward(&ours, policy, build_pid));
+        thread::spawn(move || net_forward(&ours, policy, build_pid));
     }
     // The setup stage waits for the spec on stdin; move it into the
     // build cgroup first so its cgroup namespace is rooted there.
@@ -228,7 +231,7 @@ fn net_forward(sock: &OwnedFd, policy: NetPolicy, build_pid: u32) {
 pub(super) fn finish(confinement: &Confinement, root: Option<&Path>, outputs: &[String]) {
     let Some(root) = root else {
         for out in outputs {
-            super::make_readable(Path::new(out));
+            make_readable(Path::new(out));
         }
         return;
     };
@@ -248,19 +251,19 @@ pub(super) fn finish(confinement: &Confinement, root: Option<&Path>, outputs: &[
 pub(super) fn clean_scratch(confinement: &Confinement, scratch_root: &Path) -> Result<(), Error> {
     match fs::remove_dir_all(scratch_root) {
         Ok(()) => return Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(_) if confinement.userns.is_some() => {
             run_in_userns(
                 confinement,
                 "remove",
-                std::slice::from_ref(&scratch_root.to_path_buf()),
+                slice::from_ref(&scratch_root.to_path_buf()),
             )?;
         }
         Err(e) => return Err(e.into()),
     }
     match fs::remove_dir_all(scratch_root) {
         Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(msg(format!(
             "stale scratch tree {} could not be removed: {e}",
             scratch_root.display()
@@ -278,11 +281,7 @@ pub(super) fn cleanup(confinement: &Confinement, build: &Build) {
         {
             tracing::warn!("removing the build cgroup: {}", chain(&e));
         }
-        if let Err(e) = run_in_userns(
-            confinement,
-            "remove",
-            std::slice::from_ref(&build.scratch_root),
-        ) {
+        if let Err(e) = run_in_userns(confinement, "remove", slice::from_ref(&build.scratch_root)) {
             tracing::warn!("removing the scratch tree: {}", chain(&e));
         }
         return;
@@ -304,7 +303,7 @@ fn run_in_userns(confinement: &Confinement, op: &str, paths: &[PathBuf]) -> Resu
         .userns
         .as_ref()
         .ok_or_else(|| msg("no pre-mapped user namespace"))?;
-    let exe = std::env::current_exe()?;
+    let exe = env::current_exe()?;
     let (_ns_fd, ns_path) = userns::inherited_ns(&userns.fd)?;
     let status = Command::new(exe)
         .arg(FS_HELPER_ARG)
@@ -323,7 +322,7 @@ fn run_in_userns(confinement: &Confinement, op: &str, paths: &[PathBuf]) -> Resu
 /// files, and runs the filesystem operation the agent itself may not.
 pub fn fs_helper_stage() -> ! {
     fn run() -> Result<(), Error> {
-        let mut args = std::env::args_os().skip(2);
+        let mut args = env::args_os().skip(2);
         let ns = fs::File::open(args.next().ok_or_else(|| msg("missing userns path"))?)?;
         let op = args.next().ok_or_else(|| msg("missing op"))?;
         move_into_link_name_space(ns.as_fd(), Some(LinkNameSpaceType::User))
@@ -334,12 +333,12 @@ pub fn fs_helper_stage() -> ! {
             set_thread_gid(Gid::from_raw(0)).map_err(step("setgid 0 in the ns"))?;
             set_thread_uid(Uid::from_raw(0)).map_err(step("setuid 0 in the ns"))?;
             let build_dir = PathBuf::from(args.next().ok_or_else(|| msg("missing build dir"))?);
-            return super::stage_scratch(std::io::stdin(), &build_dir);
+            return stage_scratch(io::stdin(), &build_dir);
         }
         for path in args {
             let path = Path::new(&path);
             match op.to_str() {
-                Some("make-readable") => super::make_readable(path),
+                Some("make-readable") => make_readable(path),
                 Some("remove") => {
                     let _ = fs::remove_dir_all(path);
                     let _ = fs::remove_file(path);
@@ -350,10 +349,10 @@ pub fn fs_helper_stage() -> ! {
         Ok(())
     }
     match run() {
-        Ok(()) => std::process::exit(0),
+        Ok(()) => process::exit(0),
         Err(e) => {
             eprintln!("agent fs helper: {}", chain(&e));
-            std::process::exit(1);
+            process::exit(1);
         }
     }
 }
@@ -421,7 +420,7 @@ fn drop_caps() -> Result<(), Error> {
 /// and marks the fd non-blocking; the agent's accept loop is
 /// synchronous.
 pub(super) fn activated_unix_listener() -> Result<Option<UnixListener>, Error> {
-    let listener = crate::sd::activated_sockets()?.unix;
+    let listener = sd::activated_sockets()?.unix;
     if let Some(l) = &listener {
         l.set_nonblocking(false)?;
     }
@@ -429,10 +428,7 @@ pub(super) fn activated_unix_listener() -> Result<Option<UnixListener>, Error> {
 }
 
 pub(super) fn peer_uid(conn: &UnixStream) -> Result<u32, Error> {
-    Ok(socket_peercred(conn)
-        .map_err(std::io::Error::from)?
-        .uid
-        .as_raw())
+    Ok(socket_peercred(conn).map_err(io::Error::from)?.uid.as_raw())
 }
 
 /// Whether the build cgroup's memory.max OOM-killed the build.

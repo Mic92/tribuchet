@@ -10,6 +10,7 @@
 //! nix-daemon), so no write access to /nix/var/nix/db is needed.
 
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::path::PathBuf;
 
 use crate::errors::Result;
@@ -28,7 +29,7 @@ pub(super) struct PinPlan {
 
 /// Location of the Nix store database, honouring `NIX_STATE_DIR`.
 pub(super) fn nix_db_path() -> PathBuf {
-    let state = std::env::var("NIX_STATE_DIR").unwrap_or_else(|_| "/nix/var/nix".into());
+    let state = env::var("NIX_STATE_DIR").unwrap_or_else(|_| "/nix/var/nix".into());
     PathBuf::from(state).join("db/db.sqlite")
 }
 

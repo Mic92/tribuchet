@@ -11,12 +11,17 @@
 //! crates/sandbox-proto/proto/agent.proto.
 
 use std::collections::HashMap;
+#[cfg(target_os = "macos")]
+use std::ffi::NulError;
 use std::fs;
-use std::io::Write;
+use std::io::{self, Read, Write};
+use std::os::fd::OwnedFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::process::{self, Child};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use rustix::process::{Pid, Signal, getuid, kill_process, kill_process_group};
@@ -27,52 +32,56 @@ use sandbox_proto::agent::{
 use sandbox_proto::framing;
 
 use crate::errors::chain;
+use crate::sd;
+use crate::sockpath;
+use crate::tmpdir;
 use crate::tmpdir::unpack_tmp_dir;
+use crate::worker::{sandbox, userns};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
-    Io(#[from] std::io::Error),
+    Io(#[from] io::Error),
     #[error("{step}")]
     Step {
         step: String,
         #[source]
-        source: std::io::Error,
+        source: io::Error,
     },
     #[error("{0}")]
     Msg(String),
     #[error(transparent)]
     Framing(#[from] framing::Error),
     #[error("unpacking the tmp dir")]
-    UnpackTmpDir(#[source] crate::tmpdir::Error),
+    UnpackTmpDir(#[source] tmpdir::Error),
     #[error("staging the tmp dir")]
     StageTmpDir(#[source] Box<Error>),
     #[cfg(target_os = "linux")]
     #[error(transparent)]
-    Userns(#[from] crate::worker::userns::Error),
+    Userns(#[from] userns::Error),
     #[cfg(target_os = "linux")]
     #[error(transparent)]
     Cgroup(#[from] cgroup::Error),
     #[cfg(target_os = "linux")]
     #[error(transparent)]
-    Sandbox(#[from] crate::worker::sandbox::Error),
+    Sandbox(#[from] sandbox::Error),
     #[error(transparent)]
-    Activation(#[from] crate::sd::Error),
+    Activation(#[from] sd::Error),
     #[cfg(target_os = "linux")]
     #[error("decoding the sandbox spec")]
     DecodeSpec(#[source] serde_json::Error),
     #[cfg(target_os = "linux")]
     #[error("creating the sandbox root skeleton")]
-    PrepareRoot(#[source] crate::worker::sandbox::Error),
+    PrepareRoot(#[source] sandbox::Error),
     #[cfg(target_os = "linux")]
     #[error("creating the agent user namespace")]
-    CreateUserns(#[source] crate::worker::userns::Error),
+    CreateUserns(#[source] userns::Error),
     #[cfg(target_os = "macos")]
     #[error("NUL byte in the seatbelt profile or parameters")]
-    Nul(#[from] std::ffi::NulError),
+    Nul(#[from] NulError),
 }
 
-fn step<E: Into<std::io::Error>>(step: impl Into<String>) -> impl FnOnce(E) -> Error {
+fn step<E: Into<io::Error>>(step: impl Into<String>) -> impl FnOnce(E) -> Error {
     |source| Error::Step {
         step: step.into(),
         source: source.into(),
@@ -87,7 +96,7 @@ fn msg(m: impl Into<String>) -> Error {
 /// creating it even for an empty stream. Files belong to whoever runs
 /// this: the agent on the direct-exec and macOS paths, in-ns root
 /// through the userns helper on the Linux namespace path.
-fn stage_scratch(pack: impl std::io::Read, build_dir: &Path) -> Result<(), Error> {
+fn stage_scratch(pack: impl Read, build_dir: &Path) -> Result<(), Error> {
     fs::create_dir_all(build_dir)?;
     let dec = zstd::stream::read::Decoder::new(pack)?;
     unpack_tmp_dir(dec, build_dir).map_err(Error::UnpackTmpDir)
@@ -190,7 +199,7 @@ pub fn run(opts: &Options) -> Result<(), Error> {
         let agent = agent.clone();
         let inflight = inflight.clone();
         inflight.fetch_add(1, Ordering::SeqCst);
-        std::thread::spawn(move || {
+        thread::spawn(move || {
             if let Err(e) = handle(&agent, &conn) {
                 let e = chain(&e);
                 tracing::warn!("agent request failed: {e}");
@@ -203,7 +212,7 @@ pub fn run(opts: &Options) -> Result<(), Error> {
                 && agent.current.lock().unwrap().is_none()
             {
                 tracing::info!("no build held, exiting until the next activation");
-                std::process::exit(0);
+                process::exit(0);
             }
         });
     }
@@ -219,7 +228,7 @@ fn listener(socket: Option<&Path>) -> Result<(UnixListener, bool), Error> {
     }
     let path = socket.ok_or_else(|| msg("no activated socket and no --socket given"))?;
     let _ = fs::remove_file(path);
-    let l = crate::sockpath::bind(path).map_err(step(format!("binding {}", path.display())))?;
+    let l = sockpath::bind(path).map_err(step(format!("binding {}", path.display())))?;
     Ok((l, false))
 }
 
@@ -250,7 +259,7 @@ fn handle_start(
     agent: &Arc<Agent>,
     conn: &UnixStream,
     req: StartRequest,
-    fds: Vec<std::os::fd::OwnedFd>,
+    fds: Vec<OwnedFd>,
 ) -> Result<(), Error> {
     if req.build_id.len() != 32 || !req.build_id.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(msg(format!("invalid build id {:?}", req.build_id)));
@@ -376,7 +385,7 @@ fn handle_cleanup(
     framing::send_reply(conn, reply::Reply::Empty(Empty {}), &[])?;
     tracing::info!(id = build.id, "cleanup done");
     if agent.dedicated_uid {
-        std::process::exit(0);
+        process::exit(0);
     }
     Ok(())
 }
@@ -385,11 +394,7 @@ fn handle_cleanup(
 /// process group, stdio on the log file, cwd and env rewritten to the
 /// scratch dir, platform confinement applied in the child right
 /// before exec.
-fn spawn_plain(
-    req: &StartRequest,
-    build_dir: &Path,
-    log: &fs::File,
-) -> Result<std::process::Child, Error> {
+fn spawn_plain(req: &StartRequest, build_dir: &Path, log: &fs::File) -> Result<Child, Error> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     let build_dir_str = build_dir
@@ -432,11 +437,11 @@ fn rewrite_tmp_dir_env(env: &mut HashMap<String, String>, from: &str, to: &str) 
 fn reap_on_exit(
     agent: Arc<Agent>,
     build_id: String,
-    mut child: std::process::Child,
+    mut child: Child,
     mut log: fs::File,
     exit: Arc<(Mutex<Option<i32>>, Condvar)>,
 ) {
-    std::thread::spawn(move || {
+    thread::spawn(move || {
         use std::os::unix::process::ExitStatusExt;
         let code = match child.wait() {
             Ok(status) => status
@@ -480,7 +485,7 @@ fn kill_own_uid_processes(exempt: Option<i32>) {
     loop {
         let others = platform::own_uid_pids()
             .into_iter()
-            .filter(|&pid| pid != std::process::id().cast_signed() && Some(pid) != exempt)
+            .filter(|&pid| pid != process::id().cast_signed() && Some(pid) != exempt)
             .collect::<Vec<_>>();
         if others.is_empty() {
             return;
@@ -492,7 +497,7 @@ fn kill_own_uid_processes(exempt: Option<i32>) {
             tracing::warn!(?others, "own-uid processes survived the kill sweep");
             return;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -540,12 +545,12 @@ mod tests {
 
     #[test]
     fn make_readable_skips_symlinks() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{PermissionsExt, symlink};
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("out");
         fs::create_dir(&out).unwrap();
         fs::write(out.join("file"), "x").unwrap();
-        std::os::unix::fs::symlink("/etc/passwd", out.join("link")).unwrap();
+        symlink("/etc/passwd", out.join("link")).unwrap();
         make_readable(&out);
         assert_ne!(
             fs::metadata(out.join("file")).unwrap().permissions().mode() & 0o444,

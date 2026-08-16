@@ -8,10 +8,15 @@
 //! - reads input store paths directly from local disk
 //! - verifies worker output signatures while relaying compressed chunks
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
-use std::sync::Arc;
+use std::io;
+use std::net::SocketAddr;
+use std::os::unix::fs as unix_fs;
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use harmonia_utils_signature::PublicKey;
@@ -23,7 +28,9 @@ use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig, server::TcpConnectInfo};
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::config::Auth;
+use crate::config::{Auth, HubConfig};
+use crate::proto::worker_hub_server::{WorkerHub, WorkerHubServer};
+use crate::{chunkio, rt, sd, tailscale};
 
 use crate::proto::{
     CancelBuild, HubMessage, MAX_MSG_SIZE, Register, WorkerMessage, attach_event,
@@ -55,7 +62,7 @@ const MAX_JOB_ATTEMPTS: u32 = 3;
 enum PeerAuth {
     Mtls,
     Tailscale {
-        socket: std::path::PathBuf,
+        socket: PathBuf,
         allowed_tags: Vec<String>,
     },
 }
@@ -80,9 +87,7 @@ struct CapsGuard {
 
 impl CapsGuard {
     fn new(state: Arc<HubState>, caps: WorkerCaps) -> Self {
-        let id = state
-            .next_worker_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = state.next_worker_id.fetch_add(1, Ordering::Relaxed);
         state.worker_caps.lock().unwrap().insert(id, caps.clone());
         // Wake submissions waiting for a capable worker to appear.
         state.caps_changed.notify_waiters();
@@ -106,7 +111,7 @@ impl Drop for CapsGuard {
 /// which it observes as the worker going away.
 #[derive(Default, Clone)]
 struct Router {
-    builds: Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<worker_message::Msg>>>>,
+    builds: Arc<Mutex<HashMap<String, mpsc::Sender<worker_message::Msg>>>>,
 }
 
 impl Router {
@@ -181,7 +186,7 @@ async fn route_loop(
 }
 
 #[tonic::async_trait]
-impl crate::proto::worker_hub_server::WorkerHub for WorkerSvc {
+impl WorkerHub for WorkerSvc {
     type SessionStream = ReceiverStream<Result<HubMessage, Status>>;
 
     async fn session(
@@ -207,7 +212,7 @@ impl crate::proto::worker_hub_server::WorkerHub for WorkerSvc {
             let Some(addr) = remote else {
                 return Err(Status::unauthenticated("no peer address"));
             };
-            let who = crate::tailscale::whois(socket, addr).await.map_err(|e| {
+            let who = tailscale::whois(socket, addr).await.map_err(|e| {
                 tracing::warn!(%addr, "tailscale whois failed: {}", chain(&e));
                 Status::unauthenticated("peer is not on the tailnet")
             })?;
@@ -292,8 +297,7 @@ async fn worker_loop(
     // Each key is honored once: dedupe keys are stable per derivation,
     // so a later identical submission must go through the normal
     // credit and capability checks, not this fast path.
-    let mut resumable: std::collections::HashSet<String> =
-        register.resumable_keys.iter().cloned().collect();
+    let mut resumable: HashSet<String> = register.resumable_keys.iter().cloned().collect();
     // each received RequestJob funds at most one assignment
     let (req_tx, mut req_rx) = mpsc::channel::<()>(1024);
     let route = tokio::spawn(route_loop(in_rx, router.clone(), req_tx));
@@ -410,7 +414,7 @@ fn bind_attach_socket(socket: &Path) -> Result<tokio::net::UnixListener> {
     }
     // Refuse to replace the socket of a live hub: unlinking it would
     // leave all new attaches with ECONNREFUSED while the old hub runs.
-    if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+    if UnixStream::connect(socket).is_ok() {
         return Err(err_msg(format!(
             "another hub is already serving {}",
             socket.display()
@@ -428,7 +432,7 @@ fn bind_attach_socket(socket: &Path) -> Result<tokio::net::UnixListener> {
     let uds = uds?;
     {
         use std::os::unix::fs::PermissionsExt;
-        std::os::unix::fs::chown(socket, None, Some(group.gid.as_raw()))?;
+        unix_fs::chown(socket, None, Some(group.gid.as_raw()))?;
         fs::set_permissions(socket, fs::Permissions::from_mode(0o660))?;
     }
     Ok(uds)
@@ -481,7 +485,7 @@ fn load_trusted_keys(config_dir: &Path) -> Result<Option<Arc<Vec<PublicKey>>>> {
             tracing::info!(count = keys.len(), "worker signing keys pinned");
             Ok(Some(Arc::new(keys)))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
             tracing::warn!(
                 "no trusted-signing-keys file in {}; accepting any signing key from \
                  transport-authenticated workers",
@@ -494,7 +498,7 @@ fn load_trusted_keys(config_dir: &Path) -> Result<Option<Arc<Vec<PublicKey>>>> {
 }
 
 fn configure_auth(
-    cfg: &crate::config::HubConfig,
+    cfg: &HubConfig,
     config_dir: &Path,
 ) -> Result<(Option<ServerTlsConfig>, PeerAuth)> {
     Ok(match cfg.auth {
@@ -529,17 +533,17 @@ fn configure_auth(
     })
 }
 
-pub fn run(cfg: crate::config::HubConfig) -> Result<()> {
-    let rt = crate::rt::runtime("trib-hub").map_err(err_ctx("creating the tokio runtime"))?;
+pub fn run(cfg: HubConfig) -> Result<()> {
+    let rt = rt::runtime("trib-hub").map_err(err_ctx("creating the tokio runtime"))?;
     rt.block_on(run_async(cfg))
 }
 
-async fn run_async(cfg: crate::config::HubConfig) -> Result<()> {
+async fn run_async(cfg: HubConfig) -> Result<()> {
     let socket = cfg.socket.as_path();
     let listen = cfg.listen.as_str();
     let config_dir = cfg.config_dir.as_path();
     let state = Arc::new(HubState::new(
-        std::time::Duration::from_secs(cfg.worker_grace_secs),
+        Duration::from_secs(cfg.worker_grace_secs),
         cfg.nix_config.clone(),
     ));
 
@@ -549,7 +553,7 @@ async fn run_async(cfg: crate::config::HubConfig) -> Result<()> {
     // Listeners come from systemd socket activation when available
     // (they survive hub restarts; clients queue instead of getting
     // ECONNREFUSED), otherwise we bind ourselves.
-    let activated = crate::sd::activated_sockets()?;
+    let activated = sd::activated_sockets()?;
     let tcp = match activated.tcp {
         Some(l) => tokio::net::TcpListener::from_std(l)
             .map_err(err_ctx("adopting activated TCP socket"))?,
@@ -558,7 +562,7 @@ async fn run_async(cfg: crate::config::HubConfig) -> Result<()> {
         // below.
         None => tokio::net::TcpListener::bind(
             listen
-                .parse::<std::net::SocketAddr>()
+                .parse::<SocketAddr>()
                 .map_err(err_ctx("parsing listen address"))?,
         )
         .await
@@ -573,10 +577,10 @@ async fn run_async(cfg: crate::config::HubConfig) -> Result<()> {
         // the workers' own traffic.
         .http2_keepalive_interval(Some(Duration::from_secs(30)))
         .http2_keepalive_timeout(Some(Duration::from_secs(20)))
-        .initial_stream_window_size(Some(crate::chunkio::H2_STREAM_WINDOW))
-        .initial_connection_window_size(Some(crate::chunkio::H2_CONNECTION_WINDOW))
+        .initial_stream_window_size(Some(chunkio::H2_STREAM_WINDOW))
+        .initial_connection_window_size(Some(chunkio::H2_CONNECTION_WINDOW))
         .add_service(
-            crate::proto::worker_hub_server::WorkerHubServer::new(WorkerSvc {
+            WorkerHubServer::new(WorkerSvc {
                 state: state.clone(),
                 auth: Arc::new(peer_auth),
                 trusted_keys,
@@ -600,8 +604,8 @@ async fn run_async(cfg: crate::config::HubConfig) -> Result<()> {
         None => bind_attach_socket(socket)?,
     };
     let attach_server = Server::builder()
-        .initial_stream_window_size(Some(crate::chunkio::H2_STREAM_WINDOW))
-        .initial_connection_window_size(Some(crate::chunkio::H2_CONNECTION_WINDOW))
+        .initial_stream_window_size(Some(chunkio::H2_STREAM_WINDOW))
+        .initial_connection_window_size(Some(chunkio::H2_CONNECTION_WINDOW))
         .add_service(
             attach_hub_server::AttachHubServer::new(AttachSvc {
                 state: state.clone(),
@@ -622,8 +626,8 @@ async fn run_async(cfg: crate::config::HubConfig) -> Result<()> {
     }
 
     tracing::info!(listen, socket = %socket.display(), "hub running");
-    crate::sd::notify_ready();
-    crate::sd::spawn_watchdog();
+    sd::notify_ready();
+    sd::spawn_watchdog();
     let servers = async {
         tokio::try_join!(
             async { worker_server.await.map_err(err_ctx("worker gRPC server")) },
@@ -636,7 +640,7 @@ async fn run_async(cfg: crate::config::HubConfig) -> Result<()> {
     // keys), so exiting immediately cancels nothing.
     tokio::select! {
         res = servers => res.map(|_| ()),
-        () = crate::sd::stop_requested() => {
+        () = sd::stop_requested() => {
             tracing::info!("SIGTERM: exiting, builds resume against the replacement instance");
             Ok(())
         }

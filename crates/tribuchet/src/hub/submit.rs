@@ -9,9 +9,12 @@ use sha2::{Digest, Sha256};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
+use super::metrics::Metrics;
 use super::state::{HubState, Job, Replay};
+use crate::build_json;
 use crate::proto::{
-    AttachEvent, BuildMessage, BuildRequest, attach_event, attach_hub_server, build_message,
+    AttachEvent, BuildMessage, BuildRequest, DECLINE_EXIT_CODE, attach_event, attach_hub_server,
+    build_message,
 };
 use crate::store::{STORE_DIR, valid_store_path};
 
@@ -175,12 +178,10 @@ impl AttachSvc {
         };
         let decline = || {
             tracing::info!(system, "no capable worker; declining");
-            super::metrics::Metrics::inc(&self.state.metrics.declined);
+            Metrics::inc(&self.state.metrics.declined);
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             let _ = tx.try_send(Ok(AttachEvent {
-                event: Some(attach_event::Event::ExitCode(
-                    crate::proto::DECLINE_EXIT_CODE,
-                )),
+                event: Some(attach_event::Event::ExitCode(DECLINE_EXIT_CODE)),
             }));
             Response::new(ReceiverStream::new(rx))
         };
@@ -229,7 +230,7 @@ impl attach_hub_server::AttachHub for AttachSvc {
         let tmp_dir_pack = Arc::new(tmp_dir_pack);
         let key = dedupe_key(&req);
 
-        let features = crate::build_json::required_system_features(&req.env);
+        let features = build_json::required_system_features(&req.env);
         if let Some(declined) = self.await_capable_worker(&req.system, &features).await {
             return Ok(declined);
         }
@@ -264,7 +265,7 @@ impl attach_hub_server::AttachHub for AttachSvc {
                 requeued_at: None,
             };
             tracing::info!(id = job.id, system = job.req.system, "queueing build");
-            super::metrics::Metrics::inc(&self.state.metrics.submitted);
+            Metrics::inc(&self.state.metrics.submitted);
             self.state.queue.lock().await.push_back(job);
             self.state.notify.notify_waiters();
             replay
