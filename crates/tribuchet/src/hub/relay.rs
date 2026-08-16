@@ -243,13 +243,6 @@ pub(super) async fn recv(
         .ok_or_else(|| err_msg("worker disconnected or went silent"))
 }
 
-/// Nix db metadata for input paths, in wire form, queried over the
-/// daemon protocol rather than db.sqlite: harmonia-store-db opens the
-/// db with sqlite's immutable=1, which skips locking and WAL replay,
-/// so rows still in the WAL -- freshly registered inputs, the common
-/// case for build requests -- would be invisible and concurrent
-/// checkpoints could yield torn reads. The daemon answers from its
-/// own consistent view.
 /// References before referrers; tolerates self-refs and cycles.
 fn order_by_references(infos: Vec<PathInfoMsg>) -> Vec<PathInfoMsg> {
     let roots: Vec<String> = infos.iter().map(|i| i.store_path.clone()).collect();
@@ -309,6 +302,9 @@ async fn query_path_info_chunk(
     Ok(out)
 }
 
+/// Path info over the daemon protocol, not db.sqlite:
+/// harmonia-store-db opens the db with immutable=1, so WAL-only rows
+/// (freshly registered inputs, the common case) would be invisible.
 async fn query_path_infos(
     pool: &harmonia_store_remote::ConnectionPool,
     paths: &[String],
