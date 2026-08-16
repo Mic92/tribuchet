@@ -14,6 +14,7 @@ use std::ptr;
 use sandbox_proto::agent::{SCRATCH_DIR_PARAM, StartRequest};
 
 use super::{Build, Error, Options, make_readable, spawn_plain, stage_scratch};
+use crate::errors::{Result, err_ctx};
 use crate::sd;
 
 /// Per-agent confinement state. macOS confinement is per build (the
@@ -157,11 +158,11 @@ unsafe impl Sync for Seatbelt {}
 
 impl Seatbelt {
     fn new(profile: &str, params: &[(&str, &str)]) -> Result<Self> {
-        let profile = CString::new(profile)?;
+        let profile = CString::new(profile).map_err(err_ctx("seatbelt profile contains NUL"))?;
         let mut owned = Vec::new();
         for (k, v) in params {
-            owned.push(CString::new(*k)?);
-            owned.push(CString::new(*v)?);
+            owned.push(CString::new(*k).map_err(err_ctx("seatbelt param contains NUL"))?);
+            owned.push(CString::new(*v).map_err(err_ctx("seatbelt param contains NUL"))?);
         }
         let mut param_ptrs: Vec<*const libc::c_char> = owned.iter().map(|c| c.as_ptr()).collect();
         param_ptrs.push(ptr::null());
