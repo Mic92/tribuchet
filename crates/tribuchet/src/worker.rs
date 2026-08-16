@@ -234,10 +234,10 @@ pub(super) fn remove_build_dir(dir: &Path) {
 fn sweep_state_dir(state_dir: &Path) {
     if let Ok(entries) = fs::read_dir(state_dir.join("builds")) {
         for entry in entries.flatten() {
-            // Dirs with persisted resume/finished state belong to
+            // Dirs with a persisted state.json belong to
             // builds another worker generation left for adoption.
             let dir = entry.path();
-            if dir.join("resume.json").exists() || dir.join("finished.json").exists() {
+            if dir.join("state.json").exists() {
                 continue;
             }
             tracing::info!("removing stale build dir {}", dir.display());

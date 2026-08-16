@@ -151,10 +151,9 @@ impl ActiveBuild {
             pid: build.pid,
             spec,
             deadline_unix: unix_now() + timeout.as_secs(),
-            agent_socket: Some(socket.to_path_buf()),
+            agent_socket: socket.to_path_buf(),
         };
-        fs::write(self.dir.join("resume.json"), serde_json::to_vec(&resume)?)
-            .map_err(io_ctx("writing", &self.dir.join("resume.json")))?;
+        resume.persist(&self.dir)?;
         let fin = supervise_agent(
             &self.ctx,
             &resume,
