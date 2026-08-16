@@ -34,6 +34,7 @@ use sandbox_proto::agent::{
 use sandbox_proto::framing;
 
 use crate::errors::{Error, Result, chain, err_ctx};
+use crate::fsutil::io_ctx;
 use crate::sockpath;
 use crate::tmpdir::unpack_tmp_dir;
 
@@ -46,7 +47,7 @@ fn msg(m: impl Into<String>) -> Error {
 /// this: the agent on the direct-exec and macOS paths, in-ns root
 /// through the userns helper on the Linux namespace path.
 fn stage_scratch(pack: impl Read, build_dir: &Path) -> Result<()> {
-    fs::create_dir_all(build_dir)?;
+    fs::create_dir_all(build_dir).map_err(io_ctx("creating", build_dir))?;
     let dec = zstd::stream::read::Decoder::new(pack)?;
     unpack_tmp_dir(dec, build_dir).map_err(err_ctx("unpacking the tmp dir"))
 }
@@ -231,7 +232,7 @@ fn handle_start(
         let scratch_root = agent.state_dir.join("scratch");
         let build_dir = scratch_root.join("build");
         platform::clean_scratch(&agent.confinement, &scratch_root)?;
-        fs::create_dir_all(&scratch_root)?;
+        fs::create_dir_all(&scratch_root).map_err(io_ctx("creating", &scratch_root))?;
         platform::stage_tmp_dir(&agent.confinement, &scratch_root, &build_dir, tmp_pack)
             .map_err(err_ctx("staging the tmp dir"))?;
 

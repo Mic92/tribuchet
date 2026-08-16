@@ -46,6 +46,7 @@ use resume::{ResumableBuild, adopt_builds, spawn_resumable_reaper, sweep_orphane
 
 use crate::config::WorkerConfig;
 use crate::errors::{Result, err_ctx, err_msg};
+use crate::fsutil::io_ctx;
 use crate::netpolicy::NetPolicy;
 use crate::proto::{BuildAssignment, RequestJob, WorkerMessage, worker_message};
 use crate::{fsutil, rt, sd};
@@ -202,7 +203,8 @@ fn hostname() -> String {
 fn load_signing_key(state_dir: &Path) -> Result<SecretKey> {
     let path = state_dir.join("signing.key");
     if path.exists() {
-        fs::read_to_string(&path)?
+        fs::read_to_string(&path)
+            .map_err(io_ctx("reading", &path))?
             .trim()
             .parse::<SecretKey>()
             .map_err(|e| {
@@ -272,10 +274,11 @@ pub fn run(opts: WorkerConfig) -> Result<()> {
 
 async fn run_async(opts: WorkerConfig) -> Result<()> {
     let builds_dir = opts.state_dir.join("builds");
-    fs::create_dir_all(&builds_dir)?;
+    fs::create_dir_all(&builds_dir).map_err(io_ctx("creating", &builds_dir))?;
     // Traverse-only so leased build uids reach their own tree but
     // other local users get no listing.
-    fs::set_permissions(&builds_dir, fs::Permissions::from_mode(0o711))?;
+    fs::set_permissions(&builds_dir, fs::Permissions::from_mode(0o711))
+        .map_err(io_ctx("setting permissions on", &builds_dir))?;
     sweep_state_dir(&opts.state_dir);
     // Arc: SecretKey is not Clone (zeroized on drop); build threads share it.
     let signing_key = Arc::new(load_signing_key(&opts.state_dir)?);

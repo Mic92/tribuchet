@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use std::{env, thread};
 
 use crate::errors::{Result, chain, err_ctx, err_msg};
+use crate::fsutil::io_ctx;
 use crate::sockpath;
 use rustix::process::{Gid, Uid};
 use rustix::process::{geteuid, getuid};
@@ -57,7 +58,7 @@ pub fn spawn(state_dir: &Path, count: u32, uid_base: Option<u32>) -> Result<Vec<
     let mut sockets = Vec::new();
     for i in 1..=count {
         let dir = base_dir.join(i.to_string());
-        fs::create_dir_all(&dir)?;
+        fs::create_dir_all(&dir).map_err(io_ctx("creating", &dir))?;
         let slot = Slot {
             socket: dir.join("agent.sock"),
             state_dir: dir.clone(),

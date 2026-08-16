@@ -38,6 +38,8 @@ use std::{env, mem, ptr};
 use super::super::{SandboxSpec, binfmt};
 use super::{create_mount_points, exit_status_file, setup_error_file, write_skeleton};
 
+use crate::fsutil::io_ctx;
+
 // Interface name for the presto-pasta tap inside the build netns.
 // Addressing (link-local guest/gateway, DNS forwarded on the gateway
 // address so a loopback host resolver like systemd-resolved's stub
@@ -68,8 +70,10 @@ pub fn setup_stage() -> ! {
         // Pre-open the error and exit-status files: the fds keep
         // working after pivot_root detaches the host filesystem, a
         // path would not.
-        let err_file = fs::File::create(setup_error_file(&spec.root))?;
-        let status_file = fs::File::create(exit_status_file(&spec.root))?;
+        let err_file = fs::File::create(setup_error_file(&spec.root))
+            .map_err(io_ctx("creating", &setup_error_file(&spec.root)))?;
+        let status_file = fs::File::create(exit_status_file(&spec.root))
+            .map_err(io_ctx("creating", &exit_status_file(&spec.root)))?;
         enter_and_exec(&spec, &status_file).inspect_err(|e| {
             let _ = (&err_file).write_all(e.to_string().as_bytes());
         })

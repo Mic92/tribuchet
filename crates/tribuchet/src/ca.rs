@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use clap::Subcommand;
 
 use crate::fsutil;
+use crate::fsutil::io_ctx;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
 
 #[derive(Debug, thiserror::Error)]
@@ -81,7 +82,7 @@ fn validity(params: &mut CertificateParams, days: i64) {
 pub fn run(action: CaAction) -> Result<(), Error> {
     match action {
         CaAction::Init { dir } => {
-            fs::create_dir_all(&dir)?;
+            fs::create_dir_all(&dir).map_err(io_ctx("creating", &dir))?;
             refuse_overwrite(&dir.join("ca.key"))?;
             refuse_overwrite(&dir.join("ca.crt"))?;
             let key = KeyPair::generate()?;
@@ -90,7 +91,8 @@ pub fn run(action: CaAction) -> Result<(), Error> {
             validity(&mut params, 10 * 365);
             let cert = params.self_signed(&key)?;
             write_private(&dir.join("ca.key"), &key.serialize_pem())?;
-            fs::write(dir.join("ca.crt"), cert.pem())?;
+            fs::write(dir.join("ca.crt"), cert.pem())
+                .map_err(io_ctx("writing", &dir.join("ca.crt")))?;
             println!("CA created in {}", dir.display());
             Ok(())
         }
@@ -111,7 +113,8 @@ pub fn run(action: CaAction) -> Result<(), Error> {
             let cert = params.signed_by(&key, &issuer)?;
 
             write_private(&dir.join(format!("{name}.key")), &key.serialize_pem())?;
-            fs::write(dir.join(format!("{name}.crt")), cert.pem())?;
+            fs::write(dir.join(format!("{name}.crt")), cert.pem())
+                .map_err(io_ctx("writing", &dir.join(format!("{name}.crt"))))?;
             println!("issued {name}.crt / {name}.key in {}", dir.display());
             Ok(())
         }

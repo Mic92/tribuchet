@@ -38,6 +38,7 @@ use sandbox_proto::agent::StartRequest;
 
 use super::{Build, Options, cgroup, make_readable, msg, spawn_plain, stage_scratch};
 use crate::errors::{Error, Result, chain, err_ctx};
+use crate::fsutil::io_ctx;
 use crate::netpolicy::NetPolicy;
 use crate::sd;
 use crate::worker::sandbox::{self, SandboxSpec};
@@ -103,7 +104,8 @@ pub(super) fn stage_tmp_dir(
     // inside it otherwise. The sticky bit keeps the uid block from
     // deleting the agent's own files; the traverse-only state dir
     // hides the scratch root from other users.
-    fs::set_permissions(scratch_root, fs::Permissions::from_mode(0o1777))?;
+    fs::set_permissions(scratch_root, fs::Permissions::from_mode(0o1777))
+        .map_err(io_ctx("setting permissions on", scratch_root))?;
     let exe = env::current_exe()?;
     let (_ns_fd, ns_path) = userns::inherited_ns(&userns.fd)?;
     let status = Command::new(exe)
@@ -324,7 +326,8 @@ fn run_in_userns(confinement: &Confinement, op: &str, paths: &[PathBuf]) -> Resu
 pub fn fs_helper_stage() -> ! {
     fn run() -> Result<()> {
         let mut args = env::args_os().skip(2);
-        let ns = fs::File::open(args.next().ok_or_else(|| msg("missing userns path"))?)?;
+        let ns_path = PathBuf::from(args.next().ok_or_else(|| msg("missing userns path"))?);
+        let ns = fs::File::open(&ns_path).map_err(io_ctx("opening", &ns_path))?;
         let op = args.next().ok_or_else(|| msg("missing op"))?;
         move_into_link_name_space(ns.as_fd(), Some(LinkNameSpaceType::User))
             .map_err(err_ctx("joining the agent user namespace"))?;

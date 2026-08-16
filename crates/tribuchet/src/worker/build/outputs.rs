@@ -20,6 +20,7 @@ use super::store_base;
 use crate::capwrite::CappedWriter;
 use crate::errors::chain;
 use crate::errors::{Result, err_ctx, err_msg};
+use crate::fsutil::io_ctx;
 use crate::nar;
 use crate::store::topo_order;
 
@@ -287,7 +288,7 @@ async fn pack_one_nar(
     let mut hasher = Sha256::new();
     let mut sink = harmonia_store_ref_scan::RefScanSink::new(candidates, self_path);
     {
-        let f = fs::File::create(nar_path)?;
+        let f = fs::File::create(nar_path).map_err(io_ctx("creating", nar_path))?;
         let mut enc = zstd::stream::write::Encoder::new(f, 3)?;
         let mut tee = TeeScanner {
             zstd: &mut enc,
