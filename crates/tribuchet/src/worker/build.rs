@@ -19,17 +19,12 @@ use super::{DaemonConn, WorkerCtx, unix_now};
 use crate::chunkio::ChannelReader;
 use crate::errors::chain;
 use crate::errors::{Result, err_ctx, err_msg};
-use crate::proto::{BuildAssignment, NarTransfer, PathInfoMsg, TmpDirArchive, nar_transfer};
+use crate::proto::{
+    BuildAssignment, MAX_NAR_BYTES, MAX_RESEND_ROUNDS, NarTransfer, PathInfoMsg, TmpDirArchive,
+    nar_transfer,
+};
 use crate::store::{STORE_DIR, parse_path_info, valid_store_path};
 use crate::tmpdir::unpack_tmp_dir;
-
-/// Cap on a single NAR transfer in either direction; a `truncate -s 1P
-/// $out` build would otherwise tie up the worker and fill its disk.
-const MAX_NAR_BYTES: u64 = 64 * 1024 * 1024 * 1024;
-
-/// Cap on input re-request rounds; the set shrinks each round, so a
-/// hub that cannot deliver fails the build instead of looping.
-const MAX_RESEND_ROUNDS: u8 = 3;
 
 /// Where staging of one build stands after a hub message.
 pub(super) enum StagingStatus {
@@ -109,7 +104,7 @@ pub(super) struct ActiveBuild {
     registered: HashSet<String>,
     /// True once the tmp dir stream finished unpacking.
     tmp_dir_done: bool,
-    resend_rounds: u8,
+    resend_rounds: u32,
     /// Daemon connection; carries this build's temp roots, so it must
     /// outlive the build. None while an Importer borrows it.
     daemon: Option<DaemonConn>,
