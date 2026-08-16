@@ -6,6 +6,7 @@ use std::fs;
 use std::io;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::ptr;
@@ -84,7 +85,6 @@ pub(super) fn cleanup(_confinement: &Confinement, build: &Build) {
 /// Apply the request's seatbelt profile in the forked child right
 /// before exec.
 pub(super) fn confine(cmd: &mut Command, req: &StartRequest, build_dir: &str) -> Result<(), Error> {
-    use std::os::unix::process::CommandExt;
     if req.profile.is_empty() {
         return Ok(());
     }

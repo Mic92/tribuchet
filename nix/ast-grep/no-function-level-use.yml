@@ -1,0 +1,9 @@
+id: no-function-level-use
+message: move this `use` to the top of the module
+severity: error
+language: rust
+rule:
+  kind: use_declaration
+  inside:
+    kind: function_item
+    stopBy: end

@@ -3,6 +3,7 @@
 //! pulls in plenty and a scrape endpoint needs no routing.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -46,7 +47,6 @@ fn label(value: &str) -> String {
 }
 
 fn metric(out: &mut String, name: &str, kind: &str, help: &str, value: u64) {
-    use std::fmt::Write;
     let _ = writeln!(out, "# HELP {name} {help}");
     let _ = writeln!(out, "# TYPE {name} {kind}");
     let _ = writeln!(out, "{name} {value}");
@@ -114,7 +114,6 @@ async fn render(state: &HubState) -> String {
 /// Connected builders: a `tribuchet_builder_up` gauge per (worker,
 /// system) plus the connected and per-system totals.
 fn render_workers(out: &mut String, state: &HubState) {
-    use std::fmt::Write;
     let mut per_system: BTreeMap<String, u64> = BTreeMap::new();
     let mut builders: Vec<(String, Vec<String>)> = Vec::new();
     let caps = state.worker_caps.lock().unwrap();

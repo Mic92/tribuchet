@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
@@ -24,7 +25,6 @@ fn step(step: &'static str, path: &Path) -> impl Fn(io::Error) -> Error {
 /// file so it is never world-readable (fs::write + chmod would race)
 /// and a torn write cannot leave a short key behind.
 pub fn write_secret(path: &Path, data: &[u8]) -> Result<(), Error> {
-    use std::os::unix::fs::OpenOptionsExt;
     let tmp = path.with_extension("tmp");
     let _ = fs::remove_file(&tmp);
     let mut f = fs::OpenOptions::new()

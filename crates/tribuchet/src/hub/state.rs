@@ -1,6 +1,7 @@
 //! In-memory hub state: replay buffers, the job queue, worker capabilities.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
@@ -220,8 +221,6 @@ pub(super) struct WorkerCaps {
 /// aggregate capacity. max-jobs is omitted with no workers, leaving the
 /// base nix.conf default to govern local fallback builds.
 fn render_nix_config(caps: &HashMap<u64, WorkerCaps>, cfg: &NixConfig) -> String {
-    use std::fmt::Write as _;
-
     let systems: BTreeSet<&str> = caps
         .values()
         .flat_map(|c| c.systems.keys().map(String::as_str))

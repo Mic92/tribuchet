@@ -6,8 +6,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures_util::StreamExt as _;
+use harmonia_store_path::{StoreDir, StorePath};
+use harmonia_store_remote::DaemonStore as _;
 use harmonia_utils_signature::{PublicKey, Signature};
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncReadExt as _;
 use tokio::sync::mpsc;
 use tonic::Status;
 
@@ -271,8 +275,6 @@ async fn query_path_info_chunk(
     pool: &harmonia_store_remote::ConnectionPool,
     paths: &[String],
 ) -> Result<Vec<PathInfoMsg>> {
-    use harmonia_store_path::{StoreDir, StorePath};
-    use harmonia_store_remote::DaemonStore as _;
     let store_dir = StoreDir::default();
     let mut guard = pool
         .acquire()
@@ -337,7 +339,6 @@ async fn stream_store_path(
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
     let path = store_path.to_string();
     let task = tokio::task::spawn_blocking(move || -> Result<()> {
-        use tokio::io::AsyncReadExt as _;
         rt::name_current_thread("trib-pack");
         // harmonia's NAR pack is async-only; drive it on a current-thread
         // runtime here so its blocking file reads stay off the shared
@@ -552,9 +553,6 @@ async fn import_extra(
     info: harmonia_store_path_info::ValidPathInfo,
     rx: mpsc::Receiver<bytes::Bytes>,
 ) -> Result<()> {
-    use futures_util::StreamExt as _;
-    use harmonia_store_remote::DaemonStore as _;
-    use tokio::io::AsyncReadExt as _;
     let mut guard = pool
         .acquire()
         .await
@@ -806,6 +804,8 @@ async fn relay_build(
 
 #[cfg(test)]
 mod tests {
+    use harmonia_utils_signature::SecretKey;
+
     use super::*;
 
     fn info(path: &str, refs: &[&str]) -> PathInfoMsg {
@@ -856,7 +856,6 @@ mod tests {
     /// compromised worker cannot plant store paths on the client.
     #[tokio::test]
     async fn extras_with_wrong_signature_are_rejected() {
-        use harmonia_utils_signature::SecretKey;
         let hub_sk = SecretKey::generate("hub-trusted-key-1".into()).unwrap();
         let attacker_sk = SecretKey::generate("attacker-1".into()).unwrap();
         let vkey = hub_sk.to_public_key();

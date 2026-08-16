@@ -16,7 +16,10 @@ use crate::errors::chain;
 use crate::sockpath;
 use rustix::process::{Gid, Uid};
 use rustix::process::{geteuid, getuid};
-use rustix::thread::{set_thread_groups, set_thread_res_gid, set_thread_res_uid};
+use rustix::thread::{
+    CapabilitySet, CapabilitySets, configure_capability_in_ambient_set, set_capabilities,
+    set_keep_capabilities, set_thread_groups, set_thread_res_gid, set_thread_res_uid,
+};
 
 /// Size of each agent's mapped uid block.
 const UID_BLOCK: u32 = 65536;
@@ -145,10 +148,6 @@ fn run_once(exe: &Path, slot: &Slot) -> Result<ExitStatus, Error> {
 /// the agent needs: SETUID/SETGID for its uid-block map write, CHOWN
 /// for handing build cgroups to the mapped root uid.
 fn confine_to(uid: u32) -> io::Result<()> {
-    use rustix::thread::{
-        CapabilitySet, CapabilitySets, configure_capability_in_ambient_set, set_capabilities,
-        set_keep_capabilities,
-    };
     let keep = CapabilitySet::SETUID | CapabilitySet::SETGID | CapabilitySet::CHOWN;
     let (u, g) = (Uid::from_raw(uid), Gid::from_raw(uid));
     set_thread_groups(&[g])?;

@@ -121,7 +121,6 @@ fn launchd_sockets(out: &mut ActivatedSockets) -> Result<(), Error> {
 /// plist's `Sockets` dictionary, or None when not launchd-activated.
 #[cfg(target_os = "macos")]
 pub fn launchd_unix_listener(name: &str) -> Result<Option<UnixListener>, Error> {
-    use std::os::fd::FromRawFd as _;
     let Some(fd) = launchd_socket_fds(name)?.into_iter().next() else {
         return Ok(None);
     };

@@ -27,10 +27,11 @@ use std::convert::Infallible;
 use std::ffi::CString;
 use std::fmt::Display;
 use std::fs;
-use std::io;
+use std::io::{self, Read, Write};
 use std::iter::once;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -78,7 +79,6 @@ pub fn prepare_root(spec: &mut SandboxSpec) -> Result<(), Error> {
     // into is opened up. The build dir is already owned by the leased
     // range; the group-restricted state dir keeps other users out.
     {
-        use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(root.join("nix/store"), fs::Permissions::from_mode(0o1777))?;
     }
     Ok(())
@@ -236,7 +236,6 @@ pub const SPEC_VIA_STDIN: bool = true;
 /// post-fork `pre_exec` closure, where only async-signal-safe code is
 /// allowed.
 pub fn setup_stage() -> ! {
-    use std::io::{Read, Write};
     let err = (|| -> io::Result<Infallible> {
         let mut json = String::new();
         io::stdin().read_to_string(&mut json)?;
@@ -434,7 +433,6 @@ fn fork_into_pid_ns(status_file: &fs::File) -> io::Result<bool> {
     match unsafe { unistd::fork() }.map_err(ioerr("fork"))? {
         unistd::ForkResult::Child => Ok(true),
         unistd::ForkResult::Parent { child } => {
-            use std::io::Write;
             let child = Pid::from_raw(child.as_raw());
             // Drop every inherited fd except the status file: the
             // long-lived shim must not hold the log pipes (or the

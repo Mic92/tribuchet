@@ -4,9 +4,12 @@
 //! bind-mounts (and on macOS deletes) them, so a string that parses
 //! here but escapes /nix/store would be a path-traversal primitive.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::error;
 use std::hash::Hash;
+
+use harmonia_store_path::StoreDir;
+use harmonia_store_path_info::{NarHash, UnkeyedValidPathInfo, ValidPathInfo};
 
 use crate::proto::PathInfoMsg;
 
@@ -45,9 +48,6 @@ fn field<E: error::Error + Send + Sync + 'static>(
 pub fn parse_path_info(
     msg: &PathInfoMsg,
 ) -> Result<harmonia_store_path_info::ValidPathInfo, PathInfoError> {
-    use harmonia_store_path::StoreDir;
-    use harmonia_store_path_info::{NarHash, UnkeyedValidPathInfo, ValidPathInfo};
-    use std::collections::BTreeSet;
     let store_dir = StoreDir::default();
     Ok(ValidPathInfo {
         path: store_dir.parse(&msg.store_path).map_err(field("path"))?,

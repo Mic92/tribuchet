@@ -9,11 +9,13 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use futures_util::StreamExt as _;
 use harmonia_store_path::{StoreDir, StorePath, StorePathSet};
 use harmonia_store_path_info::{UnkeyedValidPathInfo, ValidPathInfo};
 use harmonia_store_remote::{DaemonClient, DaemonStore};
 use harmonia_utils_signature::SecretKey;
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncReadExt as _;
 use tokio::sync::mpsc;
 
 use super::pins;
@@ -140,8 +142,6 @@ async fn import_nar(
     info: &ValidPathInfo,
     rx: mpsc::Receiver<bytes::Bytes>,
 ) -> Result<()> {
-    use futures_util::StreamExt as _;
-    use tokio::io::AsyncReadExt as _;
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(Ok::<_, io::Error>);
     let reader = tokio_util::io::StreamReader::new(stream);
     let dec =

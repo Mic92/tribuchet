@@ -28,6 +28,7 @@ pub use userns::{USERNS_HOLD_ARG, hold_stage as userns_hold_stage};
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::Ordering;
@@ -279,7 +280,6 @@ pub fn run(opts: WorkerConfig) -> Result<()> {
 }
 
 async fn run_async(opts: WorkerConfig) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
     let builds_dir = opts.state_dir.join("builds");
     fs::create_dir_all(&builds_dir)?;
     // Traverse-only so leased build uids reach their own tree but
