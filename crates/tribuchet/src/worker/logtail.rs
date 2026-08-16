@@ -1,10 +1,10 @@
 //! Build-log tailing with a persisted offset, for resumed sessions.
 
 use std::fs;
-use std::io::{Read, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic;
+use std::sync::atomic::{self, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -22,7 +22,7 @@ pub(super) struct LogTail {
 
 impl LogTail {
     pub(super) fn stop(self) {
-        self.done.store(true, atomic::Ordering::Relaxed);
+        self.done.store(true, Ordering::Relaxed);
         let _ = self.handle.join();
     }
 }
@@ -39,7 +39,6 @@ impl LogCursor {
     /// Open build.log at the persisted offset. `None` when the build
     /// never started a builder.
     fn open(dir: &Path) -> Option<Self> {
-        use std::io::Seek;
         let mut file = fs::File::open(dir.join("build.log")).ok()?;
         let sent = fs::read_to_string(dir.join("log.offset"))
             .ok()
@@ -116,7 +115,6 @@ pub(super) fn spawn_log_tail(
     let done = Arc::new(atomic::AtomicBool::new(false));
     let thread_done = done.clone();
     let handle = thread::spawn(move || {
-        use atomic::Ordering;
         let done = || {
             thread_done.load(Ordering::Relaxed) || {
                 let map = ctx.resumable.lock().unwrap();

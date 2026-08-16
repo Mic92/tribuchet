@@ -16,9 +16,11 @@ use std::ffi::NulError;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
-use std::process::{self, Child};
+use std::process::{self, Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -395,8 +397,6 @@ fn handle_cleanup(
 /// scratch dir, platform confinement applied in the child right
 /// before exec.
 fn spawn_plain(req: &StartRequest, build_dir: &Path, log: &fs::File) -> Result<Child, Error> {
-    use std::os::unix::process::CommandExt;
-    use std::process::{Command, Stdio};
     let build_dir_str = build_dir
         .to_str()
         .ok_or_else(|| msg("build dir is not valid UTF-8"))?
@@ -442,7 +442,6 @@ fn reap_on_exit(
     exit: Arc<(Mutex<Option<i32>>, Condvar)>,
 ) {
     thread::spawn(move || {
-        use std::os::unix::process::ExitStatusExt;
         let code = match child.wait() {
             Ok(status) => status
                 .code()
@@ -507,7 +506,6 @@ fn kill_own_uid_processes(exempt: Option<i32>) {
 /// Symlinks are skipped, the build may have planted links to other
 /// agent-uid files.
 fn make_readable(path: &Path) {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let mut queue = vec![path.to_path_buf()];
     while let Some(path) = queue.pop() {
         let Ok(meta) = path.symlink_metadata() else {
@@ -528,6 +526,8 @@ fn make_readable(path: &Path) {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
     use super::*;
 
     #[test]
@@ -545,7 +545,6 @@ mod tests {
 
     #[test]
     fn make_readable_skips_symlinks() {
-        use std::os::unix::fs::{PermissionsExt, symlink};
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("out");
         fs::create_dir(&out).unwrap();

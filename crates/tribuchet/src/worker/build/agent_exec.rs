@@ -20,6 +20,8 @@ use crate::errors::chain;
 use crate::errors::{Result, err_ctx, err_msg};
 use crate::proto::WorkerMessage;
 use crate::tmpdir::pack_zstd_dir;
+#[cfg(target_os = "linux")]
+use crate::worker::caps::requires_uid_range;
 #[cfg(target_os = "macos")]
 use crate::worker::caps::requires_uid_range;
 use crate::worker::logtail::tail_log;
@@ -168,7 +170,6 @@ impl ActiveBuild {
     /// spawning the setup stage with it.
     #[cfg(target_os = "linux")]
     fn build_spec(&self) -> Result<sandbox::SandboxSpec> {
-        use crate::worker::caps::requires_uid_range;
         let a = &self.assignment;
         let uid_count = if requires_uid_range(&a.env) { 65536 } else { 1 };
         let spec = sandbox::prepare(

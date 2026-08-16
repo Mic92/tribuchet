@@ -11,10 +11,12 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::Once;
 use std::time::Duration;
 
 use hyper_util::rt::TokioIo;
 use tokio::sync::mpsc;
+use tonic::Code;
 use tonic::transport::{Endpoint, Uri};
 use tower::service_fn;
 
@@ -246,7 +248,6 @@ async fn attempt_build(
 /// path conflict) are final; everything else is the transport dying
 /// around a hub restart and worth resubmitting.
 fn retryable(status: &tonic::Status) -> bool {
-    use tonic::Code;
     !matches!(
         status.code(),
         Code::FailedPrecondition
@@ -262,7 +263,6 @@ fn retryable(status: &tonic::Status) -> bool {
 /// Print Nix's \x02 ready marker exactly once, however many
 /// reconnect attempts the build takes.
 fn ready_marker() -> Result<()> {
-    use std::sync::Once;
     static ONCE: Once = Once::new();
     let mut res = Ok(());
     ONCE.call_once(|| {

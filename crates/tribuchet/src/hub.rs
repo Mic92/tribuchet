@@ -13,6 +13,9 @@ use std::fs;
 use std::io;
 use std::net::SocketAddr;
 use std::os::unix::fs as unix_fs;
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -431,7 +434,6 @@ fn bind_attach_socket(socket: &Path) -> Result<tokio::net::UnixListener> {
     umask(old_umask);
     let uds = uds?;
     {
-        use std::os::unix::fs::PermissionsExt;
         unix_fs::chown(socket, None, Some(group.gid.as_raw()))?;
         fs::set_permissions(socket, fs::Permissions::from_mode(0o660))?;
     }
@@ -445,7 +447,6 @@ fn bind_attach_socket(socket: &Path) -> Result<tokio::net::UnixListener> {
 /// bind_attach_socket() puts on the socket itself.
 #[cfg(target_os = "macos")]
 fn check_attach_socket_dir(socket: &Path) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
     let Some(group) = Group::from_name("nixbld").map_err(err_ctx("looking up group nixbld"))?
     else {
         return Err(err_msg(

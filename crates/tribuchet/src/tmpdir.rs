@@ -156,7 +156,7 @@ pub(crate) fn unpack_tmp_dir(reader: impl Read, dest: &Path) -> Result<(), Error
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::{error, result};
     type Result<T> = result::Result<T, Box<dyn error::Error>>;
     use std::collections::HashMap;
@@ -240,8 +240,6 @@ mod tests {
 
     #[test]
     fn unpack_fixes_modes_and_refuses_non_basenames() -> Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-
         let data = pack(&[TmpDirFile {
             name: "file".into(),
             data: b"hi".to_vec(),
