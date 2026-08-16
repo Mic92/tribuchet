@@ -1,0 +1,11 @@
+id: no-glob-imports
+message: "import items explicitly; only `use super::*;` in test modules is idiomatic"
+severity: error
+language: rust
+rule:
+  kind: use_wildcard
+  not:
+    regex: '^super::\*$'
+  inside:
+    kind: use_declaration
+    stopBy: end

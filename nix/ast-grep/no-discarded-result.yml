@@ -1,0 +1,7 @@
+id: no-discarded-result
+message: "handle or log the error instead of discarding it with .ok()"
+severity: error
+language: rust
+rule:
+  kind: expression_statement
+  regex: '\.ok\(\);$'
