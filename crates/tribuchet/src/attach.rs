@@ -7,8 +7,10 @@
 //! Exits with the builder's exit code.
 
 use std::collections::{BTreeSet, HashMap};
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::process;
 use std::time::Duration;
 
 use hyper_util::rt::TokioIo;
@@ -17,20 +19,23 @@ use tonic::transport::{Endpoint, Uri};
 use tower::service_fn;
 
 use crate::build_json::BuildJson;
+use crate::chunkio;
 use crate::errors::{Error, Result, chain, err_ctx, err_msg};
 use crate::nar;
 use crate::proto::{
-    BuildMessage, BuildRequest, TmpDirChunk, attach_event, attach_hub_client::AttachHubClient,
-    build_message,
+    BuildMessage, BuildRequest, MAX_MSG_SIZE, OutputNar, TmpDirChunk, attach_event,
+    attach_hub_client::AttachHubClient, build_message,
 };
+use crate::rt;
+use crate::tmpdir;
 
 pub fn run(build_json: &Path, socket: &Path) -> Result<()> {
     let build = BuildJson::load(build_json)?;
-    let rt = crate::rt::runtime("trib-attach").map_err(err_ctx("creating the tokio runtime"))?;
+    let rt = rt::runtime("trib-attach").map_err(err_ctx("creating the tokio runtime"))?;
     let code = rt.block_on(run_async(build, socket.to_owned(), build_json.to_owned()))?;
     // Unix exposes only the low 8 bits of the exit status; never let a
     // nonzero code collapse to an observed 0.
-    std::process::exit(if code != 0 && code.trailing_zeros() >= 8 {
+    process::exit(if code != 0 && code.trailing_zeros() >= 8 {
         1
     } else {
         code
@@ -61,7 +66,7 @@ async fn run_async(build: BuildJson, socket: PathBuf, build_json_path: PathBuf) 
     // Nix places everything the builder consumes in topTmpDir/build.
     let tmp_dir_pack = tokio::task::spawn_blocking({
         let dir = build.top_tmp_dir.join("build");
-        move || crate::tmpdir::pack_zstd_dir(&dir)
+        move || tmpdir::pack_zstd_dir(&dir)
     })
     .await??;
     let expected_outputs: Vec<String> = req.outputs.values().cloned().collect();
@@ -112,8 +117,8 @@ enum Outcome {
 async fn connect(socket: &Path) -> Result<tonic::transport::Channel> {
     let socket = socket.to_owned();
     Endpoint::try_from("http://hub.invalid")?
-        .initial_stream_window_size(Some(crate::chunkio::H2_STREAM_WINDOW))
-        .initial_connection_window_size(Some(crate::chunkio::H2_CONNECTION_WINDOW))
+        .initial_stream_window_size(Some(chunkio::H2_STREAM_WINDOW))
+        .initial_connection_window_size(Some(chunkio::H2_CONNECTION_WINDOW))
         .connect_with_connector(service_fn(move |_: Uri| {
             let socket = socket.clone();
             async move {
@@ -135,7 +140,7 @@ fn submission(req: &BuildRequest, tmp_dir_pack: &[u8]) -> Vec<BuildMessage> {
     }];
     msgs.extend(
         tmp_dir_pack
-            .chunks(crate::chunkio::CHUNK_SIZE)
+            .chunks(chunkio::CHUNK_SIZE)
             .map(|c| tmp_dir(c.to_vec(), false)),
     );
     msgs.push(tmp_dir(Vec::new(), true));
@@ -154,8 +159,8 @@ async fn attempt_build(
         Err(e) => return Ok(Outcome::Retry(e)),
     };
     let mut client = AttachHubClient::new(channel)
-        .max_decoding_message_size(crate::proto::MAX_MSG_SIZE)
-        .max_encoding_message_size(crate::proto::MAX_MSG_SIZE);
+        .max_decoding_message_size(MAX_MSG_SIZE)
+        .max_encoding_message_size(MAX_MSG_SIZE);
 
     // Ready marker for Nix; emitted only after a hub connection
     // exists so persistent connect failures surface as setup errors,
@@ -270,8 +275,8 @@ fn ready_marker() -> Result<()> {
 type Unpacker = (mpsc::Sender<Vec<u8>>, tokio::task::JoinHandle<Result<()>>);
 
 fn remove_tree(path: &Path) {
-    let _ = std::fs::remove_dir_all(path);
-    let _ = std::fs::remove_file(path);
+    let _ = fs::remove_dir_all(path);
+    let _ = fs::remove_file(path);
 }
 
 /// Unpack directly into the output path. Nix holds the path lock and
@@ -280,7 +285,7 @@ fn remove_tree(path: &Path) {
 async fn handle_output_chunk(
     unpackers: &mut HashMap<String, Unpacker>,
     expected: &[String],
-    out: crate::proto::OutputNar,
+    out: OutputNar,
 ) -> Result<()> {
     if !expected.contains(&out.store_path) {
         return Err(err_msg(format!(
@@ -323,7 +328,7 @@ async fn handle_output_chunk(
 fn write_result_json(top_tmp_dir: &Path, added: &BTreeSet<String>) -> Result<()> {
     let path = top_tmp_dir.join("result.json");
     let body = serde_json::json!({ "addedPaths": added });
-    std::fs::write(&path, serde_json::to_vec(&body)?)
+    fs::write(&path, serde_json::to_vec(&body)?)
         .map_err(err_ctx(format!("writing {}", path.display())))
 }
 
@@ -339,12 +344,11 @@ async fn cleanup_unpackers(unpackers: &mut HashMap<String, Unpacker>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::OutputNar;
 
     /// zstd-compressed NAR of a single regular file, as the hub streams it.
     async fn zstd_nar_of_file(dir: &Path, body: &[u8]) -> Vec<u8> {
         let src = dir.join("src");
-        std::fs::write(&src, body).unwrap();
+        fs::write(&src, body).unwrap();
         let mut nar = Vec::new();
         nar::pack(&src, &mut nar).await.unwrap();
         zstd::encode_all(&nar[..], 3).unwrap()
@@ -385,14 +389,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("out");
         let out_str = out.to_string_lossy().into_owned();
-        std::fs::create_dir(&out).unwrap();
-        std::fs::write(out.join("stale"), b"junk").unwrap();
+        fs::create_dir(&out).unwrap();
+        fs::write(out.join("stale"), b"junk").unwrap();
 
         let chunk = zstd_nar_of_file(dir.path(), b"fresh").await;
         let mut unpackers = HashMap::default();
         deliver(&mut unpackers, &out_str, chunk).await.unwrap();
 
         assert!(unpackers.is_empty());
-        assert_eq!(std::fs::read(&out).unwrap(), b"fresh");
+        assert_eq!(fs::read(&out).unwrap(), b"fresh");
     }
 }

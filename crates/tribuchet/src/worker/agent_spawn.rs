@@ -3,12 +3,17 @@
 //! slot, supervises it and restarts it after it exits.
 
 use std::fs;
+use std::io;
+use std::os::unix::fs::chown as chown_path;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::process::ExitStatus;
 use std::time::{Duration, Instant};
+use std::{env, thread};
 
 use crate::errors::chain;
+use crate::sockpath;
 use rustix::process::{Gid, Uid};
 use rustix::process::{geteuid, getuid};
 use rustix::thread::{set_thread_groups, set_thread_res_gid, set_thread_res_uid};
@@ -19,12 +24,12 @@ const UID_BLOCK: u32 = 65536;
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
-    Io(#[from] std::io::Error),
+    Io(#[from] io::Error),
     #[error("{step}")]
     Step {
         step: String,
         #[source]
-        source: std::io::Error,
+        source: io::Error,
     },
     #[error("spawn-agents must be at least 1")]
     ZeroCount,
@@ -32,7 +37,7 @@ pub enum Error {
     SocketTimeout(PathBuf),
 }
 
-fn step(step: impl Into<String>) -> impl FnOnce(std::io::Error) -> Error {
+fn step(step: impl Into<String>) -> impl FnOnce(io::Error) -> Error {
     |source| Error::Step {
         step: step.into(),
         source,
@@ -55,7 +60,7 @@ pub fn spawn(state_dir: &Path, count: u32, uid_base: Option<u32>) -> Result<Vec<
     if count == 0 {
         return Err(Error::ZeroCount);
     }
-    let exe = std::env::current_exe().map_err(step("resolving the worker binary"))?;
+    let exe = env::current_exe().map_err(step("resolving the worker binary"))?;
     let root = geteuid().is_root();
     let uid_base = match (uid_base, root) {
         (Some(b), true) => Some(b),
@@ -80,12 +85,12 @@ pub fn spawn(state_dir: &Path, count: u32, uid_base: Option<u32>) -> Result<Vec<
             uid_base: uid_base.map(|b| b + i * UID_BLOCK),
         };
         if let Some(uid) = slot.uid {
-            std::os::unix::fs::chown(&dir, Some(uid), Some(uid))
+            chown_path(&dir, Some(uid), Some(uid))
                 .map_err(step(format!("chowning {}", dir.display())))?;
         }
         let _ = fs::remove_file(&slot.socket);
         sockets.push(slot.socket.clone());
-        std::thread::spawn({
+        thread::spawn({
             let exe = exe.clone();
             move || supervise(&exe, &slot)
         });
@@ -107,13 +112,13 @@ fn supervise(exe: &Path, slot: &Slot) {
             Ok(status) => tracing::info!(socket = %slot.socket.display(), %status, "agent exited"),
             Err(e) => {
                 tracing::warn!(socket = %slot.socket.display(), "starting agent: {}", chain(&e));
-                std::thread::sleep(Duration::from_secs(1));
+                thread::sleep(Duration::from_secs(1));
             }
         }
     }
 }
 
-fn run_once(exe: &Path, slot: &Slot) -> Result<std::process::ExitStatus, Error> {
+fn run_once(exe: &Path, slot: &Slot) -> Result<ExitStatus, Error> {
     let mut cmd = Command::new(exe);
     cmd.arg("agent")
         .arg("--socket")
@@ -139,7 +144,7 @@ fn run_once(exe: &Path, slot: &Slot) -> Result<std::process::ExitStatus, Error> 
 /// Switch the child to the agent uid while keeping the capabilities
 /// the agent needs: SETUID/SETGID for its uid-block map write, CHOWN
 /// for handing build cgroups to the mapped root uid.
-fn confine_to(uid: u32) -> std::io::Result<()> {
+fn confine_to(uid: u32) -> io::Result<()> {
     use rustix::thread::{
         CapabilitySet, CapabilitySets, configure_capability_in_ambient_set, set_capabilities,
         set_keep_capabilities,
@@ -173,13 +178,13 @@ fn wait_for_sockets(sockets: &[PathBuf]) -> Result<(), Error> {
     let deadline = Instant::now() + Duration::from_secs(30);
     for socket in sockets {
         loop {
-            if crate::sockpath::connect(socket).is_ok() {
+            if sockpath::connect(socket).is_ok() {
                 break;
             }
             if Instant::now() >= deadline {
                 return Err(Error::SocketTimeout(socket.clone()));
             }
-            std::thread::sleep(Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(100));
         }
     }
     Ok(())

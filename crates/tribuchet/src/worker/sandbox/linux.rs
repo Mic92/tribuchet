@@ -23,13 +23,19 @@ use rustix::thread::{
     LinkNameSpaceType, UnshareFlags, move_into_link_name_space, set_thread_gid, set_thread_groups,
     set_thread_uid, unshare_unsafe,
 };
+use std::convert::Infallible;
 use std::ffi::CString;
+use std::fmt::Display;
 use std::fs;
 use std::io;
+use std::iter::once;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::process::exit;
+use std::{env, mem, ptr};
 
 use super::{SandboxSpec, binfmt};
 
@@ -116,7 +122,7 @@ fn write_skeleton(spec: &SandboxSpec) -> Result<(), Error> {
         ("dev/stderr", "/proc/self/fd/2"),
         ("dev/ptmx", "/dev/pts/ptmx"),
     ] {
-        std::os::unix::fs::symlink(target, root.join(link))?;
+        symlink(target, root.join(link))?;
     }
     if spec.network {
         // Like Nix's fixed-output setup: name resolution via files
@@ -183,7 +189,7 @@ fn create_mount_points(spec: &SandboxSpec) -> Result<(), Error> {
         if let Some(parent) = link.parent() {
             fs::create_dir_all(parent)?;
         }
-        std::os::unix::fs::symlink(target, &link)
+        symlink(target, &link)
             .map_err(step(format!("creating symlink input {}", link.display())))?;
     }
     Ok(())
@@ -213,7 +219,7 @@ pub fn command(spec: &SandboxSpec) -> Result<Command, Error> {
     // see setup_stage() for why builds re-exec this binary. Resolve it
     // in the worker: the reaper execs this argv, and it outlives worker
     // reloads, so it must not resolve the binary in its own context.
-    let exe = std::env::current_exe().map_err(step("resolving worker binary path"))?;
+    let exe = env::current_exe().map_err(step("resolving worker binary path"))?;
     let mut cmd = Command::new(exe);
     cmd.arg(SETUP_STAGE_ARG);
     Ok(cmd)
@@ -231,9 +237,9 @@ pub const SPEC_VIA_STDIN: bool = true;
 /// allowed.
 pub fn setup_stage() -> ! {
     use std::io::{Read, Write};
-    let err = (|| -> io::Result<std::convert::Infallible> {
+    let err = (|| -> io::Result<Infallible> {
         let mut json = String::new();
-        std::io::stdin().read_to_string(&mut json)?;
+        io::stdin().read_to_string(&mut json)?;
         let spec: SandboxSpec = serde_json::from_str(&json).map_err(io::Error::other)?;
         // The builder gets /dev/null as stdin, like under Nix.
         let null = fs::File::open("/dev/null")?;
@@ -252,15 +258,12 @@ pub fn setup_stage() -> ! {
     // Write to the fd, not via eprintln!: under the unit test the
     // stage runs inside libtest, which captures macro output.
     let _ = writeln!(std::io::stderr(), "sandbox setup: {err}");
-    std::process::exit(121);
+    exit(121);
 }
 
 const CLOSE_RANGE_CLOEXEC: libc::c_uint = 4;
 
-fn enter_and_exec(
-    spec: &SandboxSpec,
-    status_file: &fs::File,
-) -> io::Result<std::convert::Infallible> {
+fn enter_and_exec(spec: &SandboxSpec, status_file: &fs::File) -> io::Result<Infallible> {
     // The agent placed this process in the build cgroup before the
     // spec arrived on stdin; CLONE_NEWCGROUP below roots the namespace
     // there.
@@ -288,7 +291,7 @@ fn enter_and_exec(
     })?;
     let prog =
         CString::new(spec.builder.as_str()).map_err(|_| io::Error::other("NUL in builder path"))?;
-    let args: Vec<CString> = std::iter::once(Ok(prog.clone()))
+    let args: Vec<CString> = once(Ok(prog.clone()))
         .chain(spec.args.iter().map(|a| CString::new(a.as_str())))
         .collect::<Result<_, _>>()
         .map_err(|_| io::Error::other("NUL in builder argument"))?;
@@ -342,21 +345,21 @@ fn existing_mount_flags(target: &Path) -> io::Result<MountFlags> {
     Ok(flags)
 }
 
-fn ioerr<E: std::fmt::Display>(step: &str) -> impl Fn(E) -> io::Error + '_ {
+fn ioerr<E: Display>(step: &str) -> impl Fn(E) -> io::Error + '_ {
     move |e| io::Error::other(format!("{step}: {e}"))
 }
 
 /// Open the tap device inside the just-created netns.
 fn open_tap(name: &str) -> io::Result<OwnedFd> {
-    let file = std::fs::OpenOptions::new()
+    let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open("/dev/net/tun")?;
-    let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+    let mut ifr: libc::ifreq = unsafe { mem::zeroed() };
     unsafe {
         // ifr_name is [c_char; _]; c_char's signedness is target-dependent,
         // so write the bytes via a u8 pointer instead of an `as` cast.
-        std::ptr::copy_nonoverlapping(
+        ptr::copy_nonoverlapping(
             name.as_ptr(),
             ifr.ifr_name.as_mut_ptr().cast::<u8>(),
             name.len().min(ifr.ifr_name.len() - 1),
@@ -408,10 +411,10 @@ fn loopback_up() -> io::Result<()> {
     )
     .map_err(ioerr("socket"))?;
     unsafe {
-        let mut ifr: libc::ifreq = std::mem::zeroed();
+        let mut ifr: libc::ifreq = mem::zeroed();
         // ifr_name is [c_char; _]; c_char's signedness is target-dependent,
         // so write the bytes via a u8 pointer instead of an `as` cast.
-        std::ptr::copy_nonoverlapping(b"lo".as_ptr(), ifr.ifr_name.as_mut_ptr().cast::<u8>(), 2);
+        ptr::copy_nonoverlapping(b"lo".as_ptr(), ifr.ifr_name.as_mut_ptr().cast::<u8>(), 2);
         #[expect(clippy::cast_possible_truncation, reason = "IFF_UP|IFF_RUNNING = 0x41")]
         {
             ifr.ifr_ifru.ifru_flags = (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
@@ -549,11 +552,11 @@ fn setup(p: &SetupParams) -> io::Result<()> {
 
     // pivot_root + detach the old root: unlike a bare chroot, the
     // host filesystem is no longer reachable in this namespace.
-    std::env::set_current_dir(&spec.root).map_err(ioerr("chdir to root"))?;
+    env::set_current_dir(&spec.root).map_err(ioerr("chdir to root"))?;
     pivot_root(".", ".").map_err(ioerr("pivot_root"))?;
     unmount(".", UnmountFlags::DETACH).map_err(ioerr("detaching old root"))?;
-    std::env::set_current_dir("/").map_err(ioerr("chdir /"))?;
-    std::env::set_current_dir(&spec.cwd)
+    env::set_current_dir("/").map_err(ioerr("chdir /"))?;
+    env::set_current_dir(&spec.cwd)
         .map_err(|e| io::Error::other(format!("chdir {}: {e}", spec.cwd)))?;
 
     if let Some(line) = p.binfmt_line {

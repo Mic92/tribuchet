@@ -3,14 +3,17 @@
 
 use std::ffi::CString;
 use std::fs;
+use std::io;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::ptr;
 
 use sandbox_proto::agent::{SCRATCH_DIR_PARAM, StartRequest};
 
-use super::{Error, Options};
+use super::{Build, Error, Options, make_readable, spawn_plain, stage_scratch};
+use crate::sd;
 
 /// Per-agent confinement state. macOS confinement is per build (the
 /// seatbelt profile arrives with the Start request), so nothing is
@@ -36,7 +39,7 @@ pub(super) fn stage_tmp_dir(
     build_dir: &Path,
     pack: OwnedFd,
 ) -> Result<(), Error> {
-    super::stage_scratch(fs::File::from(pack), build_dir)
+    stage_scratch(fs::File::from(pack), build_dir)
 }
 
 /// Exec the builder under the request's seatbelt profile. Outputs land
@@ -48,14 +51,14 @@ pub(super) fn spawn_builder(
     build_dir: &Path,
     log: &fs::File,
 ) -> Result<(Child, Option<PathBuf>), Error> {
-    Ok((super::spawn_plain(req, build_dir, log)?, None))
+    Ok((spawn_plain(req, build_dir, log)?, None))
 }
 
 /// Make outputs readable for the worker; they live at their real
 /// store paths and are agent-owned.
 pub(super) fn finish(_confinement: &Confinement, _root: Option<&Path>, outputs: &[String]) {
     for out in outputs {
-        super::make_readable(Path::new(out));
+        make_readable(Path::new(out));
     }
 }
 
@@ -63,14 +66,14 @@ pub(super) fn finish(_confinement: &Confinement, _root: Option<&Path>, outputs: 
 /// uid owns everything, so a plain removal suffices.
 pub(super) fn clean_scratch(_confinement: &Confinement, scratch_root: &Path) -> Result<(), Error> {
     match fs::remove_dir_all(scratch_root) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e.into()),
         _ => Ok(()),
     }
 }
 
 /// Remove the build's scratch tree and its store-path outputs; the
 /// sticky store dir lets the owning agent delete them.
-pub(super) fn cleanup(_confinement: &Confinement, build: &super::Build) {
+pub(super) fn cleanup(_confinement: &Confinement, build: &Build) {
     let _ = fs::remove_dir_all(&build.scratch_root);
     for out in &build.outputs {
         let _ = fs::remove_dir_all(out);
@@ -98,11 +101,11 @@ pub(super) fn confine(cmd: &mut Command, req: &StartRequest, build_dir: &str) ->
 /// launchd-held listener (socket named "agent" in the plist), or None
 /// when not launchd-activated.
 pub(super) fn activated_unix_listener() -> Result<Option<UnixListener>, Error> {
-    Ok(crate::sd::launchd_unix_listener("agent")?)
+    Ok(sd::launchd_unix_listener("agent")?)
 }
 
 pub(super) fn peer_uid(conn: &UnixStream) -> Result<u32, Error> {
-    let (uid, _) = nix::unistd::getpeereid(conn).map_err(std::io::Error::from)?;
+    let (uid, _) = nix::unistd::getpeereid(conn).map_err(io::Error::from)?;
     Ok(uid.as_raw())
 }
 
@@ -161,7 +164,7 @@ impl Seatbelt {
             owned.push(CString::new(*v)?);
         }
         let mut param_ptrs: Vec<*const libc::c_char> = owned.iter().map(|c| c.as_ptr()).collect();
-        param_ptrs.push(std::ptr::null());
+        param_ptrs.push(ptr::null());
         Ok(Self {
             profile,
             _params: owned,
@@ -169,7 +172,7 @@ impl Seatbelt {
         })
     }
 
-    fn apply(&self) -> std::io::Result<()> {
+    fn apply(&self) -> io::Result<()> {
         unsafe extern "C" {
             fn sandbox_init_with_parameters(
                 profile: *const libc::c_char,
@@ -179,7 +182,7 @@ impl Seatbelt {
             ) -> libc::c_int;
             fn sandbox_free_error(errorbuf: *mut libc::c_char);
         }
-        let mut err: *mut libc::c_char = std::ptr::null_mut();
+        let mut err: *mut libc::c_char = ptr::null_mut();
         let rc = unsafe {
             sandbox_init_with_parameters(
                 self.profile.as_ptr(),
@@ -196,6 +199,6 @@ impl Seatbelt {
         if !err.is_null() {
             unsafe { sandbox_free_error(err) };
         }
-        Err(std::io::Error::other("sandbox_init_with_parameters failed"))
+        Err(io::Error::other("sandbox_init_with_parameters failed"))
     }
 }

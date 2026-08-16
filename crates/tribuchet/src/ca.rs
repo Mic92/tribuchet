@@ -6,21 +6,24 @@
 //! works on workers).
 
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
+
+use crate::fsutil;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
-    Io(#[from] std::io::Error),
+    Io(#[from] io::Error),
     #[error(transparent)]
     Rcgen(#[from] rcgen::Error),
     #[error(transparent)]
-    Secret(#[from] crate::fsutil::Error),
+    Secret(#[from] fsutil::Error),
     #[error("reading {0}")]
-    Read(&'static str, #[source] std::io::Error),
+    Read(&'static str, #[source] io::Error),
     #[error("invalid certificate name {0:?}")]
     InvalidName(String),
     #[error("{0} already exists; refusing to overwrite key material")]
@@ -43,7 +46,7 @@ pub enum CaAction {
 }
 
 fn write_private(path: &Path, data: &str) -> Result<(), Error> {
-    Ok(crate::fsutil::write_secret(path, data.as_bytes())?)
+    Ok(fsutil::write_secret(path, data.as_bytes())?)
 }
 
 /// Issued names become file names and certificate SANs; restrict them

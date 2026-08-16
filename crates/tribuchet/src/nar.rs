@@ -4,7 +4,7 @@
 //! preserves only executable bits and symlinks, and its hash matches
 //! Nix's narHash, keeping us interoperable with caches and signatures.
 
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use futures_util::StreamExt as _;
@@ -17,10 +17,10 @@ pub enum Error {
     Pack {
         path: PathBuf,
         #[source]
-        source: std::io::Error,
+        source: io::Error,
     },
     #[error("writing NAR")]
-    Write(#[source] std::io::Error),
+    Write(#[source] io::Error),
     #[error("unpacking into {path}")]
     Unpack {
         path: PathBuf,
@@ -46,7 +46,7 @@ pub async fn pack(path: &Path, w: &mut impl Write) -> Result<(), Error> {
 /// `dest` (must not exist). Ends when the sender closes the channel.
 pub async fn unpack_zstd_chunks(rx: mpsc::Receiver<Vec<u8>>, dest: &Path) -> Result<(), Error> {
     let chunks = tokio_stream::wrappers::ReceiverStream::new(rx)
-        .map(|c| Ok::<_, std::io::Error>(bytes::Bytes::from(c)));
+        .map(|c| Ok::<_, io::Error>(bytes::Bytes::from(c)));
     let dec = async_compression::tokio::bufread::ZstdDecoder::new(
         tokio_util::io::StreamReader::new(chunks),
     );
@@ -67,9 +67,12 @@ pub async fn unpack_zstd_chunks(rx: mpsc::Receiver<Vec<u8>>, dest: &Path) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+    use std::{error, result};
+    type Result<T> = result::Result<T, Box<dyn error::Error>>;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::symlink;
+    use std::process::Command;
 
     async fn round_trip_via_zstd(src: &Path, dest: &Path) -> Result<()> {
         let mut nar = Vec::new();
@@ -96,8 +99,8 @@ mod tests {
             src.path().join("dir/exe"),
             fs::Permissions::from_mode(0o755),
         )?;
-        std::os::unix::fs::symlink("file", src.path().join("link"))?;
-        std::os::unix::fs::symlink("/nowhere", src.path().join("dangling"))?;
+        symlink("file", src.path().join("link"))?;
+        symlink("/nowhere", src.path().join("dangling"))?;
 
         let out = tempfile::tempdir()?;
         let dest = out.path().join("restored");
@@ -127,7 +130,7 @@ mod tests {
         let src = tempfile::tempdir()?;
         fs::write(src.path().join("target"), b"hello")?;
         let link = src.path().join("link");
-        std::os::unix::fs::symlink(src.path().join("target"), &link)?;
+        symlink(src.path().join("target"), &link)?;
 
         let out = tempfile::tempdir()?;
         let dest = out.path().join("restored");
@@ -139,10 +142,7 @@ mod tests {
 
         let mut ours = Vec::new();
         pack(&link, &mut ours).await?;
-        if let Ok(o) = std::process::Command::new("nix-store")
-            .arg("--dump")
-            .arg(&link)
-            .output()
+        if let Ok(o) = Command::new("nix-store").arg("--dump").arg(&link).output()
             && o.status.success()
         {
             assert_eq!(ours, o.stdout);
@@ -155,10 +155,10 @@ mod tests {
     async fn matches_nix_store_dump() -> Result<()> {
         let src = tempfile::tempdir()?;
         fs::write(src.path().join("a"), b"x")?;
-        std::os::unix::fs::symlink("a", src.path().join("b"))?;
+        symlink("a", src.path().join("b"))?;
         let mut ours = Vec::new();
         pack(src.path(), &mut ours).await?;
-        let theirs = match std::process::Command::new("nix-store")
+        let theirs = match Command::new("nix-store")
             .arg("--dump")
             .arg(src.path())
             .output()

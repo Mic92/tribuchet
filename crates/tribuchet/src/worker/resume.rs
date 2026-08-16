@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::io::Read;
+use std::panic;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -14,7 +15,7 @@ use tokio::sync::mpsc;
 use super::build::ActiveBuild;
 use super::build::supervise_agent;
 use super::logtail::LogTail;
-use super::{DaemonConn, WorkerCtx, msg, sandbox};
+use super::{DaemonConn, WorkerCtx, agents, msg, remove_build_dir, sandbox};
 use crate::chunkio::CHUNK_SIZE;
 use crate::errors::chain;
 use crate::errors::{Result, err_msg};
@@ -40,7 +41,7 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>, signing_key: &Arc<SecretK
             continue; // already swept by sweep_state_dir
         };
         let Ok(st) = serde_json::from_str::<ResumeState>(&s) else {
-            super::remove_build_dir(&dir);
+            remove_build_dir(&dir);
             continue;
         };
         // Something must tie the persisted state to live processes,
@@ -49,11 +50,11 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>, signing_key: &Arc<SecretK
         let agent = {
             let Some(socket) = st.agent_socket.clone() else {
                 tracing::warn!(id = st.build_id, "dropping unadoptable running build");
-                super::remove_build_dir(&dir);
+                remove_build_dir(&dir);
                 continue;
             };
             ctx.agents.reserve(&socket);
-            match super::agents::AgentBuild::adopt(&socket, &st.build_id) {
+            match agents::AgentBuild::adopt(&socket, &st.build_id) {
                 Ok((build, _)) => (socket, build),
                 Err(e) => {
                     tracing::warn!(
@@ -62,7 +63,7 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>, signing_key: &Arc<SecretK
                         chain(&e)
                     );
                     ctx.agents.release(socket);
-                    super::remove_build_dir(&dir);
+                    remove_build_dir(&dir);
                     continue;
                 }
             }
@@ -109,7 +110,7 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>, signing_key: &Arc<SecretK
 /// agents are already out of the pool.
 pub(super) fn sweep_orphaned_agent_builds(ctx: &Arc<WorkerCtx>) {
     for socket in ctx.agents.idle_sockets() {
-        let id = match super::agents::current_build(&socket) {
+        let id = match agents::current_build(&socket) {
             Ok(Some(id)) => id,
             Ok(None) => continue,
             Err(e) => {
@@ -123,8 +124,8 @@ pub(super) fn sweep_orphaned_agent_builds(ctx: &Arc<WorkerCtx>) {
         ctx.agents.reserve(&socket);
         let ctx = ctx.clone();
         tokio::task::spawn_blocking(move || {
-            let _ = super::agents::kill(&socket, &id);
-            if let Err(e) = super::agents::cleanup(&socket, &id) {
+            let _ = agents::kill(&socket, &id);
+            if let Err(e) = agents::cleanup(&socket, &id) {
                 tracing::warn!(id, "orphaned build cleanup failed: {}", chain(&e));
             }
             ctx.agents.release(socket);
@@ -136,7 +137,7 @@ pub(super) fn sweep_orphaned_agent_builds(ctx: &Arc<WorkerCtx>) {
 /// redelivery to a resumed session.
 fn adopt_finished(ctx: &Arc<WorkerCtx>, state_json: &str, dir: PathBuf) {
     let Ok(f) = serde_json::from_str::<FinishedState>(state_json) else {
-        super::remove_build_dir(&dir);
+        remove_build_dir(&dir);
         return;
     };
     tracing::info!(id = f.build_id, "adopted finished build awaiting delivery");
@@ -206,7 +207,7 @@ pub(super) fn spawn_resumable_reaper(ctx: Arc<WorkerCtx>) {
                 });
             }
             for (key, dir) in expired {
-                super::remove_build_dir(&dir);
+                remove_build_dir(&dir);
                 tracing::warn!(
                     key,
                     "dropping undelivered build result (no resume within TTL)"
@@ -360,7 +361,7 @@ pub(super) fn execute_to_finished(
     signing_key: &SecretKey,
     timeout: Duration,
 ) -> FinishedBuild {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    panic::catch_unwind(panic::AssertUnwindSafe(|| {
         build.execute(out_tx, signing_key, timeout)
     }))
     .unwrap_or_else(|_| Err(err_msg("build execution panicked")))
@@ -469,7 +470,7 @@ pub(super) fn ack_delivery(ctx: &Arc<WorkerCtx>, key: &str, build_id: &str) {
         }
     };
     if let Some(e) = removed {
-        super::remove_build_dir(&e.dir);
+        remove_build_dir(&e.dir);
         tracing::info!(id = build_id, "build result acknowledged");
     }
 }

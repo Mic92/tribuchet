@@ -4,6 +4,12 @@
 //! bind-mounts (and on macOS deletes) them, so a string that parses
 //! here but escapes /nix/store would be a path-traversal primitive.
 
+use std::collections::HashSet;
+use std::error;
+use std::hash::Hash;
+
+use crate::proto::PathInfoMsg;
+
 /// Only the canonical Nix store is served; clients must not anchor
 /// path validation at an arbitrary prefix.
 pub const STORE_DIR: &str = "/nix/store";
@@ -23,10 +29,10 @@ pub fn valid_store_path(store_dir: &str, path: &str) -> bool {
 pub struct PathInfoError {
     field: &'static str,
     #[source]
-    source: Box<dyn std::error::Error + Send + Sync>,
+    source: Box<dyn error::Error + Send + Sync>,
 }
 
-fn field<E: std::error::Error + Send + Sync + 'static>(
+fn field<E: error::Error + Send + Sync + 'static>(
     field: &'static str,
 ) -> impl Fn(E) -> PathInfoError {
     move |source| PathInfoError {
@@ -37,7 +43,7 @@ fn field<E: std::error::Error + Send + Sync + 'static>(
 
 /// Wire metadata -> daemon ValidPathInfo.
 pub fn parse_path_info(
-    msg: &crate::proto::PathInfoMsg,
+    msg: &PathInfoMsg,
 ) -> Result<harmonia_store_path_info::ValidPathInfo, PathInfoError> {
     use harmonia_store_path::StoreDir;
     use harmonia_store_path_info::{NarHash, UnkeyedValidPathInfo, ValidPathInfo};
@@ -79,12 +85,12 @@ pub fn parse_path_info(
 /// `refs_of` returns only edges within the node set. Cycle-safe.
 pub fn topo_order<K, I, F>(roots: I, mut refs_of: F) -> Vec<K>
 where
-    K: Eq + std::hash::Hash + Clone,
+    K: Eq + Hash + Clone,
     I: IntoIterator<Item = K>,
     F: FnMut(&K) -> Vec<K>,
 {
     let mut order = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     let mut stack: Vec<(K, bool)> = Vec::new();
     for root in roots {
         stack.push((root, false));

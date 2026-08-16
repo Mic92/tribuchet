@@ -22,6 +22,7 @@
 // struct's `timed_out` field reads naturally despite the lint.
 #![allow(clippy::too_many_lines, clippy::struct_field_names)]
 
+use std::env;
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::Once;
@@ -55,7 +56,7 @@ impl Node {
 }
 
 fn env(key: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| panic!("missing env var {key}"))
+    env::var(key).unwrap_or_else(|_| panic!("missing env var {key}"))
 }
 
 fn bash() -> String {
