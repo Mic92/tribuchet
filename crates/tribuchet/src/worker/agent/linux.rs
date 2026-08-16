@@ -121,9 +121,9 @@ pub(super) fn stage_tmp_dir(
     Ok(())
 }
 
-/// Spawn the build. With a sandbox spec from the worker the setup
-/// stage runs it inside the agent's pre-mapped user namespace; without
-/// one (development, tests) the builder is exec'd directly.
+/// Spawn the build inside the pre-mapped user namespace. Only a
+/// dev-mode agent (no --uid-base) may exec directly: on a confined
+/// agent a spec-less Start would be an unsandboxed escape.
 pub(super) fn spawn_builder(
     confinement: &Confinement,
     req: &StartRequest,
@@ -132,6 +132,9 @@ pub(super) fn spawn_builder(
     log: &fs::File,
 ) -> Result<(Child, Option<PathBuf>), Error> {
     let Some(sandbox_json) = &req.sandbox_json else {
+        if confinement.userns.is_some() {
+            return Err(msg("refusing an unsandboxed build on a confined agent"));
+        }
         return Ok((spawn_plain(req, build_dir, log)?, None));
     };
     let userns = confinement
@@ -468,4 +471,31 @@ pub(super) fn own_uid_pids() -> Vec<i32> {
             (real_uid == uid).then_some(pid)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn confined_agent_refuses_an_unsandboxed_start() -> Result<()> {
+        let Ok((holder, fd)) = UsernsHolder::new() else {
+            eprintln!("skipping: cannot create a user namespace here");
+            return Ok(());
+        };
+        let confinement = Confinement {
+            userns: Some(Userns {
+                holder,
+                fd,
+                uid_base: 65536,
+            }),
+            cgroup_base: None,
+        };
+        let dir = tempfile::tempdir()?;
+        let log = fs::File::create(dir.path().join("log"))?;
+        let req = StartRequest::default();
+        let err = spawn_builder(&confinement, &req, dir.path(), dir.path(), &log).unwrap_err();
+        assert!(err.to_string().contains("refusing an unsandboxed build"));
+        Ok(())
+    }
 }
