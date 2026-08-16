@@ -184,9 +184,12 @@ pub fn notify_ready() {
 /// stop while builds drain). Never resolves if no handler can be
 /// installed.
 pub async fn stop_requested() {
-    let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-    else {
-        return future::pending().await;
+    let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("installing the SIGTERM handler failed, graceful stop disabled: {e}");
+            return future::pending().await;
+        }
     };
     term.recv().await;
     let _ = sd_notify::notify(&[sd_notify::NotifyState::Stopping]);
