@@ -14,7 +14,7 @@ use std::collections::HashMap;
 #[cfg(target_os = "macos")]
 use std::ffi::NulError;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -33,62 +33,9 @@ use sandbox_proto::agent::{
 };
 use sandbox_proto::framing;
 
-use crate::errors::chain;
-use crate::sd;
+use crate::errors::{Error, Result, chain, err_ctx};
 use crate::sockpath;
-use crate::tmpdir;
 use crate::tmpdir::unpack_tmp_dir;
-use crate::worker::{sandbox, userns};
-
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error(transparent)]
-    Io(#[from] io::Error),
-    #[error("{step}")]
-    Step {
-        step: String,
-        #[source]
-        source: io::Error,
-    },
-    #[error("{0}")]
-    Msg(String),
-    #[error(transparent)]
-    Framing(#[from] framing::Error),
-    #[error("unpacking the tmp dir")]
-    UnpackTmpDir(#[source] tmpdir::Error),
-    #[error("staging the tmp dir")]
-    StageTmpDir(#[source] Box<Error>),
-    #[cfg(target_os = "linux")]
-    #[error(transparent)]
-    Userns(#[from] userns::Error),
-    #[cfg(target_os = "linux")]
-    #[error(transparent)]
-    Cgroup(#[from] cgroup::Error),
-    #[cfg(target_os = "linux")]
-    #[error(transparent)]
-    Sandbox(#[from] sandbox::Error),
-    #[error(transparent)]
-    Activation(#[from] sd::Error),
-    #[cfg(target_os = "linux")]
-    #[error("decoding the sandbox spec")]
-    DecodeSpec(#[source] serde_json::Error),
-    #[cfg(target_os = "linux")]
-    #[error("creating the sandbox root skeleton")]
-    PrepareRoot(#[source] sandbox::Error),
-    #[cfg(target_os = "linux")]
-    #[error("creating the agent user namespace")]
-    CreateUserns(#[source] userns::Error),
-    #[cfg(target_os = "macos")]
-    #[error("NUL byte in the seatbelt profile or parameters")]
-    Nul(#[from] NulError),
-}
-
-fn step<E: Into<io::Error>>(step: impl Into<String>) -> impl FnOnce(E) -> Error {
-    |source| Error::Step {
-        step: step.into(),
-        source: source.into(),
-    }
-}
 
 fn msg(m: impl Into<String>) -> Error {
     Error::Msg(m.into())
@@ -98,10 +45,10 @@ fn msg(m: impl Into<String>) -> Error {
 /// creating it even for an empty stream. Files belong to whoever runs
 /// this: the agent on the direct-exec and macOS paths, in-ns root
 /// through the userns helper on the Linux namespace path.
-fn stage_scratch(pack: impl Read, build_dir: &Path) -> Result<(), Error> {
+fn stage_scratch(pack: impl Read, build_dir: &Path) -> Result<()> {
     fs::create_dir_all(build_dir)?;
     let dec = zstd::stream::read::Decoder::new(pack)?;
-    unpack_tmp_dir(dec, build_dir).map_err(Error::UnpackTmpDir)
+    unpack_tmp_dir(dec, build_dir).map_err(err_ctx("unpacking the tmp dir"))
 }
 
 #[cfg(target_os = "linux")]
@@ -174,10 +121,10 @@ impl Agent {
     }
 }
 
-pub fn run(opts: &Options) -> Result<(), Error> {
+pub fn run(opts: &Options) -> Result<()> {
     let confinement = platform::Confinement::init(opts)?;
     let (listener, activated) = listener(opts.socket.as_deref())?;
-    fs::create_dir_all(&opts.state_dir).map_err(step(format!(
+    fs::create_dir_all(&opts.state_dir).map_err(err_ctx(format!(
         "creating state dir {}",
         opts.state_dir.display()
     )))?;
@@ -185,7 +132,7 @@ pub fn run(opts: &Options) -> Result<(), Error> {
         // Canonical vnode path: scratch dirs derived from it feed the
         // builder's env, cwd and the seatbelt SCRATCH_DIR filter, and
         // Seatbelt only matches canonical paths.
-        state_dir: opts.state_dir.canonicalize().map_err(step(format!(
+        state_dir: opts.state_dir.canonicalize().map_err(err_ctx(format!(
             "canonicalizing state dir {}",
             opts.state_dir.display()
         )))?,
@@ -197,7 +144,7 @@ pub fn run(opts: &Options) -> Result<(), Error> {
     tracing::info!(uid = getuid().as_raw(), "agent listening");
     let inflight = Arc::new(AtomicUsize::new(0));
     for conn in listener.incoming() {
-        let conn = conn.map_err(step("accepting connection"))?;
+        let conn = conn.map_err(err_ctx("accepting connection"))?;
         let agent = agent.clone();
         let inflight = inflight.clone();
         inflight.fetch_add(1, Ordering::SeqCst);
@@ -230,11 +177,11 @@ fn listener(socket: Option<&Path>) -> Result<(UnixListener, bool), Error> {
     }
     let path = socket.ok_or_else(|| msg("no activated socket and no --socket given"))?;
     let _ = fs::remove_file(path);
-    let l = sockpath::bind(path).map_err(step(format!("binding {}", path.display())))?;
+    let l = sockpath::bind(path).map_err(err_ctx(format!("binding {}", path.display())))?;
     Ok((l, false))
 }
 
-fn handle(agent: &Arc<Agent>, conn: &UnixStream) -> Result<(), Error> {
+fn handle(agent: &Arc<Agent>, conn: &UnixStream) -> Result<()> {
     let peer_uid = platform::peer_uid(conn)?;
     if peer_uid != agent.worker_uid {
         return Err(msg(format!(
@@ -262,7 +209,7 @@ fn handle_start(
     conn: &UnixStream,
     req: StartRequest,
     fds: Vec<OwnedFd>,
-) -> Result<(), Error> {
+) -> Result<()> {
     if req.build_id.len() != 32 || !req.build_id.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(msg(format!("invalid build id {:?}", req.build_id)));
     }
@@ -286,7 +233,7 @@ fn handle_start(
         platform::clean_scratch(&agent.confinement, &scratch_root)?;
         fs::create_dir_all(&scratch_root)?;
         platform::stage_tmp_dir(&agent.confinement, &scratch_root, &build_dir, tmp_pack)
-            .map_err(|e| Error::StageTmpDir(Box::new(e)))?;
+            .map_err(err_ctx("staging the tmp dir"))?;
 
         let (child, sandbox_root) =
             platform::spawn_builder(&agent.confinement, &req, &scratch_root, &build_dir, &log_w)?;
@@ -322,7 +269,7 @@ fn handle_start(
     notify_exit(conn, &exit)
 }
 
-fn handle_adopt(agent: &Arc<Agent>, conn: &UnixStream, req: &AdoptRequest) -> Result<(), Error> {
+fn handle_adopt(agent: &Arc<Agent>, conn: &UnixStream, req: &AdoptRequest) -> Result<()> {
     let (pid, build_dir, exit) = {
         let current = agent.current.lock().unwrap();
         match current.as_ref() {
@@ -346,7 +293,7 @@ fn handle_adopt(agent: &Arc<Agent>, conn: &UnixStream, req: &AdoptRequest) -> Re
     notify_exit(conn, &exit)
 }
 
-fn handle_kill(agent: &Arc<Agent>, conn: &UnixStream, req: &KillRequest) -> Result<(), Error> {
+fn handle_kill(agent: &Arc<Agent>, conn: &UnixStream, req: &KillRequest) -> Result<()> {
     let pid = {
         let current = agent.current.lock().unwrap();
         match current.as_ref() {
@@ -358,7 +305,7 @@ fn handle_kill(agent: &Arc<Agent>, conn: &UnixStream, req: &KillRequest) -> Resu
     framing::send_reply(conn, reply::Reply::Empty(Empty {}), &[]).map_err(Error::Framing)
 }
 
-fn handle_finish(agent: &Arc<Agent>, conn: &UnixStream, req: &FinishRequest) -> Result<(), Error> {
+fn handle_finish(agent: &Arc<Agent>, conn: &UnixStream, req: &FinishRequest) -> Result<()> {
     let (outputs, root) = {
         let current = agent.current.lock().unwrap();
         match current.as_ref() {
@@ -370,11 +317,7 @@ fn handle_finish(agent: &Arc<Agent>, conn: &UnixStream, req: &FinishRequest) -> 
     framing::send_reply(conn, reply::Reply::Empty(Empty {}), &[]).map_err(Error::Framing)
 }
 
-fn handle_cleanup(
-    agent: &Arc<Agent>,
-    conn: &UnixStream,
-    req: &CleanupRequest,
-) -> Result<(), Error> {
+fn handle_cleanup(agent: &Arc<Agent>, conn: &UnixStream, req: &CleanupRequest) -> Result<()> {
     let build = {
         let mut current = agent.current.lock().unwrap();
         match current.as_ref() {
@@ -396,7 +339,7 @@ fn handle_cleanup(
 /// process group, stdio on the log file, cwd and env rewritten to the
 /// scratch dir, platform confinement applied in the child right
 /// before exec.
-fn spawn_plain(req: &StartRequest, build_dir: &Path, log: &fs::File) -> Result<Child, Error> {
+fn spawn_plain(req: &StartRequest, build_dir: &Path, log: &fs::File) -> Result<Child> {
     let build_dir_str = build_dir
         .to_str()
         .ok_or_else(|| msg("build dir is not valid UTF-8"))?
@@ -415,7 +358,7 @@ fn spawn_plain(req: &StartRequest, build_dir: &Path, log: &fs::File) -> Result<C
     cmd.process_group(0);
     platform::confine(&mut cmd, req, &build_dir_str)?;
     cmd.spawn()
-        .map_err(step(format!("spawning builder {}", req.builder)))
+        .map_err(err_ctx(format!("spawning builder {}", req.builder)))
 }
 
 /// Rewrite env values referencing the hub's in-sandbox tmp dir (e.g.
@@ -461,7 +404,7 @@ fn reap_on_exit(
 /// Send the exit notice on the leasing connection once the builder is
 /// reaped. A vanished worker just closes the connection; the exit code
 /// stays available for Adopt.
-fn notify_exit(conn: &UnixStream, exit: &(Mutex<Option<i32>>, Condvar)) -> Result<(), Error> {
+fn notify_exit(conn: &UnixStream, exit: &(Mutex<Option<i32>>, Condvar)) -> Result<()> {
     let mut code = exit.0.lock().unwrap();
     while code.is_none() {
         code = exit.1.wait(code).unwrap();

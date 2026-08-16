@@ -8,9 +8,9 @@ use std::fmt::Write as _;
 use std::{error, io, result};
 
 use crate::proto::WorkerMessage;
+use crate::worker::sandbox;
 #[cfg(target_os = "linux")]
-use crate::worker::agent_spawn;
-use crate::worker::{agent, sandbox};
+use crate::worker::userns;
 use crate::{build_json, ca, config, fsutil, nar, sd, store, tmpdir};
 
 /// Error for the hub, attach and main orchestration paths, where a
@@ -48,18 +48,16 @@ pub enum Error {
     #[error(transparent)]
     Ca(#[from] ca::Error),
     #[error(transparent)]
-    Agent(#[from] agent::Error),
-    #[error(transparent)]
     Grpc(#[from] tonic::Status),
-    #[error("hub connection lost")]
-    Send(#[from] tokio::sync::mpsc::error::SendError<WorkerMessage>),
-    #[error(transparent)]
-    Framing(#[from] sandbox_proto::framing::Error),
     #[error(transparent)]
     Sandbox(#[from] sandbox::Error),
     #[cfg(target_os = "linux")]
     #[error(transparent)]
-    AgentSpawn(#[from] agent_spawn::Error),
+    Userns(#[from] userns::Error),
+    #[error("hub connection lost")]
+    Send(#[from] tokio::sync::mpsc::error::SendError<WorkerMessage>),
+    #[error(transparent)]
+    Framing(#[from] sandbox_proto::framing::Error),
     #[error(transparent)]
     Secret(#[from] fsutil::Error),
     #[error(transparent)]

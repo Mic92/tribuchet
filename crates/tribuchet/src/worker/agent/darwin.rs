@@ -22,7 +22,7 @@ use crate::sd;
 pub(super) struct Confinement;
 
 impl Confinement {
-    pub(super) fn init(_opts: &Options) -> Result<Self, Error> {
+    pub(super) fn init(_opts: &Options) -> Result<Self> {
         Ok(Self)
     }
 
@@ -39,7 +39,7 @@ pub(super) fn stage_tmp_dir(
     _scratch_root: &Path,
     build_dir: &Path,
     pack: OwnedFd,
-) -> Result<(), Error> {
+) -> Result<()> {
     stage_scratch(fs::File::from(pack), build_dir)
 }
 
@@ -65,7 +65,7 @@ pub(super) fn finish(_confinement: &Confinement, _root: Option<&Path>, outputs: 
 
 /// Remove a stale scratch tree before a new build. The agent's own
 /// uid owns everything, so a plain removal suffices.
-pub(super) fn clean_scratch(_confinement: &Confinement, scratch_root: &Path) -> Result<(), Error> {
+pub(super) fn clean_scratch(_confinement: &Confinement, scratch_root: &Path) -> Result<()> {
     match fs::remove_dir_all(scratch_root) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e.into()),
         _ => Ok(()),
@@ -84,7 +84,7 @@ pub(super) fn cleanup(_confinement: &Confinement, build: &Build) {
 
 /// Apply the request's seatbelt profile in the forked child right
 /// before exec.
-pub(super) fn confine(cmd: &mut Command, req: &StartRequest, build_dir: &str) -> Result<(), Error> {
+pub(super) fn confine(cmd: &mut Command, req: &StartRequest, build_dir: &str) -> Result<()> {
     if req.profile.is_empty() {
         return Ok(());
     }
@@ -100,11 +100,11 @@ pub(super) fn confine(cmd: &mut Command, req: &StartRequest, build_dir: &str) ->
 
 /// launchd-held listener (socket named "agent" in the plist), or None
 /// when not launchd-activated.
-pub(super) fn activated_unix_listener() -> Result<Option<UnixListener>, Error> {
+pub(super) fn activated_unix_listener() -> Result<Option<UnixListener>> {
     Ok(sd::launchd_unix_listener("agent")?)
 }
 
-pub(super) fn peer_uid(conn: &UnixStream) -> Result<u32, Error> {
+pub(super) fn peer_uid(conn: &UnixStream) -> Result<u32> {
     let (uid, _) = nix::unistd::getpeereid(conn).map_err(io::Error::from)?;
     Ok(uid.as_raw())
 }
@@ -156,7 +156,7 @@ unsafe impl Send for Seatbelt {}
 unsafe impl Sync for Seatbelt {}
 
 impl Seatbelt {
-    fn new(profile: &str, params: &[(&str, &str)]) -> Result<Self, Error> {
+    fn new(profile: &str, params: &[(&str, &str)]) -> Result<Self> {
         let profile = CString::new(profile)?;
         let mut owned = Vec::new();
         for (k, v) in params {

@@ -23,7 +23,7 @@ mod resume;
 pub mod sandbox;
 mod session;
 #[cfg(target_os = "linux")]
-mod userns;
+pub(crate) mod userns;
 #[cfg(target_os = "linux")]
 pub use userns::{USERNS_HOLD_ARG, hold_stage as userns_hold_stage};
 
