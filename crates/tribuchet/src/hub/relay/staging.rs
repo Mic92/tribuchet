@@ -13,7 +13,7 @@ use super::super::state::{HubState, Job};
 use super::{WorkerStaging, send};
 use crate::errors::{Result, err_ctx, err_msg};
 use crate::proto::{
-    HubMessage, NarTransfer, PathInfoMsg, StagingComplete, TmpDirArchive, hub_message, nar_transfer,
+    HubMessage, NarTransfer, PathInfoMsg, StagingComplete, TmpDirArchive, hub_message,
 };
 use crate::{chunkio, rt, store};
 
@@ -223,24 +223,14 @@ async fn stream_store_path(
     while let Some(chunk) = rx.recv().await {
         send(
             out_tx,
-            hub_message::Msg::Nar(NarTransfer {
-                build_id: build_id.into(),
-                store_path: store_path.into(),
-                payload: Some(nar_transfer::Payload::ZstdNarChunk(chunk)),
-                eof: false,
-            }),
+            hub_message::Msg::Nar(NarTransfer::chunk(build_id, store_path, chunk)),
         )
         .await?;
     }
     task.await??;
     send(
         out_tx,
-        hub_message::Msg::Nar(NarTransfer {
-            build_id: build_id.into(),
-            store_path: store_path.into(),
-            payload: None,
-            eof: true,
-        }),
+        hub_message::Msg::Nar(NarTransfer::eof(build_id, store_path)),
     )
     .await
 }
@@ -256,21 +246,13 @@ async fn stream_tmp_dir(
     for chunk in tmp_dir_pack.chunks(chunkio::CHUNK_SIZE) {
         send(
             out_tx,
-            hub_message::Msg::TmpDir(TmpDirArchive {
-                build_id: build_id.into(),
-                zstd_chunk: chunk.to_vec(),
-                eof: false,
-            }),
+            hub_message::Msg::TmpDir(TmpDirArchive::chunk(build_id, chunk.to_vec())),
         )
         .await?;
     }
     send(
         out_tx,
-        hub_message::Msg::TmpDir(TmpDirArchive {
-            build_id: build_id.into(),
-            zstd_chunk: Vec::new(),
-            eof: true,
-        }),
+        hub_message::Msg::TmpDir(TmpDirArchive::eof(build_id)),
     )
     .await
 }

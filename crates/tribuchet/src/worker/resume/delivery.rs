@@ -16,7 +16,7 @@ use crate::chunkio::CHUNK_SIZE;
 use crate::errors::{Result, chain, err_msg};
 use crate::fsutil::io_ctx;
 use crate::proto::{
-    BuildResult, ExtraPath, NarTransfer, OutputSignature, PathInfoMsg, WorkerMessage, nar_transfer,
+    BuildResult, ExtraPath, NarTransfer, OutputSignature, PathInfoMsg, WorkerMessage,
     worker_message,
 };
 use crate::worker::build::ActiveBuild;
@@ -271,19 +271,15 @@ fn stream_nar(
         if n == 0 {
             break;
         }
-        out_tx.blocking_send(msg(worker_message::Msg::Nar(NarTransfer {
-            build_id: build_id.into(),
-            store_path: store_path.into(),
-            payload: Some(nar_transfer::Payload::ZstdNarChunk(buf[..n].to_vec())),
-            eof: false,
-        })))?;
+        out_tx.blocking_send(msg(worker_message::Msg::Nar(NarTransfer::chunk(
+            build_id,
+            store_path,
+            buf[..n].to_vec(),
+        ))))?;
     }
-    out_tx.blocking_send(msg(worker_message::Msg::Nar(NarTransfer {
-        build_id: build_id.into(),
-        store_path: store_path.into(),
-        payload: None,
-        eof: true,
-    })))?;
+    out_tx.blocking_send(msg(worker_message::Msg::Nar(NarTransfer::eof(
+        build_id, store_path,
+    ))))?;
     Ok(())
 }
 
