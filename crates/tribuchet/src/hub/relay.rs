@@ -11,13 +11,14 @@ use std::time::{Duration, Instant};
 use futures_util::StreamExt as _;
 use harmonia_store_remote::DaemonStore as _;
 use harmonia_utils_signature::{PublicKey, Signature};
-use sha2::{Digest, Sha256};
+use sha2::Digest;
 use tokio::io::AsyncReadExt as _;
 use tokio::sync::mpsc;
 use tonic::Status;
 
 use super::metrics::Metrics;
 use super::state::{HubState, Job, Replay};
+use crate::capwrite::{CappedWriter, HashSink};
 use crate::errors::{Result, err_ctx, err_msg};
 use crate::proto::{
     BuildAssignment, BuildResult, CancelBuild, ExtraPath, HubMessage, MAX_RESEND_ROUNDS,
@@ -166,44 +167,8 @@ pub(super) async fn recv(
 /// untouched, so signature verification adds no extra buffering or
 /// recompression.
 struct OutputVerify {
-    decoder: zstd::stream::write::Decoder<'static, HashWriter>,
+    decoder: zstd::stream::write::Decoder<'static, CappedWriter<HashSink>>,
     signature: Signature,
-}
-
-struct HashWriter {
-    hasher: Sha256,
-    /// Decompressed byte budget: zstd RLE amplifies ~30,000:1, so a
-    /// sub-4MiB message could otherwise expand without bound on the hub
-    /// (and later fill the client's disk).
-    remaining: u64,
-}
-
-impl Default for HashWriter {
-    fn default() -> Self {
-        Self {
-            hasher: Sha256::new(),
-            remaining: MAX_OUTPUT_NAR_BYTES,
-        }
-    }
-}
-
-/// Decompressed size cap per output NAR, matching the worker's pack cap.
-const MAX_OUTPUT_NAR_BYTES: u64 = 64 * 1024 * 1024 * 1024;
-
-impl Write for HashWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if buf.len() as u64 > self.remaining {
-            return Err(io::Error::other(format!(
-                "output NAR exceeds the {MAX_OUTPUT_NAR_BYTES} byte limit"
-            )));
-        }
-        self.remaining -= buf.len() as u64;
-        self.hasher.update(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
 }
 
 /// Verifier for each output the worker reports, checked to be exactly
@@ -222,7 +187,7 @@ fn verify_set(
         pending.insert(
             out.store_path,
             OutputVerify {
-                decoder: zstd::stream::write::Decoder::new(HashWriter::default())?,
+                decoder: zstd::stream::write::Decoder::new(CappedWriter::new(HashSink::default()))?,
                 signature,
             },
         );
@@ -327,7 +292,7 @@ async fn relay_output_chunk(
     if n.eof {
         let mut verify = pending.remove(&n.store_path).unwrap();
         verify.decoder.flush()?;
-        let hash = verify.decoder.into_inner().hasher.finalize();
+        let hash = verify.decoder.into_inner().into_inner().0.finalize();
         let msg = format!("{}:{}", n.store_path, hex::encode(hash));
         if !vkey.verify(msg.as_bytes(), &verify.signature) {
             return Err(err_msg(format!(

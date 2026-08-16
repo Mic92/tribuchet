@@ -1,6 +1,7 @@
 mod attach;
 mod build_json;
 mod ca;
+mod capwrite;
 mod chunkio;
 mod config;
 mod errors;

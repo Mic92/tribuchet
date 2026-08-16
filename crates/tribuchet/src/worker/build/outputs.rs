@@ -16,7 +16,8 @@ use std::os::fd::{AsRawFd, OwnedFd};
 
 use super::super::resume::{PackedExtra, PackedOutput};
 use super::super::sandbox;
-use super::{MAX_NAR_BYTES, store_base};
+use super::store_base;
+use crate::capwrite::CappedWriter;
 use crate::errors::chain;
 use crate::errors::{Result, err_ctx, err_msg};
 use crate::nar;
@@ -295,11 +296,7 @@ async fn pack_one_nar(
         };
         // Deadline bounds packing too: a builder can exit instantly
         // leaving a multi-TB sparse output.
-        let mut limited = LimitedWriter {
-            inner: &mut tee,
-            remaining: MAX_NAR_BYTES,
-            deadline,
-        };
+        let mut limited = CappedWriter::with_deadline(&mut tee, deadline);
         nar::pack(host_path, &mut limited).await?;
         enc.finish()?.flush()?;
     }
@@ -329,32 +326,6 @@ fn scan_candidates(
         .chain(outputs.iter())
         .filter_map(|p| harmonia_store_path::StorePath::from_base_path(store_base(p)).ok())
         .collect()
-}
-
-/// Enforces a byte budget and a wall-clock deadline on a Write chain.
-struct LimitedWriter<W> {
-    inner: W,
-    remaining: u64,
-    deadline: Instant,
-}
-
-impl<W: Write> Write for LimitedWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if Instant::now() >= self.deadline {
-            return Err(io::Error::other("build timed out"));
-        }
-        if buf.len() as u64 > self.remaining {
-            return Err(io::Error::other(format!(
-                "NAR exceeds the {MAX_NAR_BYTES} byte limit"
-            )));
-        }
-        let n = self.inner.write(buf)?;
-        self.remaining -= n as u64;
-        Ok(n)
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
 }
 
 /// One-pass tee of plaintext NAR bytes into zstd, sha256, and the
