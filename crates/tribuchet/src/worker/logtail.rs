@@ -1,9 +1,12 @@
 //! Build-log tailing with a persisted offset, for resumed sessions.
 
-use std::io::Read;
+use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic;
+use std::sync::atomic::{self, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 
@@ -14,12 +17,12 @@ use crate::proto::{LogChunk, WorkerMessage, worker_message};
 /// for it.
 pub(super) struct LogTail {
     pub(super) done: Arc<atomic::AtomicBool>,
-    handle: std::thread::JoinHandle<()>,
+    handle: thread::JoinHandle<()>,
 }
 
 impl LogTail {
     pub(super) fn stop(self) {
-        self.done.store(true, atomic::Ordering::Relaxed);
+        self.done.store(true, Ordering::Relaxed);
         let _ = self.handle.join();
     }
 }
@@ -27,7 +30,7 @@ impl LogTail {
 /// Read position in build.log, persisted as log.offset so resumed
 /// sessions continue where the previous tailer stopped.
 struct LogCursor {
-    file: std::fs::File,
+    file: fs::File,
     dir: PathBuf,
     sent: u64,
 }
@@ -36,13 +39,12 @@ impl LogCursor {
     /// Open build.log at the persisted offset. `None` when the build
     /// never started a builder.
     fn open(dir: &Path) -> Option<Self> {
-        use std::io::Seek;
-        let mut file = std::fs::File::open(dir.join("build.log")).ok()?;
-        let sent = std::fs::read_to_string(dir.join("log.offset"))
+        let mut file = fs::File::open(dir.join("build.log")).ok()?;
+        let sent = fs::read_to_string(dir.join("log.offset"))
             .ok()
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(0);
-        file.seek(std::io::SeekFrom::Start(sent)).ok()?;
+        file.seek(SeekFrom::Start(sent)).ok()?;
         Some(Self {
             file,
             dir: dir.to_path_buf(),
@@ -52,8 +54,8 @@ impl LogCursor {
 
     fn persist_offset(&self) {
         let tmp = self.dir.join("log.offset.tmp");
-        if std::fs::write(&tmp, self.sent.to_string()).is_ok() {
-            let _ = std::fs::rename(&tmp, self.dir.join("log.offset"));
+        if fs::write(&tmp, self.sent.to_string()).is_ok() {
+            let _ = fs::rename(&tmp, self.dir.join("log.offset"));
         }
     }
 
@@ -97,7 +99,7 @@ pub(super) fn tail_log(
             .is_ok()
     };
     while cursor.drain(&mut emit) && !done() {
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -112,8 +114,7 @@ pub(super) fn spawn_log_tail(
 ) -> LogTail {
     let done = Arc::new(atomic::AtomicBool::new(false));
     let thread_done = done.clone();
-    let handle = std::thread::spawn(move || {
-        use atomic::Ordering;
+    let handle = thread::spawn(move || {
         let done = || {
             thread_done.load(Ordering::Relaxed) || {
                 let map = ctx.resumable.lock().unwrap();
@@ -130,7 +131,7 @@ mod tests {
     use super::*;
 
     fn offset(dir: &Path) -> u64 {
-        std::fs::read_to_string(dir.join("log.offset"))
+        fs::read_to_string(dir.join("log.offset"))
             .unwrap()
             .parse()
             .unwrap()
@@ -139,8 +140,8 @@ mod tests {
     #[test]
     fn cursor_resumes_at_persisted_offset() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("build.log"), b"old-new").unwrap();
-        std::fs::write(dir.path().join("log.offset"), "4").unwrap();
+        fs::write(dir.path().join("build.log"), b"old-new").unwrap();
+        fs::write(dir.path().join("log.offset"), "4").unwrap();
         let mut cursor = LogCursor::open(dir.path()).unwrap();
         let mut got = Vec::new();
         assert!(cursor.drain(|d| {
@@ -154,8 +155,8 @@ mod tests {
     #[test]
     fn rejected_chunk_keeps_offset_for_retry() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("build.log"), b"hello").unwrap();
-        std::fs::write(dir.path().join("log.offset"), "0").unwrap();
+        fs::write(dir.path().join("build.log"), b"hello").unwrap();
+        fs::write(dir.path().join("log.offset"), "0").unwrap();
         let mut cursor = LogCursor::open(dir.path()).unwrap();
         assert!(!cursor.drain(|_| false));
         assert_eq!(offset(dir.path()), 0);

@@ -1,17 +1,21 @@
 //! In-memory hub state: replay buffers, the job queue, worker capabilities.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::fmt::Write as _;
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic;
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, Notify, mpsc};
 use tonic::Status;
 
+use super::metrics::Metrics;
 use crate::config::NixConfig;
+use crate::fsutil::io_ctx;
 
 /// How long a build waits for a platform we expect to come back: the
 /// startup window in which workers re-register after a hub restart, and
@@ -21,6 +25,10 @@ use crate::config::NixConfig;
 pub(super) const WORKER_GRACE: Duration = Duration::from_secs(30);
 
 use crate::proto::{AttachEvent, BuildRequest, attach_event};
+
+#[path = "state/replay.rs"]
+mod replay;
+pub(super) use replay::Replay;
 
 type EventTx = mpsc::Sender<Result<AttachEvent, Status>>;
 
@@ -32,118 +40,6 @@ const MAX_REPLAY_BYTES: usize = 256 * 1024 * 1024;
 /// stalled attach client is dropped once it falls this far behind
 /// instead of buffering the whole build a second time.
 const SUB_CHANNEL_SLACK: usize = 1024;
-
-/// Buffered event log of one in-flight build; late identical submissions
-/// (dedupe) replay the buffer and then follow live. The buffer holds the
-/// compressed output chunks too, capped at MAX_REPLAY_BYTES.
-#[derive(Default)]
-pub(super) struct Replay {
-    inner: Mutex<ReplayInner>,
-}
-
-#[derive(Default)]
-struct ReplayInner {
-    events: Vec<AttachEvent>,
-    bytes: usize,
-    /// Buffer cap hit: the backlog is incomplete, so late dedupe
-    /// subscribers must error instead of getting a truncated stream.
-    overflowed: bool,
-    subs: Vec<EventTx>,
-    done: bool,
-}
-
-fn event_size(ev: &attach_event::Event) -> usize {
-    match ev {
-        attach_event::Event::Log(d) => d.len(),
-        attach_event::Event::Output(o) => o.zstd_nar_chunk.len(),
-        attach_event::Event::OutputRestart(p)
-        | attach_event::Event::AddedPath(p)
-        | attach_event::Event::Dispatched(p) => p.len(),
-        attach_event::Event::Error(e) => e.len(),
-        attach_event::Event::ExitCode(_) => 0,
-    }
-    .saturating_add(64)
-}
-
-impl Replay {
-    pub(super) async fn publish(&self, ev: attach_event::Event) {
-        let sz = event_size(&ev);
-        let ev = AttachEvent { event: Some(ev) };
-        let mut inner = self.inner.lock().await;
-        // try_send: a subscriber that stopped reading is dropped (its
-        // attach errors out) instead of buffering unboundedly.
-        inner.subs.retain(|tx| match tx.try_send(Ok(ev.clone())) {
-            Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                tracing::warn!("dropping attach subscriber that fell too far behind");
-                false
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
-        });
-        if inner.overflowed {
-            return;
-        }
-        if inner.bytes + sz > MAX_REPLAY_BYTES {
-            tracing::warn!("replay buffer cap reached; late dedupe subscribers will be rejected");
-            inner.overflowed = true;
-            inner.events.clear();
-            inner.bytes = 0;
-            return;
-        }
-        inner.bytes += sz;
-        inner.events.push(ev);
-    }
-
-    pub(super) async fn subscribe(&self) -> mpsc::Receiver<Result<AttachEvent, Status>> {
-        let mut inner = self.inner.lock().await;
-        if inner.overflowed {
-            let (tx, rx) = mpsc::channel(1);
-            let _ = tx.try_send(Err(Status::resource_exhausted(
-                "build output exceeded the replay buffer; retry after it finishes",
-            )));
-            return rx;
-        }
-        // Enough capacity for the whole backlog plus live slack (and
-        // one error slot), so the snapshot below cannot drop events.
-        let (tx, rx) = mpsc::channel(inner.events.len() + SUB_CHANNEL_SLACK);
-        for ev in &inner.events {
-            let _ = tx.try_send(Ok(ev.clone()));
-        }
-        if inner.done {
-            // Finished without a verdict in the backlog (e.g. the job
-            // was dropped as abandoned between the dedupe lookup and
-            // this subscribe): an error beats a silently empty stream.
-            let concluded = inner.events.iter().any(|e| {
-                matches!(
-                    e.event,
-                    Some(attach_event::Event::ExitCode(_) | attach_event::Event::Error(_))
-                )
-            });
-            if !concluded {
-                let _ = tx.try_send(Err(Status::unavailable(
-                    "build is no longer in flight; resubmit",
-                )));
-            }
-        } else {
-            inner.subs.push(tx);
-        }
-        rx
-    }
-
-    /// Close all subscriber streams.
-    pub(super) async fn finish(&self) {
-        let mut inner = self.inner.lock().await;
-        inner.done = true;
-        inner.subs.clear();
-    }
-
-    /// Any attach client still listening? Subscribers whose stream was
-    /// dropped count as gone even before publish() prunes them.
-    pub(super) async fn has_subscribers(&self) -> bool {
-        let inner = self.inner.lock().await;
-        inner.subs.iter().any(|tx| !tx.is_closed())
-    }
-}
 
 pub(super) struct Job {
     pub(super) id: String,
@@ -183,7 +79,7 @@ pub(super) struct HubState {
     /// Connected workers' capabilities, keyed by a per-connection id;
     /// submissions no worker can serve fail fast instead of queueing
     /// forever.
-    pub(super) worker_caps: std::sync::Mutex<HashMap<u64, WorkerCaps>>,
+    pub(super) worker_caps: StdMutex<HashMap<u64, WorkerCaps>>,
     pub(super) next_worker_id: atomic::AtomicU64,
     /// Grace period before an unservable build is declined or failed.
     pub(super) worker_grace: Duration,
@@ -191,12 +87,12 @@ pub(super) struct HubState {
     /// ended: together they tell `expected_deadline` which platforms are
     /// still worth waiting for after a restart or a worker drop.
     pub(super) started_at: Instant,
-    pub(super) departed: std::sync::Mutex<Vec<(WorkerCaps, Instant)>>,
+    pub(super) departed: StdMutex<Vec<(WorkerCaps, Instant)>>,
     /// Woken when worker capabilities change so waiting submissions
     /// re-check servability without polling.
     pub(super) caps_changed: Notify,
     /// Build lifecycle counters scraped by the metrics endpoint.
-    pub(super) metrics: super::metrics::Metrics,
+    pub(super) metrics: Metrics,
     /// When set, the connected-worker set is mirrored to this nix.conf
     /// fragment on every register/deregister.
     pub(super) nix_config: Option<NixConfig>,
@@ -218,8 +114,6 @@ pub(super) struct WorkerCaps {
 /// aggregate capacity. max-jobs is omitted with no workers, leaving the
 /// base nix.conf default to govern local fallback builds.
 fn render_nix_config(caps: &HashMap<u64, WorkerCaps>, cfg: &NixConfig) -> String {
-    use std::fmt::Write as _;
-
     let systems: BTreeSet<&str> = caps
         .values()
         .flat_map(|c| c.systems.keys().map(String::as_str))
@@ -240,14 +134,14 @@ fn render_nix_config(caps: &HashMap<u64, WorkerCaps>, cfg: &NixConfig) -> String
     out
 }
 
-fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
+fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
     {
-        let mut f = fs::File::create(&tmp)?;
+        let mut f = fs::File::create(&tmp).map_err(io_ctx("creating", &tmp))?;
         f.write_all(content.as_bytes())?;
         f.sync_all()?;
     }
-    fs::rename(&tmp, path)
+    fs::rename(&tmp, path).map_err(io_ctx("renaming into", path))
 }
 
 impl WorkerCaps {
@@ -274,13 +168,13 @@ impl HubState {
                 "/nix/var/nix/daemon-socket/socket",
                 harmonia_store_remote::PoolConfig::default(),
             ),
-            worker_caps: std::sync::Mutex::default(),
+            worker_caps: StdMutex::default(),
             next_worker_id: atomic::AtomicU64::default(),
             worker_grace,
             started_at: Instant::now(),
-            departed: std::sync::Mutex::default(),
+            departed: StdMutex::default(),
             caps_changed: Notify::default(),
-            metrics: super::metrics::Metrics::default(),
+            metrics: Metrics::default(),
             nix_config,
         }
     }

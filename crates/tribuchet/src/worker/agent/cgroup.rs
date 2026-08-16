@@ -7,31 +7,14 @@
 //! subgroups, which is why the cgroup is chowned to the build's
 //! mapped root uid; that chown is what the agent keeps CAP_CHOWN for.
 
+use crate::errors::{Result, err_ctx, err_msg};
+use crate::fsutil::io_ctx;
 use std::fs;
+use std::io;
 use std::os::unix::fs::chown;
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::{Duration, Instant};
-
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum Error {
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-    #[error("{step}")]
-    Step {
-        step: String,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("cgroup did not drain")]
-    DidNotDrain,
-}
-
-fn step(step: impl Into<String>) -> impl FnOnce(std::io::Error) -> Error {
-    |source| Error::Step {
-        step: step.into(),
-        source,
-    }
-}
 
 /// Vacate the delegated unit cgroup (cgroup v2's no-internal-process
 /// rule forbids enabling controllers while it holds processes) and
@@ -60,9 +43,9 @@ pub(super) fn init() -> Option<PathBuf> {
 /// uid so the in-sandbox payload can manage subgroups. cgroup.procs
 /// stays agent-owned until [`enter`] moved the setup stage in;
 /// cgroup.kill and memory.max stay agent-owned for good.
-pub(super) fn create(base: &Path, build_id: &str, owner_uid: u32) -> Result<PathBuf, Error> {
+pub(super) fn create(base: &Path, build_id: &str, owner_uid: u32) -> Result<PathBuf> {
     let dir = base.join(format!("build-{build_id}"));
-    fs::create_dir(&dir).map_err(step(format!("creating cgroup {}", dir.display())))?;
+    fs::create_dir(&dir).map_err(err_ctx(format!("creating cgroup {}", dir.display())))?;
     chown(&dir, Some(owner_uid), None)?;
     for f in ["cgroup.subtree_control", "cgroup.threads"] {
         chown(dir.join(f), Some(owner_uid), None)?;
@@ -73,43 +56,46 @@ pub(super) fn create(base: &Path, build_id: &str, owner_uid: u32) -> Result<Path
 /// Cap the build's memory. memory.max stays agent-owned so the
 /// payload cannot raise it. oom.group makes the kernel kill the whole
 /// build instead of one victim, so it fails instead of hanging.
-pub(super) fn set_memory_max(dir: &Path, bytes: u64) -> Result<(), Error> {
+pub(super) fn set_memory_max(dir: &Path, bytes: u64) -> Result<()> {
     fs::write(dir.join("memory.max"), bytes.to_string())
-        .map_err(step(format!("writing memory.max in {}", dir.display())))?;
-    fs::write(dir.join("memory.oom.group"), "1").map_err(step("writing memory.oom.group"))
+        .map_err(err_ctx(format!("writing memory.max in {}", dir.display())))?;
+    fs::write(dir.join("memory.oom.group"), "1").map_err(err_ctx("writing memory.oom.group"))
 }
 
 /// Move a pid into the build cgroup, then hand cgroup.procs to the
 /// build's mapped root uid (the payload migrates processes into its
 /// own subgroups). Called on the setup stage before the spec is sent,
 /// so its CLONE_NEWCGROUP is rooted there.
-pub(super) fn enter(dir: &Path, pid: i32, owner_uid: u32) -> Result<(), Error> {
+pub(super) fn enter(dir: &Path, pid: i32, owner_uid: u32) -> Result<()> {
     fs::write(dir.join("cgroup.procs"), pid.to_string())
-        .map_err(step(format!("moving pid {pid} into {}", dir.display())))?;
+        .map_err(err_ctx(format!("moving pid {pid} into {}", dir.display())))?;
     chown(dir.join("cgroup.procs"), Some(owner_uid), None)?;
     Ok(())
 }
 
 /// Kill everything in the build cgroup, wait for it to drain and
 /// remove it, subgroups first (cgroup dirs can only be rmdir'd).
-pub(super) fn destroy(dir: &Path) -> Result<(), Error> {
+pub(super) fn destroy(dir: &Path) -> Result<()> {
     match fs::write(dir.join("cgroup.kill"), "1") {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        other => other.map_err(step("writing cgroup.kill"))?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        other => other.map_err(err_ctx("writing cgroup.kill"))?,
     }
     let deadline = Instant::now() + Duration::from_mins(1);
     // A vanished events file (systemd already removed the cgroup)
     // counts as drained.
     while fs::read_to_string(dir.join("cgroup.events")).is_ok_and(|e| !e.contains("populated 0")) {
         if Instant::now() >= deadline {
-            return Err(Error::DidNotDrain);
+            return Err(err_msg("cgroup did not drain"));
         }
-        std::thread::sleep(Duration::from_millis(50));
+        thread::sleep(Duration::from_millis(50));
     }
     let mut dirs = vec![dir.to_path_buf()];
     let mut i = 0;
     while i < dirs.len() {
-        for entry in fs::read_dir(&dirs[i])?.flatten() {
+        for entry in fs::read_dir(&dirs[i])
+            .map_err(io_ctx("listing", &dirs[i]))?
+            .flatten()
+        {
             if entry.file_type().is_ok_and(|t| t.is_dir()) {
                 dirs.push(entry.path());
             }
@@ -117,7 +103,7 @@ pub(super) fn destroy(dir: &Path) -> Result<(), Error> {
         i += 1;
     }
     for d in dirs.iter().rev() {
-        fs::remove_dir(d).map_err(step(format!("removing cgroup {}", d.display())))?;
+        fs::remove_dir(d).map_err(err_ctx(format!("removing cgroup {}", d.display())))?;
     }
     Ok(())
 }

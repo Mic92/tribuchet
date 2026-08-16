@@ -1,54 +1,21 @@
 //! Linux sandbox implementation: namespaces, bind mounts, pivot_root.
 
-use nix::unistd;
-
-use rustix::fs::{Mode, StatVfsMountFlags, statvfs};
-use rustix::io::Errno as Rerrno;
-use rustix::ioctl::{Opcode, Setter, ioctl, opcode};
-use rustix::mount::{
-    MountFlags, MountPropagationFlags, MoveMountFlags, OpenTreeFlags, UnmountFlags, mount,
-    mount_bind_recursive, mount_change, mount_remount, move_mount, open_tree, unmount,
-};
-use rustix::net::{
-    AddressFamily, RecvFlags, SendAncillaryBuffer, SendAncillaryMessage, SendFlags, SocketFlags,
-    SocketType, recv, sendmsg, socket_with,
-};
-use rustix::process::{
-    DumpableBehavior, Gid, Pid, Resource, Rlimit, Uid, WaitOptions, getrlimit, pivot_root,
-    set_dumpable_behavior, setrlimit, umask, waitpid,
-};
-use rustix::stdio::dup2_stdin;
-use rustix::system::{setdomainname, sethostname};
-use rustix::thread::{
-    LinkNameSpaceType, UnshareFlags, move_into_link_name_space, set_thread_gid, set_thread_groups,
-    set_thread_uid, unshare_unsafe,
-};
-use std::ffi::CString;
+use std::env;
 use std::fs;
-use std::io;
-use std::mem::MaybeUninit;
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::{SandboxSpec, binfmt};
 
-// Interface name for the presto-pasta tap inside the build netns.
-// Addressing (link-local guest/gateway, DNS forwarded on the gateway
-// address so a loopback host resolver like systemd-resolved's stub
-// stays reachable) comes from presto_pasta::Config::default().
-const NET_IFNAME: &str = "eth0";
-
-// linux/if_tun.h
-const IFF_TAP: i16 = 0x0002;
-const IFF_NO_PI: i16 = 0x1000;
-const IFF_VNET_HDR: i16 = 0x4000;
-// linux/if_tun.h: _IOW('T', 202, int), taking a struct ifreq pointer
-const TUNSETIFF: Opcode = opcode::write::<libc::c_int>(b'T', 202);
-// linux/sockios.h
-const SIOCSIFFLAGS: Opcode = 0x8914;
-
 use super::{Error, step};
+
+use crate::fsutil::io_ctx;
+
+#[path = "linux/stage.rs"]
+mod stage;
+pub use stage::setup_stage;
 
 /// Prepare the on-disk sandbox root and finalize the spec. Only the
 /// scratch store is created on disk because outputs must survive the
@@ -56,7 +23,8 @@ use super::{Error, step};
 /// so nothing stale persists across builds.
 pub fn prepare_root(spec: &mut SandboxSpec) -> Result<(), Error> {
     let root = &spec.root;
-    fs::create_dir_all(root.join("nix/store"))?;
+    fs::create_dir_all(root.join("nix/store"))
+        .map_err(io_ctx("creating", &root.join("nix/store")))?;
     dev_binds(&mut spec.binds_dev);
     if spec.network {
         // Host CA bundle at the standard path for TLS fetches, like
@@ -72,8 +40,8 @@ pub fn prepare_root(spec: &mut SandboxSpec) -> Result<(), Error> {
     // into is opened up. The build dir is already owned by the leased
     // range; the group-restricted state dir keeps other users out.
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(root.join("nix/store"), fs::Permissions::from_mode(0o1777))?;
+        fs::set_permissions(root.join("nix/store"), fs::Permissions::from_mode(0o1777))
+            .map_err(io_ctx("setting permissions on", &root.join("nix/store")))?;
     }
     Ok(())
 }
@@ -93,7 +61,7 @@ fn write_skeleton(spec: &SandboxSpec) -> Result<(), Error> {
         "etc",
         "tmp",
     ] {
-        fs::create_dir_all(root.join(sub))?;
+        fs::create_dir_all(root.join(sub)).map_err(io_ctx("creating", &root.join(sub)))?;
     }
     fs::write(
         root.join("etc/passwd"),
@@ -116,7 +84,7 @@ fn write_skeleton(spec: &SandboxSpec) -> Result<(), Error> {
         ("dev/stderr", "/proc/self/fd/2"),
         ("dev/ptmx", "/dev/pts/ptmx"),
     ] {
-        std::os::unix::fs::symlink(target, root.join(link))?;
+        symlink(target, root.join(link))?;
     }
     if spec.network {
         // Like Nix's fixed-output setup: name resolution via files
@@ -127,7 +95,8 @@ fn write_skeleton(spec: &SandboxSpec) -> Result<(), Error> {
         )?;
         for f in ["services", "hosts"] {
             if let Ok(data) = fs::read(Path::new("/etc").join(f)) {
-                fs::write(root.join("etc").join(f), data)?;
+                fs::write(root.join("etc").join(f), data)
+                    .map_err(io_ctx("writing", &root.join("etc").join(f)))?;
             }
         }
         if spec.net_isolation {
@@ -136,9 +105,11 @@ fn write_skeleton(spec: &SandboxSpec) -> Result<(), Error> {
             // nameserver may be an unreachable loopback stub.
             let net = presto_pasta::Config::default();
             let conf = format!("nameserver {}\nnameserver {}\n", net.gateway4, net.gateway6);
-            fs::write(root.join("etc/resolv.conf"), conf)?;
+            fs::write(root.join("etc/resolv.conf"), conf)
+                .map_err(io_ctx("writing", &root.join("etc/resolv.conf")))?;
         } else if let Ok(data) = fs::read("/etc/resolv.conf") {
-            fs::write(root.join("etc/resolv.conf"), data)?;
+            fs::write(root.join("etc/resolv.conf"), data)
+                .map_err(io_ctx("writing", &root.join("etc/resolv.conf")))?;
         }
     }
     Ok(())
@@ -164,12 +135,12 @@ fn create_mount_points(spec: &SandboxSpec) -> Result<(), Error> {
             continue;
         }
         if src.is_dir() {
-            fs::create_dir_all(&target)?;
+            fs::create_dir_all(&target).map_err(io_ctx("creating", &target))?;
         } else {
             if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
+                fs::create_dir_all(parent).map_err(io_ctx("creating", parent))?;
             }
-            fs::File::create(&target)?;
+            fs::File::create(&target).map_err(io_ctx("creating", &target))?;
         }
     }
 
@@ -181,9 +152,9 @@ fn create_mount_points(spec: &SandboxSpec) -> Result<(), Error> {
             continue;
         }
         if let Some(parent) = link.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent).map_err(io_ctx("creating", parent))?;
         }
-        std::os::unix::fs::symlink(target, &link)
+        symlink(target, &link)
             .map_err(step(format!("creating symlink input {}", link.display())))?;
     }
     Ok(())
@@ -213,7 +184,7 @@ pub fn command(spec: &SandboxSpec) -> Result<Command, Error> {
     // see setup_stage() for why builds re-exec this binary. Resolve it
     // in the worker: the reaper execs this argv, and it outlives worker
     // reloads, so it must not resolve the binary in its own context.
-    let exe = std::env::current_exe().map_err(step("resolving worker binary path"))?;
+    let exe = env::current_exe().map_err(step("resolving worker binary path"))?;
     let mut cmd = Command::new(exe);
     cmd.arg(SETUP_STAGE_ARG);
     Ok(cmd)
@@ -223,553 +194,6 @@ pub const SETUP_STAGE_ARG: &str = "__sandbox_setup";
 
 /// The spec travels via the setup stage's stdin.
 pub const SPEC_VIA_STDIN: bool = true;
-
-/// Entry point of the re-exec'd setup stage: builds run as
-/// `/proc/self/exe __sandbox_setup` with the spec on stdin, so the
-/// namespace/mount/uid work runs in a fresh process instead of a
-/// post-fork `pre_exec` closure, where only async-signal-safe code is
-/// allowed.
-pub fn setup_stage() -> ! {
-    use std::io::{Read, Write};
-    let err = (|| -> io::Result<std::convert::Infallible> {
-        let mut json = String::new();
-        std::io::stdin().read_to_string(&mut json)?;
-        let spec: SandboxSpec = serde_json::from_str(&json).map_err(io::Error::other)?;
-        // The builder gets /dev/null as stdin, like under Nix.
-        let null = fs::File::open("/dev/null")?;
-        dup2_stdin(&null).map_err(ioerr("dup2 stdin"))?;
-        // Pre-open the error and exit-status files: the fds keep
-        // working after pivot_root detaches the host filesystem, a
-        // path would not.
-        let err_file = fs::File::create(setup_error_file(&spec.root))?;
-        let status_file = fs::File::create(exit_status_file(&spec.root))?;
-        enter_and_exec(&spec, &status_file).inspect_err(|e| {
-            let _ = (&err_file).write_all(e.to_string().as_bytes());
-        })
-    })()
-    .unwrap_err();
-    // stderr is the build log pipe; the client sees the message.
-    // Write to the fd, not via eprintln!: under the unit test the
-    // stage runs inside libtest, which captures macro output.
-    let _ = writeln!(std::io::stderr(), "sandbox setup: {err}");
-    std::process::exit(121);
-}
-
-const CLOSE_RANGE_CLOEXEC: libc::c_uint = 4;
-
-fn enter_and_exec(
-    spec: &SandboxSpec,
-    status_file: &fs::File,
-) -> io::Result<std::convert::Infallible> {
-    // The agent placed this process in the build cgroup before the
-    // spec arrived on stdin; CLONE_NEWCGROUP below roots the namespace
-    // there.
-    let binfmt_line = match &spec.emulator {
-        Some(_) => Some(binfmt::register_line(&spec.system).ok_or_else(|| {
-            io::Error::other(format!("no binfmt magic known for system {}", spec.system))
-        })?),
-        None => None,
-    };
-    // The leased namespace already carries its maps (written by the
-    // agent at startup); setup becomes in-ns root after joining.
-    let uid_count = spec
-        .leased_uid_count
-        .ok_or_else(|| io::Error::other("sandbox spec lacks a leased uid count"))?;
-    let leased_userns = spec
-        .leased_userns
-        .as_deref()
-        .ok_or_else(|| io::Error::other("sandbox spec lacks a leased user namespace"))?;
-    setup(&SetupParams {
-        spec,
-        binfmt_line: binfmt_line.as_deref(),
-        leased_userns,
-        uid_count,
-        status_file,
-    })?;
-    let prog =
-        CString::new(spec.builder.as_str()).map_err(|_| io::Error::other("NUL in builder path"))?;
-    let args: Vec<CString> = std::iter::once(Ok(prog.clone()))
-        .chain(spec.args.iter().map(|a| CString::new(a.as_str())))
-        .collect::<Result<_, _>>()
-        .map_err(|_| io::Error::other("NUL in builder argument"))?;
-    // The setup stage runs with a clean environment; the derivation
-    // env is applied only here, to the builder inside the sandbox.
-    let env: Vec<CString> = spec
-        .env
-        .iter()
-        .map(|(k, v)| CString::new(format!("{k}={v}")))
-        .collect::<Result<_, _>>()
-        .map_err(|_| io::Error::other("NUL in builder environment"))?;
-    // Fds the setup stage still holds (error file, leased namespace)
-    // must not leak into the builder.
-    unsafe {
-        libc::syscall(
-            libc::SYS_close_range,
-            3,
-            libc::c_uint::MAX,
-            CLOSE_RANGE_CLOEXEC,
-        );
-    }
-    unistd::execve(&prog, &args, &env).map_err(ioerr("exec builder"))
-}
-
-fn existing_mount_flags(target: &Path) -> io::Result<MountFlags> {
-    // statvfs on the bound target fails for some source mounts (ENXIO on a
-    // unix socket, ENOENT on an envfs/FUSE mount like NixOS's /bin); the
-    // parent describes the same mount, so fall back to it.
-    let st = match statvfs(target) {
-        Ok(st) => st,
-        Err(Rerrno::NXIO | Rerrno::NOENT) => {
-            let parent = target.parent().unwrap_or(target);
-            statvfs(parent).map_err(ioerr("statvfs"))?
-        }
-        Err(e) => return Err(ioerr("statvfs")(e)),
-    };
-    let f = st.f_flag;
-    let mut flags = MountFlags::empty();
-    for (fs, ms) in [
-        (StatVfsMountFlags::NOSUID, MountFlags::NOSUID),
-        (StatVfsMountFlags::NODEV, MountFlags::NODEV),
-        (StatVfsMountFlags::NOEXEC, MountFlags::NOEXEC),
-        (StatVfsMountFlags::NOATIME, MountFlags::NOATIME),
-        (StatVfsMountFlags::NODIRATIME, MountFlags::NODIRATIME),
-        (StatVfsMountFlags::RELATIME, MountFlags::RELATIME),
-    ] {
-        if f.contains(fs) {
-            flags |= ms;
-        }
-    }
-    Ok(flags)
-}
-
-fn ioerr<E: std::fmt::Display>(step: &str) -> impl Fn(E) -> io::Error + '_ {
-    move |e| io::Error::other(format!("{step}: {e}"))
-}
-
-/// Open the tap device inside the just-created netns.
-fn open_tap(name: &str) -> io::Result<OwnedFd> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/net/tun")?;
-    let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
-    unsafe {
-        // ifr_name is [c_char; _]; c_char's signedness is target-dependent,
-        // so write the bytes via a u8 pointer instead of an `as` cast.
-        std::ptr::copy_nonoverlapping(
-            name.as_ptr(),
-            ifr.ifr_name.as_mut_ptr().cast::<u8>(),
-            name.len().min(ifr.ifr_name.len() - 1),
-        );
-        ifr.ifr_ifru.ifru_flags = IFF_TAP | IFF_NO_PI | IFF_VNET_HDR;
-        ioctl(&file, Setter::<TUNSETIFF, libc::ifreq>::new(ifr)).map_err(ioerr("TUNSETIFF"))?;
-    }
-    Ok(OwnedFd::from(file))
-}
-
-/// Called after unshare: create and configure the tap in the new
-/// netns, hand its fd to the agent's forwarder over `sock` and wait
-/// until the datapath runs.
-/// The local tap fd is closed afterwards
-/// because the agent's copy keeps the interface carrier up.
-fn attach_net(sock: &OwnedFd) -> io::Result<()> {
-    let net = presto_pasta::Config::default();
-    let tap = open_tap(NET_IFNAME)?;
-    presto_pasta::netdev::configure(NET_IFNAME, &net)?;
-    let fds = [tap.as_fd()];
-    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
-    let mut cmsg = SendAncillaryBuffer::new(&mut space);
-    cmsg.push(SendAncillaryMessage::ScmRights(&fds));
-    sendmsg(
-        sock,
-        &[io::IoSlice::new(b"tap")],
-        &mut cmsg,
-        SendFlags::empty(),
-    )
-    .map_err(ioerr("sending tap fd"))?;
-    let mut ack = [0u8; 2];
-    match recv(sock, &mut ack, RecvFlags::empty()) {
-        Ok((n, _)) if n > 0 => Ok(()),
-        _ => Err(io::Error::other(
-            "the agent failed to start the presto-pasta datapath",
-        )),
-    }
-}
-
-/// Bring the loopback interface up. A fresh network namespace has
-/// `lo` down; builders that talk to 127.0.0.1 (test suites) would
-/// otherwise fail, unlike under Nix's own sandbox.
-fn loopback_up() -> io::Result<()> {
-    let fd = socket_with(
-        AddressFamily::INET,
-        SocketType::DGRAM,
-        SocketFlags::CLOEXEC,
-        None,
-    )
-    .map_err(ioerr("socket"))?;
-    unsafe {
-        let mut ifr: libc::ifreq = std::mem::zeroed();
-        // ifr_name is [c_char; _]; c_char's signedness is target-dependent,
-        // so write the bytes via a u8 pointer instead of an `as` cast.
-        std::ptr::copy_nonoverlapping(b"lo".as_ptr(), ifr.ifr_name.as_mut_ptr().cast::<u8>(), 2);
-        #[expect(clippy::cast_possible_truncation, reason = "IFF_UP|IFF_RUNNING = 0x41")]
-        {
-            ifr.ifr_ifru.ifru_flags = (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
-        }
-        ioctl(&fd, Setter::<SIOCSIFFLAGS, libc::ifreq>::new(ifr)).map_err(ioerr("SIOCSIFFLAGS"))?;
-    }
-    Ok(())
-}
-
-/// Fork so the exec'd builder is PID 1 of the new PID namespace;
-/// this process becomes a shim that persists the builder's exit
-/// status to `status_file` (so a worker that is not our parent can
-/// still learn it) and then exits with it. When PID 1 dies the kernel
-/// kills every namespace member, so daemonized/setsid'd builder
-/// children cannot outlive the build.
-fn fork_into_pid_ns(status_file: &fs::File) -> io::Result<bool> {
-    match unsafe { unistd::fork() }.map_err(ioerr("fork"))? {
-        unistd::ForkResult::Child => Ok(true),
-        unistd::ForkResult::Parent { child } => {
-            use std::io::Write;
-            let child = Pid::from_raw(child.as_raw());
-            // Drop every inherited fd except the status file: the
-            // long-lived shim must not hold the log pipes (or the
-            // setup error file) open for the build's whole lifetime.
-            let mut status_file = status_file;
-            let keep = status_file.as_raw_fd().cast_unsigned();
-            unsafe {
-                if keep > 3 {
-                    libc::syscall(libc::SYS_close_range, 3, keep - 1, 0);
-                }
-                libc::syscall(libc::SYS_close_range, keep + 1, libc::c_uint::MAX, 0);
-            }
-            let code = loop {
-                match waitpid(child, WaitOptions::empty()) {
-                    Ok(Some((_, status))) => {
-                        if let Some(code) = status.exit_status() {
-                            break code;
-                        }
-                        if let Some(sig) = status.terminating_signal() {
-                            break 128 + sig;
-                        }
-                    }
-                    Ok(None) | Err(Rerrno::INTR) => {}
-                    Err(_) => break 1,
-                }
-            };
-            let _ = writeln!(status_file, "{code}");
-            let _ = status_file.sync_all();
-            unsafe { libc::_exit(code) }
-        }
-    }
-}
-
-struct SetupParams<'a> {
-    spec: &'a SandboxSpec,
-    binfmt_line: Option<&'a str>,
-    /// The agent's pre-mapped user namespace to join.
-    leased_userns: &'a Path,
-    /// Uids mapped in the lease (1 or 65536).
-    uid_count: u32,
-    /// Pre-opened file the PID-1 shim writes the builder's exit code
-    /// to (readable by the worker even when it is not the parent).
-    status_file: &'a fs::File,
-}
-
-fn setup(p: &SetupParams) -> io::Result<()> {
-    let spec = p.spec;
-    let mut flags = UnshareFlags::NEWUSER
-        | UnshareFlags::NEWNS
-        | UnshareFlags::NEWPID
-        | UnshareFlags::NEWIPC
-        | UnshareFlags::NEWUTS;
-    // Network builds keep the host namespace only without isolation;
-    // with it they get a private one plus user-mode NAT.
-    let private_net = !spec.network || spec.net_isolation;
-    if private_net {
-        flags |= UnshareFlags::NEWNET;
-    }
-    // The agent runs the datapath. This end of the tap-handoff
-    // socketpair was inherited across the setup stage's exec.
-    let net_fwd = if spec.net_isolation && spec.network {
-        let fd = spec
-            .net_fwd_fd
-            .ok_or_else(|| io::Error::other("sandbox spec lacks the tap handoff fd"))?;
-        // SAFETY: the fd was opened by the agent for this handoff and
-        // nothing else in the setup stage owns it.
-        Some(unsafe { OwnedFd::from_raw_fd(fd) })
-    } else {
-        None
-    };
-    if spec.cgroup.is_some() {
-        // Cgroup namespace rooted at the just-entered build cgroup:
-        // the cgroup2 mount below then exposes only the build's own
-        // delegated subtree (usable by nspawn inside the sandbox).
-        flags |= UnshareFlags::NEWCGROUP;
-    }
-    // The agent already wrote the maps of its namespace; join it
-    // (allowed: this uid owns it) and unshare the rest inside. Then
-    // become in-ns root (backed by the pool base uid): the worker uid
-    // is not mapped here, so the file creation and mounts below need
-    // mapped credentials.
-    let ns = fs::File::open(p.leased_userns)
-        .map_err(|e| io::Error::other(format!("opening leased userns: {e}")))?;
-    move_into_link_name_space(ns.as_fd(), Some(LinkNameSpaceType::User))
-        .map_err(ioerr("joining leased userns"))?;
-    // SAFETY: only namespace flags; no fd-table, fs or VM sharing changes.
-    unsafe { unshare_unsafe(flags & !UnshareFlags::NEWUSER) }.map_err(ioerr("unshare"))?;
-    // Per-thread credential calls: the setns/unshare above already
-    // require a single-threaded process, so they cover the whole one.
-    set_thread_groups(&[]).map_err(ioerr("setgroups"))?;
-    set_thread_gid(Gid::from_raw(0)).map_err(ioerr("setgid"))?;
-    set_thread_uid(Uid::from_raw(0)).map_err(ioerr("setuid"))?;
-    // The setuid from the unmapped worker uid cleared the dumpable
-    // flag, which makes /proc/self inodes root-owned and would reject
-    // the nested userns map writes below; the userns still confines
-    // ptrace, so restore it.
-    set_dumpable_behavior(DumpableBehavior::Dumpable).map_err(ioerr("set dumpable"))?;
-    sethostname(b"localhost").map_err(ioerr("sethostname"))?;
-    // "(none)" is the kernel default; fixed like Nix for determinism
-    setdomainname(b"(none)").map_err(ioerr("setdomainname"))?;
-    if private_net {
-        loopback_up().map_err(ioerr("bringing lo up"))?;
-    }
-    if let Some(sock) = net_fwd {
-        attach_net(&sock)?;
-    }
-
-    // CLONE_NEWPID only applies to children: fork so the builder
-    // runs as PID 1. Everything below runs in the child.
-    if !fork_into_pid_ns(p.status_file)? {
-        unreachable!("parent never returns");
-    }
-
-    mount_filesystems(p)?;
-
-    // pivot_root + detach the old root: unlike a bare chroot, the
-    // host filesystem is no longer reachable in this namespace.
-    std::env::set_current_dir(&spec.root).map_err(ioerr("chdir to root"))?;
-    pivot_root(".", ".").map_err(ioerr("pivot_root"))?;
-    unmount(".", UnmountFlags::DETACH).map_err(ioerr("detaching old root"))?;
-    std::env::set_current_dir("/").map_err(ioerr("chdir /"))?;
-    std::env::set_current_dir(&spec.cwd)
-        .map_err(|e| io::Error::other(format!("chdir {}: {e}", spec.cwd)))?;
-
-    if let Some(line) = p.binfmt_line {
-        register_binfmt(line)?;
-    }
-    apply_process_limits(&spec.system)?;
-
-    // The build became in-ns root when joining the namespace;
-    // single-uid builds must not run the builder with sandbox root's
-    // capabilities, so remap to Nix's uid 1000 via a nested userns
-    // (any binfmt registration above already ran as root). uid-range
-    // builds keep in-ns root: container payloads need it.
-    if p.uid_count == 1 {
-        // SAFETY: only namespace flags; no fd-table, fs or VM sharing changes.
-        unsafe { unshare_unsafe(UnshareFlags::NEWUSER) }.map_err(ioerr("nested unshare"))?;
-        fs::write("/proc/self/setgroups", "deny").map_err(ioerr("nested setgroups"))?;
-        fs::write("/proc/self/uid_map", "1000 0 1").map_err(ioerr("nested uid_map"))?;
-        fs::write("/proc/self/gid_map", "100 0 1").map_err(ioerr("nested gid_map"))?;
-    }
-    Ok(())
-}
-
-/// Bind the sandbox root over itself, populate it with input/device
-/// binds and the pseudo-filesystems the builder expects. Runs in the
-/// PID-1 child after fork, before pivot_root.
-fn mount_filesystems(p: &SetupParams) -> io::Result<()> {
-    let root = &p.spec.root;
-    mount_change(
-        "/",
-        MountPropagationFlags::REC | MountPropagationFlags::PRIVATE,
-    )
-    .map_err(ioerr("making / private"))?;
-    tmpfs_root(p)?;
-
-    let bind_one = |src: &Path, dst: &Path, ro: bool, extra: MountFlags| -> io::Result<()> {
-        let target = root.join(dst.strip_prefix("/").unwrap_or(dst));
-        mount_bind_recursive(src, &target)
-            .map_err(|e| io::Error::other(format!("binding {}: {e}", src.display())))?;
-        // In a user namespace, a bind mount keeps its source's
-        // locked flags (nosuid, nodev, ...); a remount that drops
-        // any of them fails with EPERM, so carry them over.
-        let locked = existing_mount_flags(&target)?;
-        let mut remount = MountFlags::BIND | locked | extra;
-        if ro {
-            remount |= MountFlags::RDONLY;
-        }
-        mount_remount(&target, remount, "")
-            .map_err(|e| io::Error::other(format!("remounting {}: {e}", src.display())))?;
-        Ok(())
-    };
-    // Every bind is read-only: request-derived ones because the request
-    // must not expose writable host files, device binds because the
-    // sandbox must not chmod/chown the host nodes (writing *to* a char
-    // device works regardless of MS_RDONLY).
-    let nosuid_nodev = MountFlags::NOSUID | MountFlags::NODEV;
-    for (src, dst) in &p.spec.binds_ro {
-        bind_one(src, dst, true, nosuid_nodev)?;
-    }
-    for (src, dst) in &p.spec.binds_dev {
-        bind_one(src, dst, true, MountFlags::NOSUID)?;
-    }
-    bind_one(
-        &p.spec.build_dir,
-        Path::new(&p.spec.cwd),
-        false,
-        nosuid_nodev,
-    )?;
-
-    mount(
-        "tmpfs",
-        root.join("dev/shm"),
-        "tmpfs",
-        nosuid_nodev,
-        c"mode=1777",
-    )
-    .map_err(ioerr("mounting /dev/shm"))?;
-    mount(
-        "devpts",
-        root.join("dev/pts"),
-        "devpts",
-        MountFlags::NOSUID | MountFlags::NOEXEC,
-        c"newinstance,mode=0620,ptmxmode=0666",
-    )
-    .map_err(ioerr("mounting /dev/pts"))?;
-
-    // Inside the fresh PID namespace this shows only the build's own
-    // processes; the old host-/proc bind fallback exposed every host
-    // PID (and /proc/<pid>/root, a chroot escape).
-    mount(
-        "proc",
-        root.join("proc"),
-        "proc",
-        MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC,
-        None,
-    )
-    .map_err(ioerr("mounting /proc"))?;
-
-    // Like Nix: uid-range builds get a real sysfs (the userns owns
-    // its netns, so the kernel allows it); container managers fail
-    // without one ("VFS: Mount too revealing").
-    if p.uid_count > 1 {
-        mount(
-            "sysfs",
-            root.join("sys"),
-            "sysfs",
-            MountFlags::empty(),
-            None,
-        )
-        .map_err(ioerr("mounting /sys"))?;
-    }
-
-    if p.spec.cgroup.is_some() {
-        // the cgroup namespace makes the build's own cgroup the root
-        mount(
-            "cgroup2",
-            root.join("sys/fs/cgroup"),
-            "cgroup2",
-            MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC,
-            None,
-        )
-        .map_err(ioerr("mounting /sys/fs/cgroup"))?;
-    }
-    Ok(())
-}
-
-/// A leased build cannot own the worker-created on-disk skeleton (the
-/// worker uid is unmapped here); recreate it on a tmpfs owned by this
-/// namespace (setup runs as in-ns root) so the build can chmod and
-/// chown it like under a root worker. Only the scratch store stays on
-/// disk: outputs must survive the namespace.
-fn tmpfs_root(p: &SetupParams) -> io::Result<()> {
-    let root = &p.spec.root;
-    // Detach the scratch store as a floating bind mount, reattached below.
-    let store = open_tree(
-        rustix::fs::CWD,
-        root.join("nix/store"),
-        OpenTreeFlags::OPEN_TREE_CLONE | OpenTreeFlags::OPEN_TREE_CLOEXEC,
-    )
-    .map_err(ioerr("detaching scratch store"))?;
-    mount("tmpfs", root, "tmpfs", MountFlags::empty(), None)
-        .map_err(ioerr("mounting tmpfs root"))?;
-    write_skeleton(p.spec)
-        .map_err(|e| io::Error::other(format!("populating tmpfs root: {e:#}")))?;
-    move_mount(
-        store.as_fd(),
-        "",
-        rustix::fs::CWD,
-        root.join("nix/store"),
-        MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
-    )
-    .map_err(ioerr("attaching scratch store"))?;
-    // After the store reattach, so store-input mount points land on
-    // the on-disk store instead of being hidden by it.
-    create_mount_points(p.spec).map_err(|e| io::Error::other(format!("mount points: {e:#}")))
-}
-
-/// Fresh per-userns binfmt_misc instance (kernel 6.7+) so emulated
-/// builds bind their interpreter without touching the host registry.
-fn register_binfmt(line: &str) -> io::Result<()> {
-    mount(
-        "binfmt_misc",
-        "/proc/sys/fs/binfmt_misc",
-        "binfmt_misc",
-        MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC,
-        None,
-    )
-    .map_err(ioerr(
-        "mounting binfmt_misc (emulated builds need kernel 6.7+)",
-    ))?;
-    fs::write("/proc/sys/fs/binfmt_misc/register", line).map_err(ioerr("registering binfmt entry"))
-}
-
-/// Match Nix's process environment: no core dumps in outputs, a
-/// predictable umask (output modes feed the NAR hash), 32-bit
-/// personality for 32-bit systems, no ASLR for determinism, no
-/// privilege gain via setuid binaries, and a fork-bomb-braking
-/// RLIMIT_NPROC. Hard limits are never raised: the child userns has no
-/// CAP_SYS_RESOURCE in the initial namespace, so a host with finite
-/// hard limits (e.g. GitHub-hosted runners cap RLIMIT_CORE) would
-/// EPERM.
-fn apply_process_limits(system: &str) -> io::Result<()> {
-    let hard = getrlimit(Resource::Nproc).maximum;
-    let limit = Some(hard.unwrap_or(u64::MAX).min(4096));
-    setrlimit(
-        Resource::Nproc,
-        Rlimit {
-            current: limit,
-            maximum: limit,
-        },
-    )
-    .map_err(ioerr("setting RLIMIT_NPROC"))?;
-    let hard = getrlimit(Resource::Core).maximum;
-    setrlimit(
-        Resource::Core,
-        Rlimit {
-            current: Some(0),
-            maximum: hard,
-        },
-    )
-    .map_err(ioerr("setting RLIMIT_CORE"))?;
-    umask(Mode::from_bits_truncate(0o022));
-    // PER_LINUX32 is a base persona, not a flag bit; nix's Persona
-    // bitflags truncate it, so do the read/modify/write via raw libc.
-    let base: libc::c_ulong = if matches!(
-        system,
-        "i686-linux" | "armv7l-linux" | "armv6l-linux" | "armv5tel-linux"
-    ) {
-        0x0008 // PER_LINUX32
-    } else {
-        libc::c_ulong::from(unsafe { libc::personality(0xFFFF_FFFF) }.cast_unsigned())
-    };
-    unsafe {
-        libc::personality(base | 0x0004_0000 /* ADDR_NO_RANDOMIZE */)
-    };
-    rustix::thread::set_no_new_privs(true).map_err(ioerr("PR_SET_NO_NEW_PRIVS"))
-}
 
 pub fn setup_error_file(root: &Path) -> PathBuf {
     root.with_file_name("setup-error")

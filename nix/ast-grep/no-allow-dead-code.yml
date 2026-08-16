@@ -1,0 +1,7 @@
+id: no-allow-dead-code
+message: delete the dead code instead of silencing the lint
+severity: error
+language: rust
+rule:
+  kind: attribute_item
+  regex: '^#!?\[allow\((dead_code|unused)'

@@ -3,41 +3,27 @@
 //! slot, supervises it and restarts it after it exits.
 
 use std::fs;
+use std::io;
+use std::os::unix::fs::chown as chown_path;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::process::ExitStatus;
 use std::time::{Duration, Instant};
+use std::{env, thread};
 
-use crate::errors::chain;
+use crate::errors::{Result, chain, err_ctx, err_msg};
+use crate::fsutil::io_ctx;
+use crate::sockpath;
 use rustix::process::{Gid, Uid};
 use rustix::process::{geteuid, getuid};
-use rustix::thread::{set_thread_groups, set_thread_res_gid, set_thread_res_uid};
+use rustix::thread::{
+    CapabilitySet, CapabilitySets, configure_capability_in_ambient_set, set_capabilities,
+    set_keep_capabilities, set_thread_groups, set_thread_res_gid, set_thread_res_uid,
+};
 
 /// Size of each agent's mapped uid block.
 const UID_BLOCK: u32 = 65536;
-
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-    #[error("{step}")]
-    Step {
-        step: String,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("spawn-agents must be at least 1")]
-    ZeroCount,
-    #[error("agent socket {0} did not come up")]
-    SocketTimeout(PathBuf),
-}
-
-fn step(step: impl Into<String>) -> impl FnOnce(std::io::Error) -> Error {
-    |source| Error::Step {
-        step: step.into(),
-        source,
-    }
-}
 
 /// One spawned agent slot.
 struct Slot {
@@ -51,11 +37,11 @@ struct Slot {
 
 /// Spawn `count` agents under `<state_dir>/agents` and return their
 /// socket paths once they accept connections.
-pub fn spawn(state_dir: &Path, count: u32, uid_base: Option<u32>) -> Result<Vec<PathBuf>, Error> {
+pub fn spawn(state_dir: &Path, count: u32, uid_base: Option<u32>) -> Result<Vec<PathBuf>> {
     if count == 0 {
-        return Err(Error::ZeroCount);
+        return Err(err_msg("spawn-agents must be at least 1"));
     }
-    let exe = std::env::current_exe().map_err(step("resolving the worker binary"))?;
+    let exe = env::current_exe().map_err(err_ctx("resolving the worker binary"))?;
     let root = geteuid().is_root();
     let uid_base = match (uid_base, root) {
         (Some(b), true) => Some(b),
@@ -72,7 +58,7 @@ pub fn spawn(state_dir: &Path, count: u32, uid_base: Option<u32>) -> Result<Vec<
     let mut sockets = Vec::new();
     for i in 1..=count {
         let dir = base_dir.join(i.to_string());
-        fs::create_dir_all(&dir)?;
+        fs::create_dir_all(&dir).map_err(io_ctx("creating", &dir))?;
         let slot = Slot {
             socket: dir.join("agent.sock"),
             state_dir: dir.clone(),
@@ -80,12 +66,12 @@ pub fn spawn(state_dir: &Path, count: u32, uid_base: Option<u32>) -> Result<Vec<
             uid_base: uid_base.map(|b| b + i * UID_BLOCK),
         };
         if let Some(uid) = slot.uid {
-            std::os::unix::fs::chown(&dir, Some(uid), Some(uid))
-                .map_err(step(format!("chowning {}", dir.display())))?;
+            chown_path(&dir, Some(uid), Some(uid))
+                .map_err(err_ctx(format!("chowning {}", dir.display())))?;
         }
         let _ = fs::remove_file(&slot.socket);
         sockets.push(slot.socket.clone());
-        std::thread::spawn({
+        thread::spawn({
             let exe = exe.clone();
             move || supervise(&exe, &slot)
         });
@@ -107,13 +93,13 @@ fn supervise(exe: &Path, slot: &Slot) {
             Ok(status) => tracing::info!(socket = %slot.socket.display(), %status, "agent exited"),
             Err(e) => {
                 tracing::warn!(socket = %slot.socket.display(), "starting agent: {}", chain(&e));
-                std::thread::sleep(Duration::from_secs(1));
+                thread::sleep(Duration::from_secs(1));
             }
         }
     }
 }
 
-fn run_once(exe: &Path, slot: &Slot) -> Result<std::process::ExitStatus, Error> {
+fn run_once(exe: &Path, slot: &Slot) -> Result<ExitStatus> {
     let mut cmd = Command::new(exe);
     cmd.arg("agent")
         .arg("--socket")
@@ -131,19 +117,15 @@ fn run_once(exe: &Path, slot: &Slot) -> Result<std::process::ExitStatus, Error> 
         unsafe { cmd.pre_exec(move || confine_to(uid)) };
     }
     cmd.spawn()
-        .map_err(step(format!("spawning {}", exe.display())))?
+        .map_err(err_ctx(format!("spawning {}", exe.display())))?
         .wait()
-        .map_err(step("waiting for the agent"))
+        .map_err(err_ctx("waiting for the agent"))
 }
 
 /// Switch the child to the agent uid while keeping the capabilities
 /// the agent needs: SETUID/SETGID for its uid-block map write, CHOWN
 /// for handing build cgroups to the mapped root uid.
-fn confine_to(uid: u32) -> std::io::Result<()> {
-    use rustix::thread::{
-        CapabilitySet, CapabilitySets, configure_capability_in_ambient_set, set_capabilities,
-        set_keep_capabilities,
-    };
+fn confine_to(uid: u32) -> io::Result<()> {
     let keep = CapabilitySet::SETUID | CapabilitySet::SETGID | CapabilitySet::CHOWN;
     let (u, g) = (Uid::from_raw(uid), Gid::from_raw(uid));
     set_thread_groups(&[g])?;
@@ -169,17 +151,20 @@ fn confine_to(uid: u32) -> std::io::Result<()> {
 }
 
 /// Wait until every agent socket accepts a connection.
-fn wait_for_sockets(sockets: &[PathBuf]) -> Result<(), Error> {
+fn wait_for_sockets(sockets: &[PathBuf]) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(30);
     for socket in sockets {
         loop {
-            if crate::sockpath::connect(socket).is_ok() {
+            if sockpath::connect(socket).is_ok() {
                 break;
             }
             if Instant::now() >= deadline {
-                return Err(Error::SocketTimeout(socket.clone()));
+                return Err(err_msg(format!(
+                    "agent socket {} did not come up",
+                    socket.display()
+                )));
             }
-            std::thread::sleep(Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(100));
         }
     }
     Ok(())

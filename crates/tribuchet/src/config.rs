@@ -5,9 +5,15 @@
 //! editing the unit.
 
 use std::collections::BTreeMap;
+use std::env;
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::thread;
 
 use serde::Deserialize;
+
+use crate::netpolicy::NetPolicy;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -15,7 +21,7 @@ pub enum Error {
     Read {
         path: PathBuf,
         #[source]
-        source: std::io::Error,
+        source: io::Error,
     },
     #[error("parsing config file {path}")]
     Parse {
@@ -38,7 +44,7 @@ pub enum Auth {
 }
 
 pub fn load<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Error> {
-    let text = std::fs::read_to_string(path).map_err(|source| Error::Read {
+    let text = fs::read_to_string(path).map_err(|source| Error::Read {
         path: path.to_path_buf(),
         source,
     })?;
@@ -185,7 +191,7 @@ pub struct WorkerConfig {
     /// allow/deny rules on destination address, protocol and port,
     /// evaluated when a build opens an outbound connection.
     #[serde(default)]
-    pub fod_network: crate::netpolicy::NetPolicy,
+    pub fod_network: NetPolicy,
     /// Advertise the `recursive-nix` system feature so the hub routes
     /// derivations using it here. Requires the patched Nix on the
     /// client side (see `nix/patches/`).
@@ -218,7 +224,7 @@ impl WorkerConfig {
             ("TRIBUCHET_CERT", &mut self.cert),
             ("TRIBUCHET_KEY", &mut self.key),
         ] {
-            if let Some(v) = std::env::var_os(var) {
+            if let Some(v) = env::var_os(var) {
                 *field = PathBuf::from(v);
             }
         }
@@ -241,7 +247,7 @@ fn default_build_timeout() -> u64 {
     24 * 3600
 }
 fn default_max_jobs() -> u32 {
-    std::thread::available_parallelism()
+    thread::available_parallelism()
         .ok()
         .and_then(|n| u32::try_from(n.get()).ok())
         .unwrap_or(1)
@@ -254,9 +260,9 @@ mod tests {
     fn env_overrides_tls_paths() {
         let mut cfg: WorkerConfig = toml::from_str("hub = \"https://hub:7437\"").unwrap();
         // SAFETY: test-only; no other thread reads the environment here.
-        unsafe { std::env::set_var("TRIBUCHET_KEY", "/run/credentials/w/worker-key") };
+        unsafe { env::set_var("TRIBUCHET_KEY", "/run/credentials/w/worker-key") };
         cfg.apply_env_overrides();
-        unsafe { std::env::remove_var("TRIBUCHET_KEY") };
+        unsafe { env::remove_var("TRIBUCHET_KEY") };
         assert_eq!(cfg.key, PathBuf::from("/run/credentials/w/worker-key"));
         assert_eq!(cfg.cert, default_cert());
     }

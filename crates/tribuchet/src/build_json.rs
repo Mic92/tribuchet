@@ -4,6 +4,8 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -14,7 +16,7 @@ pub enum Error {
     Read {
         path: PathBuf,
         #[source]
-        source: std::io::Error,
+        source: io::Error,
     },
     #[error("parsing build.json")]
     Parse(#[from] serde_json::Error),
@@ -41,7 +43,7 @@ pub struct BuildJson {
 
 impl BuildJson {
     pub fn load(path: &Path) -> Result<Self, Error> {
-        let data = std::fs::read_to_string(path).map_err(|source| Error::Read {
+        let data = fs::read_to_string(path).map_err(|source| Error::Read {
             path: path.to_path_buf(),
             source,
         })?;

@@ -1,6 +1,7 @@
 mod attach;
 mod build_json;
 mod ca;
+mod capwrite;
 mod chunkio;
 mod config;
 mod errors;
@@ -17,7 +18,9 @@ mod tailscale;
 mod tmpdir;
 mod worker;
 
+use std::env;
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
@@ -77,12 +80,12 @@ enum Command {
     },
 }
 
-fn main() -> std::process::ExitCode {
+fn main() -> ExitCode {
     match run() {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+        Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("tribuchet: {}", errors::chain(&e));
-            std::process::ExitCode::FAILURE
+            ExitCode::FAILURE
         }
     }
 }
@@ -91,17 +94,17 @@ fn run() -> Result<(), errors::Error> {
     // Builds re-exec this binary as the sandbox setup stage; divert
     // before clap and tracing touch anything.
     #[cfg(target_os = "linux")]
-    if std::env::args().nth(1).as_deref() == Some(worker::sandbox::SETUP_STAGE_ARG) {
+    if env::args().nth(1).as_deref() == Some(worker::sandbox::SETUP_STAGE_ARG) {
         worker::sandbox::setup_stage();
     }
     // Same for the build agent's userns filesystem helper.
     #[cfg(target_os = "linux")]
-    if std::env::args().nth(1).as_deref() == Some(worker::agent::FS_HELPER_ARG) {
+    if env::args().nth(1).as_deref() == Some(worker::agent::FS_HELPER_ARG) {
         worker::agent::fs_helper_stage();
     }
     // And for the agent's userns holder child.
     #[cfg(target_os = "linux")]
-    if std::env::args().nth(1).as_deref() == Some(worker::USERNS_HOLD_ARG) {
+    if env::args().nth(1).as_deref() == Some(worker::USERNS_HOLD_ARG) {
         worker::userns_hold_stage();
     }
     tracing_subscriber::fmt()

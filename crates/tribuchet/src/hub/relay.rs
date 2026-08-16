@@ -1,30 +1,35 @@
 //! Per-job protocol with a worker: input staging, output relay and verification.
 
-use std::collections::{HashMap, HashSet};
+mod staging;
+use staging::{restage_inputs, stage_inputs, validate_missing};
+
+use std::collections::HashMap;
 use std::io::{self, Write};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures_util::StreamExt as _;
+use harmonia_store_remote::DaemonStore as _;
 use harmonia_utils_signature::{PublicKey, Signature};
-use sha2::{Digest, Sha256};
+use sha2::Digest;
+use tokio::io::AsyncReadExt as _;
 use tokio::sync::mpsc;
 use tonic::Status;
 
-use super::state::{HubState, Job};
+use super::metrics::Metrics;
+use super::state::{HubState, Job, Replay};
+use crate::capwrite::{CappedWriter, HashSink};
 use crate::errors::{Result, err_ctx, err_msg};
 use crate::proto::{
-    BuildAssignment, BuildResult, CancelBuild, ExtraPath, HubMessage, NarTransfer, OutputNar,
-    OutputSignature, PathInfoMsg, PathOffer, ResultAck, StagingComplete, TmpDirArchive,
-    attach_event, hub_message, nar_transfer, worker_message,
+    BuildAssignment, BuildResult, CancelBuild, ExtraPath, HubMessage, MAX_RESEND_ROUNDS,
+    NarTransfer, OutputNar, OutputSignature, PathOffer, ResultAck, attach_event, hub_message,
+    nar_transfer, worker_message,
 };
+use crate::store;
 
 /// How long a dispatched build may run with no attach client listening
 /// before the hub cancels it on the worker.
 const CANCEL_GRACE: Duration = Duration::from_secs(10);
-
-/// Cap on input resend rounds per build.
-const MAX_RESEND_ROUNDS: u32 = 3;
 
 /// Per-worker-session staging state: one build's inputs stream at a
 /// time. Dedup of shared inputs happens on the worker.
@@ -131,85 +136,6 @@ pub(super) async fn run_job(
         .map(|_| ())
 }
 
-/// Reject paths we never offered and dedupe the rest.
-fn validate_missing(offered_paths: &[String], requested: Vec<String>) -> Result<Vec<String>> {
-    let offered: HashSet<&String> = offered_paths.iter().collect();
-    let mut missing = Vec::new();
-    let mut seen = HashSet::new();
-    for p in requested {
-        if !offered.contains(&p) {
-            return Err(err_msg(format!("worker requested unoffered path {p}")));
-        }
-        if seen.insert(p.clone()) {
-            missing.push(p);
-        }
-    }
-    Ok(missing)
-}
-
-/// Stream this build's missing inputs and tmp dir under the session's
-/// staging permit.
-async fn stage_inputs(
-    state: &HubState,
-    job: &Job,
-    out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
-    staging: &WorkerStaging,
-    missing: &[String],
-) -> Result<()> {
-    // Serialize only the import: negotiation before this is read-only
-    // on the worker store, so it runs in parallel (bounded by
-    // RequestJob credits) instead of gating throughput on its
-    // round-trip.
-    let _permit = staging
-        .permits
-        .acquire()
-        .await
-        .expect("staging semaphore closed");
-    stream_inputs(state, job, out_tx, missing).await?;
-    stream_tmp_dir(&job.id, &job.tmp_dir_pack, out_tx).await
-}
-
-/// Stream inputs re-requested after staging, then send StagingComplete.
-async fn restage_inputs(
-    state: &HubState,
-    job: &Job,
-    out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
-    staging: &WorkerStaging,
-    missing: &[String],
-) -> Result<()> {
-    let _permit = staging
-        .permits
-        .acquire()
-        .await
-        .expect("staging semaphore closed");
-    stream_inputs(state, job, out_tx, missing).await?;
-    send(
-        out_tx,
-        hub_message::Msg::StagingComplete(StagingComplete {
-            build_id: job.id.clone(),
-        }),
-    )
-    .await
-}
-
-/// Stream PathInfo + NAR for each path, references before referrers
-/// (the worker's daemon import needs the references valid first).
-async fn stream_inputs(
-    state: &HubState,
-    job: &Job,
-    out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
-    paths: &[String],
-) -> Result<()> {
-    let infos = order_by_references(query_path_infos(&state.daemon_pool, paths).await?);
-    for mut info in infos {
-        let path = info.store_path.clone();
-        info.build_id = job.id.clone();
-        send(out_tx, hub_message::Msg::PathInfo(info)).await?;
-        stream_store_path(&job.id, &path, out_tx).await?;
-    }
-    Ok(())
-}
-
 /// Log/error-safe name of a worker message variant. The messages embed
 /// peer-controlled bytes (NAR chunks, log data); Debug-formatting them
 /// into error strings would balloon logs and replay buffers.
@@ -237,231 +163,12 @@ pub(super) async fn recv(
         .ok_or_else(|| err_msg("worker disconnected or went silent"))
 }
 
-/// Nix db metadata for input paths, in wire form, queried over the
-/// daemon protocol rather than db.sqlite: harmonia-store-db opens the
-/// db with sqlite's immutable=1, which skips locking and WAL replay,
-/// so rows still in the WAL -- freshly registered inputs, the common
-/// case for build requests -- would be invisible and concurrent
-/// checkpoints could yield torn reads. The daemon answers from its
-/// own consistent view.
-/// References before referrers; tolerates self-refs and cycles.
-fn order_by_references(infos: Vec<PathInfoMsg>) -> Vec<PathInfoMsg> {
-    let roots: Vec<String> = infos.iter().map(|i| i.store_path.clone()).collect();
-    let mut nodes: HashMap<String, PathInfoMsg> = infos
-        .into_iter()
-        .map(|i| (i.store_path.clone(), i))
-        .collect();
-    crate::store::topo_order(roots, |p| {
-        nodes[p]
-            .references
-            .iter()
-            .filter(|r| nodes.contains_key(*r))
-            .cloned()
-            .collect()
-    })
-    .into_iter()
-    .map(|p| nodes.remove(&p).unwrap())
-    .collect()
-}
-
-/// Per-path query info from one daemon connection, for a slice of paths.
-async fn query_path_info_chunk(
-    pool: &harmonia_store_remote::ConnectionPool,
-    paths: &[String],
-) -> Result<Vec<PathInfoMsg>> {
-    use harmonia_store_path::{StoreDir, StorePath};
-    use harmonia_store_remote::DaemonStore as _;
-    let store_dir = StoreDir::default();
-    let mut guard = pool
-        .acquire()
-        .await
-        .map_err(err_ctx("connecting to the local nix-daemon"))?;
-    let mut out = Vec::with_capacity(paths.len());
-    for p in paths {
-        let sp: StorePath = store_dir.parse(p)?;
-        let info = guard
-            .execute(|c| c.query_path_info(&sp))
-            .await
-            .map_err(err_ctx(format!("querying path info for {p}")))?
-            .ok_or_else(|| err_msg(format!("{p} is not a valid path in the local store")))?;
-        out.push(PathInfoMsg {
-            build_id: String::new(), // filled in by the caller
-            store_path: p.clone(),
-            nar_sha256: info.nar_hash.digest_bytes().to_vec(),
-            nar_size: info.nar_size,
-            references: info
-                .references
-                .iter()
-                .map(|r| store_dir.display(r).to_string())
-                .collect(),
-            signatures: info.signatures.iter().map(ToString::to_string).collect(),
-            deriver: info
-                .deriver
-                .map(|d| store_dir.display(&d).to_string())
-                .unwrap_or_default(),
-            ca: info.ca.map(|c| c.to_string()).unwrap_or_default(),
-        });
-    }
-    Ok(out)
-}
-
-async fn query_path_infos(
-    pool: &harmonia_store_remote::ConnectionPool,
-    paths: &[String],
-) -> Result<Vec<PathInfoMsg>> {
-    // Spread the per-path query_path_info round trips over several
-    // daemon connections; the pool caps real concurrency (one per CPU).
-    const PARALLELISM: usize = 8;
-    if paths.is_empty() {
-        return Ok(Vec::new());
-    }
-    let chunk_size = paths.len().div_ceil(PARALLELISM).max(1);
-    let chunks = paths
-        .chunks(chunk_size)
-        .map(|chunk| query_path_info_chunk(pool, chunk));
-    let results = futures_util::future::try_join_all(chunks).await?;
-    Ok(results.into_iter().flatten().collect())
-}
-
-/// NAR-pack a local store path, zstd-compress, and stream it to the
-/// worker. The pack (blocking store reads plus the zstd encode) runs on
-/// the blocking pool, overlapping the network send it feeds through the
-/// bounded channel and keeping the async workers free.
-async fn stream_store_path(
-    build_id: &str,
-    store_path: &str,
-    out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
-) -> Result<()> {
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
-    let path = store_path.to_string();
-    let task = tokio::task::spawn_blocking(move || -> Result<()> {
-        use tokio::io::AsyncReadExt as _;
-        crate::rt::name_current_thread("trib-pack");
-        // harmonia's NAR pack is async-only; drive it on a current-thread
-        // runtime here so its blocking file reads stay off the shared
-        // runtime workers.
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .map_err(err_ctx("building NAR pack runtime"))?;
-        rt.block_on(async move {
-            let nar = harmonia_file_nar::archive::NarByteStream::new(PathBuf::from(&path));
-            let mut enc = async_compression::tokio::bufread::ZstdEncoder::with_quality(
-                tokio_util::io::StreamReader::new(nar),
-                async_compression::Level::Precise(3),
-            );
-            let mut buf = vec![0u8; crate::chunkio::CHUNK_SIZE];
-            loop {
-                let n = enc
-                    .read(&mut buf)
-                    .await
-                    .map_err(err_ctx(format!("packing {path}")))?;
-                if n == 0 {
-                    break;
-                }
-                if tx.send(buf[..n].to_vec()).await.is_err() {
-                    break; // consumer gone
-                }
-            }
-            Ok(())
-        })
-    });
-    while let Some(chunk) = rx.recv().await {
-        send(
-            out_tx,
-            hub_message::Msg::Nar(NarTransfer {
-                build_id: build_id.into(),
-                store_path: store_path.into(),
-                payload: Some(nar_transfer::Payload::ZstdNarChunk(chunk)),
-                eof: false,
-            }),
-        )
-        .await?;
-    }
-    task.await??;
-    send(
-        out_tx,
-        hub_message::Msg::Nar(NarTransfer {
-            build_id: build_id.into(),
-            store_path: store_path.into(),
-            payload: None,
-            eof: true,
-        }),
-    )
-    .await
-}
-
-/// Forward the client-shipped build tmp dir entries (structured attrs,
-/// passAsFile files) to the worker. Always sent last: its EOF tells
-/// the worker to start the build.
-async fn stream_tmp_dir(
-    build_id: &str,
-    tmp_dir_pack: &[u8],
-    out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
-) -> Result<()> {
-    for chunk in tmp_dir_pack.chunks(crate::chunkio::CHUNK_SIZE) {
-        send(
-            out_tx,
-            hub_message::Msg::TmpDir(TmpDirArchive {
-                build_id: build_id.into(),
-                zstd_chunk: chunk.to_vec(),
-                eof: false,
-            }),
-        )
-        .await?;
-    }
-    send(
-        out_tx,
-        hub_message::Msg::TmpDir(TmpDirArchive {
-            build_id: build_id.into(),
-            zstd_chunk: Vec::new(),
-            eof: true,
-        }),
-    )
-    .await
-}
-
 /// Hashes the decompressed NAR while the compressed chunks are relayed
 /// untouched, so signature verification adds no extra buffering or
 /// recompression.
 struct OutputVerify {
-    decoder: zstd::stream::write::Decoder<'static, HashWriter>,
+    decoder: zstd::stream::write::Decoder<'static, CappedWriter<HashSink>>,
     signature: Signature,
-}
-
-struct HashWriter {
-    hasher: Sha256,
-    /// Decompressed byte budget: zstd RLE amplifies ~30,000:1, so a
-    /// sub-4MiB message could otherwise expand without bound on the hub
-    /// (and later fill the client's disk).
-    remaining: u64,
-}
-
-impl Default for HashWriter {
-    fn default() -> Self {
-        Self {
-            hasher: Sha256::new(),
-            remaining: MAX_OUTPUT_NAR_BYTES,
-        }
-    }
-}
-
-/// Decompressed size cap per output NAR, matching the worker's pack cap.
-const MAX_OUTPUT_NAR_BYTES: u64 = 64 * 1024 * 1024 * 1024;
-
-impl Write for HashWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if buf.len() as u64 > self.remaining {
-            return Err(io::Error::other(format!(
-                "output NAR exceeds the {MAX_OUTPUT_NAR_BYTES} byte limit"
-            )));
-        }
-        self.remaining -= buf.len() as u64;
-        self.hasher.update(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
 }
 
 /// Verifier for each output the worker reports, checked to be exactly
@@ -480,7 +187,7 @@ fn verify_set(
         pending.insert(
             out.store_path,
             OutputVerify {
-                decoder: zstd::stream::write::Decoder::new(HashWriter::default())?,
+                decoder: zstd::stream::write::Decoder::new(CappedWriter::new(HashSink::default()))?,
                 signature,
             },
         );
@@ -536,8 +243,7 @@ fn start_extras(
                 "signature verification failed for extra {path}"
             )));
         }
-        let parsed =
-            crate::store::parse_path_info(&info).map_err(err_ctx("parsing extra PathInfo"))?;
+        let parsed = store::parse_path_info(&info).map_err(err_ctx("parsing extra PathInfo"))?;
         let (tx, rx) = mpsc::channel::<bytes::Bytes>(8);
         let pool = state.daemon_pool.clone();
         let task = tokio::spawn(async move { import_extra(&pool, parsed, rx).await });
@@ -551,9 +257,6 @@ async fn import_extra(
     info: harmonia_store_path_info::ValidPathInfo,
     rx: mpsc::Receiver<bytes::Bytes>,
 ) -> Result<()> {
-    use futures_util::StreamExt as _;
-    use harmonia_store_remote::DaemonStore as _;
-    use tokio::io::AsyncReadExt as _;
     let mut guard = pool
         .acquire()
         .await
@@ -572,7 +275,7 @@ async fn import_extra(
 async fn relay_output_chunk(
     vkey: &PublicKey,
     pending: &mut HashMap<String, OutputVerify>,
-    replay: &super::state::Replay,
+    replay: &Replay,
     n: &NarTransfer,
 ) -> Result<()> {
     let verify = pending.get_mut(&n.store_path).unwrap();
@@ -589,7 +292,7 @@ async fn relay_output_chunk(
     if n.eof {
         let mut verify = pending.remove(&n.store_path).unwrap();
         verify.decoder.flush()?;
-        let hash = verify.decoder.into_inner().hasher.finalize();
+        let hash = verify.decoder.into_inner().into_inner().0.finalize();
         let msg = format!("{}:{}", n.store_path, hex::encode(hash));
         if !vkey.verify(msg.as_bytes(), &verify.signature) {
             return Err(err_msg(format!(
@@ -610,7 +313,7 @@ async fn relay_output_chunk(
 
 async fn relay_extra_chunk(
     extras: &mut HashMap<String, ExtraImport>,
-    replay: &super::state::Replay,
+    replay: &Replay,
     n: NarTransfer,
 ) -> Result<()> {
     let extra = extras.get_mut(&n.store_path).unwrap();
@@ -637,10 +340,10 @@ async fn relay_extra_chunk(
 async fn finish_relay(
     state: &HubState,
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
-    replay: &super::state::Replay,
+    replay: &Replay,
     job: &Job,
 ) {
-    super::metrics::Metrics::inc(&state.metrics.succeeded);
+    Metrics::inc(&state.metrics.succeeded);
     replay.publish(attach_event::Event::ExitCode(0)).await;
     ack_result(out_tx, job).await;
 }
@@ -669,7 +372,7 @@ async fn publish_worker_failure(
             ))
             .await;
     }
-    super::metrics::Metrics::inc(&state.metrics.failed);
+    Metrics::inc(&state.metrics.failed);
     job.replay
         .publish(attach_event::Event::ExitCode(res.exit_code))
         .await;
@@ -805,57 +508,16 @@ async fn relay_build(
 
 #[cfg(test)]
 mod tests {
+    use harmonia_utils_signature::SecretKey;
+
+    use crate::proto::PathInfoMsg;
+
     use super::*;
-
-    fn info(path: &str, refs: &[&str]) -> PathInfoMsg {
-        PathInfoMsg {
-            build_id: String::new(),
-            store_path: path.into(),
-            nar_sha256: Vec::new(),
-            nar_size: 0,
-            references: refs.iter().map(ToString::to_string).collect(),
-            signatures: Vec::new(),
-            deriver: String::new(),
-            ca: String::new(),
-        }
-    }
-
-    #[test]
-    fn references_are_streamed_before_referrers() {
-        // keyring references more-itertools; offered in referrer-first
-        // order, as Nix's inputPaths can be.
-        let dep = "/nix/store/aaa-more-itertools";
-        let lib = "/nix/store/bbb-keyring";
-        let ordered = order_by_references(vec![info(lib, &[dep, lib]), info(dep, &[])]);
-        let seq: Vec<&str> = ordered.iter().map(|i| i.store_path.as_str()).collect();
-        assert_eq!(seq, vec![dep, lib]);
-    }
-
-    #[test]
-    fn missing_paths_are_validated_against_the_offer() {
-        let offered = vec!["/nix/store/aaa".to_string(), "/nix/store/bbb".to_string()];
-        let dup = vec![
-            "/nix/store/aaa".to_string(),
-            "/nix/store/aaa".to_string(),
-            "/nix/store/bbb".to_string(),
-        ];
-        assert_eq!(validate_missing(&offered, dup).unwrap(), offered);
-        assert!(validate_missing(&offered, vec!["/etc/shadow".into()]).is_err());
-    }
-
-    #[test]
-    fn reference_cycles_do_not_loop() {
-        let a = "/nix/store/aaa";
-        let b = "/nix/store/bbb";
-        let ordered = order_by_references(vec![info(a, &[b]), info(b, &[a])]);
-        assert_eq!(ordered.len(), 2);
-    }
 
     /// Wrong-key signatures must fail before any daemon contact, so a
     /// compromised worker cannot plant store paths on the client.
     #[tokio::test]
     async fn extras_with_wrong_signature_are_rejected() {
-        use harmonia_utils_signature::SecretKey;
         let hub_sk = SecretKey::generate("hub-trusted-key-1".into()).unwrap();
         let attacker_sk = SecretKey::generate("attacker-1".into()).unwrap();
         let vkey = hub_sk.to_public_key();

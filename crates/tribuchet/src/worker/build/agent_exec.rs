@@ -9,6 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{self, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use harmonia_utils_signature::SecretKey;
@@ -17,7 +18,11 @@ use tokio::sync::mpsc;
 use super::{ActiveBuild, pack_outputs_and_extras, unix_now};
 use crate::errors::chain;
 use crate::errors::{Result, err_ctx, err_msg};
+use crate::fsutil::io_ctx;
 use crate::proto::WorkerMessage;
+use crate::tmpdir::pack_zstd_dir;
+#[cfg(target_os = "linux")]
+use crate::worker::caps::requires_uid_range;
 #[cfg(target_os = "macos")]
 use crate::worker::caps::requires_uid_range;
 use crate::worker::logtail::tail_log;
@@ -84,7 +89,7 @@ impl ActiveBuild {
         // scratch dir, since the worker's copy is not agent-writable.
         fs::write(
             self.dir.join("top.tmpdir.zst"),
-            crate::tmpdir::pack_zstd_dir(&self.dir.join("top/build"))?,
+            pack_zstd_dir(&self.dir.join("top/build"))?,
         )?;
         let req = sandbox_proto::agent::StartRequest {
             build_id: a.build_id.clone(),
@@ -105,7 +110,8 @@ impl ActiveBuild {
         let build = agents::AgentBuild::start(
             socket,
             &req,
-            &fs::File::open(self.dir.join("top.tmpdir.zst"))?,
+            &fs::File::open(self.dir.join("top.tmpdir.zst"))
+                .map_err(io_ctx("opening", &self.dir.join("top.tmpdir.zst")))?,
             &log_w,
         )?;
         drop(log_w);
@@ -133,7 +139,7 @@ impl ActiveBuild {
             let build_id = a.build_id.clone();
             let log_done = log_done.clone();
             let dir = self.dir.clone();
-            std::thread::spawn(move || {
+            thread::spawn(move || {
                 tail_log(&dir, &build_id, &tx, || log_done.load(Ordering::Relaxed));
             })
         };
@@ -145,9 +151,9 @@ impl ActiveBuild {
             pid: build.pid,
             spec,
             deadline_unix: unix_now() + timeout.as_secs(),
-            agent_socket: Some(socket.to_path_buf()),
+            agent_socket: socket.to_path_buf(),
         };
-        fs::write(self.dir.join("resume.json"), serde_json::to_vec(&resume)?)?;
+        resume.persist(&self.dir)?;
         let fin = supervise_agent(
             &self.ctx,
             &resume,
@@ -166,7 +172,6 @@ impl ActiveBuild {
     /// spawning the setup stage with it.
     #[cfg(target_os = "linux")]
     fn build_spec(&self) -> Result<sandbox::SandboxSpec> {
-        use crate::worker::caps::requires_uid_range;
         let a = &self.assignment;
         let uid_count = if requires_uid_range(&a.env) { 65536 } else { 1 };
         let spec = sandbox::prepare(
@@ -210,7 +215,7 @@ pub(in crate::worker) fn supervise_agent(
     let log_path = dir.join("build.log");
     // The exit notice arrives on the lease connection. Wait for it on
     // its own thread so the abort conditions keep being polled.
-    let waiter = std::thread::spawn(move || build.wait_exit());
+    let waiter = thread::spawn(move || build.wait_exit());
     let mut aborted: Option<String> = None;
     while !waiter.is_finished() {
         if aborted.is_none() {
@@ -226,7 +231,7 @@ pub(in crate::worker) fn supervise_agent(
                 }
             }
         }
-        std::thread::sleep(Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(200));
     }
     let code = match waiter.join() {
         Ok(Ok(code)) => code,

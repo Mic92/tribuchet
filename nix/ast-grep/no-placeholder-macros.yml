@@ -1,0 +1,7 @@
+id: no-placeholder-macros
+message: remove the placeholder; implement it or fail with a real error
+severity: error
+language: rust
+rule:
+  kind: macro_invocation
+  regex: '^(todo|unimplemented|dbg)!'

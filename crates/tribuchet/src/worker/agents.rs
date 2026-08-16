@@ -6,6 +6,7 @@
 //! over fresh connections, so they work from any worker generation.
 
 use std::fs;
+
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -23,6 +24,7 @@ use sandbox_proto::agent::{
 use sandbox_proto::framing;
 
 use crate::errors::{Result, err_ctx, err_msg};
+use crate::sockpath;
 
 /// SBPL string literal escaping: a quote or backslash in an
 /// interpolated path must not terminate the literal and inject
@@ -204,7 +206,7 @@ impl AgentBuild {
 }
 
 fn connect(socket: &Path) -> Result<UnixStream> {
-    crate::sockpath::connect(socket).map_err(err_ctx(format!(
+    sockpath::connect(socket).map_err(err_ctx(format!(
         "connecting to the build agent at {}",
         socket.display()
     )))
@@ -264,6 +266,11 @@ pub(super) fn cleanup(socket: &Path, build_id: &str) -> Result<()> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::time::Duration;
+    use std::{env, thread};
+
+    use crate::tmpdir::pack_zstd_dir;
+    use crate::worker::agent;
 
     /// A dev-mode agent (self-bound socket, same uid) plus a staged
     /// tmp dir pack for it, shared by the tests below.
@@ -272,8 +279,8 @@ mod tests {
         let state_dir = dir.join("state");
         {
             let socket = socket.clone();
-            std::thread::spawn(move || {
-                let _ = super::super::agent::run(&super::super::agent::Options {
+            thread::spawn(move || {
+                let _ = agent::run(&agent::Options {
                     socket: Some(socket),
                     state_dir,
                     worker_uid: None,
@@ -283,14 +290,14 @@ mod tests {
             });
         }
         while !socket.exists() {
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            thread::sleep(Duration::from_millis(10));
         }
         // build dir carrying .attrs.json, like the client pack
         let build = dir.join("top/build");
         fs::create_dir_all(&build)?;
         fs::write(build.join(".attrs.json"), "{}")?;
         let pack_path = dir.join("top.tmpdir.zst");
-        fs::write(&pack_path, crate::tmpdir::pack_zstd_dir(&build)?)?;
+        fs::write(&pack_path, pack_zstd_dir(&build)?)?;
         Ok((socket, pack_path))
     }
 
@@ -303,7 +310,7 @@ mod tests {
             // need it for mkdir.
             env: HashMap::from([
                 ("NIX_BUILD_TOP".into(), "/build".into()),
-                ("PATH".into(), std::env::var("PATH").unwrap_or_default()),
+                ("PATH".into(), env::var("PATH").unwrap_or_default()),
             ]),
             tmp_dir_in_sandbox: "/build".into(),
             profile: String::new(),

@@ -9,8 +9,11 @@
 //! interface is not required for correctness (only for attack
 //! surface).
 
+use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::path::PathBuf;
+use std::str;
 
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -19,12 +22,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 pub enum Error {
     #[error("connecting to tailscaled at {path}")]
     Connect {
-        path: std::path::PathBuf,
+        path: PathBuf,
         #[source]
-        source: std::io::Error,
+        source: io::Error,
     },
     #[error(transparent)]
-    Io(#[from] std::io::Error),
+    Io(#[from] io::Error),
     #[error("parsing whois response for {addr}")]
     Parse {
         addr: SocketAddr,
@@ -123,7 +126,7 @@ fn http_body(buf: &[u8]) -> Result<&[u8], Error> {
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .ok_or(Error::MalformedResponse)?;
-    let head = std::str::from_utf8(&buf[..sep]).map_err(|_| Error::NonUtf8Head)?;
+    let head = str::from_utf8(&buf[..sep]).map_err(|_| Error::NonUtf8Head)?;
     let status = head.lines().next().unwrap_or_default();
     if !status.contains(" 200 ") {
         return Err(Error::Status(status.to_owned()));

@@ -15,8 +15,10 @@
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::fs;
+use std::io;
 #[cfg(target_os = "linux")]
 use std::os::fd::OwnedFd;
+use std::os::unix::process::CommandExt;
 #[cfg(target_os = "linux")]
 use std::path::Path;
 use std::path::PathBuf;
@@ -29,6 +31,7 @@ use rustix::pipe::{PipeFlags, pipe_with};
 
 #[cfg(target_os = "linux")]
 use super::binfmt;
+use crate::fsutil::io_ctx;
 use crate::netpolicy::NetPolicy;
 #[cfg(target_os = "linux")]
 use crate::proto::BuildAssignment;
@@ -142,13 +145,13 @@ pub struct PrepareOpts<'a> {
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
-    Io(#[from] std::io::Error),
+    Io(#[from] io::Error),
     #[cfg(target_os = "linux")]
     #[error("{step}")]
     Step {
         step: String,
         #[source]
-        source: std::io::Error,
+        source: io::Error,
     },
     #[cfg(target_os = "linux")]
     #[error("sending sandbox spec")]
@@ -159,7 +162,7 @@ pub enum Error {
 }
 
 #[cfg(target_os = "linux")]
-fn step<E: Into<std::io::Error>>(step: impl Into<String>) -> impl FnOnce(E) -> Error {
+fn step<E: Into<io::Error>>(step: impl Into<String>) -> impl FnOnce(E) -> Error {
     |source| Error::Step {
         step: step.into(),
         source: source.into(),
@@ -174,7 +177,7 @@ pub fn prepare(
     opts: &PrepareOpts,
 ) -> Result<SandboxSpec, Error> {
     let build_dir = dir.join("top").join("build");
-    fs::create_dir_all(&build_dir)?;
+    fs::create_dir_all(&build_dir).map_err(io_ctx("creating", &build_dir))?;
     let mut spec = SandboxSpec {
         builder: a.builder.clone(),
         system: a.system.clone(),
@@ -244,7 +247,7 @@ fn build_command(spec: &SandboxSpec) -> Result<(Command, Option<OwnedFd>), Error
     let mut cmd = platform::command(spec)?;
     // Own process group, so orphaned builder children can be killed
     // after the builder exits.
-    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    CommandExt::process_group(&mut cmd, 0);
     // The derivation env must not reach the pre-sandbox setup stage
     // (worker binary, worker host credentials): LD_PRELOAD would run
     // client code outside the sandbox. With the spec on stdin the env
@@ -297,10 +300,11 @@ mod platform;
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+    use std::{error, result};
+    type Result<T> = result::Result<T, Box<dyn error::Error>>;
 
-    fn min_assignment() -> crate::proto::BuildAssignment {
-        crate::proto::BuildAssignment {
+    fn min_assignment() -> BuildAssignment {
+        BuildAssignment {
             build_id: "0123456789abcdef0123456789abcdef".into(),
             dedupe_key: "k".into(),
             system: "x86_64-linux".into(),

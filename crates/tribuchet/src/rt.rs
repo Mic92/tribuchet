@@ -1,6 +1,7 @@
 //! Shared tokio runtime construction and thread naming, so a profile or
 //! `top -H` can tell which role (and which kind of work) a thread runs.
 
+use std::ffi::CString;
 use std::io;
 
 /// A multi-threaded runtime whose worker and blocking-pool threads carry
@@ -16,7 +17,7 @@ pub fn runtime(name: &'static str) -> io::Result<tokio::runtime::Runtime> {
 /// blocking-pool threads that the runtime otherwise names uniformly.
 pub fn name_current_thread(name: &str) {
     #[cfg(target_os = "linux")]
-    if let Ok(c) = std::ffi::CString::new(name) {
+    if let Ok(c) = CString::new(name) {
         // SAFETY: `c` is a valid NUL-terminated string for the call's
         // duration and pthread_self() is always valid for this thread.
         unsafe {

@@ -3,17 +3,25 @@
 //! notification. Every function degrades to a no-op outside the
 //! respective service manager, so plain CLI runs are unaffected.
 
+#[cfg(target_os = "macos")]
+use std::ffi::CString;
+use std::io;
 use std::net::TcpListener;
 use std::os::fd::{BorrowedFd, FromRawFd as _, RawFd};
+use std::os::unix::net::UnixListener;
+use std::time::Duration;
+use std::{env, future, process};
+#[cfg(target_os = "macos")]
+use std::{ptr, slice};
 
 use rustix::net::{AddressFamily, getsockname};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("inspecting LISTEN_FDS")]
-    ListenFds(#[source] std::io::Error),
+    ListenFds(#[source] io::Error),
     #[error(transparent)]
-    Io(#[from] std::io::Error),
+    Io(#[from] io::Error),
     #[error("more than one activated TCP socket")]
     MultipleTcp,
     #[error("more than one activated unix socket")]
@@ -28,7 +36,7 @@ pub enum Error {
     },
     #[cfg(target_os = "macos")]
     #[error("launch_activate_socket({0})")]
-    LaunchActivate(String, #[source] std::io::Error),
+    LaunchActivate(String, #[source] io::Error),
     #[cfg(target_os = "macos")]
     #[error("launchd socket {0} is not a unix socket")]
     LaunchdNotUnix(String),
@@ -41,7 +49,7 @@ pub enum Error {
 #[derive(Default)]
 pub struct ActivatedSockets {
     pub tcp: Option<TcpListener>,
-    pub unix: Option<std::os::unix::net::UnixListener>,
+    pub unix: Option<UnixListener>,
 }
 
 /// Claim activated sockets, at most one TCP and one unix listener.
@@ -83,7 +91,7 @@ impl ActivatedSockets {
                     return Err(Error::MultipleUnix);
                 }
                 // Safety: the service manager passed this fd for us to own.
-                let l = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
+                let l = unsafe { UnixListener::from_raw_fd(fd) };
                 l.set_nonblocking(true)?;
                 self.unix = Some(l);
             }
@@ -112,10 +120,7 @@ fn launchd_sockets(out: &mut ActivatedSockets) -> Result<(), Error> {
 /// The blocking unix listener launchd holds under `name` in the
 /// plist's `Sockets` dictionary, or None when not launchd-activated.
 #[cfg(target_os = "macos")]
-pub fn launchd_unix_listener(
-    name: &str,
-) -> Result<Option<std::os::unix::net::UnixListener>, Error> {
-    use std::os::fd::FromRawFd as _;
+pub fn launchd_unix_listener(name: &str) -> Result<Option<UnixListener>, Error> {
     let Some(fd) = launchd_socket_fds(name)?.into_iter().next() else {
         return Ok(None);
     };
@@ -123,9 +128,7 @@ pub fn launchd_unix_listener(
         return Err(Error::LaunchdNotUnix(name.to_owned()));
     }
     // Safety: launchd passed this fd for us to own.
-    Ok(Some(unsafe {
-        std::os::unix::net::UnixListener::from_raw_fd(fd)
-    }))
+    Ok(Some(unsafe { UnixListener::from_raw_fd(fd) }))
 }
 
 /// Fds launchd holds under `name`, empty when not running under
@@ -139,8 +142,8 @@ fn launchd_socket_fds(name: &str) -> Result<Vec<RawFd>, Error> {
             cnt: *mut libc::size_t,
         ) -> libc::c_int;
     }
-    let cname = std::ffi::CString::new(name).unwrap();
-    let mut fds: *mut libc::c_int = std::ptr::null_mut();
+    let cname = CString::new(name).unwrap();
+    let mut fds: *mut libc::c_int = ptr::null_mut();
     let mut cnt: libc::size_t = 0;
     let rc = unsafe { launch_activate_socket(cname.as_ptr(), &raw mut fds, &raw mut cnt) };
     match rc {
@@ -149,14 +152,14 @@ fn launchd_socket_fds(name: &str) -> Result<Vec<RawFd>, Error> {
         _ => {
             return Err(Error::LaunchActivate(
                 name.to_owned(),
-                std::io::Error::from_raw_os_error(rc),
+                io::Error::from_raw_os_error(rc),
             ));
         }
     }
     if fds.is_null() || cnt == 0 {
         return Ok(Vec::new());
     }
-    let out = unsafe { std::slice::from_raw_parts(fds, cnt) }.to_vec();
+    let out = unsafe { slice::from_raw_parts(fds, cnt) }.to_vec();
     // launch_activate_socket allocates the fd array with malloc.
     unsafe { libc::free(fds.cast()) };
     Ok(out)
@@ -181,9 +184,12 @@ pub fn notify_ready() {
 /// stop while builds drain). Never resolves if no handler can be
 /// installed.
 pub async fn stop_requested() {
-    let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-    else {
-        return std::future::pending().await;
+    let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("installing the SIGTERM handler failed, graceful stop disabled: {e}");
+            return future::pending().await;
+        }
     };
     term.recv().await;
     let _ = sd_notify::notify(&[sd_notify::NotifyState::Stopping]);
@@ -192,14 +198,14 @@ pub async fn stop_requested() {
 /// Keep the systemd watchdog fed (WatchdogSec=); a wedged runtime
 /// stops the pings and gets the service killed and restarted.
 pub fn spawn_watchdog() {
-    let Some(timeout) = std::env::var("WATCHDOG_USEC")
+    let Some(timeout) = env::var("WATCHDOG_USEC")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .map(std::time::Duration::from_micros)
+        .map(Duration::from_micros)
         .filter(|_| {
-            std::env::var("WATCHDOG_PID")
+            env::var("WATCHDOG_PID")
                 .ok()
-                .is_none_or(|p| p == std::process::id().to_string())
+                .is_none_or(|p| p == process::id().to_string())
         })
     else {
         return;

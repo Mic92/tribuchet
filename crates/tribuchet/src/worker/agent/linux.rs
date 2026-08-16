@@ -12,14 +12,16 @@
 //! stage, spawned here.
 
 use std::fs;
-use std::io::IoSliceMut;
+use std::io::{self, IoSliceMut};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::process::{self, Stdio};
 use std::process::{Child, Command};
 use std::sync::Arc;
+use std::{env, slice, thread};
 
 use rustix::io::{FdFlags, fcntl_setfd};
 use rustix::net::sockopt::socket_peercred;
@@ -34,9 +36,11 @@ use rustix::thread::{
 };
 use sandbox_proto::agent::StartRequest;
 
-use super::{Build, Error, Options, cgroup, msg, step};
-use crate::errors::chain;
+use super::{Build, Options, cgroup, make_readable, msg, spawn_plain, stage_scratch};
+use crate::errors::{Error, Result, chain, err_ctx};
+use crate::fsutil::io_ctx;
 use crate::netpolicy::NetPolicy;
+use crate::sd;
 use crate::worker::sandbox::{self, SandboxSpec};
 use crate::worker::userns::{self, UsernsHolder};
 
@@ -64,7 +68,7 @@ struct Userns {
 }
 
 impl Confinement {
-    pub(super) fn init(opts: &Options) -> Result<Self, Error> {
+    pub(super) fn init(opts: &Options) -> Result<Self> {
         // Vacate the unit cgroup before forking the userns holder;
         // with the holder still in it the leaf cannot be enabled.
         let cgroup_base = cgroup::init();
@@ -91,24 +95,25 @@ pub(super) fn stage_tmp_dir(
     scratch_root: &Path,
     build_dir: &Path,
     pack: OwnedFd,
-) -> Result<(), Error> {
+) -> Result<()> {
     let Some(userns) = &confinement.userns else {
-        return super::stage_scratch(fs::File::from(pack), build_dir);
+        return stage_scratch(fs::File::from(pack), build_dir);
     };
     // The scratch root is agent-owned and the agent's uid is unmapped
     // in the namespace, so in-ns root could not create the build dir
     // inside it otherwise. The sticky bit keeps the uid block from
     // deleting the agent's own files; the traverse-only state dir
     // hides the scratch root from other users.
-    fs::set_permissions(scratch_root, fs::Permissions::from_mode(0o1777))?;
-    let exe = std::env::current_exe()?;
+    fs::set_permissions(scratch_root, fs::Permissions::from_mode(0o1777))
+        .map_err(io_ctx("setting permissions on", scratch_root))?;
+    let exe = env::current_exe()?;
     let (_ns_fd, ns_path) = userns::inherited_ns(&userns.fd)?;
     let status = Command::new(exe)
         .arg(FS_HELPER_ARG)
         .arg(ns_path)
         .arg("unpack")
         .arg(build_dir)
-        .stdin(std::process::Stdio::from(fs::File::from(pack)))
+        .stdin(Stdio::from(fs::File::from(pack)))
         .status()?;
     if !status.success() {
         return Err(msg(format!("userns unpack helper exited with {status}")));
@@ -116,9 +121,9 @@ pub(super) fn stage_tmp_dir(
     Ok(())
 }
 
-/// Spawn the build. With a sandbox spec from the worker the setup
-/// stage runs it inside the agent's pre-mapped user namespace; without
-/// one (development, tests) the builder is exec'd directly.
+/// Spawn the build inside the pre-mapped user namespace. Only a
+/// dev-mode agent (no --uid-base) may exec directly: on a confined
+/// agent a spec-less Start would be an unsandboxed escape.
 pub(super) fn spawn_builder(
     confinement: &Confinement,
     req: &StartRequest,
@@ -127,13 +132,17 @@ pub(super) fn spawn_builder(
     log: &fs::File,
 ) -> Result<(Child, Option<PathBuf>), Error> {
     let Some(sandbox_json) = &req.sandbox_json else {
-        return Ok((super::spawn_plain(req, build_dir, log)?, None));
+        if confinement.userns.is_some() {
+            return Err(msg("refusing an unsandboxed build on a confined agent"));
+        }
+        return Ok((spawn_plain(req, build_dir, log)?, None));
     };
     let userns = confinement
         .userns
         .as_ref()
         .ok_or_else(|| msg("sandboxed build requested but the agent has no --uid-base"))?;
-    let mut spec: SandboxSpec = serde_json::from_str(sandbox_json).map_err(Error::DecodeSpec)?;
+    let mut spec: SandboxSpec =
+        serde_json::from_str(sandbox_json).map_err(err_ctx("decoding the sandbox spec"))?;
     spec.root = scratch_root.join("root");
     spec.build_dir = build_dir.to_path_buf();
     let (_ns_fd, ns_path) = userns::inherited_ns(&userns.fd)?;
@@ -147,7 +156,7 @@ pub(super) fn spawn_builder(
     if let (Some(cg), Some(bytes)) = (&spec.cgroup, req.memory_max_bytes) {
         cgroup::set_memory_max(cg, bytes)?;
     }
-    sandbox::prepare_root(&mut spec).map_err(Error::PrepareRoot)?;
+    sandbox::prepare_root(&mut spec).map_err(err_ctx("creating the sandbox root skeleton"))?;
     // Isolated network builds hand their tap fd back over this
     // socketpair to the forwarder thread spawned below.
     let net_fwd = if spec.net_isolation && spec.network {
@@ -157,9 +166,9 @@ pub(super) fn spawn_builder(
             SocketFlags::CLOEXEC,
             None,
         )
-        .map_err(step("creating the tap handoff socketpair"))?;
+        .map_err(err_ctx("creating the tap handoff socketpair"))?;
         // The setup stage inherits its end across the exec.
-        fcntl_setfd(&theirs, FdFlags::empty()).map_err(step("clearing close-on-exec"))?;
+        fcntl_setfd(&theirs, FdFlags::empty()).map_err(err_ctx("clearing close-on-exec"))?;
         spec.net_fwd_fd = Some(theirs.as_raw_fd());
         Some((ours, theirs))
     } else {
@@ -170,7 +179,7 @@ pub(super) fn spawn_builder(
         drop(theirs);
         let policy = spec.net_policy.clone();
         let build_pid = child.id();
-        std::thread::spawn(move || net_forward(&ours, policy, build_pid));
+        thread::spawn(move || net_forward(&ours, policy, build_pid));
     }
     // The setup stage waits for the spec on stdin; move it into the
     // build cgroup first so its cgroup namespace is rooted there.
@@ -228,7 +237,7 @@ fn net_forward(sock: &OwnedFd, policy: NetPolicy, build_pid: u32) {
 pub(super) fn finish(confinement: &Confinement, root: Option<&Path>, outputs: &[String]) {
     let Some(root) = root else {
         for out in outputs {
-            super::make_readable(Path::new(out));
+            make_readable(Path::new(out));
         }
         return;
     };
@@ -245,22 +254,22 @@ pub(super) fn finish(confinement: &Confinement, root: Option<&Path>, outputs: &[
 /// need the userns helper, the agent-owned remainder a plain pass.
 /// Agent-owned entries never nest under uid-block ones, so one pass
 /// of each suffices.
-pub(super) fn clean_scratch(confinement: &Confinement, scratch_root: &Path) -> Result<(), Error> {
+pub(super) fn clean_scratch(confinement: &Confinement, scratch_root: &Path) -> Result<()> {
     match fs::remove_dir_all(scratch_root) {
         Ok(()) => return Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(_) if confinement.userns.is_some() => {
             run_in_userns(
                 confinement,
                 "remove",
-                std::slice::from_ref(&scratch_root.to_path_buf()),
+                slice::from_ref(&scratch_root.to_path_buf()),
             )?;
         }
         Err(e) => return Err(e.into()),
     }
     match fs::remove_dir_all(scratch_root) {
         Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(msg(format!(
             "stale scratch tree {} could not be removed: {e}",
             scratch_root.display()
@@ -278,11 +287,7 @@ pub(super) fn cleanup(confinement: &Confinement, build: &Build) {
         {
             tracing::warn!("removing the build cgroup: {}", chain(&e));
         }
-        if let Err(e) = run_in_userns(
-            confinement,
-            "remove",
-            std::slice::from_ref(&build.scratch_root),
-        ) {
+        if let Err(e) = run_in_userns(confinement, "remove", slice::from_ref(&build.scratch_root)) {
             tracing::warn!("removing the scratch tree: {}", chain(&e));
         }
         return;
@@ -299,12 +304,12 @@ pub(super) fn cleanup(confinement: &Confinement, build: &Build) {
 
 /// Re-exec this binary as the userns filesystem helper and wait it
 /// out.
-fn run_in_userns(confinement: &Confinement, op: &str, paths: &[PathBuf]) -> Result<(), Error> {
+fn run_in_userns(confinement: &Confinement, op: &str, paths: &[PathBuf]) -> Result<()> {
     let userns = confinement
         .userns
         .as_ref()
         .ok_or_else(|| msg("no pre-mapped user namespace"))?;
-    let exe = std::env::current_exe()?;
+    let exe = env::current_exe()?;
     let (_ns_fd, ns_path) = userns::inherited_ns(&userns.fd)?;
     let status = Command::new(exe)
         .arg(FS_HELPER_ARG)
@@ -322,24 +327,25 @@ fn run_in_userns(confinement: &Confinement, op: &str, paths: &[PathBuf]) -> Resu
 /// namespace, whose owner gets full capabilities over the uid-block
 /// files, and runs the filesystem operation the agent itself may not.
 pub fn fs_helper_stage() -> ! {
-    fn run() -> Result<(), Error> {
-        let mut args = std::env::args_os().skip(2);
-        let ns = fs::File::open(args.next().ok_or_else(|| msg("missing userns path"))?)?;
+    fn run() -> Result<()> {
+        let mut args = env::args_os().skip(2);
+        let ns_path = PathBuf::from(args.next().ok_or_else(|| msg("missing userns path"))?);
+        let ns = fs::File::open(&ns_path).map_err(io_ctx("opening", &ns_path))?;
         let op = args.next().ok_or_else(|| msg("missing op"))?;
         move_into_link_name_space(ns.as_fd(), Some(LinkNameSpaceType::User))
-            .map_err(step("joining the agent user namespace"))?;
+            .map_err(err_ctx("joining the agent user namespace"))?;
         if op.to_str() == Some("unpack") {
             // Become in-ns root so the unpacked files belong to the
             // uid block instead of the agent's unmapped uid.
-            set_thread_gid(Gid::from_raw(0)).map_err(step("setgid 0 in the ns"))?;
-            set_thread_uid(Uid::from_raw(0)).map_err(step("setuid 0 in the ns"))?;
+            set_thread_gid(Gid::from_raw(0)).map_err(err_ctx("setgid 0 in the ns"))?;
+            set_thread_uid(Uid::from_raw(0)).map_err(err_ctx("setuid 0 in the ns"))?;
             let build_dir = PathBuf::from(args.next().ok_or_else(|| msg("missing build dir"))?);
-            return super::stage_scratch(std::io::stdin(), &build_dir);
+            return stage_scratch(io::stdin(), &build_dir);
         }
         for path in args {
             let path = Path::new(&path);
             match op.to_str() {
-                Some("make-readable") => super::make_readable(path),
+                Some("make-readable") => make_readable(path),
                 Some("remove") => {
                     let _ = fs::remove_dir_all(path);
                     let _ = fs::remove_file(path);
@@ -350,21 +356,17 @@ pub fn fs_helper_stage() -> ! {
         Ok(())
     }
     match run() {
-        Ok(()) => std::process::exit(0),
+        Ok(()) => process::exit(0),
         Err(e) => {
             eprintln!("agent fs helper: {}", chain(&e));
-            std::process::exit(1);
+            process::exit(1);
         }
     }
 }
 
 /// Confinement hook of the direct-exec path (no sandbox spec):
 /// seatbelt-profile requests have no Linux equivalent there.
-pub(super) fn confine(
-    _cmd: &mut Command,
-    req: &StartRequest,
-    _build_dir: &str,
-) -> Result<(), Error> {
+pub(super) fn confine(_cmd: &mut Command, req: &StartRequest, _build_dir: &str) -> Result<()> {
     if !req.profile.is_empty() {
         return Err(msg("seatbelt profiles are only supported on macOS"));
     }
@@ -375,14 +377,15 @@ impl Userns {
     /// Create the agent's user namespace, map `0 uid_base 65536` into
     /// it and drop the ambient/permitted capabilities that allowed
     /// the map write.
-    fn create(uid_base: u32) -> Result<Self, Error> {
-        let (holder, fd) = UsernsHolder::new().map_err(Error::CreateUserns)?;
+    fn create(uid_base: u32) -> Result<Self> {
+        let (holder, fd) =
+            UsernsHolder::new().map_err(err_ctx("creating the agent user namespace"))?;
         let map = format!("0 {uid_base} {UID_COUNT}");
         let pid = holder.pid();
-        fs::write(format!("/proc/{pid}/uid_map"), &map).map_err(step(
+        fs::write(format!("/proc/{pid}/uid_map"), &map).map_err(err_ctx(
             "writing the agent uid_map, which needs ambient CAP_SETUID",
         ))?;
-        fs::write(format!("/proc/{pid}/gid_map"), &map).map_err(step(
+        fs::write(format!("/proc/{pid}/gid_map"), &map).map_err(err_ctx(
             "writing the agent gid_map, which needs ambient CAP_SETGID",
         ))?;
         drop_caps()?;
@@ -402,8 +405,8 @@ impl Userns {
 /// Drop the agent's capabilities down to CAP_CHOWN; only handing the
 /// build cgroups to their mapped root uid still needs privilege after
 /// the map write.
-fn drop_caps() -> Result<(), Error> {
-    rustix::thread::clear_ambient_capability_set().map_err(step("clearing the ambient set"))?;
+fn drop_caps() -> Result<()> {
+    rustix::thread::clear_ambient_capability_set().map_err(err_ctx("clearing the ambient set"))?;
     rustix::thread::set_capabilities(
         None,
         rustix::thread::CapabilitySets {
@@ -412,7 +415,7 @@ fn drop_caps() -> Result<(), Error> {
             inheritable: rustix::thread::CapabilitySet::empty(),
         },
     )
-    .map_err(step("reducing the capability sets"))?;
+    .map_err(err_ctx("reducing the capability sets"))?;
     Ok(())
 }
 
@@ -420,19 +423,16 @@ fn drop_caps() -> Result<(), Error> {
 /// socket-activated. The shared adoption helper serves the async hub
 /// and marks the fd non-blocking; the agent's accept loop is
 /// synchronous.
-pub(super) fn activated_unix_listener() -> Result<Option<UnixListener>, Error> {
-    let listener = crate::sd::activated_sockets()?.unix;
+pub(super) fn activated_unix_listener() -> Result<Option<UnixListener>> {
+    let listener = sd::activated_sockets()?.unix;
     if let Some(l) = &listener {
         l.set_nonblocking(false)?;
     }
     Ok(listener)
 }
 
-pub(super) fn peer_uid(conn: &UnixStream) -> Result<u32, Error> {
-    Ok(socket_peercred(conn)
-        .map_err(std::io::Error::from)?
-        .uid
-        .as_raw())
+pub(super) fn peer_uid(conn: &UnixStream) -> Result<u32> {
+    Ok(socket_peercred(conn).map_err(io::Error::from)?.uid.as_raw())
 }
 
 /// Whether the build cgroup's memory.max OOM-killed the build.
@@ -471,4 +471,31 @@ pub(super) fn own_uid_pids() -> Vec<i32> {
             (real_uid == uid).then_some(pid)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn confined_agent_refuses_an_unsandboxed_start() -> Result<()> {
+        let Ok((holder, fd)) = UsernsHolder::new() else {
+            eprintln!("skipping: cannot create a user namespace here");
+            return Ok(());
+        };
+        let confinement = Confinement {
+            userns: Some(Userns {
+                holder,
+                fd,
+                uid_base: 65536,
+            }),
+            cgroup_base: None,
+        };
+        let dir = tempfile::tempdir()?;
+        let log = fs::File::create(dir.path().join("log"))?;
+        let req = StartRequest::default();
+        let err = spawn_builder(&confinement, &req, dir.path(), dir.path(), &log).unwrap_err();
+        assert!(err.to_string().contains("refusing an unsandboxed build"));
+        Ok(())
+    }
 }

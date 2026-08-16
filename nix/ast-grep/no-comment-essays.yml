@@ -1,0 +1,9 @@
+id: no-comment-essays
+message: comment block of 8+ lines; condense it to the WHY
+severity: error
+language: rust
+rule:
+  kind: line_comment
+  not: {regex: "^//!"}
+  precedes: {not: {kind: line_comment}}
+  follows: {kind: line_comment, not: {regex: "^//!"}, follows: {kind: line_comment, not: {regex: "^//!"}, follows: {kind: line_comment, not: {regex: "^//!"}, follows: {kind: line_comment, not: {regex: "^//!"}, follows: {kind: line_comment, not: {regex: "^//!"}, follows: {kind: line_comment, not: {regex: "^//!"}, follows: {kind: line_comment, not: {regex: "^//!"}}}}}}}}
