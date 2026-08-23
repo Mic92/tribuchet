@@ -18,6 +18,7 @@ use std::fs;
 use std::io;
 #[cfg(target_os = "linux")]
 use std::os::fd::OwnedFd;
+#[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 #[cfg(target_os = "linux")]
 use std::path::Path;
@@ -31,6 +32,7 @@ use rustix::pipe::{PipeFlags, pipe_with};
 
 #[cfg(target_os = "linux")]
 use super::binfmt;
+#[cfg(target_os = "linux")]
 use crate::fsutil::io_ctx;
 use crate::netpolicy::NetPolicy;
 #[cfg(target_os = "linux")]

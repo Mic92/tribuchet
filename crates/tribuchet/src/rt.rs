@@ -1,6 +1,7 @@
 //! Shared tokio runtime construction and thread naming, so a profile or
 //! `top -H` can tell which role (and which kind of work) a thread runs.
 
+#[cfg(target_os = "linux")]
 use std::ffi::CString;
 use std::io;
 
