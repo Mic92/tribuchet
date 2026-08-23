@@ -101,7 +101,11 @@ pub(in crate::hub) async fn stage_chunked(
             continue;
         }
         served.extend(&todo);
-        stream_path_chunks(cache, job, &info.store_path, todo, &mut run, out_tx).await?;
+        let rest = serve_cached(cache, &job.id, todo, &mut run, out_tx).await?;
+        if rest.is_empty() {
+            continue;
+        }
+        stream_path_chunks(cache, job, &info.store_path, rest, &mut run, out_tx).await?;
     }
     run.flush(&job.id, out_tx).await?;
     tracing::debug!(
@@ -185,6 +189,37 @@ async fn compute_recipe(cache: Option<&ChunkCache>, store_path: &str) -> Result<
         c.store_recipe(store_path.to_string(), recipe.clone());
     }
     Ok(recipe)
+}
+
+/// Serve needed chunks from the cache, returning what still needs a repack.
+async fn serve_cached(
+    cache: Option<&ChunkCache>,
+    build_id: &str,
+    todo: HashSet<Hash>,
+    run: &mut RunFrames,
+    out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
+) -> Result<HashSet<Hash>> {
+    let Some(frames) = cache.and_then(|c| c.locate_all(&todo)) else {
+        return Ok(todo);
+    };
+    let mut rest = todo;
+    run.flush(build_id, out_tx).await?;
+    for (hash, fref) in frames {
+        // Evicted between locate and read: the repack picks it up.
+        let Ok(frame) = fref.read() else { break };
+        send(
+            out_tx,
+            hub_message::Msg::ChunkRun(ChunkRun {
+                build_id: build_id.to_string(),
+                hashes: hash.to_vec(),
+                zstd_data: frame,
+                eof: false,
+            }),
+        )
+        .await?;
+        rest.remove(&hash);
+    }
+    Ok(rest)
 }
 
 /// Re-pack the path and route its needed chunks: cache hits as their
@@ -326,5 +361,47 @@ impl RunFrames {
     ) -> Result<()> {
         self.rotate(build_id, out_tx).await?;
         self.drain(build_id, out_tx).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn serve_cached_skips_repack_and_reports_leftovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ChunkCache::open(dir.path().to_path_buf(), 1 << 20).unwrap();
+        let a: Hash = [1; 32];
+        let b: Hash = [2; 32];
+        cache.admit(a, &zstd::bulk::compress(b"hello", 3).unwrap());
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut run = RunFrames::default();
+
+        let todo: HashSet<Hash> = [a, b].into();
+        let rest = serve_cached(Some(&cache), "b1", todo.clone(), &mut run, &tx)
+            .await
+            .unwrap();
+        assert_eq!(rest, todo);
+
+        let rest = serve_cached(Some(&cache), "b1", [a].into(), &mut run, &tx)
+            .await
+            .unwrap();
+        assert!(rest.is_empty());
+        let msg = rx.recv().await.unwrap().unwrap();
+        let Some(hub_message::Msg::ChunkRun(cr)) = msg.msg else {
+            panic!("expected ChunkRun");
+        };
+        assert_eq!(cr.hashes, a.to_vec());
+        assert_eq!(
+            zstd::bulk::decompress(&cr.zstd_data, 1 << 20).unwrap(),
+            b"hello"
+        );
+
+        let rest = serve_cached(None, "b1", [a].into(), &mut run, &tx)
+            .await
+            .unwrap();
+        assert_eq!(rest, [a].into());
     }
 }

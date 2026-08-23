@@ -76,6 +76,15 @@ impl ChunkCache {
         Disposition::FirstSeen
     }
 
+    /// Locate every hash under one lock. None unless all are cached.
+    pub fn locate_all(&self, hashes: &HashSet<Hash>) -> Option<Vec<(Hash, FrameRef)>> {
+        let mut inner = self.inner.lock().unwrap();
+        hashes
+            .iter()
+            .map(|h| inner.store.locate(h).map(|f| (*h, f)))
+            .collect()
+    }
+
     pub fn recipe(&self, store_path: &str) -> Option<Recipe> {
         self.inner.lock().unwrap().recipes.get(store_path).cloned()
     }
