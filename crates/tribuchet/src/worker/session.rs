@@ -152,9 +152,11 @@ async fn session_loop(
                 let id = n.build_id.clone();
                 if let Some(build) = active.get_mut(&id) {
                     // A bad transfer fails this build, not the session.
-                    if let Err(e) = build.feed_nar(n).await {
-                        abort_active(active, &id, out_tx, &e).await?;
-                    }
+                    // A NAR eof can complete staging: the hub streams
+                    // optimistically, so the tmp dir may already be done.
+                    let res = build.feed_nar(n).await;
+                    advance_staging(active, &id, res, ctx, out_tx, signing_key, build_timeout)
+                        .await?;
                 }
             }
             hub_message::Msg::TmpDir(t) => {

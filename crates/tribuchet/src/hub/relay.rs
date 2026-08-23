@@ -1,18 +1,18 @@
 //! Per-job protocol with a worker: input staging, output relay and verification.
 
+mod extras;
 mod staging;
-use staging::{restage_inputs, stage_inputs, validate_missing};
+use extras::{ExtraImport, relay_extra_chunk, start_extras};
+use staging::{restage_inputs, stage_optimistic, validate_missing};
 
-use std::collections::HashMap;
-use std::io::{self, Write};
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use futures_util::StreamExt as _;
-use harmonia_store_remote::DaemonStore as _;
 use harmonia_utils_signature::{PublicKey, Signature};
 use sha2::Digest;
-use tokio::io::AsyncReadExt as _;
 use tokio::sync::mpsc;
 use tonic::Status;
 
@@ -21,11 +21,10 @@ use super::state::{HubState, Job, Replay};
 use crate::capwrite::{CappedWriter, HashSink};
 use crate::errors::{Result, err_ctx, err_msg};
 use crate::proto::{
-    BuildAssignment, BuildResult, CancelBuild, ExtraPath, HubMessage, MAX_RESEND_ROUNDS,
-    NarTransfer, OutputNar, OutputSignature, PathOffer, ResultAck, attach_event, hub_message,
-    nar_transfer, worker_message,
+    BuildAssignment, BuildResult, CancelBuild, HubMessage, MAX_RESEND_ROUNDS, NarTransfer,
+    OutputNar, OutputSignature, PathOffer, ResultAck, attach_event, hub_message, nar_transfer,
+    worker_message,
 };
-use crate::store;
 
 /// How long a dispatched build may run with no attach client listening
 /// before the hub cancels it on the worker.
@@ -35,13 +34,33 @@ const CANCEL_GRACE: Duration = Duration::from_secs(10);
 /// time. Dedup of shared inputs happens on the worker.
 pub(super) struct WorkerStaging {
     permits: tokio::sync::Semaphore,
+    /// Paths this session's worker is believed to hold. Optimistic
+    /// streaming skips them. MissingPaths stays the authority: a
+    /// stale entry is restaged, costing bytes, never correctness.
+    sent: Mutex<HashSet<String>>,
 }
 
 impl WorkerStaging {
     pub(super) fn new() -> Self {
         Self {
             permits: tokio::sync::Semaphore::new(1),
+            sent: Mutex::new(HashSet::new()),
         }
+    }
+
+    pub(super) fn holds(&self, path: &str) -> bool {
+        self.sent.lock().unwrap().contains(path)
+    }
+
+    /// Record a path as held by the worker. Returns false if it
+    /// already was.
+    pub(super) fn mark_sent(&self, path: &str) -> bool {
+        self.sent.lock().unwrap().insert(path.to_string())
+    }
+
+    pub(super) fn mark_all_sent<'a>(&self, paths: impl Iterator<Item = &'a String>) {
+        let mut sent = self.sent.lock().unwrap();
+        sent.extend(paths.cloned());
     }
 }
 
@@ -89,10 +108,29 @@ pub(super) async fn run_job(
     )
     .await?;
 
-    let missing = loop {
-        match recv(&mut in_rx).await? {
+    // Stream the tmp dir and the sent-set complement without waiting
+    // for MissingPaths. The answer reconciles: anything requested
+    // beyond the optimistic stream goes out as a delta.
+    let streamed = Mutex::new(HashSet::new());
+    let (missing_tx, missing_rx) = tokio::sync::watch::channel(None);
+    let stage_fut = stage_optimistic(state, job, out_tx, &staging, &streamed, missing_rx);
+    tokio::pin!(stage_fut);
+    let mut staged = false;
+    let mut missing: Option<Vec<String>> = None;
+    while !(staged && missing.is_some()) {
+        let m = tokio::select! {
+            r = &mut stage_fut, if !staged => {
+                r?;
+                staged = true;
+                continue;
+            }
+            m = recv(&mut in_rx) => m?,
+        };
+        match m {
             // The worker already holds this build (it survived a hub
             // restart); skip staging, its result arrives like any other.
+            // Optimistically streamed bytes land on a build id the
+            // worker no longer stages and are dropped there.
             worker_message::Msg::Resumed(_) => {
                 tracing::info!(id = job.id, "worker resumed an in-flight build");
                 return relay_build(state, job, vkey, out_tx, &mut in_rx, &staging)
@@ -104,8 +142,13 @@ pub(super) async fn run_job(
             worker_message::Msg::Log(l) => {
                 job.replay.publish(attach_event::Event::Log(l.data)).await;
             }
-            worker_message::Msg::MissingPaths(m) => {
-                break validate_missing(&req.input_paths, m.store_paths)?;
+            worker_message::Msg::MissingPaths(m) if missing.is_none() => {
+                let m = validate_missing(&req.input_paths, m.store_paths)?;
+                // Offered but not missing means confirmed present.
+                let missing_set: HashSet<&String> = m.iter().collect();
+                staging.mark_all_sent(req.input_paths.iter().filter(|p| !missing_set.contains(*p)));
+                let _ = missing_tx.send(Some(m.clone()));
+                missing = Some(m);
             }
             // Staging failed worker-side (assignment validation, its
             // nix-daemon unreachable, ...): the worker reports it as a
@@ -122,15 +165,28 @@ pub(super) async fn run_job(
                 )));
             }
         }
+    }
+    let missing = missing.unwrap();
+    let (delta, streamed_count) = {
+        let streamed = streamed.lock().unwrap();
+        let delta: Vec<String> = missing
+            .iter()
+            .filter(|p| !streamed.contains(*p))
+            .cloned()
+            .collect();
+        (delta, streamed.len())
     };
     tracing::info!(
         id = job.id,
         total = req.input_paths.len(),
         missing = missing.len(),
+        streamed = streamed_count,
+        delta = delta.len(),
         "input path negotiation done"
     );
-
-    stage_inputs(state, job, out_tx, &staging, &missing).await?;
+    if !delta.is_empty() {
+        restage_inputs(state, job, out_tx, &staging, &delta).await?;
+    }
     relay_build(state, job, vkey, out_tx, &mut in_rx, &staging)
         .await
         .map(|_| ())
@@ -211,67 +267,6 @@ fn verify_set(
     Ok(pending)
 }
 
-/// In-flight AddToStoreNar of one recursive-nix extra. Chunks stream
-/// through `tx` into a daemon-pool connection held by `task`.
-struct ExtraImport {
-    tx: mpsc::Sender<bytes::Bytes>,
-    task: tokio::task::JoinHandle<Result<()>>,
-}
-
-/// Verify each extra's worker signature over `path:nar_sha256_hex`
-/// (the same envelope as outputs) and spawn the daemon import. The
-/// daemon then verifies on its end that the NAR matches the signed
-/// hash.
-fn start_extras(
-    state: &HubState,
-    vkey: &PublicKey,
-    reported: Vec<ExtraPath>,
-) -> Result<HashMap<String, ExtraImport>> {
-    let mut out = HashMap::with_capacity(reported.len());
-    for extra in reported {
-        let info = extra
-            .info
-            .ok_or_else(|| err_msg("extra without PathInfo"))?;
-        let path = info.store_path.clone();
-        let sig: Signature = extra
-            .signature
-            .parse()
-            .map_err(err_ctx("malformed extra signature"))?;
-        let envelope = format!("{}:{}", path, hex::encode(&info.nar_sha256));
-        if !vkey.verify(envelope.as_bytes(), &sig) {
-            return Err(err_msg(format!(
-                "signature verification failed for extra {path}"
-            )));
-        }
-        let parsed = store::parse_path_info(&info).map_err(err_ctx("parsing extra PathInfo"))?;
-        let (tx, rx) = mpsc::channel::<bytes::Bytes>(8);
-        let pool = state.daemon_pool.clone();
-        let task = tokio::spawn(async move { import_extra(&pool, parsed, rx).await });
-        out.insert(path, ExtraImport { tx, task });
-    }
-    Ok(out)
-}
-
-async fn import_extra(
-    pool: &harmonia_store_remote::ConnectionPool,
-    info: harmonia_store_path_info::ValidPathInfo,
-    rx: mpsc::Receiver<bytes::Bytes>,
-) -> Result<()> {
-    let mut guard = pool
-        .acquire()
-        .await
-        .map_err(err_ctx("connecting to the local nix-daemon"))?;
-    let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(Ok::<_, io::Error>);
-    let reader = tokio_util::io::StreamReader::new(stream);
-    let dec =
-        async_compression::tokio::bufread::ZstdDecoder::new(tokio::io::BufReader::new(reader));
-    let limited = tokio::io::BufReader::new(dec.take(info.info.nar_size));
-    guard
-        .execute(|c| c.add_to_store_nar(&info, limited, false, true))
-        .await
-        .map_err(|e| err_msg(format!("registering extra {} via daemon: {e}", info.path)))
-}
-
 async fn relay_output_chunk(
     vkey: &PublicKey,
     pending: &mut HashMap<String, OutputVerify>,
@@ -306,32 +301,6 @@ async fn relay_output_chunk(
                 zstd_nar_chunk: Vec::new(),
                 eof: true,
             }))
-            .await;
-    }
-    Ok(())
-}
-
-async fn relay_extra_chunk(
-    extras: &mut HashMap<String, ExtraImport>,
-    replay: &Replay,
-    n: NarTransfer,
-) -> Result<()> {
-    let extra = extras.get_mut(&n.store_path).unwrap();
-    if let Some(nar_transfer::Payload::ZstdNarChunk(chunk)) = n.payload
-        && extra.tx.send(chunk.into()).await.is_err()
-    {
-        // rx closed does not imply failure: the import reads via
-        // take(nar_size) and drops rx once done.
-        let extra = extras.remove(&n.store_path).unwrap();
-        extra.task.await??;
-        return Err(err_msg(format!("excess extra chunks for {}", n.store_path)));
-    }
-    if n.eof {
-        let extra = extras.remove(&n.store_path).unwrap();
-        drop(extra.tx);
-        extra.task.await??;
-        replay
-            .publish(attach_event::Event::AddedPath(n.store_path))
             .await;
     }
     Ok(())
@@ -503,48 +472,5 @@ async fn relay_build(
                 )));
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use harmonia_utils_signature::SecretKey;
-
-    use crate::proto::PathInfoMsg;
-
-    use super::*;
-
-    /// Wrong-key signatures must fail before any daemon contact, so a
-    /// compromised worker cannot plant store paths on the client.
-    #[tokio::test]
-    async fn extras_with_wrong_signature_are_rejected() {
-        let hub_sk = SecretKey::generate("hub-trusted-key-1".into()).unwrap();
-        let attacker_sk = SecretKey::generate("attacker-1".into()).unwrap();
-        let vkey = hub_sk.to_public_key();
-
-        let path = format!("/nix/store/{}-extra", "0".repeat(32));
-        let nar_sha256 = vec![0u8; 32];
-        let envelope = format!("{path}:{}", hex::encode(&nar_sha256));
-        let bad = ExtraPath {
-            info: Some(PathInfoMsg {
-                build_id: String::new(),
-                store_path: path.clone(),
-                nar_sha256: nar_sha256.clone(),
-                nar_size: 1024,
-                references: vec![],
-                signatures: vec![],
-                deriver: String::new(),
-                ca: String::new(),
-            }),
-            signature: attacker_sk.sign(envelope.as_bytes()).to_string(),
-        };
-        let state = HubState::default();
-        let err = start_extras(&state, &vkey, vec![bad])
-            .err()
-            .expect("expected signature rejection");
-        assert!(
-            err.to_string().contains("signature verification failed"),
-            "{err}"
-        );
     }
 }

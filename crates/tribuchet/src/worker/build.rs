@@ -96,6 +96,9 @@ pub(super) struct ActiveBuild {
     /// True once the tmp dir stream finished unpacking.
     tmp_dir_done: bool,
     resend_rounds: u32,
+    /// A NeedResend answer is on the wire. A StagingComplete crossing
+    /// it belongs to the superseded round and is ignored.
+    awaiting_resend: bool,
     /// Daemon connection; carries this build's temp roots, so it must
     /// outlive the build.
     daemon: Option<DaemonConn>,
@@ -134,6 +137,7 @@ impl ActiveBuild {
             registered: HashSet::new(),
             tmp_dir_done: false,
             resend_rounds: 0,
+            awaiting_resend: false,
             daemon: None,
             imports: HashMap::new(),
             pool: None,
@@ -253,8 +257,17 @@ impl ActiveBuild {
         }
     }
 
+    /// Unrequested paths (already valid here, or deferred to
+    /// another build's import) arrive anyway and are dropped.
+    fn tolerated(&self, path: &str) -> bool {
+        self.inputs.iter().any(|p| p == path) || self.deferred.iter().any(|p| p == path)
+    }
+
     pub(super) fn feed_path_info(&mut self, pi: &PathInfoMsg) -> Result<()> {
         let Some(slot) = self.pending.get_mut(&pi.store_path) else {
+            if self.tolerated(&pi.store_path) {
+                return Ok(());
+            }
             return Err(err_msg(format!(
                 "hub sent path info for unrequested path {}",
                 pi.store_path
@@ -271,7 +284,7 @@ impl ActiveBuild {
         Ok(())
     }
 
-    pub(super) async fn feed_nar(&mut self, n: NarTransfer) -> Result<()> {
+    pub(super) async fn feed_nar(&mut self, n: NarTransfer) -> Result<StagingStatus> {
         if !self.imports.contains_key(&n.store_path) {
             let info = match self.pending.remove(&n.store_path) {
                 Some(Some(info)) => info,
@@ -282,6 +295,9 @@ impl ActiveBuild {
                     )));
                 }
                 None => {
+                    if self.tolerated(&n.store_path) {
+                        return Ok(StagingStatus::InProgress);
+                    }
                     return Err(err_msg(format!(
                         "hub sent NAR for unrequested path {}",
                         n.store_path
@@ -344,11 +360,12 @@ impl ActiveBuild {
             });
         }
         if n.eof {
-            // Import completion is reaped in complete_staging. The
+            // Import completion is reaped when staging finishes. The
             // next NAR dispatches to another pool connection now.
             handle.tx = None;
+            return self.try_complete().await;
         }
-        Ok(())
+        Ok(StagingStatus::InProgress)
     }
 
     /// Reports staging progress; the tmp dir eof completes round one.
@@ -376,7 +393,7 @@ impl ActiveBuild {
             drop(tx);
             task.await??;
             self.tmp_dir_done = true;
-            return self.complete_staging().await;
+            return self.try_complete().await;
         }
         Ok(StagingStatus::InProgress)
     }
@@ -385,6 +402,9 @@ impl ActiveBuild {
     /// requested NAR must have arrived; deferred paths that are still
     /// invalid are re-requested instead of failing the build.
     pub(super) async fn complete_staging(&mut self) -> Result<StagingStatus> {
+        if self.awaiting_resend {
+            return Ok(StagingStatus::InProgress);
+        }
         if !self.tmp_dir_done {
             return Err(err_msg(
                 "hub signalled staging completion before the tmp dir arrived",
@@ -395,13 +415,30 @@ impl ActiveBuild {
                 "hub never sent a NAR for requested input {p}"
             )));
         }
+        if let Some((p, _)) = self.imports.iter().find(|(_, h)| h.tx.is_some()) {
+            return Err(err_msg(format!(
+                "staging round ended during the NAR transfer of {p}"
+            )));
+        }
+        self.finish_staging().await
+    }
+
+    /// Staging finishes once the tmp dir is unpacked and every
+    /// requested NAR is fully fed, checked from both eof paths.
+    async fn try_complete(&mut self) -> Result<StagingStatus> {
+        if !self.tmp_dir_done
+            || !self.pending.is_empty()
+            || self.imports.values().any(|h| h.tx.is_some())
+        {
+            return Ok(StagingStatus::InProgress);
+        }
+        self.finish_staging().await
+    }
+
+    async fn finish_staging(&mut self) -> Result<StagingStatus> {
+        self.awaiting_resend = false;
         let imports: Vec<(String, ImportHandle)> = self.imports.drain().collect();
         for (path, mut h) in imports {
-            if h.tx.is_some() {
-                return Err(err_msg(format!(
-                    "staging round ended during the NAR transfer of {path}"
-                )));
-            }
             let state = h
                 .done
                 .wait_for(|s| !matches!(s, ImportState::Running))
@@ -448,6 +485,7 @@ impl ActiveBuild {
             )));
         }
         self.resend_rounds += 1;
+        self.awaiting_resend = true;
         // This build imports them itself now: claim and expect them.
         let mut inflight = self.ctx.staging_inflight.lock().unwrap();
         for p in &still_missing {

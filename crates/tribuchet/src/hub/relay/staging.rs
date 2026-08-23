@@ -2,11 +2,12 @@
 
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use harmonia_store_path::{StoreDir, StorePath};
 use harmonia_store_remote::DaemonStore as _;
 use tokio::io::AsyncReadExt as _;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tonic::Status;
 
 use super::super::state::{HubState, Job};
@@ -36,29 +37,53 @@ pub(super) fn validate_missing(
     Ok(missing)
 }
 
-/// Stream this build's missing inputs and tmp dir under the session's
-/// staging permit.
-pub(super) async fn stage_inputs(
+/// Tmp dir first, then the offer minus the sent-set. With no
+/// session knowledge of the offer, wait for MissingPaths instead of
+/// blasting a possibly warm worker. Streamed paths are recorded for
+/// the caller's delta.
+pub(super) async fn stage_optimistic(
     state: &HubState,
     job: &Job,
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
     staging: &WorkerStaging,
-    missing: &[String],
+    streamed: &Mutex<HashSet<String>>,
+    mut missing_rx: watch::Receiver<Option<Vec<String>>>,
 ) -> Result<()> {
-    // Serialize only the import: negotiation before this is read-only
-    // on the worker store, so it runs in parallel (bounded by
-    // RequestJob credits) instead of gating throughput on its
-    // round-trip.
     let _permit = staging
         .permits
         .acquire()
         .await
         .expect("staging semaphore closed");
-    stream_inputs(state, job, out_tx, missing).await?;
-    stream_tmp_dir(&job.id, &job.tmp_dir_pack, out_tx).await
+    stream_tmp_dir(&job.id, &job.tmp_dir_pack, out_tx).await?;
+    let complement: Vec<String> = job
+        .req
+        .input_paths
+        .iter()
+        .filter(|p| !staging.holds(p))
+        .cloned()
+        .collect();
+    let candidates = if complement.len() == job.req.input_paths.len() {
+        let missing = missing_rx
+            .wait_for(Option::is_some)
+            .await
+            .map_err(|_| err_msg("build gone before the MissingPaths answer"))?;
+        missing.clone().unwrap()
+    } else {
+        complement
+    };
+    stream_inputs(state, job, out_tx, &candidates, &mut |p| {
+        if staging.mark_sent(p) {
+            streamed.lock().unwrap().insert(p.to_string());
+            true
+        } else {
+            false
+        }
+    })
+    .await
 }
 
-/// Stream inputs re-requested after staging, then send StagingComplete.
+/// Stream inputs the worker asked for beyond the optimistic stream,
+/// then send StagingComplete.
 pub(super) async fn restage_inputs(
     state: &HubState,
     job: &Job,
@@ -71,7 +96,8 @@ pub(super) async fn restage_inputs(
         .acquire()
         .await
         .expect("staging semaphore closed");
-    stream_inputs(state, job, out_tx, missing).await?;
+    stream_inputs(state, job, out_tx, missing, &mut |_| true).await?;
+    staging.mark_all_sent(missing.iter());
     send(
         out_tx,
         hub_message::Msg::StagingComplete(StagingComplete {
@@ -91,6 +117,7 @@ async fn stream_inputs(
     job: &Job,
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
     paths: &[String],
+    admit: &mut (dyn FnMut(&str) -> bool + Send),
 ) -> Result<()> {
     let infos = order_by_references(query_path_infos(&state.daemon_pool, paths).await?);
     let mut infos = infos.into_iter();
@@ -98,6 +125,9 @@ async fn stream_inputs(
     loop {
         while inflight.len() < PACK_PIPELINE {
             let Some(info) = infos.next() else { break };
+            if !admit(&info.store_path) {
+                continue;
+            }
             let pack = spawn_pack(&info.store_path);
             inflight.push_back((info, pack));
         }
