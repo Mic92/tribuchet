@@ -93,6 +93,25 @@ pub struct HubConfig {
     /// whatever systems are available right now.
     #[serde(default)]
     pub nix_config: Option<NixConfig>,
+    /// Disk budget for the staging chunk cache. 0 disables it.
+    #[serde(default = "default_chunk_cache_bytes")]
+    pub chunk_cache_bytes: u64,
+    /// Cache directory override. Defaults to XDG_CACHE_HOME/tribuchet.
+    #[serde(default)]
+    pub chunk_cache_dir: Option<PathBuf>,
+}
+
+fn default_chunk_cache_bytes() -> u64 {
+    10 << 30
+}
+
+/// XDG_CACHE_HOME/tribuchet/chunks with the usual ~/.cache fallback.
+pub fn default_chunk_cache_dir() -> PathBuf {
+    let base = env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(|| PathBuf::from("/var/cache"));
+    base.join("tribuchet").join("chunks")
 }
 
 /// A hub-maintained nix.conf fragment. A local nix.conf `include`s the
@@ -183,6 +202,13 @@ pub struct WorkerConfig {
     /// Concurrent build slots.
     #[serde(default = "default_max_jobs")]
     pub max_jobs: u32,
+    /// Parallel nix-daemon connections importing staged input NARs.
+    #[serde(default = "default_import_jobs")]
+    pub import_jobs: u32,
+    /// Disk budget for the input chunk store (dedup of staged NARs
+    /// across builds). 0 disables it and inputs arrive as whole NARs.
+    #[serde(default = "default_chunk_store_bytes")]
+    pub chunk_store_bytes: u64,
     /// Emulated systems: system -> path of a static emulator binary
     /// (Linux, kernel 6.7+).
     #[serde(default)]
@@ -245,6 +271,12 @@ fn default_key() -> PathBuf {
 }
 fn default_build_timeout() -> u64 {
     24 * 3600
+}
+fn default_import_jobs() -> u32 {
+    4
+}
+fn default_chunk_store_bytes() -> u64 {
+    10 << 30
 }
 fn default_max_jobs() -> u32 {
     thread::available_parallelism()

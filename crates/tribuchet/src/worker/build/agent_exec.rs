@@ -282,6 +282,8 @@ pub(in crate::worker) fn supervise_agent(
     // (packing above already read them) and forgets the build.
     if let Err(e) = agents::cleanup(socket, &st.build_id) {
         tracing::warn!(id = st.build_id, "agent cleanup failed: {}", chain(&e));
+    } else if let Err(e) = agents::shutdown(socket) {
+        tracing::warn!(id = st.build_id, "agent shutdown failed: {}", chain(&e));
     }
     FinishedBuild {
         exit_code,

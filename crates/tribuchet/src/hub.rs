@@ -29,6 +29,7 @@ use crate::proto::{
     CancelBuild, HubMessage, Register, WorkerMessage, attach_event, hub_message, worker_message,
 };
 
+mod chunkcache;
 mod metrics;
 mod relay;
 mod serve;
@@ -130,6 +131,7 @@ fn msg_build_id(msg: &worker_message::Msg) -> Option<&str> {
         worker_message::Msg::Nar(n) => Some(&n.build_id),
         worker_message::Msg::MissingPaths(m) => Some(&m.build_id),
         worker_message::Msg::Resumed(r) => Some(&r.build_id),
+        worker_message::Msg::NeedChunks(n) => Some(&n.build_id),
         worker_message::Msg::Register(_)
         | worker_message::Msg::Heartbeat(_)
         | worker_message::Msg::RequestJob(_) => None,
@@ -298,7 +300,7 @@ async fn worker_loop(
     // each closure in isolation (references before referrers, no
     // shared-path lock contention) and a later build sees earlier shared
     // inputs as valid, so it fetches only its delta.
-    let staging = Arc::new(WorkerStaging::new());
+    let staging = Arc::new(WorkerStaging::new(register.chunk_support));
 
     let mut credits: usize = 0;
     'outer: loop {

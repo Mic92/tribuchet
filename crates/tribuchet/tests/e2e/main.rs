@@ -15,7 +15,6 @@
 //!   TT_SSH_CONFIG  ssh_config with the `vsock-mux/*` ProxyCommand
 //!   TT_HUB_SOCK    host unix socket bridging to the hub's vsock
 //!   TT_WORKER_SOCK host unix socket bridging to the worker's vsock
-//!   TT_CTLDIR      writable dir for ssh control sockets
 //!   TT_BASH        store path of `pkgs.bash` (for inline derivations)
 
 // The lifecycle sequence is intentionally one long serial test; the ssh output

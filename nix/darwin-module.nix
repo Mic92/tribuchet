@@ -198,9 +198,13 @@ in
         StandardOutPath = toString hub.logFile;
         StandardErrorPath = toString hub.logFile;
         EnvironmentVariables.RUST_LOG = "info";
+        # staging chunk cache; the rootless hub has no usable HOME
+        EnvironmentVariables.XDG_CACHE_HOME = "/var/lib/tribuchet/hub/cache";
       };
       system.activationScripts.preActivation.text = ''
         mkdir -p ${attachDir}
+        mkdir -p /var/lib/tribuchet/hub/cache
+        chown ${toString cfg.uid} /var/lib/tribuchet/hub/cache
         chown root:${toString nixbldGid} ${attachDir}
         chmod 0750 ${attachDir}
         touch ${lib.escapeShellArg (toString hub.logFile)}

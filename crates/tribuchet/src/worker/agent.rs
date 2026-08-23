@@ -21,7 +21,6 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{self, Child, Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -143,30 +142,52 @@ pub fn run(opts: &Options) -> Result<()> {
         dedicated_uid: activated || opts.dedicated_uid,
     });
     tracing::info!(uid = getuid().as_raw(), "agent listening");
-    let inflight = Arc::new(AtomicUsize::new(0));
+    // One thread accepts and reads every call, so Shutdown is
+    // serialized with accepts: exiting here cannot drop an accepted
+    // connection.
     for conn in listener.incoming() {
         let conn = conn.map_err(err_ctx("accepting connection"))?;
-        let agent = agent.clone();
-        let inflight = inflight.clone();
-        inflight.fetch_add(1, Ordering::SeqCst);
-        thread::spawn(move || {
-            if let Err(e) = handle(&agent, &conn) {
-                let e = chain(&e);
-                tracing::warn!("agent request failed: {e}");
-                let _ = framing::send_error(&conn, &e);
+        let (call, fds) = match read_call(&agent, &conn) {
+            Ok(x) => x,
+            Err(e) => {
+                report(&conn, &e);
+                continue;
             }
-            // The service manager re-activates on the next
-            // connection, including backlogged ones.
-            if activated
-                && inflight.fetch_sub(1, Ordering::SeqCst) == 1
-                && agent.current.lock().unwrap().is_none()
-            {
-                tracing::info!("no build held, exiting until the next activation");
-                process::exit(0);
+        };
+        match call {
+            call::Call::Shutdown(_) => {
+                if agent.current.lock().unwrap().is_some() {
+                    let _ = framing::send_error(&conn, ERROR_BUSY);
+                    continue;
+                }
+                let _ = framing::send_reply(&conn, reply::Reply::Empty(Empty {}), &[]);
+                if activated {
+                    tracing::info!("no build held, exiting until the next activation");
+                    process::exit(0);
+                }
             }
-        });
+            call::Call::Start(_) | call::Call::Adopt(_) => {
+                let agent = agent.clone();
+                thread::spawn(move || {
+                    if let Err(e) = dispatch(&agent, &conn, call, fds) {
+                        report(&conn, &e);
+                    }
+                });
+            }
+            _ => {
+                if let Err(e) = dispatch(&agent, &conn, call, fds) {
+                    report(&conn, &e);
+                }
+            }
+        }
     }
     Ok(())
+}
+
+fn report(conn: &UnixStream, e: &Error) {
+    let e = chain(e);
+    tracing::warn!("agent request failed: {e}");
+    let _ = framing::send_error(conn, &e);
 }
 
 /// Service-manager-activated listener (launchd socket named "agent",
@@ -182,7 +203,9 @@ fn listener(socket: Option<&Path>) -> Result<(UnixListener, bool), Error> {
     Ok((l, false))
 }
 
-fn handle(agent: &Arc<Agent>, conn: &UnixStream) -> Result<()> {
+/// Verify the peer and read its call, with a timeout so a wedged
+/// client cannot stall the accept loop.
+fn read_call(agent: &Arc<Agent>, conn: &UnixStream) -> Result<(call::Call, Vec<OwnedFd>)> {
     let peer_uid = platform::peer_uid(conn)?;
     if peer_uid != agent.worker_uid {
         return Err(msg(format!(
@@ -190,7 +213,18 @@ fn handle(agent: &Arc<Agent>, conn: &UnixStream) -> Result<()> {
             agent.worker_uid
         )));
     }
-    let (call, fds) = framing::recv_call(conn)?;
+    let _ = conn.set_read_timeout(Some(Duration::from_secs(10)));
+    let res = framing::recv_call(conn);
+    let _ = conn.set_read_timeout(None);
+    Ok(res?)
+}
+
+fn dispatch(
+    agent: &Arc<Agent>,
+    conn: &UnixStream,
+    call: call::Call,
+    fds: Vec<OwnedFd>,
+) -> Result<()> {
     match call {
         call::Call::Start(req) => handle_start(agent, conn, *req, fds),
         call::Call::Adopt(req) => handle_adopt(agent, conn, &req),
@@ -202,6 +236,7 @@ fn handle(agent: &Arc<Agent>, conn: &UnixStream) -> Result<()> {
         call::Call::Kill(req) => handle_kill(agent, conn, &req),
         call::Call::Finish(req) => handle_finish(agent, conn, &req),
         call::Call::Cleanup(req) => handle_cleanup(agent, conn, &req),
+        call::Call::Shutdown(_) => Err(msg("shutdown handled in the accept loop")),
     }
 }
 

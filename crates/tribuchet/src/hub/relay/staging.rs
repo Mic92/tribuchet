@@ -1,21 +1,29 @@
 //! Input staging: path-info queries and NAR/tmp-dir streaming to the worker.
 
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+mod chunked;
+pub(super) use chunked::stage_chunked;
+
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::io::Write as _;
+use std::mem;
+use std::sync::{Arc, Mutex};
 
 use harmonia_store_path::{StoreDir, StorePath};
 use harmonia_store_remote::DaemonStore as _;
-use tokio::io::AsyncReadExt as _;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tonic::Status;
 
-use super::super::state::{HubState, Job};
 use super::{WorkerStaging, send};
+use crate::chunker::{Chunk, chunk_store_path};
+use crate::chunkio;
 use crate::errors::{Result, err_ctx, err_msg};
+use crate::hub::chunkcache::{ChunkCache, Disposition};
+use crate::hub::state::{HubState, Job};
 use crate::proto::{
     HubMessage, NarTransfer, PathInfoMsg, StagingComplete, TmpDirArchive, hub_message,
 };
-use crate::{chunkio, rt, store};
+use tokio::task::spawn_blocking;
+use zstd::stream::write::Encoder;
 
 /// Reject paths we never offered and dedupe the rest.
 pub(super) fn validate_missing(
@@ -36,29 +44,58 @@ pub(super) fn validate_missing(
     Ok(missing)
 }
 
-/// Stream this build's missing inputs and tmp dir under the session's
-/// staging permit.
-pub(super) async fn stage_inputs(
+/// Tmp dir first, then the offer minus the sent-set. With no
+/// session knowledge of the offer, wait for MissingPaths instead of
+/// blasting a possibly warm worker. Streamed paths are recorded for
+/// the caller's delta.
+pub(super) async fn stage_optimistic(
     state: &HubState,
     job: &Job,
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
     staging: &WorkerStaging,
-    missing: &[String],
+    streamed: &Mutex<HashSet<String>>,
+    mut missing_rx: watch::Receiver<Option<Vec<String>>>,
 ) -> Result<()> {
-    // Serialize only the import: negotiation before this is read-only
-    // on the worker store, so it runs in parallel (bounded by
-    // RequestJob credits) instead of gating throughput on its
-    // round-trip.
     let _permit = staging
         .permits
         .acquire()
         .await
         .expect("staging semaphore closed");
-    stream_inputs(state, job, out_tx, missing).await?;
-    stream_tmp_dir(&job.id, &job.tmp_dir_pack, out_tx).await
+    stream_tmp_dir(&job.id, &job.tmp_dir_pack, out_tx).await?;
+    // Chunk sessions stage missing paths as recipes after the answer,
+    // so there is nothing to stream optimistically here.
+    if staging.chunked {
+        return Ok(());
+    }
+    let complement: Vec<String> = job
+        .req
+        .input_paths
+        .iter()
+        .filter(|p| !staging.holds(p))
+        .cloned()
+        .collect();
+    let candidates = if complement.len() == job.req.input_paths.len() {
+        let missing = missing_rx
+            .wait_for(Option::is_some)
+            .await
+            .map_err(|_| err_msg("build gone before the MissingPaths answer"))?;
+        missing.clone().unwrap()
+    } else {
+        complement
+    };
+    stream_inputs(state, job, out_tx, &candidates, &mut |p| {
+        if staging.mark_sent(p) {
+            streamed.lock().unwrap().insert(p.to_string());
+            true
+        } else {
+            false
+        }
+    })
+    .await
 }
 
-/// Stream inputs re-requested after staging, then send StagingComplete.
+/// Stream inputs the worker asked for beyond the optimistic stream,
+/// then send StagingComplete.
 pub(super) async fn restage_inputs(
     state: &HubState,
     job: &Job,
@@ -71,7 +108,8 @@ pub(super) async fn restage_inputs(
         .acquire()
         .await
         .expect("staging semaphore closed");
-    stream_inputs(state, job, out_tx, missing).await?;
+    stream_inputs(state, job, out_tx, missing, &mut |_| true).await?;
+    staging.mark_all_sent(missing.iter());
     send(
         out_tx,
         hub_message::Msg::StagingComplete(StagingComplete {
@@ -81,42 +119,96 @@ pub(super) async fn restage_inputs(
     .await
 }
 
-/// Stream PathInfo + NAR for each path, references before referrers
-/// (the worker's daemon import needs the references valid first).
+/// Packs compressed ahead of the in-order send: one zstd-3 encoder
+/// cannot fill a 1 Gbit link on its own, eight measured 1.5x and
+/// deeper buys nothing.
+const PACK_PIPELINE: usize = 8;
+
 async fn stream_inputs(
     state: &HubState,
     job: &Job,
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
     paths: &[String],
+    admit: &mut (dyn FnMut(&str) -> bool + Send),
 ) -> Result<()> {
     let infos = order_by_references(query_path_infos(&state.daemon_pool, paths).await?);
-    for mut info in infos {
+    let mut infos = infos.into_iter();
+    let mut inflight: VecDeque<(PathInfoMsg, Pack)> = VecDeque::new();
+    loop {
+        while inflight.len() < PACK_PIPELINE {
+            let Some(info) = infos.next() else { break };
+            if !admit(&info.store_path) {
+                continue;
+            }
+            let pack = spawn_pack(state.chunks.clone(), &info.store_path);
+            inflight.push_back((info, pack));
+        }
+        let Some((mut info, pack)) = inflight.pop_front() else {
+            break;
+        };
         let path = info.store_path.clone();
         info.build_id = job.id.clone();
         send(out_tx, hub_message::Msg::PathInfo(info)).await?;
-        stream_store_path(&job.id, &path, out_tx).await?;
+        let res = forward_pack(&job.id, &path, pack, out_tx).await;
+        if res.is_err() {
+            for (_, pack) in inflight {
+                pack.task.abort();
+                let _ = pack.task.await;
+            }
+            return res;
+        }
     }
     Ok(())
 }
 
-/// References before referrers; tolerates self-refs and cycles.
-fn order_by_references(infos: Vec<PathInfoMsg>) -> Vec<PathInfoMsg> {
-    let roots: Vec<String> = infos.iter().map(|i| i.store_path.clone()).collect();
+/// References before referrers, largest nar_size first among ready
+/// paths (Kahn's algorithm, max-heap): with parallel worker imports
+/// this starts the biggest import earliest so it hides behind the
+/// rest of the transfer. Tolerates self-refs. Cycle members are
+/// appended at the end in arbitrary order.
+pub(super) fn order_by_references(infos: Vec<PathInfoMsg>) -> Vec<PathInfoMsg> {
     let mut nodes: HashMap<String, PathInfoMsg> = infos
         .into_iter()
         .map(|i| (i.store_path.clone(), i))
         .collect();
-    store::topo_order(roots, |p| {
-        nodes[p]
-            .references
-            .iter()
-            .filter(|r| nodes.contains_key(*r))
-            .cloned()
-            .collect()
-    })
-    .into_iter()
-    .map(|p| nodes.remove(&p).unwrap())
-    .collect()
+    let mut indegree: HashMap<&str, usize> = HashMap::new();
+    let mut referrers: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (path, info) in &nodes {
+        indegree.entry(path).or_default();
+        for r in &info.references {
+            if r != path && nodes.contains_key(r) {
+                *indegree.entry(path).or_default() += 1;
+                referrers.entry(r).or_default().push(path);
+            }
+        }
+    }
+    let mut ready: BinaryHeap<(u64, &str)> = indegree
+        .iter()
+        .filter(|(_, d)| **d == 0)
+        .map(|(p, _)| (nodes[*p].nar_size, *p))
+        .collect();
+    let mut order: Vec<String> = Vec::with_capacity(nodes.len());
+    while let Some((_, p)) = ready.pop() {
+        order.push(p.to_string());
+        for r in referrers.remove(p).unwrap_or_default() {
+            let d = indegree.get_mut(r).unwrap();
+            *d -= 1;
+            if *d == 0 {
+                ready.push((nodes[r].nar_size, r));
+            }
+        }
+    }
+    let mut rest: Vec<&str> = indegree
+        .iter()
+        .filter(|(_, d)| **d > 0)
+        .map(|(p, _)| *p)
+        .collect();
+    rest.sort_unstable();
+    order.extend(rest.into_iter().map(str::to_string));
+    order
+        .into_iter()
+        .map(|p| nodes.remove(&p).unwrap())
+        .collect()
 }
 
 /// Per-path query info from one daemon connection, for a slice of paths.
@@ -161,7 +253,7 @@ async fn query_path_info_chunk(
 /// Path info over the daemon protocol, not db.sqlite:
 /// harmonia-store-db opens the db with immutable=1, so WAL-only rows
 /// (freshly registered inputs, the common case) would be invisible.
-async fn query_path_infos(
+pub(super) async fn query_path_infos(
     pool: &harmonia_store_remote::ConnectionPool,
     paths: &[String],
 ) -> Result<Vec<PathInfoMsg>> {
@@ -179,55 +271,116 @@ async fn query_path_infos(
     Ok(results.into_iter().flatten().collect())
 }
 
-/// NAR-pack a local store path, zstd-compress, and stream it to the
-/// worker. The pack (blocking store reads plus the zstd encode) runs on
-/// the blocking pool, overlapping the network send it feeds through the
-/// bounded channel and keeping the async workers free.
-async fn stream_store_path(
+struct Pack {
+    rx: mpsc::Receiver<Vec<u8>>,
+    task: tokio::task::JoinHandle<Result<()>>,
+}
+
+/// NAR-pack a store path on the blocking pool, chunk it and feed
+/// zstd frames into a bounded channel: cached chunks as their stored
+/// frame (no compression CPU), everything between two cache hits as
+/// one fresh run frame at the full streaming-window ratio. Without a
+/// cache the whole NAR is a single run, exactly the old behavior.
+fn spawn_pack(cache: Option<Arc<ChunkCache>>, store_path: &str) -> Pack {
+    let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
+    let path = store_path.to_string();
+    let task = spawn_blocking(move || -> Result<()> {
+        let mut run = RunEncoder::default();
+        let mut gone = false;
+        chunk_store_path(&path, async |c| {
+            gone = !emit_chunk(cache.as_deref(), c, &mut run, &tx).await?;
+            Ok(!gone)
+        })?;
+        if !gone && let Some(out) = run.finish()? {
+            let _ = tx.blocking_send(out);
+        }
+        Ok(())
+    });
+    Pack { rx, task }
+}
+
+/// Route one chunk: cache hits and admissions ship as their own
+/// frame, first-sightings join the current run. Returns false when
+/// the consumer is gone.
+async fn emit_chunk(
+    cache: Option<&ChunkCache>,
+    chunk: Chunk,
+    run: &mut RunEncoder,
+    tx: &mpsc::Sender<Vec<u8>>,
+) -> Result<bool> {
+    let frame = match cache.map(|c| c.classify(&chunk.hash)) {
+        None | Some(Disposition::FirstSeen) => return run.write(&chunk.data, tx).await,
+        Some(Disposition::Cached(fref)) => match fref.read() {
+            Ok(frame) => frame,
+            Err(_) => return run.write(&chunk.data, tx).await,
+        },
+        Some(Disposition::Admit) => {
+            let frame =
+                zstd::bulk::compress(&chunk.data, 3).map_err(err_ctx("compressing chunk frame"))?;
+            cache.unwrap().admit(chunk.hash, &frame);
+            frame
+        }
+    };
+    if !run.flush(tx).await? {
+        return Ok(false);
+    }
+    Ok(tx.send(frame).await.is_ok())
+}
+
+/// One zstd frame per run of consecutive uncached chunks, drained to
+/// the channel in message-sized pieces as it grows.
+#[derive(Default)]
+struct RunEncoder {
+    enc: Option<Encoder<'static, Vec<u8>>>,
+}
+
+impl RunEncoder {
+    async fn write(&mut self, data: &[u8], tx: &mpsc::Sender<Vec<u8>>) -> Result<bool> {
+        let enc = match &mut self.enc {
+            Some(enc) => enc,
+            None => self
+                .enc
+                .insert(Encoder::new(Vec::new(), 3).map_err(err_ctx("creating zstd encoder"))?),
+        };
+        enc.write_all(data).map_err(err_ctx("zstd write"))?;
+        if enc.get_ref().len() >= chunkio::CHUNK_SIZE {
+            let out = mem::take(enc.get_mut());
+            return Ok(tx.send(out).await.is_ok());
+        }
+        Ok(true)
+    }
+
+    async fn flush(&mut self, tx: &mpsc::Sender<Vec<u8>>) -> Result<bool> {
+        match self.finish()? {
+            Some(out) => Ok(tx.send(out).await.is_ok()),
+            None => Ok(true),
+        }
+    }
+
+    /// End the current frame and hand back its remaining bytes.
+    fn finish(&mut self) -> Result<Option<Vec<u8>>> {
+        let Some(enc) = self.enc.take() else {
+            return Ok(None);
+        };
+        let out = enc.finish().map_err(err_ctx("finishing zstd frame"))?;
+        Ok((!out.is_empty()).then_some(out))
+    }
+}
+
+async fn forward_pack(
     build_id: &str,
     store_path: &str,
+    mut pack: Pack,
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
 ) -> Result<()> {
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
-    let path = store_path.to_string();
-    let task = tokio::task::spawn_blocking(move || -> Result<()> {
-        rt::name_current_thread("trib-pack");
-        // harmonia's NAR pack is async-only; drive it on a current-thread
-        // runtime here so its blocking file reads stay off the shared
-        // runtime workers.
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .map_err(err_ctx("building NAR pack runtime"))?;
-        rt.block_on(async move {
-            let nar = harmonia_file_nar::archive::NarByteStream::new(PathBuf::from(&path));
-            let mut enc = async_compression::tokio::bufread::ZstdEncoder::with_quality(
-                tokio_util::io::StreamReader::new(nar),
-                async_compression::Level::Precise(3),
-            );
-            let mut buf = vec![0u8; chunkio::CHUNK_SIZE];
-            loop {
-                let n = enc
-                    .read(&mut buf)
-                    .await
-                    .map_err(err_ctx(format!("packing {path}")))?;
-                if n == 0 {
-                    break;
-                }
-                if tx.send(buf[..n].to_vec()).await.is_err() {
-                    break; // consumer gone
-                }
-            }
-            Ok(())
-        })
-    });
-    while let Some(chunk) = rx.recv().await {
+    while let Some(chunk) = pack.rx.recv().await {
         send(
             out_tx,
             hub_message::Msg::Nar(NarTransfer::chunk(build_id, store_path, chunk)),
         )
         .await?;
     }
-    task.await??;
+    pack.task.await??;
     send(
         out_tx,
         hub_message::Msg::Nar(NarTransfer::eof(build_id, store_path)),
@@ -261,17 +414,36 @@ async fn stream_tmp_dir(
 mod tests {
     use super::*;
 
-    fn info(path: &str, refs: &[&str]) -> PathInfoMsg {
+    fn sized(path: &str, refs: &[&str], nar_size: u64) -> PathInfoMsg {
         PathInfoMsg {
             build_id: String::new(),
             store_path: path.into(),
             nar_sha256: Vec::new(),
-            nar_size: 0,
+            nar_size,
             references: refs.iter().map(ToString::to_string).collect(),
             signatures: Vec::new(),
             deriver: String::new(),
             ca: String::new(),
         }
+    }
+
+    fn info(path: &str, refs: &[&str]) -> PathInfoMsg {
+        sized(path, refs, 0)
+    }
+
+    #[test]
+    fn largest_ready_path_streams_first() {
+        let big = "/nix/store/aaa-chromium";
+        let small = "/nix/store/bbb-sed";
+        let dep = "/nix/store/ccc-glibc";
+        let ordered = order_by_references(vec![
+            sized(small, &[], 10),
+            sized(big, &[dep], 1000),
+            sized(dep, &[], 1),
+        ]);
+        let seq: Vec<&str> = ordered.iter().map(|i| i.store_path.as_str()).collect();
+        // dep unblocks big, which then outranks small.
+        assert_eq!(seq, vec![small, dep, big]);
     }
 
     #[test]

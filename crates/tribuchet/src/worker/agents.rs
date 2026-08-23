@@ -18,8 +18,8 @@ use std::fmt::Write as _;
 #[cfg(target_os = "macos")]
 use sandbox_proto::agent::SCRATCH_DIR_PARAM;
 use sandbox_proto::agent::{
-    AdoptRequest, CleanupRequest, FinishRequest, KillRequest, StartRequest, StatusRequest, call,
-    reply,
+    AdoptRequest, CleanupRequest, FinishRequest, KillRequest, ShutdownRequest, StartRequest,
+    StatusRequest, call, reply,
 };
 use sandbox_proto::framing;
 
@@ -260,6 +260,12 @@ pub(super) fn cleanup(socket: &Path, build_id: &str) -> Result<()> {
             build_id: build_id.into(),
         }),
     )
+}
+
+/// Ask an idle activated agent to exit. Sent while the caller still
+/// holds the agent slot, so nothing connects to the dying instance.
+pub(super) fn shutdown(socket: &Path) -> Result<()> {
+    control(socket, call::Call::Shutdown(ShutdownRequest {}))
 }
 
 #[cfg(test)]

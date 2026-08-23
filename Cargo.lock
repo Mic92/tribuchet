@@ -569,6 +569,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
+name = "fastcdc"
+version = "3.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf51ceb43e96afbfe4dd5c6f6082af5dfd60e220820b8123792d61963f2ce6bc"
+
+[[package]]
 name = "fastrand"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1292,6 +1298,16 @@ name = "multimap"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
+
+[[package]]
+name = "netbench"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "libc",
+ "serde_json",
+ "tempfile",
+]
 
 [[package]]
 name = "nix"
@@ -2376,8 +2392,10 @@ name = "tribuchet"
 version = "0.1.0"
 dependencies = [
  "async-compression",
+ "blake3",
  "bytes",
  "clap",
+ "fastcdc",
  "futures-util",
  "getrandom 0.4.3",
  "harmonia-file-nar",

@@ -44,17 +44,14 @@ pub fn bash() -> String {
 // ---------------------------------------------------------------------------
 
 fn ssh_base(node: Node) -> Vec<String> {
-    let ctl = format!("{}/ctl-{}", env("TT_CTLDIR"), node.name());
     let mut args = vec!["-F".into(), env("TT_SSH_CONFIG")];
     for opt in [
         "User=root",
         "StrictHostKeyChecking=no",
         "UserKnownHostsFile=/dev/null",
-        "ControlMaster=auto",
-        "ControlPersist=300",
+        // No ControlMaster: multiplexed sessions share the master's
+        // fate, and one test flooding the connection killed them all.
         "ConnectTimeout=10",
-        // A dropped ControlMaster kills every multiplexed session, so
-        // ride out VM stalls. run_timeout bounds each command.
         "ServerAliveInterval=30",
         "ServerAliveCountMax=10",
         "LogLevel=ERROR",
@@ -62,8 +59,6 @@ fn ssh_base(node: Node) -> Vec<String> {
         args.push("-o".into());
         args.push(opt.into());
     }
-    args.push("-o".into());
-    args.push(format!("ControlPath={ctl}"));
     args.push(format!("vsock-mux/{}", node.sock()));
     args
 }
@@ -86,6 +81,32 @@ impl Out {
 /// command is killed if it outlasts `timeout`.
 fn run_timeout(node: Node, cmd: &str, timeout: Duration) -> Out {
     ensure_ready();
+    // A connect-phase failure happens before the remote command runs,
+    // so retrying cannot re-execute anything.
+    for _ in 0..3 {
+        let o = run_once(node, cmd, timeout);
+        if o.code == 255 && !o.timed_out && connect_failed(&o.stderr) {
+            thread::sleep(Duration::from_secs(2));
+            continue;
+        }
+        return o;
+    }
+    run_once(node, cmd, timeout)
+}
+
+fn connect_failed(stderr: &str) -> bool {
+    [
+        "banner exchange",
+        "Connection refused",
+        "Connection timed out",
+        "Connection closed by remote host",
+        "kex_exchange_identification",
+    ]
+    .iter()
+    .any(|m| stderr.contains(m))
+}
+
+fn run_once(node: Node, cmd: &str, timeout: Duration) -> Out {
     let script = format!("set -euo pipefail\n{cmd}");
     let mut child = Command::new(env("TT_SSH"))
         .args(ssh_base(node))

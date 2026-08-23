@@ -86,10 +86,27 @@
           );
         }
         // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
-          nixos-test = pkgs.testers.runNixOSTest (
+          nixos-test-builds = pkgs.testers.runNixOSTest (
             import ./nix/test.nix {
               tribuchet = self.packages.x86_64-linux.default;
               nixosModule = self.nixosModules.default;
+              phase = "builds";
+            }
+          );
+
+          nixos-test-nspawn = pkgs.testers.runNixOSTest (
+            import ./nix/test.nix {
+              tribuchet = self.packages.x86_64-linux.default;
+              nixosModule = self.nixosModules.default;
+              phase = "nspawn";
+            }
+          );
+
+          nixos-test-lifecycle = pkgs.testers.runNixOSTest (
+            import ./nix/test.nix {
+              tribuchet = self.packages.x86_64-linux.default;
+              nixosModule = self.nixosModules.default;
+              phase = "lifecycle";
             }
           );
 
