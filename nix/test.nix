@@ -286,16 +286,14 @@ in
 
     # Hand off to the Rust e2e harness. It runs on the driver host and drives
     # both VMs over the vsock ssh backdoor, so independent subtests overlap.
-    import os, subprocess, tempfile
+    import os, subprocess
 
-    ctldir = tempfile.mkdtemp(prefix="tt-ssh-")
     e2e_env = dict(os.environ)
     e2e_env.update({
         "TT_SSH": "${pkgs.openssh}/bin/ssh",
         "TT_SSH_CONFIG": "${pkgs.systemd}/lib/systemd/ssh_config.d/20-systemd-ssh-proxy.conf",
         "TT_HUB_SOCK": str(hub.vsock_host),
         "TT_WORKER_SOCK": str(worker.vsock_host),
-        "TT_CTLDIR": ctldir,
         "TT_BASH": "${pkgs.bash}",
     })
     e2e = "${tribuchet.e2eTests}/bin/tribuchet-e2e"
