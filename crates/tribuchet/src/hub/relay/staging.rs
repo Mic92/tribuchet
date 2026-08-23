@@ -81,8 +81,11 @@ pub(super) async fn restage_inputs(
     .await
 }
 
-/// Stream PathInfo + NAR for each path, references before referrers
-/// (the worker's daemon import needs the references valid first).
+/// Packs compressed ahead of the in-order send: one zstd-3 encoder
+/// cannot fill a 1 Gbit link on its own, eight measured 1.5x and
+/// deeper buys nothing.
+const PACK_PIPELINE: usize = 8;
+
 async fn stream_inputs(
     state: &HubState,
     job: &Job,
@@ -90,11 +93,29 @@ async fn stream_inputs(
     paths: &[String],
 ) -> Result<()> {
     let infos = order_by_references(query_path_infos(&state.daemon_pool, paths).await?);
-    for mut info in infos {
+    let mut infos = infos.into_iter();
+    let mut inflight: std::collections::VecDeque<(PathInfoMsg, Pack)> =
+        std::collections::VecDeque::new();
+    loop {
+        while inflight.len() < PACK_PIPELINE {
+            let Some(info) = infos.next() else { break };
+            let pack = spawn_pack(&info.store_path);
+            inflight.push_back((info, pack));
+        }
+        let Some((mut info, pack)) = inflight.pop_front() else {
+            break;
+        };
         let path = info.store_path.clone();
         info.build_id = job.id.clone();
         send(out_tx, hub_message::Msg::PathInfo(info)).await?;
-        stream_store_path(&job.id, &path, out_tx).await?;
+        let res = forward_pack(&job.id, &path, pack, out_tx).await;
+        if res.is_err() {
+            for (_, pack) in inflight {
+                pack.task.abort();
+                let _ = pack.task.await;
+            }
+            return res;
+        }
     }
     Ok(())
 }
@@ -179,16 +200,15 @@ async fn query_path_infos(
     Ok(results.into_iter().flatten().collect())
 }
 
-/// NAR-pack a local store path, zstd-compress, and stream it to the
-/// worker. The pack (blocking store reads plus the zstd encode) runs on
-/// the blocking pool, overlapping the network send it feeds through the
-/// bounded channel and keeping the async workers free.
-async fn stream_store_path(
-    build_id: &str,
-    store_path: &str,
-    out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
-) -> Result<()> {
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+struct Pack {
+    rx: mpsc::Receiver<Vec<u8>>,
+    task: tokio::task::JoinHandle<Result<()>>,
+}
+
+/// NAR-pack a store path and zstd-compress on the blocking pool,
+/// feeding a bounded channel.
+fn spawn_pack(store_path: &str) -> Pack {
+    let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
     let path = store_path.to_string();
     let task = tokio::task::spawn_blocking(move || -> Result<()> {
         rt::name_current_thread("trib-pack");
@@ -220,14 +240,23 @@ async fn stream_store_path(
             Ok(())
         })
     });
-    while let Some(chunk) = rx.recv().await {
+    Pack { rx, task }
+}
+
+async fn forward_pack(
+    build_id: &str,
+    store_path: &str,
+    mut pack: Pack,
+    out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
+) -> Result<()> {
+    while let Some(chunk) = pack.rx.recv().await {
         send(
             out_tx,
             hub_message::Msg::Nar(NarTransfer::chunk(build_id, store_path, chunk)),
         )
         .await?;
     }
-    task.await??;
+    pack.task.await??;
     send(
         out_tx,
         hub_message::Msg::Nar(NarTransfer::eof(build_id, store_path)),
