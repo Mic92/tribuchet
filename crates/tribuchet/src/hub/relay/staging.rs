@@ -1,6 +1,6 @@
 //! Input staging: path-info queries and NAR/tmp-dir streaming to the worker.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 
 use harmonia_store_path::{StoreDir, StorePath};
@@ -94,8 +94,7 @@ async fn stream_inputs(
 ) -> Result<()> {
     let infos = order_by_references(query_path_infos(&state.daemon_pool, paths).await?);
     let mut infos = infos.into_iter();
-    let mut inflight: std::collections::VecDeque<(PathInfoMsg, Pack)> =
-        std::collections::VecDeque::new();
+    let mut inflight: VecDeque<(PathInfoMsg, Pack)> = VecDeque::new();
     loop {
         while inflight.len() < PACK_PIPELINE {
             let Some(info) = infos.next() else { break };
@@ -141,7 +140,7 @@ fn order_by_references(infos: Vec<PathInfoMsg>) -> Vec<PathInfoMsg> {
             }
         }
     }
-    let mut ready: std::collections::BinaryHeap<(u64, &str)> = indegree
+    let mut ready: BinaryHeap<(u64, &str)> = indegree
         .iter()
         .filter(|(_, d)| **d == 0)
         .map(|(p, _)| (nodes[*p].nar_size, *p))

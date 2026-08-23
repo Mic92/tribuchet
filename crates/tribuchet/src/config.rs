@@ -183,6 +183,9 @@ pub struct WorkerConfig {
     /// Concurrent build slots.
     #[serde(default = "default_max_jobs")]
     pub max_jobs: u32,
+    /// Parallel nix-daemon connections importing staged input NARs.
+    #[serde(default = "default_import_jobs")]
+    pub import_jobs: u32,
     /// Emulated systems: system -> path of a static emulator binary
     /// (Linux, kernel 6.7+).
     #[serde(default)]
@@ -245,6 +248,9 @@ fn default_key() -> PathBuf {
 }
 fn default_build_timeout() -> u64 {
     24 * 3600
+}
+fn default_import_jobs() -> u32 {
+    4
 }
 fn default_max_jobs() -> u32 {
     thread::available_parallelism()

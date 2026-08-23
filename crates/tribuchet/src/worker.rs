@@ -94,6 +94,8 @@ struct WorkerCtx {
     /// Input paths a build is currently importing. Other builds defer
     /// to that import instead of requesting the same NAR again.
     staging_inflight: Mutex<HashSet<String>>,
+    /// Parallel daemon connections importing input NARs per build.
+    import_jobs: usize,
 }
 
 impl WorkerCtx {
@@ -272,6 +274,32 @@ pub fn run(opts: WorkerConfig) -> Result<()> {
     rt.block_on(run_async(opts))
 }
 
+/// Validate the emulate map and register its systems.
+fn resolve_emulators(opts: &mut WorkerConfig) -> Result<HashMap<String, PathBuf>> {
+    let mut emulators = HashMap::new();
+    for (system, path) in &opts.emulate {
+        if !cfg!(target_os = "linux") {
+            return Err(err_msg("emulate requires Linux (binfmt_misc)"));
+        }
+        if binfmt::register_line(system).is_none() {
+            return Err(err_msg(format!("emulate {system}: no binfmt magic known")));
+        }
+        if !path.is_file() {
+            return Err(err_msg(format!(
+                "emulate {system}: {} not found",
+                path.display()
+            )));
+        }
+        emulators.insert(system.clone(), path.clone());
+    }
+    for system in emulators.keys() {
+        if !opts.systems.contains(system) {
+            opts.systems.push(system.clone());
+        }
+    }
+    Ok(emulators)
+}
+
 async fn run_async(opts: WorkerConfig) -> Result<()> {
     let builds_dir = opts.state_dir.join("builds");
     fs::create_dir_all(&builds_dir).map_err(io_ctx("creating", &builds_dir))?;
@@ -323,31 +351,14 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
     // main logs the config before the baked-in bin_sh default applies;
     // log the effective values.
     tracing::info!(fod_isolation, bin_sh = ?opts.sandbox_bin_sh, "resolved sandbox defaults");
-    let mut emulators = HashMap::new();
-    for (system, path) in &opts.emulate {
-        if !cfg!(target_os = "linux") {
-            return Err(err_msg("emulate requires Linux (binfmt_misc)"));
-        }
-        if binfmt::register_line(system).is_none() {
-            return Err(err_msg(format!("emulate {system}: no binfmt magic known")));
-        }
-        if !path.is_file() {
-            return Err(err_msg(format!(
-                "emulate {system}: {} not found",
-                path.display()
-            )));
-        }
-        if !opts.systems.contains(system) {
-            opts.systems.push(system.clone());
-        }
-        emulators.insert(system.clone(), path.clone());
-    }
+    let emulators = resolve_emulators(&mut opts)?;
     let opts = opts;
     let ctx = Arc::new(WorkerCtx {
         state_dir: opts.state_dir.clone(),
         sandbox_bin_sh: opts.sandbox_bin_sh.clone(),
         secret_paths: vec![opts.key.clone(), opts.state_dir.join("signing.key")],
         slots: Arc::new(Semaphore::new(opts.max_jobs.max(1) as usize)),
+        import_jobs: opts.import_jobs.max(1) as usize,
         cancelled: Mutex::new(HashSet::new()),
         staging_inflight: Mutex::new(HashSet::new()),
         resumable: Mutex::new(HashMap::new()),

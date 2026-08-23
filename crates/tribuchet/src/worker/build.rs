@@ -2,17 +2,16 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self};
 use std::mem;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use futures_util::StreamExt as _;
 use harmonia_store_path::{StoreDir, StorePath, StorePathSet};
 use harmonia_store_path_info::ValidPathInfo;
 use harmonia_store_remote::{DaemonClient, DaemonStore};
-use tokio::io::AsyncReadExt as _;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
+
+use import_pool::{ImportHandle, ImportJob, ImportPool, ImportState};
 
 use super::pins;
 use super::{DaemonConn, WorkerCtx, unix_now};
@@ -78,15 +77,6 @@ pub(super) fn validate_assignment(a: &BuildAssignment) -> Result<()> {
 
 type Unpacker = (mpsc::Sender<Vec<u8>>, tokio::task::JoinHandle<Result<()>>);
 
-/// In-flight daemon import of one input NAR. Owns the build's daemon
-/// connection while streaming (AddToStoreNar holds the protocol);
-/// the connection comes back when the transfer finishes.
-struct Importer {
-    store_path: String,
-    tx: mpsc::Sender<bytes::Bytes>,
-    task: tokio::task::JoinHandle<(DaemonConn, Result<()>)>,
-}
-
 pub(super) struct ActiveBuild {
     pub(super) assignment: BuildAssignment,
     pub(super) dir: PathBuf, // state_dir/builds/<id>
@@ -107,9 +97,10 @@ pub(super) struct ActiveBuild {
     tmp_dir_done: bool,
     resend_rounds: u32,
     /// Daemon connection; carries this build's temp roots, so it must
-    /// outlive the build. None while an Importer borrows it.
+    /// outlive the build.
     daemon: Option<DaemonConn>,
-    importer: Option<Importer>,
+    imports: HashMap<String, ImportHandle>,
+    pool: Option<ImportPool>,
     tmp_unpacker: Option<Unpacker>,
 }
 
@@ -122,27 +113,6 @@ async fn add_temp_root(daemon: &mut DaemonConn, path: &str, sp: &StorePath) -> R
         .add_temp_root(sp)
         .await
         .map_err(err_ctx(format!("adding temp root for {path}")))
-}
-
-/// Drive one AddToStoreNar: hub chunks -> zstd decode -> daemon. The
-/// daemon verifies the NAR against info.nar_hash and registers the
-/// path, so no separate integrity check is needed here.
-async fn import_nar(
-    conn: &mut DaemonConn,
-    info: &ValidPathInfo,
-    rx: mpsc::Receiver<bytes::Bytes>,
-) -> Result<()> {
-    let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(Ok::<_, io::Error>);
-    let reader = tokio_util::io::StreamReader::new(stream);
-    let dec =
-        async_compression::tokio::bufread::ZstdDecoder::new(tokio::io::BufReader::new(reader));
-    // take(nar_size): the daemon reads a self-delimiting NAR, but a
-    // malicious hub must not stream unbounded decompressed bytes.
-    let limited = tokio::io::BufReader::new(dec.take(info.info.nar_size));
-    conn.add_to_store_nar(info, limited, false, true)
-        .await
-        .map_err(|e| err_msg(format!("importing {} via the daemon: {e}", info.path)))?;
-    Ok(())
 }
 
 impl ActiveBuild {
@@ -165,7 +135,8 @@ impl ActiveBuild {
             tmp_dir_done: false,
             resend_rounds: 0,
             daemon: None,
-            importer: None,
+            imports: HashMap::new(),
+            pool: None,
             tmp_unpacker: None,
         })
     }
@@ -301,15 +272,7 @@ impl ActiveBuild {
     }
 
     pub(super) async fn feed_nar(&mut self, n: NarTransfer) -> Result<()> {
-        if self
-            .importer
-            .as_ref()
-            .is_none_or(|i| i.store_path != n.store_path)
-        {
-            // Start a new import; the hub streams one path at a time.
-            if self.importer.is_some() {
-                return Err(err_msg("hub interleaved NAR transfers for different paths"));
-            }
+        if !self.imports.contains_key(&n.store_path) {
             let info = match self.pending.remove(&n.store_path) {
                 Some(Some(info)) => info,
                 Some(None) => {
@@ -325,44 +288,65 @@ impl ActiveBuild {
                     )));
                 }
             };
-            let mut conn = self
-                .daemon
-                .take()
-                .ok_or_else(|| err_msg("daemon connection missing (no negotiation?)"))?;
+            let store_dir = StoreDir::default();
+            let gates = info
+                .info
+                .references
+                .iter()
+                .filter_map(|r| self.imports.get(&store_dir.display(r).to_string()))
+                .map(|h| h.done.clone())
+                .collect();
             let (tx, rx) = mpsc::channel::<bytes::Bytes>(8);
-            let task = tokio::spawn(async move {
-                let res = import_nar(&mut conn, &info, rx).await;
-                (conn, res)
-            });
-            self.importer = Some(Importer {
-                store_path: n.store_path.clone(),
-                tx,
-                task,
-            });
+            let (done_tx, done_rx) = watch::channel(ImportState::Running);
+            let jobs = self.ctx.import_jobs;
+            let pool = self.pool.get_or_insert_with(|| ImportPool::spawn(jobs));
+            pool.job_tx
+                .send(ImportJob {
+                    info,
+                    rx,
+                    gates,
+                    done: done_tx,
+                })
+                .await
+                .map_err(|_| err_msg("import pool gone"))?;
+            self.imports.insert(
+                n.store_path.clone(),
+                ImportHandle {
+                    tx: Some(tx),
+                    done: done_rx,
+                },
+            );
         }
-        let importer = self.importer.as_ref().unwrap();
+        let handle = self.imports.get_mut(&n.store_path).unwrap();
         let send_failed = match n.payload {
-            Some(nar_transfer::Payload::ZstdNarChunk(chunk)) => {
-                importer.tx.send(chunk.into()).await.is_err()
-            }
+            Some(nar_transfer::Payload::ZstdNarChunk(chunk)) => match &handle.tx {
+                Some(tx) => tx.send(chunk.into()).await.is_err(),
+                None => {
+                    return Err(err_msg(format!(
+                        "hub sent a NAR chunk after eof for {}",
+                        n.store_path
+                    )));
+                }
+            },
             None => false,
         };
-        if send_failed || n.eof {
-            // Reap the import task: on eof for its result, on a failed
-            // send for the error that killed it.
-            let Importer { task, tx, .. } = self.importer.take().unwrap();
-            drop(tx);
-            let (conn, res) = task.await?;
-            self.daemon = Some(conn);
-            res?;
-            if send_failed {
-                return Err(err_msg(format!(
-                    "input import ended early for {}",
-                    n.store_path
-                )));
-            }
-            self.deregister(&n.store_path);
-            self.inputs.push(n.store_path);
+        if send_failed {
+            // The import task died early. Surface its error.
+            let state = handle
+                .done
+                .wait_for(|s| !matches!(s, ImportState::Running))
+                .await
+                .map_err(|_| err_msg("import task abandoned"))?
+                .clone();
+            return Err(match state {
+                ImportState::Failed(e) => err_msg(e),
+                _ => err_msg(format!("input import ended early for {}", n.store_path)),
+            });
+        }
+        if n.eof {
+            // Import completion is reaped in complete_staging. The
+            // next NAR dispatches to another pool connection now.
+            handle.tx = None;
         }
         Ok(())
     }
@@ -406,13 +390,29 @@ impl ActiveBuild {
                 "hub signalled staging completion before the tmp dir arrived",
             ));
         }
-        if self.importer.is_some() {
-            return Err(err_msg("staging round ended during an input NAR transfer"));
-        }
         if let Some(p) = self.pending.keys().next() {
             return Err(err_msg(format!(
                 "hub never sent a NAR for requested input {p}"
             )));
+        }
+        let imports: Vec<(String, ImportHandle)> = self.imports.drain().collect();
+        for (path, mut h) in imports {
+            if h.tx.is_some() {
+                return Err(err_msg(format!(
+                    "staging round ended during the NAR transfer of {path}"
+                )));
+            }
+            let state = h
+                .done
+                .wait_for(|s| !matches!(s, ImportState::Running))
+                .await
+                .map_err(|_| err_msg("import task abandoned"))?
+                .clone();
+            if let ImportState::Failed(e) = state {
+                return Err(err_msg(e));
+            }
+            self.deregister(&path);
+            self.inputs.push(path);
         }
         if self.deferred.is_empty() {
             return Ok(StagingStatus::Ready);
@@ -465,10 +465,9 @@ impl ActiveBuild {
     /// half-imported path is the daemon's to clean up.
     pub(super) async fn abort(mut self) {
         self.deregister_all();
-        if let Some(Importer { tx, task, .. }) = self.importer.take() {
-            drop(tx);
-            task.abort();
-            let _ = task.await;
+        self.imports.clear();
+        if let Some(pool) = self.pool.take() {
+            pool.shutdown().await;
         }
         if let Some((tx, task)) = self.tmp_unpacker.take() {
             drop(tx);
@@ -483,6 +482,8 @@ impl ActiveBuild {
 
 #[path = "build/agent_exec.rs"]
 mod agent_exec;
+#[path = "build/import_pool.rs"]
+mod import_pool;
 mod outputs;
 pub(super) use agent_exec::supervise_agent;
 pub(super) use outputs::pack_outputs_and_extras;
