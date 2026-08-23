@@ -15,7 +15,7 @@ use crate::errors::{Result, err_ctx, err_msg};
 use crate::proto::{
     HubMessage, NarTransfer, PathInfoMsg, StagingComplete, TmpDirArchive, hub_message,
 };
-use crate::{chunkio, rt, store};
+use crate::{chunkio, rt};
 
 /// Reject paths we never offered and dedupe the rest.
 pub(super) fn validate_missing(
@@ -120,24 +120,54 @@ async fn stream_inputs(
     Ok(())
 }
 
-/// References before referrers; tolerates self-refs and cycles.
+/// References before referrers, largest nar_size first among ready
+/// paths (Kahn's algorithm, max-heap): with parallel worker imports
+/// this starts the biggest import earliest so it hides behind the
+/// rest of the transfer. Tolerates self-refs. Cycle members are
+/// appended at the end in arbitrary order.
 fn order_by_references(infos: Vec<PathInfoMsg>) -> Vec<PathInfoMsg> {
-    let roots: Vec<String> = infos.iter().map(|i| i.store_path.clone()).collect();
     let mut nodes: HashMap<String, PathInfoMsg> = infos
         .into_iter()
         .map(|i| (i.store_path.clone(), i))
         .collect();
-    store::topo_order(roots, |p| {
-        nodes[p]
-            .references
-            .iter()
-            .filter(|r| nodes.contains_key(*r))
-            .cloned()
-            .collect()
-    })
-    .into_iter()
-    .map(|p| nodes.remove(&p).unwrap())
-    .collect()
+    let mut indegree: HashMap<&str, usize> = HashMap::new();
+    let mut referrers: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (path, info) in &nodes {
+        indegree.entry(path).or_default();
+        for r in &info.references {
+            if r != path && nodes.contains_key(r) {
+                *indegree.entry(path).or_default() += 1;
+                referrers.entry(r).or_default().push(path);
+            }
+        }
+    }
+    let mut ready: std::collections::BinaryHeap<(u64, &str)> = indegree
+        .iter()
+        .filter(|(_, d)| **d == 0)
+        .map(|(p, _)| (nodes[*p].nar_size, *p))
+        .collect();
+    let mut order: Vec<String> = Vec::with_capacity(nodes.len());
+    while let Some((_, p)) = ready.pop() {
+        order.push(p.to_string());
+        for r in referrers.remove(p).unwrap_or_default() {
+            let d = indegree.get_mut(r).unwrap();
+            *d -= 1;
+            if *d == 0 {
+                ready.push((nodes[r].nar_size, r));
+            }
+        }
+    }
+    let mut rest: Vec<&str> = indegree
+        .iter()
+        .filter(|(_, d)| **d > 0)
+        .map(|(p, _)| *p)
+        .collect();
+    rest.sort_unstable();
+    order.extend(rest.into_iter().map(str::to_string));
+    order
+        .into_iter()
+        .map(|p| nodes.remove(&p).unwrap())
+        .collect()
 }
 
 /// Per-path query info from one daemon connection, for a slice of paths.
@@ -290,17 +320,36 @@ async fn stream_tmp_dir(
 mod tests {
     use super::*;
 
-    fn info(path: &str, refs: &[&str]) -> PathInfoMsg {
+    fn sized(path: &str, refs: &[&str], nar_size: u64) -> PathInfoMsg {
         PathInfoMsg {
             build_id: String::new(),
             store_path: path.into(),
             nar_sha256: Vec::new(),
-            nar_size: 0,
+            nar_size,
             references: refs.iter().map(ToString::to_string).collect(),
             signatures: Vec::new(),
             deriver: String::new(),
             ca: String::new(),
         }
+    }
+
+    fn info(path: &str, refs: &[&str]) -> PathInfoMsg {
+        sized(path, refs, 0)
+    }
+
+    #[test]
+    fn largest_ready_path_streams_first() {
+        let big = "/nix/store/aaa-chromium";
+        let small = "/nix/store/bbb-sed";
+        let dep = "/nix/store/ccc-glibc";
+        let ordered = order_by_references(vec![
+            sized(small, &[], 10),
+            sized(big, &[dep], 1000),
+            sized(dep, &[], 1),
+        ]);
+        let seq: Vec<&str> = ordered.iter().map(|i| i.store_path.as_str()).collect();
+        // dep unblocks big, which then outranks small.
+        assert_eq!(seq, vec![small, dep, big]);
     }
 
     #[test]
