@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/tribuchet", "crates/sandbox-proto"]
+members = ["crates/tribuchet", "crates/sandbox-proto", "crates/netbench"]
 resolver = "2"
 
 [workspace.package]
