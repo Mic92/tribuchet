@@ -137,6 +137,8 @@ pub(super) fn sweep_orphaned_agent_builds(ctx: &Arc<WorkerCtx>) {
             let _ = agents::kill(&socket, &id);
             if let Err(e) = agents::cleanup(&socket, &id) {
                 tracing::warn!(id, "orphaned build cleanup failed: {}", chain(&e));
+            } else if let Err(e) = agents::shutdown(&socket) {
+                tracing::warn!(id, "agent shutdown failed: {}", chain(&e));
             }
             ctx.agents.release(socket);
         });

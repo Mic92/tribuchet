@@ -15,8 +15,13 @@ message Call {
     KillRequest kill = 4;
     FinishRequest finish = 5;
     CleanupRequest cleanup = 6;
+    ShutdownRequest shutdown = 7;
   }
 }
+
+// Ask an idle agent to exit so the next connection activates a fresh
+// instance. Refused while a build is held. Answers with `empty`.
+message ShutdownRequest {}
 
 // Kill, Finish and Cleanup answer with `empty`; ExitNotice arrives
 // later on the Start/Adopt connection.
