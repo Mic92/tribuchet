@@ -1,5 +1,8 @@
 //! Input staging: path-info queries and NAR/tmp-dir streaming to the worker.
 
+mod chunked;
+pub(super) use chunked::stage_chunked;
+
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::io::Write as _;
 use std::mem;
@@ -10,12 +13,12 @@ use harmonia_store_remote::DaemonStore as _;
 use tokio::sync::{mpsc, watch};
 use tonic::Status;
 
-use super::super::chunkcache::{ChunkCache, Disposition};
-use super::super::state::{HubState, Job};
 use super::{WorkerStaging, send};
 use crate::chunker::{Chunk, chunk_store_path};
 use crate::chunkio;
 use crate::errors::{Result, err_ctx, err_msg};
+use crate::hub::chunkcache::{ChunkCache, Disposition};
+use crate::hub::state::{HubState, Job};
 use crate::proto::{
     HubMessage, NarTransfer, PathInfoMsg, StagingComplete, TmpDirArchive, hub_message,
 };
@@ -59,6 +62,11 @@ pub(super) async fn stage_optimistic(
         .await
         .expect("staging semaphore closed");
     stream_tmp_dir(&job.id, &job.tmp_dir_pack, out_tx).await?;
+    // Chunk sessions stage missing paths as recipes after the answer,
+    // so there is nothing to stream optimistically here.
+    if staging.chunked {
+        return Ok(());
+    }
     let complement: Vec<String> = job
         .req
         .input_paths
@@ -158,7 +166,7 @@ async fn stream_inputs(
 /// this starts the biggest import earliest so it hides behind the
 /// rest of the transfer. Tolerates self-refs. Cycle members are
 /// appended at the end in arbitrary order.
-fn order_by_references(infos: Vec<PathInfoMsg>) -> Vec<PathInfoMsg> {
+pub(super) fn order_by_references(infos: Vec<PathInfoMsg>) -> Vec<PathInfoMsg> {
     let mut nodes: HashMap<String, PathInfoMsg> = infos
         .into_iter()
         .map(|i| (i.store_path.clone(), i))
@@ -245,7 +253,7 @@ async fn query_path_info_chunk(
 /// Path info over the daemon protocol, not db.sqlite:
 /// harmonia-store-db opens the db with immutable=1, so WAL-only rows
 /// (freshly registered inputs, the common case) would be invisible.
-async fn query_path_infos(
+pub(super) async fn query_path_infos(
     pool: &harmonia_store_remote::ConnectionPool,
     paths: &[String],
 ) -> Result<Vec<PathInfoMsg>> {

@@ -21,8 +21,8 @@ use crate::config::{Auth, WorkerConfig};
 use crate::errors::{Error, Result, chain, err_ctx, err_msg};
 use crate::proto::{
     BuildAssignment, BuildResult, CancelBuild, Heartbeat, HubMessage, MAX_MSG_SIZE, MissingPaths,
-    Register, Resumed, WorkerMessage, hub_message, worker_hub_client::WorkerHubClient,
-    worker_message,
+    NeedChunks, PathRecipe, Register, Resumed, WorkerMessage, hub_message,
+    worker_hub_client::WorkerHubClient, worker_message,
 };
 
 pub(super) async fn session(
@@ -67,6 +67,7 @@ pub(super) async fn session(
             signing_public_key: signing_key.to_public_key().to_string(),
             resumable_keys: ctx.resumable_keys(),
             max_jobs: opts.max_jobs.max(1),
+            chunk_support: ctx.chunks.is_some(),
         })))
         .await?;
 
@@ -193,6 +194,16 @@ async fn session_loop(
                     abort_active(active, &id, out_tx, &e).await?;
                 }
             }
+            hub_message::Msg::Recipe(r) => {
+                handle_recipe(r, active, &mut ready, out_tx, &env).await?;
+            }
+            hub_message::Msg::ChunkRun(c) => {
+                let id = c.build_id.clone();
+                if let Some(build) = active.get_mut(&id) {
+                    let res = build.feed_chunk_run(c).await;
+                    advance_staging(active, &mut ready, &id, res, &env).await?;
+                }
+            }
             hub_message::Msg::Cancel(c) => handle_cancel(c, active, out_tx, ctx).await?,
             hub_message::Msg::ResultAck(a) => {
                 ack_delivery(ctx, &a.dedupe_key, &a.build_id);
@@ -276,6 +287,36 @@ async fn handle_cancel(
         if map.get(&c.dedupe_key).is_some_and(|e| e.finished.is_none()) {
             ctx.cancelled.lock().unwrap().insert(c.dedupe_key);
         }
+    }
+    Ok(())
+}
+
+/// A recipe may end the recipe set (`last`), in which case the union
+/// of chunks the store lacks goes back as one NeedChunks.
+async fn handle_recipe(
+    r: PathRecipe,
+    active: &mut HashMap<String, ActiveBuild>,
+    ready: &mut VecDeque<String>,
+    out_tx: &mpsc::Sender<WorkerMessage>,
+    env: &LaunchEnv<'_>,
+) -> Result<()> {
+    let id = r.build_id.clone();
+    let Some(build) = active.get_mut(&id) else {
+        return Ok(());
+    };
+    match build.feed_recipe(r).await {
+        Ok((needed, status)) => {
+            if let Some(hashes) = needed {
+                out_tx
+                    .send(msg(worker_message::Msg::NeedChunks(NeedChunks {
+                        build_id: id.clone(),
+                        hashes,
+                    })))
+                    .await?;
+            }
+            advance_staging(active, ready, &id, Ok(status), env).await?;
+        }
+        Err(e) => abort_active(active, &id, out_tx, &e).await?,
     }
     Ok(())
 }

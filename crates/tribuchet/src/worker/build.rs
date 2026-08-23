@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::mem;
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use harmonia_store_path::{StoreDir, StorePath, StorePathSet};
@@ -11,6 +11,7 @@ use harmonia_store_path_info::ValidPathInfo;
 use harmonia_store_remote::{DaemonClient, DaemonStore};
 use tokio::sync::{mpsc, watch};
 
+use chunks::ChunkStaging;
 use import_pool::{ImportHandle, ImportJob, ImportPool, ImportState};
 
 use super::pins;
@@ -23,7 +24,7 @@ use crate::proto::{
     BuildAssignment, MAX_NAR_BYTES, MAX_RESEND_ROUNDS, NarTransfer, PathInfoMsg, TmpDirArchive,
     nar_transfer,
 };
-use crate::store::{STORE_DIR, parse_path_info, valid_store_path};
+use crate::store::parse_path_info;
 use crate::tmpdir::unpack_tmp_dir;
 
 /// Where staging of one build stands after a hub message.
@@ -33,46 +34,6 @@ pub(super) enum StagingStatus {
     Ready,
     /// Deferred paths never became valid; ask the hub for them.
     NeedResend(Vec<String>),
-}
-
-/// The worker must not trust the hub for filesystem-relevant strings:
-/// build ids become path components, output paths are packed (and on
-/// macOS deleted) on the host.
-pub(super) fn validate_assignment(a: &BuildAssignment) -> Result<()> {
-    if a.build_id.len() != 32 || !a.build_id.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(err_msg(format!("invalid build id {:?}", a.build_id)));
-    }
-    if !a.builder.starts_with('/') {
-        return Err(err_msg("builder must be an absolute path"));
-    }
-    let tmp = Path::new(&a.tmp_dir_in_sandbox);
-    if !tmp.is_absolute()
-        || tmp
-            .components()
-            .any(|c| !matches!(c, Component::RootDir | Component::Normal(_)))
-    {
-        return Err(err_msg(format!(
-            "invalid tmpDirInSandbox {:?}",
-            a.tmp_dir_in_sandbox
-        )));
-    }
-    for p in a.outputs.values() {
-        if !valid_store_path(STORE_DIR, p) {
-            return Err(err_msg(format!("invalid output path {p:?}")));
-        }
-        // macOS builds write into /nix/store and cleanup deletes the
-        // output, so a pre-existing path would be tampered with and
-        // removed; reject it. Linux builds run in a private root with
-        // a no-op cleanup, so the real path is untouched -- and
-        // rejecting it would break re-dispatch of a path already valid
-        // here (e.g. a fixed-output derivation built before).
-        if cfg!(target_os = "macos") && fs::symlink_metadata(p).is_ok() {
-            return Err(err_msg(format!(
-                "output path {p} already exists on this worker"
-            )));
-        }
-    }
-    Ok(())
 }
 
 type Unpacker = (mpsc::Sender<Vec<u8>>, tokio::task::JoinHandle<Result<()>>);
@@ -104,6 +65,8 @@ pub(super) struct ActiveBuild {
     daemon: Option<DaemonConn>,
     imports: HashMap<String, ImportHandle>,
     pool: Option<ImportPool>,
+    /// Chunk-staging state, created by the first recipe.
+    chunks: Option<ChunkStaging>,
     tmp_unpacker: Option<Unpacker>,
 }
 
@@ -141,6 +104,7 @@ impl ActiveBuild {
             daemon: None,
             imports: HashMap::new(),
             pool: None,
+            chunks: None,
             tmp_unpacker: None,
         })
     }
@@ -410,6 +374,26 @@ impl ActiveBuild {
                 "hub signalled staging completion before the tmp dir arrived",
             ));
         }
+        // Chunked paths whose chunks never all arrived fall back to
+        // plain NAR resends instead of failing the build.
+        if let Some(cs) = &mut self.chunks {
+            let stuck = cs.take_undispatched();
+            if !stuck.is_empty() {
+                if self.resend_rounds >= MAX_RESEND_ROUNDS {
+                    return Err(err_msg(format!(
+                        "chunks for {} never arrived after {} rounds",
+                        stuck[0], self.resend_rounds
+                    )));
+                }
+                self.resend_rounds += 1;
+                self.awaiting_resend = true;
+                tracing::warn!(
+                    count = stuck.len(),
+                    "chunked paths incomplete, requesting plain NARs"
+                );
+                return Ok(StagingStatus::NeedResend(stuck));
+            }
+        }
         if let Some(p) = self.pending.keys().next() {
             return Err(err_msg(format!(
                 "hub never sent a NAR for requested input {p}"
@@ -520,6 +504,11 @@ impl ActiveBuild {
 
 #[path = "build/agent_exec.rs"]
 mod agent_exec;
+#[path = "build/chunks.rs"]
+mod chunks;
+#[path = "build/validate.rs"]
+mod validate;
+pub(super) use validate::validate_assignment;
 #[path = "build/import_pool.rs"]
 mod import_pool;
 mod outputs;
@@ -528,8 +517,8 @@ pub(super) use outputs::pack_outputs_and_extras;
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
+    use crate::store::{STORE_DIR, valid_store_path};
 
     fn base_assignment() -> BuildAssignment {
         BuildAssignment {

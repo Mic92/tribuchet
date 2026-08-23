@@ -11,8 +11,8 @@ use std::io;
 use tokio::io::AsyncReadExt as _;
 use tokio::sync::{mpsc, watch};
 
-use super::super::DaemonConn;
 use crate::errors::{Result, chain, err_ctx, err_msg};
+use crate::worker::DaemonConn;
 
 #[derive(Clone, Debug)]
 pub(super) enum ImportState {

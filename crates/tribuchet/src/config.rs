@@ -205,6 +205,10 @@ pub struct WorkerConfig {
     /// Parallel nix-daemon connections importing staged input NARs.
     #[serde(default = "default_import_jobs")]
     pub import_jobs: u32,
+    /// Disk budget for the input chunk store (dedup of staged NARs
+    /// across builds). 0 disables it and inputs arrive as whole NARs.
+    #[serde(default = "default_chunk_store_bytes")]
+    pub chunk_store_bytes: u64,
     /// Emulated systems: system -> path of a static emulator binary
     /// (Linux, kernel 6.7+).
     #[serde(default)]
@@ -270,6 +274,9 @@ fn default_build_timeout() -> u64 {
 }
 fn default_import_jobs() -> u32 {
     4
+}
+fn default_chunk_store_bytes() -> u64 {
+    10 << 30
 }
 fn default_max_jobs() -> u32 {
     thread::available_parallelism()

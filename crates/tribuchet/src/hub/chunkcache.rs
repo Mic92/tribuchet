@@ -8,10 +8,20 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use crate::chunkstore::{ChunkStore, FrameRef, Hash};
 
 /// Bound on remembered first-sightings, ~16 MB of RAM.
 const SEEN_CAP: usize = 256 * 1024;
+
+/// Bound on cached recipes. Store paths are immutable, so entries
+/// never invalidate, only age out.
+const RECIPE_CAP: usize = 64 * 1024;
+
+/// Ordered (hash, uncompressed size) chunk list of one NAR.
+pub type Recipe = Arc<Vec<(Hash, u64)>>;
 
 pub enum Disposition {
     /// A stored frame, read outside the cache lock. A failed read
@@ -32,6 +42,8 @@ struct Inner {
     store: ChunkStore,
     seen: VecDeque<Hash>,
     seen_set: HashSet<Hash>,
+    recipes: HashMap<String, Recipe>,
+    recipe_order: VecDeque<String>,
 }
 
 impl ChunkCache {
@@ -41,6 +53,8 @@ impl ChunkCache {
                 store: ChunkStore::open(dir, budget)?,
                 seen: VecDeque::new(),
                 seen_set: HashSet::new(),
+                recipes: HashMap::new(),
+                recipe_order: VecDeque::new(),
             }),
         })
     }
@@ -60,6 +74,21 @@ impl ChunkCache {
             inner.seen_set.remove(&old);
         }
         Disposition::FirstSeen
+    }
+
+    pub fn recipe(&self, store_path: &str) -> Option<Recipe> {
+        self.inner.lock().unwrap().recipes.get(store_path).cloned()
+    }
+
+    pub fn store_recipe(&self, store_path: String, recipe: Recipe) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.recipes.insert(store_path.clone(), recipe).is_none() {
+            inner.recipe_order.push_back(store_path);
+        }
+        while inner.recipe_order.len() > RECIPE_CAP {
+            let old = inner.recipe_order.pop_front().unwrap();
+            inner.recipes.remove(&old);
+        }
     }
 
     /// A cache write failure only loses future hits.

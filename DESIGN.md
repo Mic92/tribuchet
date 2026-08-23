@@ -166,8 +166,25 @@ signatures).
 MVP targets 2–10 workers and a few clients: all scheduler state is in
 memory (no database). The hub's replay buffer is capped at 256 MiB per
 build and slow dedupe subscribers are dropped rather than buffered. The
-transfer protocol keeps a `oneof` payload so a chunked CAS (FastCDC +
-blake3) can replace whole-NAR streaming later without a protocol break.
+transfer protocol keeps a `oneof` payload, which chunked staging uses
+next to whole-NAR streaming.
+
+### Chunked staging
+
+For chunk-capable workers the hub sends per-path recipes (FastCDC
+chunk boundaries + blake3 hashes) instead of NARs; the worker answers
+with the union of chunks it lacks and only those are transferred.
+Warm workers skip most bytes this way and re-staging a cached closure
+costs milliseconds.
+
+Both sides back this with an on-disk chunk store (hub:
+`chunk-cache-bytes`, worker: `chunk-store-bytes`, 10 GiB default, 0
+disables): append-only packs with S3-FIFO eviction, chosen over LRU
+because cold stagings are one-hit-wonder scans. The store is never a
+source of truth — a lost or corrupt chunk costs a re-transfer and the
+daemon's NAR-hash check backstops correctness, so the whole directory
+can be deleted at rest. Any chunk failure degrades to plain NAR
+resend.
 
 Hub restarts cancel nothing, without any state handoff: on SIGTERM the
 hub exits immediately and the replacement reconstructs its state from

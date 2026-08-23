@@ -28,6 +28,8 @@ message WorkerMessage {
     // skips staging and waits for the result, which arrives under the
     // new build_id. This is how builds survive a hub restart.
     Resumed resumed = 8;
+    // Union of recipe chunks the worker's chunk store lacks.
+    NeedChunks need_chunks = 9;
   }
 }
 
@@ -56,7 +58,40 @@ message HubMessage {
     // Ends an input resend round; the worker re-checks its inputs
     // and either starts the build or asks again.
     StagingComplete staging_complete = 8;
+    // Chunk list of one missing input NAR (chunk-capable workers).
+    PathRecipe recipe = 9;
+    // Chunk data answering NeedChunks.
+    ChunkRun chunk_run = 10;
   }
+}
+
+// The ordered chunk list of one missing input NAR. Concatenating the
+// chunks yields the NAR, so reassembly needs no parsing. Sent after
+// the path's PathInfoMsg instead of NarTransfer chunks.
+message PathRecipe {
+  string build_id = 1;
+  string store_path = 2;
+  bytes hashes = 3;          // n*32 bytes, BLAKE3 of uncompressed chunk
+  repeated uint64 sizes = 4; // uncompressed, same order
+  // Final recipe of the staging round: the worker answers with one
+  // NeedChunks for the union of chunks it lacks.
+  bool last = 5;
+}
+
+message NeedChunks {
+  string build_id = 1;
+  bytes hashes = 2; // n*32 bytes, deduplicated
+}
+
+// One zstd frame covering a run of chunks. The worker re-splits the
+// decompressed bytes at the recipe sizes, so frame layout is a
+// per-transfer serving decision, never a protocol commitment.
+message ChunkRun {
+  string build_id = 1;
+  bytes hashes = 2; // n*32 bytes, in-frame order
+  bytes zstd_data = 3;
+  // Ends the chunk stream of the staging round.
+  bool eof = 4;
 }
 
 message StagingComplete {
@@ -105,6 +140,9 @@ message Register {
   // Advisory capacity, summed across workers to size the max-jobs of
   // the generated nix.conf fragment. Not the RequestJob dispatch path.
   uint32 max_jobs = 8;
+  // Worker runs a chunk store: the hub stages missing inputs as
+  // recipes plus NeedChunks data instead of whole NARs.
+  bool chunk_support = 9;
 }
 
 message Heartbeat {
@@ -139,8 +177,8 @@ message MissingPaths {
 }
 
 // One store path or output, streamed as a zstd-compressed NAR.
-// `payload` is a oneof so a chunked CAS encoding can be added later
-// without breaking the protocol.
+// Chunk-capable workers receive inputs as PathRecipe/ChunkRun instead;
+// this stays the output path and the input fallback.
 message NarTransfer {
   string build_id = 1;
   string store_path = 2;

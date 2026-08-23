@@ -10,8 +10,8 @@ use harmonia_utils_signature::{PublicKey, Signature};
 use tokio::io::AsyncReadExt as _;
 use tokio::sync::mpsc;
 
-use super::super::state::{HubState, Replay};
 use crate::errors::{Result, err_ctx, err_msg};
+use crate::hub::state::{HubState, Replay};
 use crate::proto::{ExtraPath, NarTransfer, attach_event, nar_transfer};
 use crate::store;
 

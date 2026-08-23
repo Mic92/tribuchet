@@ -142,6 +142,12 @@ impl ChunkStore {
         Ok(())
     }
 
+    /// Existence only. No frequency bump, so probing for NeedChunks
+    /// does not fake reuse.
+    pub fn contains(&self, hash: &Hash) -> bool {
+        self.map.contains_key(hash)
+    }
+
     /// Locate a frame for reading outside the store lock: the pread
     /// dominates get() and would otherwise convoy concurrent callers.
     pub fn locate(&mut self, hash: &Hash) -> Option<FrameRef> {

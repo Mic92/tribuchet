@@ -44,6 +44,7 @@ use caps::host_system;
 use logtail::spawn_log_tail;
 use resume::{ResumableBuild, adopt_builds, spawn_resumable_reaper, sweep_orphaned_agent_builds};
 
+use crate::chunkstore::ChunkStore;
 use crate::config::WorkerConfig;
 use crate::errors::{Result, err_ctx, err_msg};
 use crate::fsutil::io_ctx;
@@ -96,6 +97,9 @@ struct WorkerCtx {
     staging_inflight: Mutex<HashSet<String>>,
     /// Parallel daemon connections importing input NARs per build.
     import_jobs: usize,
+    /// Input chunk store. None when disabled or failed to open, in
+    /// which case inputs arrive as whole NARs.
+    chunks: Option<Arc<Mutex<ChunkStore>>>,
 }
 
 impl WorkerCtx {
@@ -275,6 +279,21 @@ pub fn run(opts: WorkerConfig) -> Result<()> {
 }
 
 /// Validate the emulate map and register its systems.
+/// A store that fails to open costs dedup, not the worker.
+fn open_chunk_store(opts: &WorkerConfig) -> Option<Arc<Mutex<ChunkStore>>> {
+    if opts.chunk_store_bytes == 0 {
+        return None;
+    }
+    let dir = opts.state_dir.join("chunks");
+    match ChunkStore::open(dir.clone(), opts.chunk_store_bytes) {
+        Ok(store) => Some(Arc::new(Mutex::new(store))),
+        Err(e) => {
+            tracing::warn!(error = %e, dir = %dir.display(), "chunk store disabled");
+            None
+        }
+    }
+}
+
 fn resolve_emulators(opts: &mut WorkerConfig) -> Result<HashMap<String, PathBuf>> {
     let mut emulators = HashMap::new();
     for (system, path) in &opts.emulate {
@@ -359,6 +378,7 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
         secret_paths: vec![opts.key.clone(), opts.state_dir.join("signing.key")],
         slots: Arc::new(Semaphore::new(opts.max_jobs.max(1) as usize)),
         import_jobs: opts.import_jobs.max(1) as usize,
+        chunks: open_chunk_store(&opts),
         cancelled: Mutex::new(HashSet::new()),
         staging_inflight: Mutex::new(HashSet::new()),
         resumable: Mutex::new(HashMap::new()),

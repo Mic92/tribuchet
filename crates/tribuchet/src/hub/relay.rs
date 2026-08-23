@@ -3,7 +3,7 @@
 mod extras;
 mod staging;
 use extras::{ExtraImport, relay_extra_chunk, start_extras};
-use staging::{restage_inputs, stage_optimistic, validate_missing};
+use staging::{restage_inputs, stage_chunked, stage_optimistic, validate_missing};
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -15,6 +15,8 @@ use harmonia_utils_signature::{PublicKey, Signature};
 use sha2::Digest;
 use tokio::sync::mpsc;
 use tonic::Status;
+
+use tokio::sync::watch;
 
 use super::metrics::Metrics;
 use super::state::{HubState, Job, Replay};
@@ -38,13 +40,17 @@ pub(super) struct WorkerStaging {
     /// streaming skips them. MissingPaths stays the authority: a
     /// stale entry is restaged, costing bytes, never correctness.
     sent: Mutex<HashSet<String>>,
+    /// Worker registered with chunk support: missing inputs stage as
+    /// recipes plus chunk data instead of whole NARs.
+    pub(super) chunked: bool,
 }
 
 impl WorkerStaging {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(chunked: bool) -> Self {
         Self {
             permits: tokio::sync::Semaphore::new(1),
             sent: Mutex::new(HashSet::new()),
+            chunked,
         }
     }
 
@@ -112,7 +118,7 @@ pub(super) async fn run_job(
     // for MissingPaths. The answer reconciles: anything requested
     // beyond the optimistic stream goes out as a delta.
     let streamed = Mutex::new(HashSet::new());
-    let (missing_tx, missing_rx) = tokio::sync::watch::channel(None);
+    let (missing_tx, missing_rx) = watch::channel(None);
     let stage_fut = stage_optimistic(state, job, out_tx, &staging, &streamed, missing_rx);
     tokio::pin!(stage_fut);
     let mut staged = false;
@@ -167,25 +173,29 @@ pub(super) async fn run_job(
         }
     }
     let missing = missing.unwrap();
-    let (delta, streamed_count) = {
-        let streamed = streamed.lock().unwrap();
-        let delta: Vec<String> = missing
-            .iter()
-            .filter(|p| !streamed.contains(*p))
-            .cloned()
-            .collect();
-        (delta, streamed.len())
-    };
     tracing::info!(
         id = job.id,
         total = req.input_paths.len(),
         missing = missing.len(),
-        streamed = streamed_count,
-        delta = delta.len(),
         "input path negotiation done"
     );
-    if !delta.is_empty() {
-        restage_inputs(state, job, out_tx, &staging, &delta).await?;
+    if staging.chunked {
+        if !missing.is_empty() {
+            stage_chunked(state, job, out_tx, &staging, &missing, &mut in_rx).await?;
+        }
+    } else {
+        // stale sent-set entries the worker asked for anyway
+        let delta: Vec<String> = {
+            let streamed = streamed.lock().unwrap();
+            missing
+                .iter()
+                .filter(|p| !streamed.contains(*p))
+                .cloned()
+                .collect()
+        };
+        if !delta.is_empty() {
+            restage_inputs(state, job, out_tx, &staging, &delta).await?;
+        }
     }
     relay_build(state, job, vkey, out_tx, &mut in_rx, &staging)
         .await
@@ -195,12 +205,13 @@ pub(super) async fn run_job(
 /// Log/error-safe name of a worker message variant. The messages embed
 /// peer-controlled bytes (NAR chunks, log data); Debug-formatting them
 /// into error strings would balloon logs and replay buffers.
-fn msg_name(msg: &worker_message::Msg) -> &'static str {
+pub(super) fn msg_name(msg: &worker_message::Msg) -> &'static str {
     match msg {
         worker_message::Msg::Register(_) => "Register",
         worker_message::Msg::Heartbeat(_) => "Heartbeat",
         worker_message::Msg::MissingPaths(_) => "MissingPaths",
         worker_message::Msg::Log(_) => "Log",
+        worker_message::Msg::NeedChunks(_) => "NeedChunks",
         worker_message::Msg::Result(_) => "Result",
         worker_message::Msg::Nar(_) => "Nar",
         worker_message::Msg::RequestJob(_) => "RequestJob",

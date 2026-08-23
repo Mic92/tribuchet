@@ -121,6 +121,12 @@ aarch64-linux = "/path/to/static/qemu-aarch64"
 $ tribuchet worker --config /etc/tribuchet/worker.toml
 ```
 
+Hub and worker keep a chunk cache for input staging (10 GiB each by
+default, under `XDG_CACHE_HOME/tribuchet`): warm workers only receive
+chunks they don't already hold. Tune with `chunk-cache-bytes` (hub)
+and `chunk-store-bytes` (worker); 0 disables. The cache is safe to
+delete whenever the process is stopped.
+
 The full set of options for both files is documented in
 [`crates/tribuchet/src/config.rs`](crates/tribuchet/src/config.rs).
 
