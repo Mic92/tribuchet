@@ -1,6 +1,6 @@
 //! Hub session: connect, register, and drive the per-build message loop.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
@@ -104,13 +104,27 @@ async fn session_loop(
     build_timeout: Duration,
     max_jobs: u32,
 ) -> Result<()> {
+    let env = LaunchEnv {
+        ctx,
+        out_tx,
+        signing_key,
+        build_timeout,
+    };
     // Permits already funded to the hub but not yet assigned back.
     let mut pending = Vec::new();
+    // Builds staged to completion but waiting for a free slot.
+    let mut ready: VecDeque<String> = VecDeque::new();
     let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+    // One unfunded request beyond the free slots: the hub assigns and
+    // stages the next build while every slot is busy, so a finishing
+    // build hands its slot to a build that starts immediately instead
+    // of waiting a round trip plus staging.
+    out_tx.send(request_job()).await?;
     loop {
         let m = tokio::select! {
             permit = ctx.slots.clone().acquire_owned() => {
-                pending.push(permit.expect("slots never closed"));
+                let permit = permit.expect("slots never closed");
+                grant_slot(permit, active, &mut ready, &mut pending, &env);
                 out_tx.send(request_job()).await?;
                 continue;
             }
@@ -155,31 +169,20 @@ async fn session_loop(
                     // A NAR eof can complete staging: the hub streams
                     // optimistically, so the tmp dir may already be done.
                     let res = build.feed_nar(n).await;
-                    advance_staging(active, &id, res, ctx, out_tx, signing_key, build_timeout)
-                        .await?;
+                    advance_staging(active, &mut ready, &id, res, &env).await?;
                 }
             }
             hub_message::Msg::TmpDir(t) => {
                 let id = t.build_id.clone();
                 if let Some(build) = active.get_mut(&id) {
                     let res = build.feed_tmp_dir(t).await;
-                    advance_staging(active, &id, res, ctx, out_tx, signing_key, build_timeout)
-                        .await?;
+                    advance_staging(active, &mut ready, &id, res, &env).await?;
                 }
             }
             hub_message::Msg::StagingComplete(s) => {
                 if let Some(build) = active.get_mut(&s.build_id) {
                     let res = build.complete_staging().await;
-                    advance_staging(
-                        active,
-                        &s.build_id,
-                        res,
-                        ctx,
-                        out_tx,
-                        signing_key,
-                        build_timeout,
-                    )
-                    .await?;
+                    advance_staging(active, &mut ready, &s.build_id, res, &env).await?;
                 }
             }
             hub_message::Msg::PathInfo(pi) => {
@@ -201,19 +204,35 @@ async fn session_loop(
 /// Act on a staging step: launch, request an input resend, or abort.
 async fn advance_staging(
     active: &mut HashMap<String, ActiveBuild>,
+    ready: &mut VecDeque<String>,
     id: &str,
     res: Result<StagingStatus>,
-    ctx: &Arc<WorkerCtx>,
-    out_tx: &mpsc::Sender<WorkerMessage>,
-    signing_key: &Arc<SecretKey>,
-    build_timeout: Duration,
+    env: &LaunchEnv<'_>,
 ) -> Result<()> {
     match res {
-        Err(e) => abort_active(active, id, out_tx, &e).await?,
+        Err(e) => abort_active(active, id, env.out_tx, &e).await?,
         Ok(StagingStatus::InProgress) => {}
         Ok(StagingStatus::Ready) => {
+            // The lookahead assignment carries no permit. Grab a free
+            // slot (funding its advertisement ourselves) or queue
+            // until one frees.
+            let build = active.get_mut(id).unwrap();
+            if build.permit.is_none() {
+                let Ok(p) = env.ctx.slots.clone().try_acquire_owned() else {
+                    ready.push_back(id.to_string());
+                    return Ok(());
+                };
+                build.permit = Some(p);
+                env.out_tx.send(request_job()).await?;
+            }
             let build = active.remove(id).unwrap();
-            launch_build(ctx, build, out_tx, signing_key, build_timeout);
+            launch_build(
+                env.ctx,
+                build,
+                env.out_tx,
+                env.signing_key,
+                env.build_timeout,
+            );
         }
         Ok(StagingStatus::NeedResend(paths)) => {
             tracing::info!(
@@ -221,7 +240,7 @@ async fn advance_staging(
                 count = paths.len(),
                 "re-requesting inputs another build failed to import"
             );
-            out_tx
+            env.out_tx
                 .send(msg(worker_message::Msg::MissingPaths(MissingPaths {
                     build_id: id.to_string(),
                     store_paths: paths,
@@ -231,6 +250,7 @@ async fn advance_staging(
     }
     Ok(())
 }
+
 /// Cancel a build. Still staging: tear it down right here. Already
 /// executing: flag its dedupe key for the supervising loop. The key
 /// is the stable identity, the build_id the hub knows may predate a
@@ -258,6 +278,43 @@ async fn handle_cancel(
         }
     }
     Ok(())
+}
+
+/// Everything needed to launch a staged build.
+struct LaunchEnv<'a> {
+    ctx: &'a Arc<WorkerCtx>,
+    out_tx: &'a mpsc::Sender<WorkerMessage>,
+    signing_key: &'a Arc<SecretKey>,
+    build_timeout: Duration,
+}
+
+/// Hand a freed slot to a staged build waiting for one, or advertise
+/// it to the hub as pending.
+fn grant_slot(
+    permit: tokio::sync::OwnedSemaphorePermit,
+    active: &mut HashMap<String, ActiveBuild>,
+    ready: &mut VecDeque<String>,
+    pending: &mut Vec<tokio::sync::OwnedSemaphorePermit>,
+    env: &LaunchEnv<'_>,
+) {
+    let mut permit = Some(permit);
+    while let Some(id) = ready.pop_front() {
+        // cancel may have removed it from active
+        if let Some(mut build) = active.remove(&id) {
+            build.permit = permit.take();
+            launch_build(
+                env.ctx,
+                build,
+                env.out_tx,
+                env.signing_key,
+                env.build_timeout,
+            );
+            break;
+        }
+    }
+    if let Some(p) = permit {
+        pending.push(p);
+    }
 }
 
 /// Adopt a re-dispatched build or stage a fresh assignment.
