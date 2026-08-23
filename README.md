@@ -286,7 +286,9 @@ model, and failure handling in detail.
 $ nix develop            # rust toolchain + protobuf
 $ cargo test
 $ cargo clippy --all-targets
-$ nix build .#checks.x86_64-linux.nixos-test   # end-to-end VM test (hub + worker)
+$ nix build .#checks.x86_64-linux.nixos-test-builds     # end-to-end VM test (hub + worker)
+$ nix build .#checks.x86_64-linux.nixos-test-nspawn     # NixOS-container build in the sandbox
+$ nix build .#checks.x86_64-linux.nixos-test-lifecycle  # daemon restart/reload/stop sequence
 ```
 
 The VM test exercises remote builds, hub/worker restarts and reloads

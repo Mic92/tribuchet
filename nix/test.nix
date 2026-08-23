@@ -1,16 +1,29 @@
 # NixOS VM test: a real nix-daemon on `hub` routes a build through the
 # external-builders feature to tribuchet, which dispatches it to `worker`
 # over mTLS and unpacks the signed outputs back into the hub's store.
-{ tribuchet, nixosModule }:
+{
+  tribuchet,
+  nixosModule,
+  # "builds", "nspawn" or "lifecycle": independent derivations
+  # instead of one long serial run, and only nspawn seeds the ~900 MB
+  # container closure into the VM stores.
+  phase,
+}:
 { pkgs, lib, ... }:
 let
   # evaluated here so the container closure can be pre-seeded into both
   # VM stores; the hub re-evaluates the same expression at test time
   nspawn = import ./nspawn-container.nix { nixpkgs = pkgs.path; };
+  # the container closure and the stdenvNoCC that builds it stay out
+  # of the other phases' VM stores
+  nspawnPaths = lib.optionals (phase == "nspawn") [
+    pkgs.stdenvNoCC
+    nspawn.toplevel
+  ];
 
 in
 {
-  name = "tribuchet";
+  name = "tribuchet-${phase}";
 
   # Faster eval
   defaults.documentation.enable = false;
@@ -47,9 +60,8 @@ in
         virtualisation.additionalPaths = [
           pkgs.bash
           pkgs.coreutils
-          pkgs.stdenvNoCC
-          nspawn.toplevel
-        ];
+        ]
+        ++ nspawnPaths;
 
         nix.settings = {
           experimental-features = [
@@ -71,9 +83,13 @@ in
         environment.etc."tt/par.nix".text = ''
           import ${./tests/par.nix} { bash = "${pkgs.bash}"; }
         '';
-        environment.etc."tt/nspawn.nix".text = ''
-          import ${./nspawn-container.nix} { nixpkgs = ${pkgs.path}; }
-        '';
+        # references pkgs.path, which drags the full nixpkgs source
+        # into the hub closure. Only the nspawn phase pays for it.
+        environment.etc."tt/nspawn.nix" = lib.mkIf (phase == "nspawn") {
+          text = ''
+            import ${./nspawn-container.nix} { nixpkgs = ${pkgs.path}; }
+          '';
+        };
         environment.etc."tt/kvm.nix".text = ''
           import ${./tests/kvm.nix} { bash = "${pkgs.bash}"; }
         '';
@@ -223,10 +239,7 @@ in
         # the memhog subtest relies on a plain memcg OOM kill
         boot.kernel.sysctl."vm.panic_on_oom" = lib.mkForce 0;
         virtualisation.diskSize = 4096;
-        virtualisation.additionalPaths = [
-          pkgs.stdenvNoCC
-          nspawn.toplevel
-        ];
+        virtualisation.additionalPaths = nspawnPaths;
 
         imports = [ nixosModule ];
         services.tribuchet-worker = {
@@ -298,16 +311,28 @@ in
     })
     e2e = "${tribuchet.e2eTests}/bin/tribuchet-e2e"
 
-    # Phase 1: independent builds, multi-threaded. The worker/hub max-jobs
-    # queues bound real build concurrency; test-threads only caps ssh sessions.
+  ''
+  + lib.optionalString (phase == "builds") ''
+    # Independent builds, multi-threaded. The worker/hub max-jobs
+    # queues bound real build concurrency. test-threads only caps ssh
+    # sessions. build_nspawn runs in the nspawn phase.
     with subtest("parallel builds"):
         subprocess.run(
-            [e2e, "build_", "--nocapture", "--test-threads=8"],
+            [e2e, "build_", "--skip", "build_nspawn",
+             "--nocapture", "--test-threads=8"],
             env=e2e_env, check=True,
         )
-
-    # Phase 2: the stateful daemon-lifecycle sequence, serial and in order.
-    # Must run after phase 1: it restarts/reloads/stops the daemons.
+  ''
+  + lib.optionalString (phase == "nspawn") ''
+    with subtest("NixOS container build"):
+        subprocess.run(
+            [e2e, "build_nspawn", "--nocapture"],
+            env=e2e_env, check=True,
+        )
+  ''
+  + lib.optionalString (phase == "lifecycle") ''
+    # The stateful daemon-lifecycle sequence, serial and in order. It
+    # restarts/reloads/stops the daemons, so it gets its own VMs.
     with subtest("daemon lifecycle"):
         subprocess.run(
             [e2e, "lifecycle", "--nocapture", "--test-threads=1"],
