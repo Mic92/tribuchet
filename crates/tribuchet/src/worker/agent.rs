@@ -11,8 +11,6 @@
 //! crates/sandbox-proto/proto/agent.proto.
 
 use std::collections::HashMap;
-#[cfg(target_os = "macos")]
-use std::ffi::NulError;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;

@@ -20,6 +20,7 @@ mod tailscale;
 mod tmpdir;
 mod worker;
 
+#[cfg(target_os = "linux")]
 use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;

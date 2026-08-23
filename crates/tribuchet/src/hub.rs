@@ -9,8 +9,6 @@
 //! - verifies worker output signatures while relaying compressed chunks
 
 use std::collections::{HashMap, HashSet};
-#[cfg(target_os = "macos")]
-use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
