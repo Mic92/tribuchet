@@ -310,7 +310,12 @@ in
           # Never unlink the activated socket's path on service stop;
           # the listener in systemd must stay reachable across restarts.
           RuntimeDirectoryPreserve = true;
-          Environment = "RUST_LOG=info";
+          # staging chunk cache
+          CacheDirectory = "tribuchet";
+          Environment = [
+            "RUST_LOG=info"
+            "XDG_CACHE_HOME=/var/cache"
+          ];
           WatchdogSec = "30";
           Restart = "on-failure";
         };

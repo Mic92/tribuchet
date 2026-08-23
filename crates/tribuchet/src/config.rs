@@ -93,6 +93,25 @@ pub struct HubConfig {
     /// whatever systems are available right now.
     #[serde(default)]
     pub nix_config: Option<NixConfig>,
+    /// Disk budget for the staging chunk cache. 0 disables it.
+    #[serde(default = "default_chunk_cache_bytes")]
+    pub chunk_cache_bytes: u64,
+    /// Cache directory override. Defaults to XDG_CACHE_HOME/tribuchet.
+    #[serde(default)]
+    pub chunk_cache_dir: Option<PathBuf>,
+}
+
+fn default_chunk_cache_bytes() -> u64 {
+    10 << 30
+}
+
+/// XDG_CACHE_HOME/tribuchet/chunks with the usual ~/.cache fallback.
+pub fn default_chunk_cache_dir() -> PathBuf {
+    let base = env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(|| PathBuf::from("/var/cache"));
+    base.join("tribuchet").join("chunks")
 }
 
 /// A hub-maintained nix.conf fragment. A local nix.conf `include`s the

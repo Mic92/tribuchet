@@ -1,22 +1,26 @@
 //! Input staging: path-info queries and NAR/tmp-dir streaming to the worker.
 
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::io::Write as _;
+use std::mem;
+use std::sync::{Arc, Mutex};
 
 use harmonia_store_path::{StoreDir, StorePath};
 use harmonia_store_remote::DaemonStore as _;
-use tokio::io::AsyncReadExt as _;
 use tokio::sync::{mpsc, watch};
 use tonic::Status;
 
+use super::super::chunkcache::{ChunkCache, Disposition};
 use super::super::state::{HubState, Job};
 use super::{WorkerStaging, send};
+use crate::chunker::{Chunk, chunk_store_path};
+use crate::chunkio;
 use crate::errors::{Result, err_ctx, err_msg};
 use crate::proto::{
     HubMessage, NarTransfer, PathInfoMsg, StagingComplete, TmpDirArchive, hub_message,
 };
-use crate::{chunkio, rt};
+use tokio::task::spawn_blocking;
+use zstd::stream::write::Encoder;
 
 /// Reject paths we never offered and dedupe the rest.
 pub(super) fn validate_missing(
@@ -128,7 +132,7 @@ async fn stream_inputs(
             if !admit(&info.store_path) {
                 continue;
             }
-            let pack = spawn_pack(&info.store_path);
+            let pack = spawn_pack(state.chunks.clone(), &info.store_path);
             inflight.push_back((info, pack));
         }
         let Some((mut info, pack)) = inflight.pop_front() else {
@@ -264,42 +268,95 @@ struct Pack {
     task: tokio::task::JoinHandle<Result<()>>,
 }
 
-/// NAR-pack a store path and zstd-compress on the blocking pool,
-/// feeding a bounded channel.
-fn spawn_pack(store_path: &str) -> Pack {
+/// NAR-pack a store path on the blocking pool, chunk it and feed
+/// zstd frames into a bounded channel: cached chunks as their stored
+/// frame (no compression CPU), everything between two cache hits as
+/// one fresh run frame at the full streaming-window ratio. Without a
+/// cache the whole NAR is a single run, exactly the old behavior.
+fn spawn_pack(cache: Option<Arc<ChunkCache>>, store_path: &str) -> Pack {
     let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
     let path = store_path.to_string();
-    let task = tokio::task::spawn_blocking(move || -> Result<()> {
-        rt::name_current_thread("trib-pack");
-        // harmonia's NAR pack is async-only; drive it on a current-thread
-        // runtime here so its blocking file reads stay off the shared
-        // runtime workers.
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .map_err(err_ctx("building NAR pack runtime"))?;
-        rt.block_on(async move {
-            let nar = harmonia_file_nar::archive::NarByteStream::new(PathBuf::from(&path));
-            let mut enc = async_compression::tokio::bufread::ZstdEncoder::with_quality(
-                tokio_util::io::StreamReader::new(nar),
-                async_compression::Level::Precise(3),
-            );
-            let mut buf = vec![0u8; chunkio::CHUNK_SIZE];
-            loop {
-                let n = enc
-                    .read(&mut buf)
-                    .await
-                    .map_err(err_ctx(format!("packing {path}")))?;
-                if n == 0 {
-                    break;
-                }
-                if tx.send(buf[..n].to_vec()).await.is_err() {
-                    break; // consumer gone
-                }
-            }
-            Ok(())
-        })
+    let task = spawn_blocking(move || -> Result<()> {
+        let mut run = RunEncoder::default();
+        let mut gone = false;
+        chunk_store_path(&path, async |c| {
+            gone = !emit_chunk(cache.as_deref(), c, &mut run, &tx).await?;
+            Ok(!gone)
+        })?;
+        if !gone && let Some(out) = run.finish()? {
+            let _ = tx.blocking_send(out);
+        }
+        Ok(())
     });
     Pack { rx, task }
+}
+
+/// Route one chunk: cache hits and admissions ship as their own
+/// frame, first-sightings join the current run. Returns false when
+/// the consumer is gone.
+async fn emit_chunk(
+    cache: Option<&ChunkCache>,
+    chunk: Chunk,
+    run: &mut RunEncoder,
+    tx: &mpsc::Sender<Vec<u8>>,
+) -> Result<bool> {
+    let frame = match cache.map(|c| c.classify(&chunk.hash)) {
+        None | Some(Disposition::FirstSeen) => return run.write(&chunk.data, tx).await,
+        Some(Disposition::Cached(fref)) => match fref.read() {
+            Ok(frame) => frame,
+            Err(_) => return run.write(&chunk.data, tx).await,
+        },
+        Some(Disposition::Admit) => {
+            let frame =
+                zstd::bulk::compress(&chunk.data, 3).map_err(err_ctx("compressing chunk frame"))?;
+            cache.unwrap().admit(chunk.hash, &frame);
+            frame
+        }
+    };
+    if !run.flush(tx).await? {
+        return Ok(false);
+    }
+    Ok(tx.send(frame).await.is_ok())
+}
+
+/// One zstd frame per run of consecutive uncached chunks, drained to
+/// the channel in message-sized pieces as it grows.
+#[derive(Default)]
+struct RunEncoder {
+    enc: Option<Encoder<'static, Vec<u8>>>,
+}
+
+impl RunEncoder {
+    async fn write(&mut self, data: &[u8], tx: &mpsc::Sender<Vec<u8>>) -> Result<bool> {
+        let enc = match &mut self.enc {
+            Some(enc) => enc,
+            None => self
+                .enc
+                .insert(Encoder::new(Vec::new(), 3).map_err(err_ctx("creating zstd encoder"))?),
+        };
+        enc.write_all(data).map_err(err_ctx("zstd write"))?;
+        if enc.get_ref().len() >= chunkio::CHUNK_SIZE {
+            let out = mem::take(enc.get_mut());
+            return Ok(tx.send(out).await.is_ok());
+        }
+        Ok(true)
+    }
+
+    async fn flush(&mut self, tx: &mpsc::Sender<Vec<u8>>) -> Result<bool> {
+        match self.finish()? {
+            Some(out) => Ok(tx.send(out).await.is_ok()),
+            None => Ok(true),
+        }
+    }
+
+    /// End the current frame and hand back its remaining bytes.
+    fn finish(&mut self) -> Result<Option<Vec<u8>>> {
+        let Some(enc) = self.enc.take() else {
+            return Ok(None);
+        };
+        let out = enc.finish().map_err(err_ctx("finishing zstd frame"))?;
+        Ok((!out.is_empty()).then_some(out))
+    }
 }
 
 async fn forward_pack(

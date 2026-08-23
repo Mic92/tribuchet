@@ -19,11 +19,12 @@ use rustix::process::umask;
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 
+use super::chunkcache::ChunkCache;
 use super::metrics;
 use super::state::HubState;
 use super::submit::AttachSvc;
 use super::{PeerAuth, WorkerSvc};
-use crate::config::{Auth, HubConfig};
+use crate::config::{Auth, HubConfig, default_chunk_cache_dir};
 use crate::errors::{Result, chain, err_ctx, err_msg};
 use crate::fsutil::io_ctx;
 use crate::proto::worker_hub_server::WorkerHubServer;
@@ -170,9 +171,12 @@ async fn run_async(cfg: HubConfig) -> Result<()> {
     let socket = cfg.socket.as_path();
     let listen = cfg.listen.as_str();
     let config_dir = cfg.config_dir.as_path();
+    let chunks = open_chunk_cache(&cfg);
+
     let state = Arc::new(HubState::new(
         Duration::from_secs(cfg.worker_grace_secs),
         cfg.nix_config.clone(),
+        chunks,
     ));
 
     let (tls, peer_auth) = configure_auth(&cfg, config_dir)?;
@@ -271,6 +275,24 @@ async fn run_async(cfg: HubConfig) -> Result<()> {
         () = sd::stop_requested() => {
             tracing::info!("SIGTERM: exiting, builds resume against the replacement instance");
             Ok(())
+        }
+    }
+}
+
+/// A cache that fails to open costs re-compression, not the hub.
+fn open_chunk_cache(cfg: &HubConfig) -> Option<Arc<ChunkCache>> {
+    if cfg.chunk_cache_bytes == 0 {
+        return None;
+    }
+    let dir = cfg
+        .chunk_cache_dir
+        .clone()
+        .unwrap_or_else(default_chunk_cache_dir);
+    match ChunkCache::open(dir.clone(), cfg.chunk_cache_bytes) {
+        Ok(cache) => Some(Arc::new(cache)),
+        Err(e) => {
+            tracing::warn!(error = %e, dir = %dir.display(), "chunk cache disabled");
+            None
         }
     }
 }

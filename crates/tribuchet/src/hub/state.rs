@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, mpsc};
 use tonic::Status;
 
+use super::chunkcache::ChunkCache;
 use super::metrics::Metrics;
 use crate::config::NixConfig;
 use crate::fsutil::io_ctx;
@@ -96,6 +97,8 @@ pub(super) struct HubState {
     /// When set, the connected-worker set is mirrored to this nix.conf
     /// fragment on every register/deregister.
     pub(super) nix_config: Option<NixConfig>,
+    /// Staging chunk cache; None when disabled or failed to open.
+    pub(super) chunks: Option<Arc<ChunkCache>>,
 }
 
 #[derive(Clone)]
@@ -154,12 +157,16 @@ impl WorkerCaps {
 
 impl Default for HubState {
     fn default() -> Self {
-        Self::new(WORKER_GRACE, None)
+        Self::new(WORKER_GRACE, None, None)
     }
 }
 
 impl HubState {
-    pub(super) fn new(worker_grace: Duration, nix_config: Option<NixConfig>) -> Self {
+    pub(super) fn new(
+        worker_grace: Duration,
+        nix_config: Option<NixConfig>,
+        chunks: Option<Arc<ChunkCache>>,
+    ) -> Self {
         Self {
             queue: Mutex::default(),
             inflight: Mutex::default(),
@@ -176,6 +183,7 @@ impl HubState {
             caps_changed: Notify::default(),
             metrics: Metrics::default(),
             nix_config,
+            chunks,
         }
     }
 
@@ -389,16 +397,16 @@ mod tests {
         // Within the startup window any platform is awaited (workers
         // have not re-registered yet); once it lapses a never-seen
         // platform with no departed worker declines at once.
-        let within = HubState::new(Duration::from_secs(30), None);
+        let within = HubState::new(Duration::from_secs(30), None, None);
         assert!(within.expected_deadline("aarch64-linux", &[]).is_some());
-        let lapsed = HubState::new(Duration::ZERO, None);
+        let lapsed = HubState::new(Duration::ZERO, None, None);
         assert!(lapsed.expected_deadline("aarch64-linux", &[]).is_none());
     }
 
     #[test]
     fn departed_worker_keeps_its_platform_expected() {
         // Past the startup window but inside the reconnect window.
-        let mut state = HubState::new(Duration::from_secs(30), None);
+        let mut state = HubState::new(Duration::from_secs(30), None, None);
         state.started_at = Instant::now().checked_sub(Duration::from_mins(1)).unwrap();
         state.record_departed(caps("x86_64-linux", &["kvm"]));
         let kvm = vec!["kvm".to_owned()];

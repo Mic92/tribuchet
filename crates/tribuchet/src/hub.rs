@@ -29,6 +29,7 @@ use crate::proto::{
     CancelBuild, HubMessage, Register, WorkerMessage, attach_event, hub_message, worker_message,
 };
 
+mod chunkcache;
 mod metrics;
 mod relay;
 mod serve;

@@ -127,8 +127,14 @@ async fn import_nar(
 ) -> Result<()> {
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(Ok::<_, io::Error>);
     let reader = tokio_util::io::StreamReader::new(stream);
-    let dec =
-        async_compression::tokio::bufread::ZstdDecoder::new(tokio::io::BufReader::new(reader));
+    let dec = {
+        let mut dec =
+            async_compression::tokio::bufread::ZstdDecoder::new(tokio::io::BufReader::new(reader));
+        // The hub stitches cached per-chunk frames with fresh run
+        // frames, so the stream is multi-frame.
+        dec.multiple_members(true);
+        dec
+    };
     // take(nar_size): the daemon reads a self-delimiting NAR, but a
     // malicious hub must not stream unbounded decompressed bytes.
     let limited = tokio::io::BufReader::new(dec.take(info.info.nar_size));
