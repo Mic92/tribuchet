@@ -186,7 +186,7 @@ fn start(cli: &Cli) -> Result<Setup, Box<dyn Error>> {
         .arg(&hub_toml)
         .env(
             "RUST_LOG",
-            "info,tribuchet::hub::relay::staging=debug,tribuchet::worker::build=debug",
+            "info,tribuchet::hub::relay=debug,tribuchet::worker::build=debug",
         )
         .stdout(log_file(&wd, "hub.log")?)
         .stderr(log_file(&wd, "hub.err")?)
@@ -268,7 +268,7 @@ fn spawn_worker(
         .arg(worker_toml)
         .env(
             "RUST_LOG",
-            "info,tribuchet::hub::relay::staging=debug,tribuchet::worker::build=debug",
+            "info,tribuchet::hub::relay=debug,tribuchet::worker::build=debug",
         )
         .stdout(Stdio::piped())
         .stderr(log_file(wd, "worker.err")?);

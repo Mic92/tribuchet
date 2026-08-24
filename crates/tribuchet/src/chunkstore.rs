@@ -142,10 +142,17 @@ impl ChunkStore {
         Ok(())
     }
 
-    /// Existence only. No frequency bump, so probing for NeedChunks
+    /// Existence only. No frequency bump, so probing for a Need
     /// does not fake reuse.
     pub fn contains(&self, hash: &Hash) -> bool {
         self.map.contains_key(hash)
+    }
+
+    /// Drop a chunk found corrupt or unreadable. The bytes stay dead in
+    /// their pack until eviction. On reopen the pack index resurrects
+    /// the entry, and the next import check forgets it again.
+    pub fn forget(&mut self, hash: &Hash) {
+        self.map.remove(hash);
     }
 
     /// Locate a frame for reading outside the store lock: the pread

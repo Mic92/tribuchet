@@ -93,7 +93,7 @@ pub struct HubConfig {
     /// whatever systems are available right now.
     #[serde(default)]
     pub nix_config: Option<NixConfig>,
-    /// Disk budget for the staging chunk cache. 0 disables it.
+    /// Disk budget for the staging chunk cache.
     #[serde(default = "default_chunk_cache_bytes")]
     pub chunk_cache_bytes: u64,
     /// Cache directory override. Defaults to XDG_CACHE_HOME/tribuchet.
@@ -206,7 +206,7 @@ pub struct WorkerConfig {
     #[serde(default = "default_import_jobs")]
     pub import_jobs: u32,
     /// Disk budget for the input chunk store (dedup of staged NARs
-    /// across builds). 0 disables it and inputs arrive as whole NARs.
+    /// across builds).
     #[serde(default = "default_chunk_store_bytes")]
     pub chunk_store_bytes: u64,
     /// Emulated systems: system -> path of a static emulator binary

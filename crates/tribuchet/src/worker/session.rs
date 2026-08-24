@@ -5,7 +5,6 @@ use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
 
-use harmonia_utils_signature::SecretKey;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
@@ -13,23 +12,18 @@ use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 use super::build::{ActiveBuild, StagingStatus, validate_assignment};
 use super::caps::system_caps;
 use super::resume::{
-    ResumableBuild, ack_delivery, execute_to_finished, record_finished, try_deliver,
+    ResumableBuild, ack_delivery, execute_to_finished, record_finished, serve_chunks, try_deliver,
 };
 use super::{WorkerCtx, hostname, loadavg1, msg, request_job};
 use crate::chunkio;
 use crate::config::{Auth, WorkerConfig};
 use crate::errors::{Error, Result, chain, err_ctx, err_msg};
 use crate::proto::{
-    BuildAssignment, BuildResult, CancelBuild, Heartbeat, HubMessage, MAX_MSG_SIZE, MissingPaths,
-    NeedChunks, PathRecipe, Register, Resumed, WorkerMessage, hub_message,
-    worker_hub_client::WorkerHubClient, worker_message,
+    BuildAssignment, BuildResult, CancelBuild, Heartbeat, HubMessage, MAX_MSG_SIZE, Need, Register,
+    Resumed, WorkerMessage, hub_message, worker_hub_client::WorkerHubClient, worker_message,
 };
 
-pub(super) async fn session(
-    opts: &WorkerConfig,
-    signing_key: &Arc<SecretKey>,
-    ctx: &Arc<WorkerCtx>,
-) -> Result<()> {
+pub(super) async fn session(opts: &WorkerConfig, ctx: &Arc<WorkerCtx>) -> Result<()> {
     let mut endpoint = Endpoint::from_shared(opts.hub.clone())?;
     if matches!(opts.auth, Auth::Mtls) {
         let tls = ClientTlsConfig::new()
@@ -64,10 +58,8 @@ pub(super) async fn session(
         .send(msg(worker_message::Msg::Register(Register {
             worker_name: hostname(),
             caps: system_caps(opts, ctx),
-            signing_public_key: signing_key.to_public_key().to_string(),
             resumable_keys: ctx.resumable_keys(),
             max_jobs: opts.max_jobs.max(1),
-            chunk_support: ctx.chunks.is_some(),
         })))
         .await?;
 
@@ -82,7 +74,6 @@ pub(super) async fn session(
         &mut inbound,
         &mut active,
         &out_tx,
-        signing_key,
         ctx,
         Duration::from_secs(opts.build_timeout_secs),
         opts.max_jobs.max(1),
@@ -100,7 +91,6 @@ async fn session_loop(
     inbound: &mut tonic::Streaming<HubMessage>,
     active: &mut HashMap<String, ActiveBuild>,
     out_tx: &mpsc::Sender<WorkerMessage>,
-    signing_key: &Arc<SecretKey>,
     ctx: &Arc<WorkerCtx>,
     build_timeout: Duration,
     max_jobs: u32,
@@ -108,7 +98,6 @@ async fn session_loop(
     let env = LaunchEnv {
         ctx,
         out_tx,
-        signing_key,
         build_timeout,
     };
     // Permits already funded to the hub but not yet assigned back.
@@ -145,66 +134,36 @@ async fn session_loop(
         let Some(m) = m.msg else { continue };
         match m {
             hub_message::Msg::Assignment(a) => {
-                handle_assignment(a, active, &mut pending, out_tx, ctx).await?;
-            }
-            hub_message::Msg::PathOffer(offer) => {
-                let Some(build) = active.get_mut(&offer.build_id) else {
-                    continue;
-                };
-                match build.negotiate(&offer.store_paths).await {
-                    Ok(missing) => {
-                        out_tx
-                            .send(msg(worker_message::Msg::MissingPaths(MissingPaths {
-                                build_id: offer.build_id,
-                                store_paths: missing,
-                            })))
-                            .await?;
-                    }
-                    Err(e) => abort_active(active, &offer.build_id, out_tx, &e).await?,
-                }
-            }
-            hub_message::Msg::Nar(n) => {
-                let id = n.build_id.clone();
-                if let Some(build) = active.get_mut(&id) {
-                    // A bad transfer fails this build, not the session.
-                    // A NAR eof can complete staging: the hub streams
-                    // optimistically, so the tmp dir may already be done.
-                    let res = build.feed_nar(n).await;
+                if let Some(id) = handle_assignment(a, active, &mut pending, out_tx, ctx).await? {
+                    let res = active.get_mut(&id).unwrap().negotiate().await;
                     advance_staging(active, &mut ready, &id, res, &env).await?;
                 }
             }
             hub_message::Msg::TmpDir(t) => {
                 let id = t.build_id.clone();
                 if let Some(build) = active.get_mut(&id) {
-                    let res = build.feed_tmp_dir(t).await;
+                    let res = build.feed_tmp_dir(t).await.map(|s| (None, s));
                     advance_staging(active, &mut ready, &id, res, &env).await?;
                 }
             }
-            hub_message::Msg::StagingComplete(s) => {
-                if let Some(build) = active.get_mut(&s.build_id) {
-                    let res = build.complete_staging().await;
-                    advance_staging(active, &mut ready, &s.build_id, res, &env).await?;
+            hub_message::Msg::Manifest(m) => {
+                let id = m.build_id.clone();
+                if let Some(build) = active.get_mut(&id) {
+                    let res = build.feed_manifest(m).await;
+                    advance_staging(active, &mut ready, &id, res, &env).await?;
                 }
             }
-            hub_message::Msg::PathInfo(pi) => {
-                let id = pi.build_id.clone();
-                if let Some(build) = active.get_mut(&id)
-                    && let Err(e) = build.feed_path_info(&pi)
-                {
-                    abort_active(active, &id, out_tx, &e).await?;
-                }
-            }
-            hub_message::Msg::Recipe(r) => {
-                handle_recipe(r, active, &mut ready, out_tx, &env).await?;
-            }
-            hub_message::Msg::ChunkRun(c) => {
+            hub_message::Msg::Chunk(c) => {
                 let id = c.build_id.clone();
                 if let Some(build) = active.get_mut(&id) {
-                    let res = build.feed_chunk_run(c).await;
+                    let res = build.feed_chunk(c).await;
                     advance_staging(active, &mut ready, &id, res, &env).await?;
                 }
             }
             hub_message::Msg::Cancel(c) => handle_cancel(c, active, out_tx, ctx).await?,
+            hub_message::Msg::Need(n) => {
+                serve_chunks(ctx, n.build_id, &n.hashes, out_tx.clone());
+            }
             hub_message::Msg::ResultAck(a) => {
                 ack_delivery(ctx, &a.dedupe_key, &a.build_id);
             }
@@ -212,18 +171,26 @@ async fn session_loop(
     }
 }
 
-/// Act on a staging step: launch, request an input resend, or abort.
+/// Act on a staging step: forward a Need, launch, or abort.
 async fn advance_staging(
     active: &mut HashMap<String, ActiveBuild>,
     ready: &mut VecDeque<String>,
     id: &str,
-    res: Result<StagingStatus>,
+    res: Result<(Option<Need>, StagingStatus)>,
     env: &LaunchEnv<'_>,
 ) -> Result<()> {
-    match res {
-        Err(e) => abort_active(active, id, env.out_tx, &e).await?,
-        Ok(StagingStatus::InProgress) => {}
-        Ok(StagingStatus::Ready) => {
+    let status = match res {
+        Err(e) => return abort_active(active, id, env.out_tx, &e).await,
+        Ok((need, status)) => {
+            if let Some(n) = need {
+                env.out_tx.send(msg(worker_message::Msg::Need(n))).await?;
+            }
+            status
+        }
+    };
+    match status {
+        StagingStatus::InProgress => {}
+        StagingStatus::Ready => {
             // The lookahead assignment carries no permit. Grab a free
             // slot (funding its advertisement ourselves) or queue
             // until one frees.
@@ -237,25 +204,16 @@ async fn advance_staging(
                 env.out_tx.send(request_job()).await?;
             }
             let build = active.remove(id).unwrap();
-            launch_build(
-                env.ctx,
-                build,
-                env.out_tx,
-                env.signing_key,
-                env.build_timeout,
-            );
+            launch_build(env.ctx, build, env.out_tx, env.build_timeout);
         }
-        Ok(StagingStatus::NeedResend(paths)) => {
+        StagingStatus::NeedResend(need) => {
             tracing::info!(
                 id,
-                count = paths.len(),
+                count = need.paths.len(),
                 "re-requesting inputs another build failed to import"
             );
             env.out_tx
-                .send(msg(worker_message::Msg::MissingPaths(MissingPaths {
-                    build_id: id.to_string(),
-                    store_paths: paths,
-                })))
+                .send(msg(worker_message::Msg::Need(need)))
                 .await?;
         }
     }
@@ -291,41 +249,10 @@ async fn handle_cancel(
     Ok(())
 }
 
-/// A recipe may end the recipe set (`last`), in which case the union
-/// of chunks the store lacks goes back as one NeedChunks.
-async fn handle_recipe(
-    r: PathRecipe,
-    active: &mut HashMap<String, ActiveBuild>,
-    ready: &mut VecDeque<String>,
-    out_tx: &mpsc::Sender<WorkerMessage>,
-    env: &LaunchEnv<'_>,
-) -> Result<()> {
-    let id = r.build_id.clone();
-    let Some(build) = active.get_mut(&id) else {
-        return Ok(());
-    };
-    match build.feed_recipe(r).await {
-        Ok((needed, status)) => {
-            if let Some(hashes) = needed {
-                out_tx
-                    .send(msg(worker_message::Msg::NeedChunks(NeedChunks {
-                        build_id: id.clone(),
-                        hashes,
-                    })))
-                    .await?;
-            }
-            advance_staging(active, ready, &id, Ok(status), env).await?;
-        }
-        Err(e) => abort_active(active, &id, out_tx, &e).await?,
-    }
-    Ok(())
-}
-
 /// Everything needed to launch a staged build.
 struct LaunchEnv<'a> {
     ctx: &'a Arc<WorkerCtx>,
     out_tx: &'a mpsc::Sender<WorkerMessage>,
-    signing_key: &'a Arc<SecretKey>,
     build_timeout: Duration,
 }
 
@@ -343,13 +270,7 @@ fn grant_slot(
         // cancel may have removed it from active
         if let Some(mut build) = active.remove(&id) {
             build.permit = permit.take();
-            launch_build(
-                env.ctx,
-                build,
-                env.out_tx,
-                env.signing_key,
-                env.build_timeout,
-            );
+            launch_build(env.ctx, build, env.out_tx, env.build_timeout);
             break;
         }
     }
@@ -358,14 +279,14 @@ fn grant_slot(
     }
 }
 
-/// Adopt a re-dispatched build or stage a fresh assignment.
+/// Adopt a re-dispatched build or register a fresh one for staging.
 async fn handle_assignment(
     a: BuildAssignment,
     active: &mut HashMap<String, ActiveBuild>,
     pending: &mut Vec<tokio::sync::OwnedSemaphorePermit>,
     out_tx: &mpsc::Sender<WorkerMessage>,
     ctx: &Arc<WorkerCtx>,
-) -> Result<()> {
+) -> Result<Option<String>> {
     // A key we already hold means a hub (likely freshly restarted)
     // re-dispatched a build we are running or have finished: adopt
     // the new build_id and deliver the result when there is one,
@@ -379,7 +300,7 @@ async fn handle_assignment(
             .await?;
         let ctx = ctx.clone();
         tokio::task::spawn_blocking(move || try_deliver(&ctx, &a.dedupe_key));
-        return Ok(());
+        return Ok(None);
     }
     // Resumed assignments are credit-free on the hub, so never funded
     // a permit into `pending`.
@@ -394,11 +315,14 @@ async fn handle_assignment(
     match validate_assignment(&a).and_then(|()| ActiveBuild::new(a, ctx.clone())) {
         Ok(mut b) => {
             b.permit = permit;
-            active.insert(build_id, b);
+            active.insert(build_id.clone(), b);
+            Ok(Some(build_id))
         }
-        Err(e) => fail_build(out_tx, &build_id, &e).await?,
+        Err(e) => {
+            fail_build(out_tx, &build_id, &e).await?;
+            Ok(None)
+        }
     }
-    Ok(())
 }
 
 /// Register a fully-staged build as resumable and run it on a blocking
@@ -408,12 +332,10 @@ fn launch_build(
     ctx: &Arc<WorkerCtx>,
     build: ActiveBuild,
     out_tx: &mpsc::Sender<WorkerMessage>,
-    signing_key: &Arc<SecretKey>,
     build_timeout: Duration,
 ) {
     let ctx = ctx.clone();
     let out_tx = out_tx.clone();
-    let signing_key = signing_key.clone();
     let key = build.assignment.dedupe_key.clone();
     ctx.resumable.lock().unwrap().insert(
         key.clone(),
@@ -428,7 +350,7 @@ fn launch_build(
         },
     );
     tokio::task::spawn_blocking(move || {
-        let fin = execute_to_finished(&build, &out_tx, &signing_key, build_timeout);
+        let fin = execute_to_finished(&build, &out_tx, build_timeout);
         drop(build);
         record_finished(&ctx, &key, fin);
     });

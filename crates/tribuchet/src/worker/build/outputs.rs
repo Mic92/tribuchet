@@ -1,27 +1,28 @@
-//! Output packing: NARs for outputs and runtime-closure extras.
+//! Output packing: chunked NARs for outputs and runtime-closure extras.
 
 use std::collections::{BTreeSet, HashMap};
-use std::fs;
-use std::io::{self, Write};
+use std::fs::File;
+use std::io::{self, BufWriter, Write};
+use std::num::NonZero;
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::Instant;
 
 use harmonia_store_path::{StoreDir, StorePath};
 use harmonia_store_path_info::UnkeyedValidPathInfo;
+use harmonia_store_ref_scan::RefScanSink;
 use harmonia_store_remote::{DaemonClient, DaemonStore};
-use harmonia_utils_signature::SecretKey;
-use sha2::{Digest, Sha256};
 
 use std::os::fd::{AsRawFd, OwnedFd};
 
-use super::super::resume::{PackedExtra, PackedOutput};
+use super::super::resume::{OutChunk, PackedExtra, PackedOutput};
 use super::super::sandbox;
 use super::store_base;
-use crate::capwrite::CappedWriter;
+use crate::chunker::{Chunk, chunk_store_path};
 use crate::errors::chain;
 use crate::errors::{Result, err_ctx, err_msg};
 use crate::fsutil::io_ctx;
-use crate::nar;
+use crate::proto::MAX_NAR_BYTES;
 use crate::store::topo_order;
 
 /// Pack the outputs, then (under recursive-nix) the closure-delta
@@ -31,7 +32,6 @@ pub(in crate::worker) async fn pack_outputs_and_extras(
     spec: &sandbox::SandboxSpec,
     pack_root: Option<&OwnedFd>,
     deadline: Instant,
-    signing_key: &SecretKey,
     build_id: &str,
 ) -> Result<(Vec<PackedOutput>, Vec<PackedExtra>)> {
     let extra_candidates = if spec.recursive_nix {
@@ -42,29 +42,14 @@ pub(in crate::worker) async fn pack_outputs_and_extras(
     } else {
         BTreeSet::new()
     };
-    let packed = pack_outputs(
-        dir,
-        spec,
-        pack_root,
-        &extra_candidates,
-        deadline,
-        signing_key,
-    )
-    .await?;
+    let packed = pack_outputs(dir, spec, pack_root, &extra_candidates, deadline)?;
     let extras = if spec.recursive_nix {
-        pack_extras(
-            dir,
-            &packed,
-            &spec.store_inputs,
-            &spec.outputs,
-            deadline,
-            signing_key,
-        )
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(id = build_id, "packing extras failed: {}", chain(&e));
-            Vec::new()
-        })
+        pack_extras(dir, &packed, &spec.store_inputs, &spec.outputs, deadline)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(id = build_id, "packing extras failed: {}", chain(&e));
+                Vec::new()
+            })
     } else {
         Vec::new()
     };
@@ -85,15 +70,12 @@ async fn query_all_valid_paths() -> Result<BTreeSet<harmonia_store_path::StorePa
     Ok(set.into_iter().collect())
 }
 
-/// Pack, hash and sign every output before announcing the result,
-/// because signatures travel in BuildResult ahead of the NAR data.
-async fn pack_outputs(
+fn pack_outputs(
     dir: &Path,
     spec: &sandbox::SandboxSpec,
     pack_root: Option<&OwnedFd>,
     extra_candidates: &BTreeSet<harmonia_store_path::StorePath>,
     deadline: Instant,
-    signing_key: &SecretKey,
 ) -> Result<Vec<PackedOutput>> {
     let mut candidates = scan_candidates(&spec.store_inputs, &spec.outputs);
     candidates.extend(extra_candidates.iter().cloned());
@@ -114,24 +96,17 @@ async fn pack_outputs(
         if host_path.symlink_metadata().is_err() {
             return Err(err_msg(format!("builder did not produce output {scratch}")));
         }
-        let nar_file = dir.join(format!("{}.nar.zst", store_base(scratch)));
+        let frames_file = dir.join(format!("{}.frames", store_base(scratch)));
         let self_path = harmonia_store_path::StorePath::from_base_path(store_base(scratch)).ok();
-        let res = pack_one_nar(
-            &host_path,
-            &nar_file,
-            &candidates,
-            self_path.as_ref(),
-            deadline,
-        )
-        .await
-        .map_err(err_ctx(format!("packing output {scratch}")))?;
-        let sig =
-            signing_key.sign(format!("{scratch}:{}", hex::encode(&res.nar_sha256)).as_bytes());
+        let scan = spec
+            .recursive_nix
+            .then_some((&candidates, self_path.as_ref()));
+        let res = pack_one_nar(&host_path, &frames_file, scan, deadline)
+            .map_err(err_ctx(format!("packing output {scratch}")))?;
         packed.push(PackedOutput {
             scratch: scratch.clone(),
-            nar_file,
-            nar_sha256: res.nar_sha256,
-            signature: sig.to_string(),
+            frames_file,
+            chunks: res.chunks,
             references: res.references,
         });
     }
@@ -146,7 +121,6 @@ async fn pack_extras(
     store_inputs: &[String],
     spec_outputs: &[String],
     deadline: Instant,
-    signing_key: &SecretKey,
 ) -> Result<Vec<PackedExtra>> {
     let known: BTreeSet<&str> = store_inputs
         .iter()
@@ -183,26 +157,20 @@ async fn pack_extras(
         let sp = StorePath::from_base_path(store_base(&path))?;
         let mut candidates: BTreeSet<StorePath> = info.references.iter().cloned().collect();
         candidates.insert(sp.clone());
-        let nar_file = dir.join(format!("extra-{}.nar.zst", store_base(&path)));
+        let frames_file = dir.join(format!("extra-{}.frames", store_base(&path)));
         let res = pack_one_nar(
             Path::new(&path),
-            &nar_file,
-            &candidates,
-            Some(&sp),
+            &frames_file,
+            Some((&candidates, Some(&sp))),
             deadline,
         )
-        .await
         .map_err(err_ctx(format!("packing extra {path}")))?;
-        // Daemon NAR layout is deterministic, so its recorded
-        // nar_size matches the bytes we just hashed.
-        let nar_size = info.nar_size;
-        let sig = signing_key.sign(format!("{path}:{}", hex::encode(&res.nar_sha256)).as_bytes());
         out.push(PackedExtra {
             path,
-            nar_file,
-            nar_sha256: res.nar_sha256,
-            nar_size,
-            signature: sig.to_string(),
+            frames_file,
+            chunks: res.chunks,
+            nar_sha256: info.nar_hash.digest_bytes().to_vec(),
+            nar_size: info.nar_size,
             references: info
                 .references
                 .iter()
@@ -272,38 +240,62 @@ async fn extra_closure(
 }
 
 struct NarPackResult {
-    nar_sha256: Vec<u8>,
     references: Vec<String>,
+    chunks: Vec<OutChunk>,
 }
 
-/// Pack `host_path` as a zstd-compressed NAR into `nar_path`, hashing
-/// and reference-scanning the plaintext NAR in the same pass.
-async fn pack_one_nar(
+type ScanArgs<'a> = (
+    &'a BTreeSet<harmonia_store_path::StorePath>,
+    Option<&'a harmonia_store_path::StorePath>,
+);
+
+/// Chunks compressed per parallel batch.
+const BATCH: usize = 64;
+
+/// Chunk `host_path`'s NAR into a file of zstd frames, reference-
+/// scanning the plaintext when `scan` is set. Blocking.
+fn pack_one_nar(
     host_path: &Path,
-    nar_path: &Path,
-    candidates: &BTreeSet<harmonia_store_path::StorePath>,
-    self_path: Option<&harmonia_store_path::StorePath>,
+    frames_path: &Path,
+    scan: Option<ScanArgs>,
     deadline: Instant,
 ) -> Result<NarPackResult> {
-    let mut hasher = Sha256::new();
-    let mut sink = harmonia_store_ref_scan::RefScanSink::new(candidates, self_path);
-    {
-        let f = fs::File::create(nar_path).map_err(io_ctx("creating", nar_path))?;
-        let mut enc = zstd::stream::write::Encoder::new(f, 3)?;
-        let mut tee = TeeScanner {
-            zstd: &mut enc,
-            hasher: &mut hasher,
-            scan: &mut sink,
-        };
-        // Deadline bounds packing too: a builder can exit instantly
-        // leaving a multi-TB sparse output.
-        let mut limited = CappedWriter::with_deadline(&mut tee, deadline);
-        nar::pack(host_path, &mut limited).await?;
-        enc.finish()?.flush()?;
-    }
-    let store_dir = harmonia_store_path::StoreDir::default();
+    let mut sink = scan.map(|(c, s)| RefScanSink::new(c, s));
+    let mut frames = FrameWriter {
+        file: BufWriter::new(File::create(frames_path).map_err(io_ctx("creating", frames_path))?),
+        chunks: Vec::new(),
+        off: 0,
+    };
+    let mut batch: Vec<Chunk> = Vec::with_capacity(BATCH);
+    let mut total = 0u64;
+    chunk_store_path(host_path, |c| {
+        // A builder can exit instantly leaving a multi-TB sparse output.
+        if Instant::now() >= deadline {
+            return Err(err_msg("build timed out"));
+        }
+        total += c.data.len() as u64;
+        if total > MAX_NAR_BYTES {
+            return Err(err_msg(format!("NAR exceeds {MAX_NAR_BYTES} bytes")));
+        }
+        if let Some(s) = &mut sink {
+            s.feed(&c.data);
+        }
+        batch.push(c);
+        if batch.len() == BATCH {
+            frames.write(&mut batch)?;
+        }
+        Ok(true)
+    })?;
+    frames.write(&mut batch)?;
+    frames
+        .file
+        .flush()
+        .map_err(io_ctx("writing", frames_path))?;
+    let store_dir = StoreDir::default();
+    let self_path = scan.and_then(|(_, s)| s);
     let references = sink
-        .found_paths()
+        .map(|s| s.found_paths())
+        .unwrap_or_default()
         .into_iter()
         .filter(|p| self_path != Some(p))
         .map(|p| {
@@ -313,9 +305,53 @@ async fn pack_one_nar(
         })
         .collect();
     Ok(NarPackResult {
-        nar_sha256: hasher.finalize().to_vec(),
         references,
+        chunks: frames.chunks,
     })
+}
+
+struct FrameWriter {
+    file: BufWriter<File>,
+    chunks: Vec<OutChunk>,
+    off: u64,
+}
+
+impl FrameWriter {
+    /// zstd-3 does ~330 MB/s per core, so compress a batch in parallel.
+    fn write(&mut self, batch: &mut Vec<Chunk>) -> Result<()> {
+        let threads = thread::available_parallelism()
+            .map_or(1, NonZero::get)
+            .min(4);
+        let per = batch.len().div_ceil(threads).max(1);
+        let parts: Vec<io::Result<Vec<Vec<u8>>>> = thread::scope(|s| {
+            let handles: Vec<_> = batch
+                .chunks(per)
+                .map(|part| {
+                    s.spawn(move || {
+                        part.iter()
+                            .map(|c| zstd::bulk::compress(&c.data, 3))
+                            .collect()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let mut frames = Vec::with_capacity(batch.len());
+        for p in parts {
+            frames.append(&mut p.map_err(err_ctx("compressing chunk"))?);
+        }
+        for (c, frame) in batch.drain(..).zip(frames) {
+            self.file.write_all(&frame)?;
+            self.chunks.push(OutChunk {
+                hash: c.hash,
+                size: u32::try_from(c.data.len()).expect("chunk size bounded"),
+                off: self.off,
+                len: u32::try_from(frame.len()).expect("frame size bounded"),
+            });
+            self.off += frame.len() as u64;
+        }
+        Ok(())
+    }
 }
 
 fn scan_candidates(
@@ -329,36 +365,16 @@ fn scan_candidates(
         .collect()
 }
 
-/// One-pass tee of plaintext NAR bytes into zstd, sha256, and the
-/// reference scanner.
-struct TeeScanner<'a, W: Write> {
-    zstd: &'a mut W,
-    hasher: &'a mut Sha256,
-    scan: &'a mut harmonia_store_ref_scan::RefScanSink,
-}
-
-impl<W: Write> Write for TeeScanner<'_, W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.zstd.write_all(buf)?;
-        self.hasher.update(buf);
-        self.scan.feed(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        self.zstd.flush()
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::time::Duration;
 
     use super::*;
 
-    /// pack_one_nar finds references in the same pass as the NAR
-    /// hash; self-paths are dropped.
-    #[tokio::test]
-    async fn pack_one_nar_finds_references_and_excludes_self() -> Result<()> {
+    /// pack_one_nar finds references while chunking and drops self-paths.
+    #[test]
+    fn pack_one_nar_finds_references_and_excludes_self() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let host = dir.path().join("out");
         fs::create_dir(&host)?;
@@ -370,14 +386,12 @@ mod tests {
         let self_sp = harmonia_store_path::StorePath::from_base_path(store_base(self_path)).ok();
         let res = pack_one_nar(
             &host,
-            &dir.path().join("out.nar.zst"),
-            &candidates,
-            self_sp.as_ref(),
+            &dir.path().join("out.frames"),
+            Some((&candidates, self_sp.as_ref())),
             Instant::now() + Duration::from_secs(30),
-        )
-        .await?;
+        )?;
         assert_eq!(res.references, vec![input.to_string()]);
-        assert_eq!(res.nar_sha256.len(), 32);
+        assert_eq!(res.chunks.len(), 1);
         Ok(())
     }
 }

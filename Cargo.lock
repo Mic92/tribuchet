@@ -2404,7 +2404,6 @@ dependencies = [
  "harmonia-store-path-info",
  "harmonia-store-ref-scan",
  "harmonia-store-remote",
- "harmonia-utils-signature",
  "hex",
  "hyper-util",
  "libc",

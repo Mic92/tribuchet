@@ -1,6 +1,6 @@
 # NixOS VM test: a real nix-daemon on `hub` routes a build through the
 # external-builders feature to tribuchet, which dispatches it to `worker`
-# over mTLS and unpacks the signed outputs back into the hub's store.
+# over mTLS and unpacks the outputs back into the hub's store.
 {
   tribuchet,
   nixosModule,

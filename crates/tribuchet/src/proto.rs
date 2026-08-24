@@ -7,7 +7,7 @@
 
 tonic::include_proto!("tribuchet.v1");
 
-/// gRPC message size cap. Metadata messages (BuildRequest, PathOffer)
+/// gRPC message size cap. Metadata messages (BuildRequest, BuildAssignment)
 /// carry the whole input closure; tonic's 4 MiB default rejects large
 /// but legitimate closures.
 pub const MAX_MSG_SIZE: usize = 64 * 1024 * 1024;
@@ -25,27 +25,6 @@ pub const MAX_NAR_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 /// the missing set shrinks each round, so a hub that cannot deliver
 /// fails the build instead of looping.
 pub const MAX_RESEND_ROUNDS: u32 = 3;
-
-/// Chunked NAR streaming, both directions: chunks, then one payload-free eof.
-impl NarTransfer {
-    pub fn chunk(build_id: &str, store_path: &str, zstd_chunk: Vec<u8>) -> Self {
-        Self {
-            build_id: build_id.into(),
-            store_path: store_path.into(),
-            payload: Some(nar_transfer::Payload::ZstdNarChunk(zstd_chunk)),
-            eof: false,
-        }
-    }
-
-    pub fn eof(build_id: &str, store_path: &str) -> Self {
-        Self {
-            build_id: build_id.into(),
-            store_path: store_path.into(),
-            payload: None,
-            eof: true,
-        }
-    }
-}
 
 impl TmpDirArchive {
     pub fn chunk(build_id: &str, zstd_chunk: Vec<u8>) -> Self {

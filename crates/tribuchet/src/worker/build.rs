@@ -9,10 +9,10 @@ use std::sync::Arc;
 use harmonia_store_path::{StoreDir, StorePath, StorePathSet};
 use harmonia_store_path_info::ValidPathInfo;
 use harmonia_store_remote::{DaemonClient, DaemonStore};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 use chunks::ChunkStaging;
-use import_pool::{ImportHandle, ImportJob, ImportPool, ImportState};
+use import_pool::{ImportHandle, ImportPool, ImportState};
 
 use super::pins;
 use super::{DaemonConn, WorkerCtx, unix_now};
@@ -20,11 +20,7 @@ use crate::chunkio::ChannelReader;
 use crate::errors::chain;
 use crate::errors::{Result, err_ctx, err_msg};
 use crate::fsutil::io_ctx;
-use crate::proto::{
-    BuildAssignment, MAX_NAR_BYTES, MAX_RESEND_ROUNDS, NarTransfer, PathInfoMsg, TmpDirArchive,
-    nar_transfer,
-};
-use crate::store::parse_path_info;
+use crate::proto::{BuildAssignment, MAX_RESEND_ROUNDS, Need, TmpDirArchive};
 use crate::tmpdir::unpack_tmp_dir;
 
 /// Where staging of one build stands after a hub message.
@@ -33,7 +29,7 @@ pub(super) enum StagingStatus {
     /// Everything staged; start the build.
     Ready,
     /// Deferred paths never became valid; ask the hub for them.
-    NeedResend(Vec<String>),
+    NeedResend(Need),
 }
 
 type Unpacker = (mpsc::Sender<Vec<u8>>, tokio::task::JoinHandle<Result<()>>);
@@ -46,9 +42,11 @@ pub(super) struct ActiveBuild {
     pub(super) permit: Option<tokio::sync::OwnedSemaphorePermit>,
     /// Input store paths available in /nix/store (bind-mount sources).
     inputs: Vec<String>,
-    /// Paths reported missing, waiting for PathInfo + NAR. The value
-    /// holds the parsed metadata once it arrived.
-    pending: HashMap<String, Option<ValidPathInfo>>,
+    /// Paths this build imports, removed at dispatch.
+    pending: HashSet<String>,
+    infos: HashMap<String, ValidPathInfo>,
+    /// Complete paths waiting for a reference to dispatch.
+    parked: HashSet<String>,
     /// Missing paths another build is importing; not requested from
     /// the hub, re-checked when staging completes.
     deferred: Vec<String>,
@@ -57,16 +55,14 @@ pub(super) struct ActiveBuild {
     /// True once the tmp dir stream finished unpacking.
     tmp_dir_done: bool,
     resend_rounds: u32,
-    /// A NeedResend answer is on the wire. A StagingComplete crossing
-    /// it belongs to the superseded round and is ignored.
-    awaiting_resend: bool,
+    /// Needs with hashes the hub has not answered with eof yet.
+    needs_outstanding: u32,
     /// Daemon connection; carries this build's temp roots, so it must
     /// outlive the build.
     daemon: Option<DaemonConn>,
     imports: HashMap<String, ImportHandle>,
     pool: Option<ImportPool>,
-    /// Chunk-staging state, created by the first recipe.
-    chunks: Option<ChunkStaging>,
+    chunks: ChunkStaging,
     tmp_unpacker: Option<Unpacker>,
 }
 
@@ -89,27 +85,53 @@ impl ActiveBuild {
         }
         fs::create_dir_all(dir.join("top/build"))
             .map_err(io_ctx("creating", &dir.join("top/build")))?;
+        let chunks = ChunkStaging::new(ctx.chunks.clone());
         Ok(Self {
             assignment,
             dir,
             ctx,
             permit: None,
             inputs: Vec::new(),
-            pending: HashMap::new(),
+            pending: HashSet::new(),
+            infos: HashMap::new(),
+            parked: HashSet::new(),
             deferred: Vec::new(),
             registered: HashSet::new(),
             tmp_dir_done: false,
             resend_rounds: 0,
-            awaiting_resend: false,
+            needs_outstanding: 0,
             daemon: None,
             imports: HashMap::new(),
             pool: None,
-            chunks: None,
+            chunks,
             tmp_unpacker: None,
         })
     }
 
-    pub(super) async fn negotiate(&mut self, offered: &[String]) -> Result<Vec<String>> {
+    /// Pin and check the inputs, take inline manifests, and answer
+    /// with the first Need listing every path this build imports.
+    pub(super) async fn negotiate(&mut self) -> Result<(Option<Need>, StagingStatus)> {
+        let inputs = mem::take(&mut self.assignment.inputs);
+        let offered: Vec<String> = inputs.iter().map(|m| m.store_path.clone()).collect();
+        let missing = self.check_inputs(&offered).await?;
+        let mut hashes = Vec::new();
+        for m in inputs {
+            if m.info.is_some() {
+                hashes.extend(self.take_manifest(m).await?);
+            }
+        }
+        if !hashes.is_empty() {
+            self.needs_outstanding += 1;
+        }
+        let need = Need {
+            build_id: self.assignment.build_id.clone(),
+            paths: missing,
+            hashes,
+        };
+        Ok((Some(need), self.try_complete().await?))
+    }
+
+    async fn check_inputs(&mut self, offered: &[String]) -> Result<Vec<String>> {
         let store_dir = StoreDir::default();
         let mut daemon = DaemonClient::builder()
             .connect_daemon()
@@ -135,7 +157,7 @@ impl ActiveBuild {
         // roots (plus paths the database doesn't know) need their own
         // AddTempRoot round trip. Without the graph, every path does.
         let plan = {
-            let offered = offered.to_vec();
+            let offered = offered.to_owned();
             match tokio::task::spawn_blocking(move || {
                 let db = pins::StoreDb::open_readonly(pins::nix_db_path())?;
                 pins::plan_pins(&db, &offered)
@@ -195,7 +217,7 @@ impl ActiveBuild {
             } else {
                 inflight.insert(p.clone());
                 self.registered.insert(p.clone());
-                self.pending.insert(p.clone(), None);
+                self.pending.insert(p.clone());
                 missing.push(p.clone());
             }
         }
@@ -221,118 +243,12 @@ impl ActiveBuild {
         }
     }
 
-    /// Unrequested paths (already valid here, or deferred to
-    /// another build's import) arrive anyway and are dropped.
+    /// Inline manifests for paths already valid here or deferred to
+    /// another build's import are dropped.
     fn tolerated(&self, path: &str) -> bool {
         self.inputs.iter().any(|p| p == path) || self.deferred.iter().any(|p| p == path)
     }
 
-    pub(super) fn feed_path_info(&mut self, pi: &PathInfoMsg) -> Result<()> {
-        let Some(slot) = self.pending.get_mut(&pi.store_path) else {
-            if self.tolerated(&pi.store_path) {
-                return Ok(());
-            }
-            return Err(err_msg(format!(
-                "hub sent path info for unrequested path {}",
-                pi.store_path
-            )));
-        };
-        if pi.nar_size > MAX_NAR_BYTES {
-            return Err(err_msg(format!(
-                "input {} exceeds the {MAX_NAR_BYTES} byte NAR limit",
-                pi.store_path
-            )));
-        }
-        *slot =
-            Some(parse_path_info(pi).map_err(err_ctx(format!("path info for {}", pi.store_path)))?);
-        Ok(())
-    }
-
-    pub(super) async fn feed_nar(&mut self, n: NarTransfer) -> Result<StagingStatus> {
-        if !self.imports.contains_key(&n.store_path) {
-            let info = match self.pending.remove(&n.store_path) {
-                Some(Some(info)) => info,
-                Some(None) => {
-                    return Err(err_msg(format!(
-                        "hub sent NAR before path info for {}",
-                        n.store_path
-                    )));
-                }
-                None => {
-                    if self.tolerated(&n.store_path) {
-                        return Ok(StagingStatus::InProgress);
-                    }
-                    return Err(err_msg(format!(
-                        "hub sent NAR for unrequested path {}",
-                        n.store_path
-                    )));
-                }
-            };
-            let store_dir = StoreDir::default();
-            let gates = info
-                .info
-                .references
-                .iter()
-                .filter_map(|r| self.imports.get(&store_dir.display(r).to_string()))
-                .map(|h| h.done.clone())
-                .collect();
-            let (tx, rx) = mpsc::channel::<bytes::Bytes>(8);
-            let (done_tx, done_rx) = watch::channel(ImportState::Running);
-            let jobs = self.ctx.import_jobs;
-            let pool = self.pool.get_or_insert_with(|| ImportPool::spawn(jobs));
-            pool.job_tx
-                .send(ImportJob {
-                    info,
-                    rx,
-                    gates,
-                    done: done_tx,
-                })
-                .await
-                .map_err(|_| err_msg("import pool gone"))?;
-            self.imports.insert(
-                n.store_path.clone(),
-                ImportHandle {
-                    tx: Some(tx),
-                    done: done_rx,
-                },
-            );
-        }
-        let handle = self.imports.get_mut(&n.store_path).unwrap();
-        let send_failed = match n.payload {
-            Some(nar_transfer::Payload::ZstdNarChunk(chunk)) => match &handle.tx {
-                Some(tx) => tx.send(chunk.into()).await.is_err(),
-                None => {
-                    return Err(err_msg(format!(
-                        "hub sent a NAR chunk after eof for {}",
-                        n.store_path
-                    )));
-                }
-            },
-            None => false,
-        };
-        if send_failed {
-            // The import task died early. Surface its error.
-            let state = handle
-                .done
-                .wait_for(|s| !matches!(s, ImportState::Running))
-                .await
-                .map_err(|_| err_msg("import task abandoned"))?
-                .clone();
-            return Err(match state {
-                ImportState::Failed(e) => err_msg(e),
-                _ => err_msg(format!("input import ended early for {}", n.store_path)),
-            });
-        }
-        if n.eof {
-            // Import completion is reaped when staging finishes. The
-            // next NAR dispatches to another pool connection now.
-            handle.tx = None;
-            return self.try_complete().await;
-        }
-        Ok(StagingStatus::InProgress)
-    }
-
-    /// Reports staging progress; the tmp dir eof completes round one.
     pub(super) async fn feed_tmp_dir(&mut self, t: TmpDirArchive) -> Result<StagingStatus> {
         let (tx, _) = self.tmp_unpacker.get_or_insert_with(|| {
             let dest = self.dir.join("top/build");
@@ -362,78 +278,52 @@ impl ActiveBuild {
         Ok(StagingStatus::InProgress)
     }
 
-    /// End of a staging round (tmp dir eof or StagingComplete): every
-    /// requested NAR must have arrived; deferred paths that are still
-    /// invalid are re-requested instead of failing the build.
-    pub(super) async fn complete_staging(&mut self) -> Result<StagingStatus> {
-        if self.awaiting_resend {
-            return Ok(StagingStatus::InProgress);
-        }
-        if !self.tmp_dir_done {
-            return Err(err_msg(
-                "hub signalled staging completion before the tmp dir arrived",
-            ));
-        }
-        // Chunked paths whose chunks never all arrived fall back to
-        // plain NAR resends instead of failing the build.
-        if let Some(cs) = &mut self.chunks {
-            let stuck = cs.take_undispatched();
-            if !stuck.is_empty() {
-                if self.resend_rounds >= MAX_RESEND_ROUNDS {
-                    return Err(err_msg(format!(
-                        "chunks for {} never arrived after {} rounds",
-                        stuck[0], self.resend_rounds
-                    )));
-                }
-                self.resend_rounds += 1;
-                self.awaiting_resend = true;
-                tracing::warn!(
-                    count = stuck.len(),
-                    "chunked paths incomplete, requesting plain NARs"
-                );
-                return Ok(StagingStatus::NeedResend(stuck));
+    /// Wait for the dispatched imports. Imports that failed on corrupt
+    /// or vanished chunks are staged again instead of failing the
+    /// build. Returns the Need of that retry.
+    async fn collect_imports(&mut self) -> Result<Option<Need>> {
+        let mut failed = Vec::new();
+        let mut bad_chunks = 0;
+        let mut error = None;
+        for (path, handle) in mem::take(&mut self.imports) {
+            let (state, bad) = handle.finish().await?;
+            if let ImportState::Failed(e) = state {
+                bad_chunks += bad.len();
+                error.get_or_insert(e);
+                failed.push(path);
+                continue;
             }
+            self.chunks.forget_path(&path);
+            self.infos.remove(&path);
+            self.deregister(&path);
+            self.inputs.push(path);
         }
-        if let Some(p) = self.pending.keys().next() {
-            return Err(err_msg(format!(
-                "hub never sent a NAR for requested input {p}"
-            )));
+        let Some(e) = error else {
+            return Ok(None);
+        };
+        // Without a bad chunk to blame a retry would fail the same way.
+        if bad_chunks == 0 || self.resend_rounds >= MAX_RESEND_ROUNDS {
+            return Err(err_msg(e));
         }
-        if let Some((p, _)) = self.imports.iter().find(|(_, h)| h.tx.is_some()) {
-            return Err(err_msg(format!(
-                "staging round ended during the NAR transfer of {p}"
-            )));
-        }
-        self.finish_staging().await
+        self.resend_rounds += 1;
+        tracing::warn!(
+            paths = failed.len(),
+            bad_chunks,
+            "staging failed imports again: {e}"
+        );
+        self.restage(failed).await
     }
 
     /// Staging finishes once the tmp dir is unpacked and every
-    /// requested NAR is fully fed, checked from both eof paths.
+    /// pending path is dispatched and imported.
     async fn try_complete(&mut self) -> Result<StagingStatus> {
-        if !self.tmp_dir_done
-            || !self.pending.is_empty()
-            || self.imports.values().any(|h| h.tx.is_some())
-        {
+        if !self.tmp_dir_done || !self.pending.is_empty() {
             return Ok(StagingStatus::InProgress);
         }
-        self.finish_staging().await
-    }
-
-    async fn finish_staging(&mut self) -> Result<StagingStatus> {
-        self.awaiting_resend = false;
-        let imports: Vec<(String, ImportHandle)> = self.imports.drain().collect();
-        for (path, mut h) in imports {
-            let state = h
-                .done
-                .wait_for(|s| !matches!(s, ImportState::Running))
-                .await
-                .map_err(|_| err_msg("import task abandoned"))?
-                .clone();
-            if let ImportState::Failed(e) = state {
-                return Err(err_msg(e));
+        while !self.imports.is_empty() {
+            if let Some(need) = self.collect_imports().await? {
+                return Ok(StagingStatus::NeedResend(need));
             }
-            self.deregister(&path);
-            self.inputs.push(path);
         }
         if self.deferred.is_empty() {
             return Ok(StagingStatus::Ready);
@@ -446,7 +336,7 @@ impl ActiveBuild {
         let daemon = self
             .daemon
             .as_mut()
-            .ok_or_else(|| err_msg("daemon connection missing (no negotiation?)"))?;
+            .ok_or_else(|| err_msg("daemon connection missing"))?;
         let valid = daemon
             .query_valid_paths(&set, false)
             .await
@@ -469,16 +359,18 @@ impl ActiveBuild {
             )));
         }
         self.resend_rounds += 1;
-        self.awaiting_resend = true;
-        // This build imports them itself now: claim and expect them.
         let mut inflight = self.ctx.staging_inflight.lock().unwrap();
         for p in &still_missing {
             if inflight.insert(p.clone()) {
                 self.registered.insert(p.clone());
             }
-            self.pending.insert(p.clone(), None);
+            self.pending.insert(p.clone());
         }
-        Ok(StagingStatus::NeedResend(still_missing))
+        Ok(StagingStatus::NeedResend(Need {
+            build_id: self.assignment.build_id.clone(),
+            paths: still_missing,
+            hashes: Vec::new(),
+        }))
     }
 
     /// Tear down a build abandoned before execution: stop the import
@@ -536,6 +428,7 @@ mod tests {
             tmp_dir_in_sandbox: "/build".into(),
             store_dir: "/nix/store".into(),
             fixed_output: false,
+            inputs: vec![],
         }
     }
 

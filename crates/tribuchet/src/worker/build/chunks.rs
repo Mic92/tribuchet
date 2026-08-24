@@ -3,11 +3,10 @@
 //! frames as-is (the import decoder is multi-frame).
 
 use std::collections::HashMap;
-use std::num::NonZero;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Instant;
+
+use bytes::Bytes;
+use zstd::bulk::decompress;
 
 use harmonia_store_path::StoreDir;
 use tokio::sync::{mpsc, watch};
@@ -17,60 +16,17 @@ use super::import_pool::{ImportHandle, ImportJob, ImportPool, ImportState};
 use super::{ActiveBuild, StagingStatus};
 use crate::chunkstore::{ChunkStore, Hash};
 use crate::errors::{Result, err_ctx, err_msg};
-use crate::proto::{ChunkRun as ChunkRunMsg, PathRecipe};
+use crate::proto::{ChunkFrame, MAX_NAR_BYTES, MAX_RESEND_ROUNDS, Manifest, Need};
+use crate::store::parse_path_info;
 
 pub(super) struct ChunkStaging {
     store: Arc<Mutex<ChunkStore>>,
-    /// path -> ordered recipe, removed at dispatch
+    /// path -> ordered recipe, kept until the import succeeded
     recipes: HashMap<String, Vec<(Hash, u64)>>,
     /// chunk -> paths waiting on it
     waiters: HashMap<Hash, Vec<String>>,
     /// path -> distinct chunks still missing from the store
     remaining: HashMap<String, usize>,
-    /// uncompressed sizes for re-splitting run frames
-    sizes: HashMap<Hash, u64>,
-}
-
-/// Verify, compress and store a run's chunks, fanned over threads:
-/// zstd-3 at ~330 MB/s per core is otherwise the staging bottleneck.
-fn store_chunks(store: &Mutex<ChunkStore>, raw: &[u8], expect: &[(Hash, usize)]) -> Result<()> {
-    let mut jobs = Vec::with_capacity(expect.len());
-    let mut off = 0;
-    for &(hash, size) in expect {
-        jobs.push((hash, &raw[off..off + size]));
-        off += size;
-    }
-    let threads = thread::available_parallelism()
-        .map_or(1, NonZero::get)
-        .clamp(1, 4);
-    let next = AtomicUsize::new(0);
-    thread::scope(|s| {
-        let workers: Vec<_> = (0..threads)
-            .map(|_| {
-                s.spawn(|| -> Result<()> {
-                    loop {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(&(hash, chunk)) = jobs.get(i) else {
-                            return Ok(());
-                        };
-                        if *blake3::hash(chunk).as_bytes() != hash {
-                            return Err(err_msg("chunk hash mismatch"));
-                        }
-                        let frame =
-                            zstd::bulk::compress(chunk, 3).map_err(err_ctx("compressing chunk"))?;
-                        // This build reassembles from the store, so unlike
-                        // a cache fill a write failure must fail the round.
-                        if let Err(e) = store.lock().unwrap().insert(hash, &frame) {
-                            return Err(err_msg(format!("chunk store write failed: {e}")));
-                        }
-                    }
-                })
-            })
-            .collect();
-        workers
-            .into_iter()
-            .try_for_each(|w| w.join().map_err(|_| err_msg("chunk worker panicked"))?)
-    })
 }
 
 impl ChunkStaging {
@@ -80,201 +36,248 @@ impl ChunkStaging {
             recipes: HashMap::new(),
             waiters: HashMap::new(),
             remaining: HashMap::new(),
-            sizes: HashMap::new(),
         }
     }
 
-    pub(super) fn add_recipe(&mut self, path: String, hashes: &[u8], sizes: &[u64]) -> Result<()> {
+    /// Register a recipe. Returns the hashes to request (not in the
+    /// store, not already awaited) and whether the path is complete.
+    fn add_recipe(
+        &mut self,
+        path: String,
+        hashes: &[u8],
+        sizes: &[u64],
+    ) -> Result<(Vec<u8>, bool)> {
         if !hashes.len().is_multiple_of(32) || hashes.len() / 32 != sizes.len() {
-            return Err(err_msg(format!("malformed recipe for {path}")));
+            return Err(err_msg(format!("malformed manifest for {path}")));
         }
-        let mut recipe = Vec::with_capacity(sizes.len());
-        for (h, s) in hashes.chunks_exact(32).zip(sizes) {
-            let hash: Hash = h.try_into().unwrap();
-            // The same content always chunks the same way, so a size
-            // conflict means a corrupt or malicious recipe.
-            if *self.sizes.entry(hash).or_insert(*s) != *s {
-                return Err(err_msg(format!("conflicting chunk sizes for {path}")));
-            }
-            recipe.push((hash, *s));
-        }
+        let recipe: Vec<(Hash, u64)> = hashes
+            .chunks_exact(32)
+            .zip(sizes)
+            .map(|(h, s)| (h.try_into().unwrap(), *s))
+            .collect();
+        let need = self.await_missing(&path, &recipe);
+        let ready = !self.remaining.contains_key(&path);
         self.recipes.insert(path, recipe);
-        Ok(())
+        Ok((need, ready))
     }
 
-    /// After the last recipe: the union of chunks the store lacks
-    /// (concatenated hashes for NeedChunks) and the paths that can
-    /// dispatch right away.
-    pub(super) fn seal(&mut self) -> (Vec<u8>, Vec<String>) {
+    fn await_missing(&mut self, path: &str, recipe: &[(Hash, u64)]) -> Vec<u8> {
         let store = self.store.lock().unwrap();
-        let mut needed: Vec<u8> = Vec::new();
-        let mut ready = Vec::new();
-        for (path, recipe) in &self.recipes {
-            let mut missing = 0;
-            for (hash, _) in recipe {
-                if store.contains(hash) {
-                    continue;
-                }
-                let waiters = self.waiters.entry(*hash).or_default();
-                if waiters.is_empty() {
-                    needed.extend_from_slice(hash);
-                }
-                if !waiters.contains(path) {
-                    waiters.push(path.clone());
-                    missing += 1;
-                }
+        let mut need: Vec<u8> = Vec::new();
+        let mut missing = 0;
+        for (hash, _) in recipe {
+            if store.contains(hash) {
+                continue;
             }
-            if missing == 0 {
-                ready.push(path.clone());
-            } else {
-                self.remaining.insert(path.clone(), missing);
+            let waiters = self.waiters.entry(*hash).or_default();
+            if waiters.is_empty() {
+                need.extend_from_slice(hash);
+            }
+            if !waiters.iter().any(|p| p == path) {
+                waiters.push(path.to_string());
+                missing += 1;
             }
         }
-        (needed, ready)
+        if missing > 0 {
+            *self.remaining.entry(path.to_string()).or_default() += missing;
+        }
+        need
     }
 
-    /// Ingest one run frame: decompress, split at the recipe sizes,
-    /// verify each BLAKE3, re-compress per chunk and store. Returns
-    /// the paths whose last missing chunk arrived.
-    pub(super) async fn ingest(&mut self, hashes: &[u8], data: &[u8]) -> Result<Vec<String>> {
-        if !hashes.len().is_multiple_of(32) {
-            return Err(err_msg("misaligned ChunkRun hashes"));
-        }
-        let mut expect: Vec<(Hash, usize)> = Vec::with_capacity(hashes.len() / 32);
-        let mut total = 0usize;
-        for h in hashes.chunks_exact(32) {
-            let hash: Hash = h.try_into().unwrap();
-            let size = *self
-                .sizes
-                .get(&hash)
-                .ok_or_else(|| err_msg("ChunkRun chunk outside every recipe"))?;
-            let size = usize::try_from(size).map_err(|_| err_msg("oversized chunk"))?;
-            expect.push((hash, size));
-            total += size;
-        }
-        let store = self.store.clone();
-        let data = data.to_vec();
-        let t0 = Instant::now();
-        spawn_blocking(move || -> Result<()> {
-            let raw =
-                zstd::bulk::decompress(&data, total).map_err(err_ctx("decompressing chunk run"))?;
-            if raw.len() != total {
-                return Err(err_msg("chunk run size mismatch"));
-            }
-            let dec_us = u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX);
-            let r = store_chunks(&store, &raw, &expect);
-            tracing::debug!(
-                raw = raw.len(),
-                dec_us,
-                store_us = u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX) - dec_us,
-                "chunk run ingested"
-            );
-            r
-        })
-        .await
-        .map_err(err_ctx("chunk ingest task panicked"))??;
+    /// Paths still waiting on chunks after every Need was answered
+    /// (evicted, or stored by another build without waking us):
+    /// re-request what the store lacks now, report what is complete.
+    fn reawait_stuck(&mut self) -> (Vec<u8>, Vec<String>) {
+        self.waiters.clear();
+        let stuck: Vec<String> = self.remaining.drain().map(|(p, _)| p).collect();
+        let mut need = Vec::new();
         let mut ready = Vec::new();
-        for h in hashes.chunks_exact(32) {
-            let hash: Hash = h.try_into().unwrap();
-            for path in self.waiters.remove(&hash).unwrap_or_default() {
-                let left = self
-                    .remaining
-                    .get_mut(&path)
-                    .ok_or_else(|| err_msg("waiter without remaining count"))?;
-                *left -= 1;
-                if *left == 0 {
-                    self.remaining.remove(&path);
-                    ready.push(path);
-                }
+        for path in stuck {
+            let recipe = self.recipes[&path].clone();
+            need.extend(self.await_missing(&path, &recipe));
+            if !self.remaining.contains_key(&path) {
+                ready.push(path);
+            }
+        }
+        (need, ready)
+    }
+
+    /// Store one frame as received, integrity is checked at import.
+    /// Returns the paths whose last missing chunk arrived.
+    pub(super) fn ingest(&mut self, hash: &[u8], frame: &[u8]) -> Result<Vec<String>> {
+        let hash: Hash = hash
+            .try_into()
+            .map_err(|_| err_msg("malformed chunk hash"))?;
+        self.store
+            .lock()
+            .unwrap()
+            .insert(hash, frame)
+            .map_err(|e| err_msg(format!("chunk store write failed: {e}")))?;
+        let mut ready = Vec::new();
+        for path in self.waiters.remove(&hash).unwrap_or_default() {
+            let left = self
+                .remaining
+                .get_mut(&path)
+                .ok_or_else(|| err_msg("waiter without remaining count"))?;
+            *left -= 1;
+            if *left == 0 {
+                self.remaining.remove(&path);
+                ready.push(path);
             }
         }
         Ok(ready)
     }
 
-    /// Remove and return a ready path's recipe for dispatch.
-    pub(super) fn take_recipe(&mut self, path: &str) -> Result<Vec<(Hash, u64)>> {
+    fn recipe(&self, path: &str) -> Result<Vec<(Hash, u64)>> {
         self.recipes
-            .remove(path)
+            .get(path)
+            .cloned()
             .ok_or_else(|| err_msg(format!("no recipe for ready path {path}")))
     }
 
-    /// Paths whose chunks never all arrived, handed to the plain
-    /// NAR resend fallback.
-    pub(super) fn take_undispatched(&mut self) -> Vec<String> {
-        self.waiters.clear();
-        self.remaining.clear();
-        self.recipes.drain().map(|(p, _)| p).collect()
-    }
-
-    pub(super) fn store(&self) -> Arc<Mutex<ChunkStore>> {
-        self.store.clone()
+    pub(super) fn forget_path(&mut self, path: &str) {
+        self.recipes.remove(path);
     }
 }
 
 impl ActiveBuild {
-    /// Returns the NeedChunks hash union once the last recipe arrived.
-    pub(in crate::worker) async fn feed_recipe(
-        &mut self,
-        r: PathRecipe,
-    ) -> Result<(Option<Vec<u8>>, StagingStatus)> {
-        let store = self
-            .ctx
-            .chunks
-            .clone()
-            .ok_or_else(|| err_msg("hub sent a recipe but the chunk store is disabled"))?;
-        let cs = self.chunks.get_or_insert_with(|| ChunkStaging::new(store));
-        if matches!(self.pending.get(&r.store_path), Some(Some(_))) {
-            cs.add_recipe(r.store_path, &r.hashes, &r.sizes)?;
-        } else if !self.tolerated(&r.store_path) {
-            return Err(err_msg(format!(
-                "hub sent a recipe for unrequested path {}",
-                r.store_path
-            )));
+    fn need(&mut self, paths: Vec<String>, hashes: Vec<u8>) -> Option<Need> {
+        if paths.is_empty() && hashes.is_empty() {
+            return None;
         }
-        if !r.last {
-            return Ok((None, StagingStatus::InProgress));
+        if !hashes.is_empty() {
+            self.needs_outstanding += 1;
         }
-        let (needed, ready) = self.chunks.as_mut().unwrap().seal();
-        tracing::debug!(
-            needed = needed.len() / 32,
-            ready = ready.len(),
-            "recipes sealed"
-        );
-        for p in ready {
-            self.start_chunk_import(&p).await?;
-        }
-        let status = self.try_complete().await?;
-        Ok((Some(needed), status))
+        Some(Need {
+            build_id: self.assignment.build_id.clone(),
+            paths,
+            hashes,
+        })
     }
 
-    pub(in crate::worker) async fn feed_chunk_run(
+    pub(in crate::worker) async fn feed_manifest(
         &mut self,
-        c: ChunkRunMsg,
-    ) -> Result<StagingStatus> {
-        if self.chunks.is_none() {
-            return Err(err_msg("hub sent a ChunkRun without any recipe"));
+        m: Manifest,
+    ) -> Result<(Option<Need>, StagingStatus)> {
+        let hashes = self.take_manifest(m).await?;
+        let need = self.need(Vec::new(), hashes);
+        Ok((need, self.try_complete().await?))
+    }
+
+    /// A manifest for a pending path: dispatch it if complete, else
+    /// return the chunk hashes to request.
+    pub(super) async fn take_manifest(&mut self, m: Manifest) -> Result<Vec<u8>> {
+        if !self.pending.contains(&m.store_path) {
+            if self.tolerated(&m.store_path) {
+                return Ok(Vec::new());
+            }
+            return Err(err_msg(format!(
+                "hub sent a manifest for unrequested path {}",
+                m.store_path
+            )));
         }
-        if !c.eof {
-            let ready = self
-                .chunks
-                .as_mut()
-                .unwrap()
-                .ingest(&c.hashes, &c.zstd_data)
-                .await?;
-            for p in ready {
+        let info = m
+            .info
+            .as_ref()
+            .ok_or_else(|| err_msg(format!("manifest for {} lacks path info", m.store_path)))?;
+        if info.nar_size > MAX_NAR_BYTES {
+            return Err(err_msg(format!(
+                "input {} exceeds the {MAX_NAR_BYTES} byte NAR limit",
+                m.store_path
+            )));
+        }
+        let parsed = parse_path_info(&m.store_path, info)
+            .map_err(err_ctx(format!("path info for {}", m.store_path)))?;
+        self.infos.insert(m.store_path.clone(), parsed);
+        let (hashes, ready) = self
+            .chunks
+            .add_recipe(m.store_path.clone(), &m.hashes, &m.sizes)?;
+        if ready {
+            self.start_chunk_import(&m.store_path).await?;
+        }
+        Ok(hashes)
+    }
+
+    /// Put imported-but-failed paths back to pending and await their
+    /// chunks again: forgotten ones are re-requested, paths still
+    /// complete dispatch right away.
+    pub(super) async fn restage(&mut self, paths: Vec<String>) -> Result<Option<Need>> {
+        let mut hashes = Vec::new();
+        let mut ready = Vec::new();
+        for path in paths {
+            let recipe = self.chunks.recipe(&path)?;
+            hashes.extend(self.chunks.await_missing(&path, &recipe));
+            if !self.chunks.remaining.contains_key(&path) {
+                ready.push(path.clone());
+            }
+            self.pending.insert(path);
+        }
+        for path in ready {
+            self.start_chunk_import(&path).await?;
+        }
+        Ok(self.need(Vec::new(), hashes))
+    }
+
+    pub(in crate::worker) async fn feed_chunk(
+        &mut self,
+        c: ChunkFrame,
+    ) -> Result<(Option<Need>, StagingStatus)> {
+        let mut need = None;
+        if c.eof {
+            self.needs_outstanding = self
+                .needs_outstanding
+                .checked_sub(1)
+                .ok_or_else(|| err_msg("chunk eof without a Need"))?;
+            if self.needs_outstanding == 0 && !self.chunks.remaining.is_empty() {
+                let (hashes, ready) = self.chunks.reawait_stuck();
+                if !hashes.is_empty() {
+                    if self.resend_rounds >= MAX_RESEND_ROUNDS {
+                        return Err(err_msg("input chunks keep going missing"));
+                    }
+                    self.resend_rounds += 1;
+                    tracing::warn!(chunks = hashes.len() / 32, "chunks lost, requesting again");
+                }
+                for p in ready {
+                    self.start_chunk_import(&p).await?;
+                }
+                need = self.need(Vec::new(), hashes);
+            }
+        } else {
+            for p in self.chunks.ingest(&c.hash, &c.zstd)? {
                 self.start_chunk_import(&p).await?;
             }
         }
-        self.try_complete().await
+        Ok((need, self.try_complete().await?))
     }
 
-    /// Feed a fully-present path's stored frames to the import pool.
-    /// Completion tracks through `done` like an eof'd NAR (tx None).
+    /// Dispatch a complete path once every reference this build
+    /// imports is dispatched too (the daemon requires valid refs), then
+    /// retry paths parked on it.
     async fn start_chunk_import(&mut self, path: &str) -> Result<()> {
-        let recipe = self.chunks.as_mut().unwrap().take_recipe(path)?;
-        let Some(Some(info)) = self.pending.remove(path) else {
+        let mut queue = vec![path.to_string()];
+        while let Some(path) = queue.pop() {
+            let store_dir = StoreDir::default();
+            let info = &self.infos[&path];
+            let blocked = info.info.references.iter().any(|r| {
+                let r = store_dir.display(r).to_string();
+                r != path && self.pending.contains(&r)
+            });
+            if blocked {
+                self.parked.insert(path);
+                continue;
+            }
+            self.dispatch_import(&path).await?;
+            queue.extend(self.parked.drain());
+        }
+        Ok(())
+    }
+
+    async fn dispatch_import(&mut self, path: &str) -> Result<()> {
+        let recipe = self.chunks.recipe(path)?;
+        if !self.pending.remove(path) {
             return Err(err_msg(format!("chunk-ready path {path} was not pending")));
-        };
+        }
+        let info = self.infos[path].clone();
         let store_dir = StoreDir::default();
         let gates = info
             .info
@@ -283,7 +286,7 @@ impl ActiveBuild {
             .filter_map(|r| self.imports.get(&store_dir.display(r).to_string()))
             .map(|h| h.done.clone())
             .collect();
-        let (tx, rx) = mpsc::channel::<bytes::Bytes>(8);
+        let (tx, rx) = mpsc::channel::<Bytes>(8);
         let (done_tx, done_rx) = watch::channel(ImportState::Running);
         let jobs = self.ctx.import_jobs;
         let pool = self.pool.get_or_insert_with(|| ImportPool::spawn(jobs));
@@ -296,28 +299,77 @@ impl ActiveBuild {
             })
             .await
             .map_err(|_| err_msg("import pool gone"))?;
+        let store = self.chunks.store.clone();
+        let feeder = spawn_blocking(move || feed_import(&store, &recipe, &tx));
         self.imports.insert(
             path.to_string(),
             ImportHandle {
-                tx: None,
                 done: done_rx,
+                feeder,
             },
         );
-        let store = self.chunks.as_ref().unwrap().store();
-        spawn_blocking(move || {
-            for (hash, _) in recipe {
-                let fref = store.lock().unwrap().locate(&hash);
-                // A chunk evicted between readiness and here truncates
-                // the stream. The daemon rejects the short NAR and the
-                // import surfaces the failure.
-                let Some(frame) = fref.and_then(|f| f.read().ok()) else {
-                    return;
-                };
-                if tx.blocking_send(frame.into()).is_err() {
-                    return;
-                }
-            }
-        });
         Ok(())
+    }
+}
+
+/// Stream a recipe's chunks, decompressed and verified, to the import.
+/// Returns the chunks found corrupt or missing, after forgetting them
+/// in the store so a retry requests them again.
+fn feed_import(
+    store: &Mutex<ChunkStore>,
+    recipe: &[(Hash, u64)],
+    tx: &mpsc::Sender<Bytes>,
+) -> Vec<Hash> {
+    let mut bad = Vec::new();
+    for (hash, size) in recipe {
+        let Some(raw) = read_verified(store, hash, *size) else {
+            tracing::warn!(chunk = hex::encode(hash), "stored chunk corrupt or missing");
+            store.lock().unwrap().forget(hash);
+            bad.push(*hash);
+            continue;
+        };
+        // One bad chunk dooms the import. Keep checking the rest so a
+        // single retry covers them all, but stop feeding.
+        if bad.is_empty() && tx.blocking_send(raw.into()).is_err() {
+            break;
+        }
+    }
+    bad
+}
+
+fn read_verified(store: &Mutex<ChunkStore>, hash: &Hash, size: u64) -> Option<Vec<u8>> {
+    let frame = store.lock().unwrap().locate(hash)?.read().ok()?;
+    let raw = decompress(&frame, usize::try_from(size).ok()?).ok()?;
+    (raw.len() as u64 == size && blake3::hash(&raw).as_bytes() == hash).then_some(raw)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zstd::bulk::compress;
+
+    #[test]
+    fn feed_import_forgets_corrupt_and_missing_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Mutex::new(ChunkStore::open(dir.path().to_path_buf(), 1 << 20).unwrap());
+        let good = b"good chunk".to_vec();
+        let good_hash: Hash = *blake3::hash(&good).as_bytes();
+        let liar: Hash = [7; 32];
+        let missing: Hash = [9; 32];
+        {
+            let mut s = store.lock().unwrap();
+            s.insert(good_hash, &compress(&good, 3).unwrap()).unwrap();
+            s.insert(liar, &compress(b"not what the hash says", 3).unwrap())
+                .unwrap();
+        }
+        let recipe = [(good_hash, good.len() as u64), (liar, 22), (missing, 1)];
+        let (tx, mut rx) = mpsc::channel(8);
+        let bad = feed_import(&store, &recipe, &tx);
+        assert_eq!(bad, vec![liar, missing]);
+        assert_eq!(rx.try_recv().unwrap().as_ref(), good.as_slice());
+        assert!(rx.try_recv().is_err());
+        let s = store.lock().unwrap();
+        assert!(s.contains(&good_hash));
+        assert!(!s.contains(&liar));
     }
 }

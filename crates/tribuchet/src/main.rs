@@ -1,7 +1,6 @@
 mod attach;
 mod build_json;
 mod ca;
-mod capwrite;
 mod chunker;
 mod chunkio;
 mod chunkstore;

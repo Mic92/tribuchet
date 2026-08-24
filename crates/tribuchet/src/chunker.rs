@@ -7,7 +7,6 @@ use std::mem;
 use std::path::Path;
 
 use fastcdc::v2020::FastCDC;
-use tokio::runtime;
 
 use crate::chunkstore::Hash;
 use crate::errors::{Result, err_ctx};
@@ -17,46 +16,52 @@ use crate::rt;
 const CDC_MIN: u32 = BODY_MIN;
 const CDC_AVG: u32 = 64 * 1024;
 const CDC_MAX: u32 = 256 * 1024;
-const MAX_SIZE: usize = CDC_MAX as usize;
+pub const MAX_SIZE: usize = CDC_MAX as usize;
 
 pub struct Chunk {
     pub hash: Hash,
     pub data: Vec<u8>,
 }
 
-fn emit(data: Vec<u8>, out: &mut Vec<Chunk>) {
-    let hash = *blake3::hash(&data).as_bytes();
-    out.push(Chunk { hash, data });
-}
-
-#[derive(Default)]
-struct Chunker {
+struct Chunker<F> {
     /// Framing and small files awaiting coalesced emission.
     lit: Vec<u8>,
     /// Carry-over of a file body streamed in parts.
     body: Vec<u8>,
+    sink: F,
 }
 
-impl Chunker {
-    fn push(&mut self, piece: Piece, out: &mut Vec<Chunk>) {
+impl<F: FnMut(Chunk) -> Result<bool>> Chunker<F> {
+    fn emit(&mut self, data: Vec<u8>) -> Result<bool> {
+        let hash = *blake3::hash(&data).as_bytes();
+        (self.sink)(Chunk { hash, data })
+    }
+
+    fn flush_lit(&mut self) -> Result<bool> {
+        if self.lit.is_empty() {
+            return Ok(true);
+        }
+        let lit = mem::take(&mut self.lit);
+        self.emit(lit)
+    }
+
+    fn push(&mut self, piece: Piece) -> Result<bool> {
         match piece {
             Piece::Framing(b) => {
                 self.lit.extend_from_slice(b);
                 if self.lit.len() >= MAX_SIZE {
-                    emit(mem::take(&mut self.lit), out);
+                    return self.flush_lit();
                 }
+                Ok(true)
             }
             Piece::Body { data, last } => {
                 // A body starts a chunk of its own, so the framing
                 // before it ends one.
-                if !self.lit.is_empty() {
-                    emit(mem::take(&mut self.lit), out);
+                if !self.flush_lit()? {
+                    return Ok(false);
                 }
                 if self.body.is_empty() && last {
-                    for piece in cdc_split(data) {
-                        emit(piece.to_vec(), out);
-                    }
-                    return;
+                    return self.split(data);
                 }
                 self.body.extend_from_slice(data);
                 // The first cut of a window at least MAX_SIZE long
@@ -65,60 +70,52 @@ impl Chunker {
                 let mut start = 0;
                 while self.body.len() - start >= MAX_SIZE {
                     let cut = start + first_cut(&self.body[start..]);
-                    emit(self.body[start..cut].to_vec(), out);
+                    if !self.emit(self.body[start..cut].to_vec())? {
+                        return Ok(false);
+                    }
                     start = cut;
                 }
                 if last {
-                    for piece in cdc_split(&self.body[start..]) {
-                        emit(piece.to_vec(), out);
-                    }
-                    self.body.clear();
+                    let body = mem::take(&mut self.body);
+                    self.split(&body[start..])
                 } else {
                     self.body.drain(..start);
+                    Ok(true)
                 }
             }
         }
     }
 
-    fn finish(&mut self, out: &mut Vec<Chunk>) {
-        if !self.lit.is_empty() {
-            emit(mem::take(&mut self.lit), out);
-        }
-    }
-}
-
-/// Serialize a store path to NAR, chunk it, and feed each chunk to
-/// `f`, which may
-/// await channel sends. Stops early when `f` returns false. Runs its
-/// own current-thread runtime, so call from spawn_blocking.
-pub fn chunk_store_path(
-    store_path: &str,
-    mut f: impl AsyncFnMut(Chunk) -> Result<bool>,
-) -> Result<()> {
-    rt::name_current_thread("trib-pack");
-    let rt = runtime::Builder::new_current_thread()
-        .build()
-        .map_err(err_ctx("building NAR pack runtime"))?;
-    let mut chunker = Chunker::default();
-    let mut chunks = Vec::new();
-    let mut feed = |chunks: &mut Vec<Chunk>| -> Result<bool> {
-        for c in chunks.drain(..) {
-            if !rt.block_on(f(c))? {
+    fn split(&mut self, data: &[u8]) -> Result<bool> {
+        for piece in cdc_split(data) {
+            if !self.emit(piece.to_vec())? {
                 return Ok(false);
             }
         }
         Ok(true)
+    }
+}
+
+/// Serialize a store path to NAR, chunk it, and feed each chunk to
+/// `sink`. Stops early when `sink` returns false. Blocking.
+pub fn chunk_store_path(store_path: &Path, sink: impl FnMut(Chunk) -> Result<bool>) -> Result<()> {
+    rt::name_current_thread("trib-pack");
+    let mut chunker = Chunker {
+        lit: Vec::new(),
+        body: Vec::new(),
+        sink,
     };
     let mut more = Ok(true);
-    pack(Path::new(store_path), |p| {
-        chunker.push(p, &mut chunks);
-        more = feed(&mut chunks);
+    pack(store_path, |p| {
+        more = chunker.push(p);
         Ok(matches!(more, Ok(true)))
     })
-    .map_err(err_ctx(format!("serializing {store_path} to NAR")))?;
+    .map_err(err_ctx(format!(
+        "serializing {} to NAR",
+        store_path.display()
+    )))?;
     if more? {
-        chunker.finish(&mut chunks);
-        feed(&mut chunks)?;
+        chunker.flush_lit()?;
     }
     Ok(())
 }
@@ -151,7 +148,7 @@ mod tests {
         }
         let mut cat = Vec::new();
         let mut n = 0;
-        chunk_store_path(dir.path().to_str().unwrap(), async |c| {
+        chunk_store_path(dir.path(), |c| {
             assert_eq!(c.hash, *blake3::hash(&c.data).as_bytes());
             assert!(c.data.len() <= MAX_SIZE);
             cat.extend_from_slice(&c.data);
@@ -159,10 +156,7 @@ mod tests {
             Ok(true)
         })
         .unwrap();
-        let rt = runtime::Builder::new_current_thread().build().unwrap();
-        let mut want = Vec::new();
-        rt.block_on(nar::pack(dir.path(), &mut want)).unwrap();
-        assert_eq!(cat, want);
+        assert_eq!(cat, nar::pack::to_vec(dir.path()).unwrap());
         // Small files coalesced rather than one chunk each.
         assert!(n < 60, "{n} chunks");
     }

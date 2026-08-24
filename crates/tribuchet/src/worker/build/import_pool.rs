@@ -1,15 +1,21 @@
 //! Parallel daemon imports of staged input NARs.
 
+use std::io;
 use std::mem;
 use std::sync::Arc;
 use std::time::Instant;
 
+use bytes::Bytes;
 use futures_util::StreamExt as _;
 use harmonia_store_path_info::ValidPathInfo;
 use harmonia_store_remote::{DaemonClient, DaemonStore as _};
-use std::io;
-use tokio::io::AsyncReadExt as _;
+use tokio::io::{AsyncReadExt as _, BufReader};
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::io::StreamReader;
+
+use crate::chunkstore::Hash;
 
 use crate::errors::{Result, chain, err_ctx, err_msg};
 use crate::worker::DaemonConn;
@@ -21,16 +27,32 @@ pub(super) enum ImportState {
     Failed(String),
 }
 
-/// One in-flight daemon import, fed chunk by chunk from feed_nar.
+/// One in-flight daemon import, fed its verified chunks.
 pub(super) struct ImportHandle {
-    /// Chunk sender, None once the NAR's eof arrived.
-    pub(super) tx: Option<mpsc::Sender<bytes::Bytes>>,
     pub(super) done: watch::Receiver<ImportState>,
+    /// Yields the chunks that failed verification.
+    pub(super) feeder: JoinHandle<Vec<Hash>>,
+}
+
+impl ImportHandle {
+    pub(super) async fn finish(mut self) -> Result<(ImportState, Vec<Hash>)> {
+        let state = self
+            .done
+            .wait_for(|s| !matches!(s, ImportState::Running))
+            .await
+            .map_err(|_| err_msg("import task abandoned"))?
+            .clone();
+        let bad = self
+            .feeder
+            .await
+            .map_err(err_ctx("import feeder panicked"))?;
+        Ok((state, bad))
+    }
 }
 
 pub(super) struct ImportJob {
     pub(super) info: ValidPathInfo,
-    pub(super) rx: mpsc::Receiver<bytes::Bytes>,
+    pub(super) rx: mpsc::Receiver<Bytes>,
     /// Imports of this path's references: AddToStoreNar registration
     /// requires every reference valid, so the import waits for them.
     pub(super) gates: Vec<watch::Receiver<ImportState>>,
@@ -39,7 +61,7 @@ pub(super) struct ImportJob {
 
 /// N tasks with one daemon connection each, so imports overlap the
 /// download and each other instead of serializing behind one
-/// AddToStoreNar. The hub streams references before referrers, so a
+/// AddToStoreNar. The hub sends recipes references before referrers, so a
 /// job's gates always point at jobs queued earlier: FIFO dispatch
 /// cannot deadlock on a gate.
 pub(super) struct ImportPool {
@@ -117,27 +139,16 @@ async fn run_import(conn: &mut Option<DaemonConn>, job: &mut ImportJob) -> Resul
     res
 }
 
-/// Drive one AddToStoreNar: hub chunks -> zstd decode -> daemon. The
-/// daemon verifies the NAR against info.nar_hash and registers the
-/// path, so no separate integrity check is needed here.
+/// Drive one AddToStoreNar from the feeder's verified NAR bytes. The
+/// daemon checks info.nar_hash on top.
 async fn import_nar(
     conn: &mut DaemonConn,
     info: &ValidPathInfo,
-    rx: mpsc::Receiver<bytes::Bytes>,
+    rx: mpsc::Receiver<Bytes>,
 ) -> Result<()> {
-    let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(Ok::<_, io::Error>);
-    let reader = tokio_util::io::StreamReader::new(stream);
-    let dec = {
-        let mut dec =
-            async_compression::tokio::bufread::ZstdDecoder::new(tokio::io::BufReader::new(reader));
-        // The hub stitches cached per-chunk frames with fresh run
-        // frames, so the stream is multi-frame.
-        dec.multiple_members(true);
-        dec
-    };
-    // take(nar_size): the daemon reads a self-delimiting NAR, but a
-    // malicious hub must not stream unbounded decompressed bytes.
-    let limited = tokio::io::BufReader::new(dec.take(info.info.nar_size));
+    let reader = StreamReader::new(ReceiverStream::new(rx).map(Ok::<_, io::Error>));
+    // take(nar_size): a malicious hub must not stream unbounded bytes.
+    let limited = BufReader::new(reader.take(info.info.nar_size));
     conn.add_to_store_nar(info, limited, false, true)
         .await
         .map_err(|e| err_msg(format!("importing {} via the daemon: {e}", info.path)))?;

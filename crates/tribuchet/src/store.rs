@@ -46,11 +46,12 @@ fn field<E: error::Error + Send + Sync + 'static>(
 
 /// Wire metadata -> daemon ValidPathInfo.
 pub fn parse_path_info(
+    store_path: &str,
     msg: &PathInfoMsg,
 ) -> Result<harmonia_store_path_info::ValidPathInfo, PathInfoError> {
     let store_dir = StoreDir::default();
     Ok(ValidPathInfo {
-        path: store_dir.parse(&msg.store_path).map_err(field("path"))?,
+        path: store_dir.parse(store_path).map_err(field("path"))?,
         info: UnkeyedValidPathInfo {
             deriver: (!msg.deriver.is_empty())
                 .then(|| store_dir.parse(&msg.deriver))

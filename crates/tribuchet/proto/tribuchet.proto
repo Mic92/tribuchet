@@ -6,7 +6,7 @@ package tribuchet.v1;
 // bidirectional stream open (NAT-friendly; the hub never dials workers).
 service WorkerHub {
   // Single bidi stream multiplexing registration, heartbeats, build
-  // assignment, path negotiation, NAR transfer, logs and results.
+  // assignment, path negotiation, chunk transfer, logs and results.
   rpc Session(stream WorkerMessage) returns (stream HubMessage);
 }
 
@@ -14,22 +14,22 @@ message WorkerMessage {
   oneof msg {
     Register register = 1;
     Heartbeat heartbeat = 2;
-    // Subset of the offered input paths the worker does not have cached.
-    MissingPaths missing_paths = 3;
-    LogChunk log = 4;
-    BuildResult result = 5;
-    // Output NARs streamed back after BuildResult announces them.
-    NarTransfer nar = 6;
+    LogChunk log = 3;
+    BuildResult result = 4;
+    // Output chunks answering the hub's Need, then one eof.
+    ChunkFrame chunk = 5;
     // One free build slot: the hub answers each request with at most
     // one BuildAssignment (worker-side admission).
-    RequestJob request_job = 7;
+    RequestJob request_job = 6;
     // Answer to a BuildAssignment whose dedupe_key matches a build the
     // worker already runs (or has finished but not delivered): the hub
     // skips staging and waits for the result, which arrives under the
     // new build_id. This is how builds survive a hub restart.
-    Resumed resumed = 8;
-    // Union of recipe chunks the worker's chunk store lacks.
-    NeedChunks need_chunks = 9;
+    Resumed resumed = 7;
+    // Input paths the worker lacks a manifest for and chunks its
+    // store lacks. The first Need answers the assignment and lists
+    // every missing input path. May repeat any number of times.
+    Need need = 8;
   }
 }
 
@@ -41,61 +41,47 @@ message RequestJob {}
 
 message HubMessage {
   oneof msg {
+    // Carries the input closure, with manifests inline where the hub
+    // has them cached and does not know the worker to have the path.
     BuildAssignment assignment = 1;
-    // Input closure of an assigned build; worker answers MissingPaths.
-    PathOffer path_offer = 2;
-    NarTransfer nar = 3;
     // Build tmp dir contents (structured attrs, passAsFile files).
-    TmpDirArchive tmp_dir = 4;
-    CancelBuild cancel = 5;
-    // Nix db metadata for an input path, sent before its NarTransfer
-    // chunks; the worker needs it to register the path in its own
-    // store via the daemon (AddToStoreNar).
-    PathInfoMsg path_info = 6;
-    // The hub received and verified the result and output NARs; the
-    // worker keeps the build for redelivery until this arrives.
-    ResultAck result_ack = 7;
-    // Ends an input resend round; the worker re-checks its inputs
-    // and either starts the build or asks again.
-    StagingComplete staging_complete = 8;
-    // Chunk list of one missing input NAR (chunk-capable workers).
-    PathRecipe recipe = 9;
-    // Chunk data answering NeedChunks.
-    ChunkRun chunk_run = 10;
+    TmpDirArchive tmp_dir = 2;
+    CancelBuild cancel = 3;
+    // The hub received the result and all output chunks. The worker
+    // keeps the build for redelivery until this arrives.
+    ResultAck result_ack = 4;
+    // Chunk data answering a Need, one eof per Need.
+    ChunkFrame chunk = 5;
+    // Manifest for a path listed in Need.paths.
+    Manifest manifest = 6;
+    // Output chunks the hub's cache lacks, sent after BuildResult.
+    Need need = 7;
   }
 }
 
-// The ordered chunk list of one missing input NAR. Concatenating the
-// chunks yields the NAR, so reassembly needs no parsing. Sent after
-// the path's PathInfoMsg instead of NarTransfer chunks.
-message PathRecipe {
-  string build_id = 1;
+// A store path, optionally with its Nix metadata and ordered chunk
+// list. Concatenating the chunks yields the NAR.
+message Manifest {
+  string build_id = 1; // empty when embedded
   string store_path = 2;
-  bytes hashes = 3;          // n*32 bytes, BLAKE3 of uncompressed chunk
-  repeated uint64 sizes = 4; // uncompressed, same order
-  // Final recipe of the staging round: the worker answers with one
-  // NeedChunks for the union of chunks it lacks.
-  bool last = 5;
+  PathInfoMsg info = 3;
+  bytes hashes = 4;          // n*32 bytes, BLAKE3 of uncompressed chunk
+  repeated uint64 sizes = 5; // uncompressed, same order
 }
 
-message NeedChunks {
+message Need {
   string build_id = 1;
-  bytes hashes = 2; // n*32 bytes, deduplicated
+  repeated string paths = 2;
+  bytes hashes = 3; // n*32 bytes, deduplicated
 }
 
-// One zstd frame covering a run of chunks. The worker re-splits the
-// decompressed bytes at the recipe sizes, so frame layout is a
-// per-transfer serving decision, never a protocol commitment.
-message ChunkRun {
+// One chunk as its own zstd frame: both ends store chunks in this
+// form, so nothing is re-compressed in transit.
+message ChunkFrame {
   string build_id = 1;
-  bytes hashes = 2; // n*32 bytes, in-frame order
-  bytes zstd_data = 3;
-  // Ends the chunk stream of the staging round.
+  bytes hash = 2; // 32 bytes, empty on eof
+  bytes zstd = 3;
   bool eof = 4;
-}
-
-message StagingComplete {
-  string build_id = 1;
 }
 
 message ResultAck {
@@ -105,16 +91,14 @@ message ResultAck {
   string dedupe_key = 2;
 }
 
-// Subset of Nix's ValidPathInfo needed to import a NAR on the worker.
+// Subset of Nix's ValidPathInfo needed to import a NAR.
 message PathInfoMsg {
-  string build_id = 1;
-  string store_path = 2;
-  bytes nar_sha256 = 3;          // hash of the uncompressed NAR
-  uint64 nar_size = 4;           // uncompressed NAR size in bytes
-  repeated string references = 5; // absolute store paths
-  repeated string signatures = 6; // Nix-format "name:base64"
-  string deriver = 7;             // absolute store path or empty
-  string ca = 8;                  // content address string or empty
+  bytes nar_sha256 = 1;          // hash of the uncompressed NAR
+  uint64 nar_size = 2;           // uncompressed NAR size in bytes
+  repeated string references = 3; // absolute store paths
+  repeated string signatures = 4; // Nix-format "name:base64"
+  string deriver = 5;             // absolute store path or empty
+  string ca = 6;                  // content address string or empty
 }
 
 // Features are per system: an emulated system must not inherit e.g.
@@ -125,24 +109,16 @@ message SystemCaps {
 }
 
 message Register {
-  // 2, 3: flat systems + features lists; 4: max_jobs (see RequestJob)
-  reserved 2, 3, 4;
   string worker_name = 1;
-  repeated SystemCaps caps = 6;
+  repeated SystemCaps caps = 2;
   // Dedupe keys of builds this worker still holds (running or finished
   // but undelivered). A freshly started hub assigns resubmitted jobs
   // with these keys to this worker, credit-free, instead of building
   // them again elsewhere.
-  repeated string resumable_keys = 7;
-  // ed25519 public key used to sign output NARs, in Nix's
-  // "name:base64" format (nix-store --generate-binary-cache-key).
-  string signing_public_key = 5;
+  repeated string resumable_keys = 3;
   // Advisory capacity, summed across workers to size the max-jobs of
   // the generated nix.conf fragment. Not the RequestJob dispatch path.
-  uint32 max_jobs = 8;
-  // Worker runs a chunk store: the hub stages missing inputs as
-  // recipes plus NeedChunks data instead of whole NARs.
-  bool chunk_support = 9;
+  uint32 max_jobs = 4;
 }
 
 message Heartbeat {
@@ -164,28 +140,7 @@ message BuildAssignment {
   // Hash of the full BuildRequest; stable across hub restarts, unlike
   // build_id. Keys the worker's resume bookkeeping.
   string dedupe_key = 10;
-}
-
-message PathOffer {
-  string build_id = 1;
-  repeated string store_paths = 2;
-}
-
-message MissingPaths {
-  string build_id = 1;
-  repeated string store_paths = 2;
-}
-
-// One store path or output, streamed as a zstd-compressed NAR.
-// Chunk-capable workers receive inputs as PathRecipe/ChunkRun instead;
-// this stays the output path and the input fallback.
-message NarTransfer {
-  string build_id = 1;
-  string store_path = 2;
-  oneof payload {
-    bytes zstd_nar_chunk = 3;
-  }
-  bool eof = 4;
+  repeated Manifest inputs = 11;
 }
 
 message TmpDirArchive {
@@ -219,31 +174,15 @@ message CancelBuild {
 message BuildResult {
   string build_id = 1;
   int32 exit_code = 2;
-  // For each output: NAR sha256 and ed25519 signature over
-  // "<store_path>:<nar_sha256>". NAR data follows as NarTransfer
-  // messages on the worker stream.
-  repeated OutputSignature outputs = 3;
+  // Manifest per output (no info). The hub asks for the chunks it
+  // lacks with Need and assembles the NAR.
+  repeated Manifest outputs = 3;
   string error = 4;
   // Inner outputs and AddToStore'd paths the build's outputs
-  // reference (recursive-nix). The hub verifies the worker signature
-  // and registers each in the local store via AddToStoreNar; attach
-  // receives an AddedPath event per registered extra.
-  repeated ExtraPath extras = 5;
-}
-
-// PathInfo plus a worker signature over "<store_path>:<nar_sha256>";
-// same trust shape as OutputSignature, but for a real registered path
-// rather than a scratch output.
-message ExtraPath {
-  PathInfoMsg info = 1;
-  string signature = 2;
-}
-
-message OutputSignature {
-  string store_path = 1;
-  bytes nar_sha256 = 2;
-  // Nix-format signature ("name:base64") over "storePath:narSha256Hex".
-  string signature = 3;
+  // reference (recursive-nix). The hub registers each in the local
+  // store via AddToStoreNar. Attach receives an AddedPath event per
+  // registered extra.
+  repeated Manifest extras = 5; // with info
 }
 
 // Local service between `tribuchet attach` and the hub, served on a unix
@@ -270,9 +209,6 @@ message TmpDirChunk {
 }
 
 message BuildRequest {
-  // 7 was top_tmp_dir, back when the hub tarred the build dir itself.
-  reserved 7;
-  reserved "top_tmp_dir";
   string system = 1;
   string builder = 2;
   repeated string args = 3;
@@ -280,9 +216,9 @@ message BuildRequest {
   // Output name -> scratch store path.
   map<string, string> outputs = 5;
   repeated string input_paths = 6;
-  string tmp_dir_in_sandbox = 8;
-  string store_dir = 9;
-  bool fixed_output = 10;
+  string tmp_dir_in_sandbox = 7;
+  string store_dir = 8;
+  bool fixed_output = 9;
 }
 
 message AttachEvent {

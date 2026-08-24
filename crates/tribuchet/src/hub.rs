@@ -6,7 +6,7 @@
 //! - queues per system type; submitters block until a worker is free
 //! - serves the WorkerHub gRPC service over mTLS; workers dial in
 //! - reads input store paths directly from local disk
-//! - verifies worker output signatures while relaying compressed chunks
+//! - verifies output chunks against their manifest while relaying
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -14,7 +14,6 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use harmonia_utils_signature::PublicKey;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::server::TcpConnectInfo;
@@ -37,7 +36,7 @@ pub use serve::run;
 
 use crate::errors::{Result, chain};
 use metrics::Metrics;
-use relay::{WorkerStaging, run_job, send};
+use relay::{WorkerSession, run_job, send};
 use state::{HubState, WorkerCaps};
 
 /// No worker message for this long tears the session down and fails
@@ -62,11 +61,6 @@ enum PeerAuth {
 struct WorkerSvc {
     state: Arc<HubState>,
     auth: Arc<PeerAuth>,
-    /// Operator-pinned worker signing keys; when configured, a worker
-    /// registering an unknown key is rejected. Without it the signature
-    /// check only proves the NARs came from whoever registered the key,
-    /// which the transport auth already guarantees.
-    trusted_keys: Option<Arc<Vec<PublicKey>>>,
 }
 
 /// Registers the worker's capabilities while alive; removes them on
@@ -126,10 +120,9 @@ fn msg_build_id(msg: &worker_message::Msg) -> Option<&str> {
     match msg {
         worker_message::Msg::Log(l) => Some(&l.build_id),
         worker_message::Msg::Result(r) => Some(&r.build_id),
-        worker_message::Msg::Nar(n) => Some(&n.build_id),
-        worker_message::Msg::MissingPaths(m) => Some(&m.build_id),
+        worker_message::Msg::Chunk(c) => Some(&c.build_id),
         worker_message::Msg::Resumed(r) => Some(&r.build_id),
-        worker_message::Msg::NeedChunks(n) => Some(&n.build_id),
+        worker_message::Msg::Need(n) => Some(&n.build_id),
         worker_message::Msg::Register(_)
         | worker_message::Msg::Heartbeat(_)
         | worker_message::Msg::RequestJob(_) => None,
@@ -224,22 +217,6 @@ impl WorkerHub for WorkerSvc {
             // another in logs and metrics.
             register.worker_name = who.node_name;
         }
-        let vkey: PublicKey = register
-            .signing_public_key
-            .parse()
-            .map_err(|e| Status::invalid_argument(format!("bad signing key: {e}")))?;
-        if let Some(trusted) = &self.trusted_keys
-            && !trusted.contains(&vkey)
-        {
-            tracing::warn!(
-                worker = register.worker_name,
-                key = %vkey,
-                "rejecting worker with unpinned signing key"
-            );
-            return Err(Status::permission_denied(
-                "signing key not in the hub's trusted-signing-keys",
-            ));
-        }
         tracing::info!(
             worker = register.worker_name,
             caps = ?register.caps,
@@ -255,13 +232,7 @@ impl WorkerHub for WorkerSvc {
                 }
             }
         });
-        tokio::spawn(worker_loop(
-            self.state.clone(),
-            register,
-            Arc::new(vkey),
-            out_tx,
-            in_rx,
-        ));
+        tokio::spawn(worker_loop(self.state.clone(), register, out_tx, in_rx));
         Ok(Response::new(ReceiverStream::new(out_rx)))
     }
 }
@@ -269,7 +240,6 @@ impl WorkerHub for WorkerSvc {
 async fn worker_loop(
     state: Arc<HubState>,
     register: Register,
-    vkey: Arc<PublicKey>,
     out_tx: mpsc::Sender<Result<HubMessage, Status>>,
     in_rx: mpsc::Receiver<WorkerMessage>,
 ) {
@@ -294,11 +264,7 @@ async fn worker_loop(
     // each received RequestJob funds at most one assignment
     let (req_tx, mut req_rx) = mpsc::channel::<()>(1024);
     let route = tokio::spawn(route_loop(in_rx, router.clone(), req_tx));
-    // Stage one build's inputs at a time per worker: the worker imports
-    // each closure in isolation (references before referrers, no
-    // shared-path lock contention) and a later build sees earlier shared
-    // inputs as valid, so it fetches only its delta.
-    let staging = Arc::new(WorkerStaging::new(register.chunk_support));
+    let sess = Arc::new(WorkerSession::new());
 
     let mut credits: usize = 0;
     'outer: loop {
@@ -346,10 +312,9 @@ async fn worker_loop(
         let state = state.clone();
         let router = router.clone();
         let out_tx = out_tx.clone();
-        let vkey = vkey.clone();
-        let staging = staging.clone();
+        let sess = sess.clone();
         tokio::spawn(async move {
-            let res = run_job(&state, &job, &vkey, &out_tx, in_rx, staging).await;
+            let res = run_job(&state, &job, &out_tx, in_rx, sess).await;
             router.unregister(&job.id);
             // run_job counts the build verdict; only session/hub-side
             // errors reach the branches below.
