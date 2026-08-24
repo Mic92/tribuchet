@@ -5,6 +5,8 @@
 //! Nix's narHash, keeping us interoperable with caches and signatures.
 
 use std::io::{self, Write};
+
+pub mod pack;
 use std::path::{Path, PathBuf};
 
 use futures_util::StreamExt as _;
