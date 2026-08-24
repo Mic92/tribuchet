@@ -6,10 +6,11 @@
 use std::collections::HashSet;
 use std::io;
 use std::mem;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+use std::thread;
 use std::time::Instant;
 
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tonic::Status;
 
 use super::{WorkerStaging, order_by_references, query_path_infos};
@@ -45,8 +46,6 @@ pub(in crate::hub) async fn stage_chunked(
     let infos = order_by_references(query_path_infos(&state.daemon_pool, missing).await?);
     let cache = state.chunks.as_deref();
     let last = infos.len().saturating_sub(1);
-    // Chunking packs each NAR: fan the paths out before the ordered
-    // send loop below.
     let recipes: Vec<Recipe> = futures_util::future::try_join_all(
         infos
             .iter()
@@ -159,6 +158,10 @@ async fn await_need_chunks(
     }
 }
 
+/// One core per pack: a large closure must not flood the blocking pool.
+static PACK_PERMITS: LazyLock<Semaphore> =
+    LazyLock::new(|| Semaphore::new(thread::available_parallelism().map_or(4, usize::from)));
+
 /// Serve a recipe from the in-memory cache or pack and chunk the NAR.
 async fn compute_recipe(cache: Option<&ChunkCache>, store_path: &str) -> Result<Recipe> {
     if let Some(c) = cache
@@ -166,6 +169,7 @@ async fn compute_recipe(cache: Option<&ChunkCache>, store_path: &str) -> Result<
     {
         return Ok(r);
     }
+    let _permit = PACK_PERMITS.acquire().await.expect("pack semaphore closed");
     let t0 = Instant::now();
     let path = store_path.to_string();
     let recipe = spawn_blocking(move || -> Result<Vec<(Hash, u64)>> {
