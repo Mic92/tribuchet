@@ -7,15 +7,18 @@ use std::error::Error;
 use std::fs;
 use std::io::{self, Write};
 use std::io::{BufRead, BufReader};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
+use std::slice;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 
+use crate::nix::{build_path, nar_size, query_closure};
 use crate::ns;
 
 type LogRx = mpsc::Receiver<(Instant, String)>;
@@ -48,6 +51,10 @@ struct Cli {
     /// (0 = kernel default). Isolates slow start from protocol cost.
     #[arg(long, default_value_t = 0)]
     initcwnd: u32,
+    /// Also run the build: copy this store path into $out and time
+    /// output packing and delivery.
+    #[arg(long)]
+    output_copy: Option<String>,
 }
 
 const STAGE_ENV: &str = "NETBENCH_STAGE";
@@ -56,14 +63,32 @@ pub fn main() -> ExitCode {
     if env::var_os(STAGE_ENV).is_none() {
         // Re-exec as root of a fresh user+mount+net namespace.
         let args: Vec<_> = env::args().collect();
+        // The agent maps a full 65536-id block above root; --map-auto
+        // would spend one of the subordinate ids on root.
+        let (uids, gids) = match (subid_range("/etc/subuid"), subid_range("/etc/subgid")) {
+            (Ok(u), Ok(g)) => (u, g),
+            (Err(e), _) | (_, Err(e)) => {
+                eprintln!("netbench: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
         // Own transient scope: the worker agent manages cgroups as
         // userns root and must never touch the login session's tree.
         let err = Command::new("systemd-run")
-            .args(["--user", "--scope", "--quiet", "--collect", "--"])
-            .arg("unshare")
             .args([
-                "-r",
-                "--map-auto",
+                "--user",
+                "--scope",
+                "--quiet",
+                "--collect",
+                "-p",
+                "Delegate=yes",
+                "--",
+            ])
+            .arg("unshare")
+            .arg("-r")
+            .arg(format!("--map-users=1:{uids}"))
+            .arg(format!("--map-groups=1:{gids}"))
+            .args([
                 "-m",
                 "-n",
                 "-p",
@@ -79,6 +104,10 @@ pub fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let cli = Cli::parse();
+    if let Err(e) = ns::enter_cgroup_self("harness") {
+        eprintln!("netbench: {e}");
+        return ExitCode::FAILURE;
+    }
     match run(&cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -86,6 +115,21 @@ pub fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// "start:count" of the invoking user's first subordinate id range.
+fn subid_range(file: &str) -> Result<String, Box<dyn Error>> {
+    let user = env::var("USER")?;
+    let uid = unsafe { libc::getuid() }.to_string();
+    fs::read_to_string(file)?
+        .lines()
+        .find_map(|l| {
+            let mut it = l.split(':');
+            let name = it.next()?;
+            (name == user || name == uid).then(|| format!("{}:{}", it.next()?, it.next()?).into())
+        })
+        .flatten()
+        .ok_or_else(|| format!("no entry for {user} in {file}").into())
 }
 
 struct Setup {
@@ -103,6 +147,17 @@ struct Setup {
 fn run(cli: &Cli) -> Result<(), Box<dyn Error>> {
     let mut setup = start(cli)?;
     let result = measure(cli, &setup);
+    if result.is_err() {
+        for (n, c) in [
+            ("worker", &mut setup.worker),
+            ("hub", &mut setup.hub),
+            ("agent", &mut setup.agent),
+        ] {
+            if let Ok(Some(st)) = c.try_wait() {
+                eprintln!("netbench: {n} exited: {st}");
+            }
+        }
+    }
     shutdown(&mut setup);
     // Runs on every exit path: either hand the tree to the user or
     // unlock the read-only imported store paths so the TempDir drop
@@ -122,20 +177,41 @@ fn run(cli: &Cli) -> Result<(), Box<dyn Error>> {
 }
 
 fn measure(cli: &Cli, setup: &Setup) -> Result<(), Box<dyn Error>> {
-    let (closure, nar_bytes) = query_closure(&cli.closure)?;
+    let (mut inputs, _) = query_closure(&cli.closure)?;
+    let mut builder = (
+        "/bin/sh".to_string(),
+        vec!["-c".to_string(), "exit 0".to_string()],
+    );
+    let mut out_bytes = 0;
+    if let Some(src) = &cli.output_copy {
+        out_bytes = nar_size(slice::from_ref(src))?;
+        let busybox = build_path("nixpkgs#pkgsStatic.busybox")?;
+        inputs.extend(query_closure(src)?.0);
+        inputs.push(busybox.clone());
+        inputs.sort();
+        inputs.dedup();
+        builder = (
+            format!("{busybox}/bin/busybox"),
+            vec!["cp".into(), "-r".into(), src.clone(), OUT.into()],
+        );
+        println!("output: copy of {src}, {} MB nar", out_bytes >> 20);
+    }
+    let nar_bytes = nar_size(&inputs)?;
     println!(
-        "closure: {} paths, {} MB nar | delay {}ms/way, {} mbit",
-        closure.len(),
+        "inputs: {} paths, {} MB nar | delay {}ms/way, {} mbit",
+        inputs.len(),
         nar_bytes >> 20,
         cli.delay_ms,
         cli.rate_mbit
     );
-    let build_json = write_build_json(&setup.wd, &closure)?;
+    let build_json = write_build_json(&setup.wd, &inputs, &builder.0, &builder.1)?;
     for i in 1..=cli.runs {
         let label = if i == 1 { "cold" } else { "warm" };
-        let (dispatch, staging) = attach(setup, &build_json)?;
-        report(i, label, dispatch, staging, nar_bytes);
-        wait_for_log(&setup.worker_log, "build result acknowledged")?;
+        let t = attach(setup, &build_json, cli.output_copy.is_some())?;
+        report(i, label, &t, nar_bytes, out_bytes);
+        if cli.output_copy.is_none() {
+            wait_for_log(&setup.worker_log, "build result acknowledged")?;
+        }
         if i == 1 && cli.phases {
             print_phases(&setup.wd);
         }
@@ -143,14 +219,14 @@ fn measure(cli: &Cli, setup: &Setup) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+const OUT: &str = "/nix/store/00000000000000000000000000000000-netbench";
+
 fn start(cli: &Cli) -> Result<Setup, Box<dyn Error>> {
-    // Holds CA and TLS key material: tempfile creates it 0700. Rooted
-    // in the user's runtime dir when available, not world-shared /tmp.
-    let base = env::var_os("XDG_RUNTIME_DIR").map_or_else(env::temp_dir, PathBuf::from);
-    let dir = tempfile::Builder::new()
-        .prefix("netbench-")
-        .tempdir_in(base)?;
+    // Throwaway CA and TLS keys live here (files are 0600). Build uids
+    // must traverse to the agent scratch dir, so not the 0700 runtime dir.
+    let dir = tempfile::Builder::new().prefix("netbench-").tempdir()?;
     let wd = dir.path().to_path_buf();
+    fs::set_permissions(&wd, fs::Permissions::from_mode(0o711))?;
     let netns = ns::WorkerNs::create()?;
     ns::setup_links(&netns, cli.delay_ms, cli.rate_mbit, cli.initcwnd)?;
 
@@ -257,9 +333,14 @@ fn spawn_worker(
         .arg(wd.join("agent.sock"))
         .arg("--state-dir")
         .arg(&agent_state)
+        // unshare --map-auto maps 65536 subordinate ids above root
+        .args(["--uid-base", "1"])
         .stdout(log_file(wd, "agent.log")?)
         .stderr(log_file(wd, "agent.err")?);
     ns::join_worker(netns, &mut agent_cmd, root_s);
+    // The agent manages (and kills) its own cgroup subtree, which must
+    // not contain the worker or this harness.
+    ns::enter_cgroup(&mut agent_cmd, "agent")?;
     let agent = agent_cmd.spawn()?;
 
     let mut worker_cmd = Command::new(&cli.tribuchet);
@@ -316,42 +397,21 @@ fn wait_for_log(rx: &LogRx, marker: &str) -> Result<(), String> {
     Err(format!("timed out waiting for worker log: {marker}"))
 }
 
-/// The closure's paths and total nar size from one path-info query.
-fn query_closure(path: &str) -> Result<(Vec<String>, u64), Box<dyn Error>> {
-    let out = Command::new("nix")
-        .args([
-            "--extra-experimental-features",
-            "nix-command",
-            "path-info",
-            "-r",
-            "--json",
-            path,
-        ])
-        .env("NIX_REMOTE", "daemon")
-        .output()?;
-    if !out.status.success() {
-        return Err(format!("nix path-info -r {path}: {}", out.status).into());
-    }
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout)?;
-    let m = v.as_object().ok_or("unexpected path-info output")?;
-    let paths = m.keys().cloned().collect();
-    let nar_bytes = m.values().filter_map(|p| p["narSize"].as_u64()).sum();
-    Ok((paths, nar_bytes))
-}
-
-fn write_build_json(wd: &Path, closure: &[String]) -> Result<PathBuf, Box<dyn Error>> {
+fn write_build_json(
+    wd: &Path,
+    closure: &[String],
+    builder: &str,
+    args: &[String],
+) -> Result<PathBuf, Box<dyn Error>> {
     let ttmp = wd.join("ttmp");
     fs::create_dir_all(ttmp.join("build"))?;
     let mut outputs = BTreeMap::new();
-    outputs.insert(
-        "out",
-        "/nix/store/00000000000000000000000000000000-netbench".to_string(),
-    );
+    outputs.insert("out", OUT.to_string());
     let json = serde_json::json!({
         "version": 1,
-        "builder": "/bin/sh",
-        "args": ["-c", "exit 0"],
-        "env": {},
+        "builder": builder,
+        "args": args,
+        "env": {"out": OUT},
         "topTmpDir": ttmp,
         "tmpDirInSandbox": "/build",
         "storeDir": "/nix/store",
@@ -368,35 +428,79 @@ fn current_system() -> String {
     format!("{}-{}", env::consts::ARCH, env::consts::OS)
 }
 
-fn attach(setup: &Setup, build_json: &Path) -> Result<(Duration, Duration), Box<dyn Error>> {
+#[derive(Default)]
+struct Timings {
+    dispatch: Duration,
+    staging: Duration,
+    /// builder exit -> result sent (output chunking)
+    pack: Option<Duration>,
+    /// result sent -> ack (chunk negotiation, upload, hub assembly)
+    deliver: Option<Duration>,
+}
+
+fn attach(setup: &Setup, build_json: &Path, full: bool) -> Result<Timings, Box<dyn Error>> {
     let t0 = Instant::now();
-    let mut child = Command::new(&setup.tribuchet)
-        .arg("attach")
+    let mut cmd = Command::new(&setup.tribuchet);
+    cmd.arg("attach")
         .arg(build_json)
         .arg("--socket")
         .arg(setup.wd.join("hub.sock"))
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    // The sandboxed build itself is not the benchmark: once staging
-    // completes (the sandbox decision is the first post-staging log)
-    // kill attach, which makes the hub cancel the build.
-    let mut assigned = None;
-    let mut staged = None;
+        .stderr(log_file(&setup.wd, "attach.err")?);
+    if full {
+        ns::writable_store(&mut cmd, &setup.wd)?;
+    }
+    let mut child = cmd.spawn()?;
+    let last = if full {
+        "build result acknowledged"
+    } else {
+        // The build itself is not the benchmark: once staging completes
+        // kill attach, which makes the hub cancel the build.
+        "sandbox network decision"
+    };
+    let mut marks: BTreeMap<&str, Instant> = BTreeMap::new();
     let deadline = Instant::now() + Duration::from_mins(10);
-    while staged.is_none() && Instant::now() < deadline {
+    while !marks.contains_key(last) && Instant::now() < deadline {
         match setup.worker_log.recv_timeout(Duration::from_millis(200)) {
-            Ok((at, line)) if line.contains("build assigned") => assigned = Some(at),
-            Ok((at, line)) if line.contains("sandbox network decision") => staged = Some(at),
-            Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Ok((at, line)) => {
+                for m in [
+                    "build assigned",
+                    "sandbox network decision",
+                    "builder finished",
+                    "build result sent",
+                    "build result acknowledged",
+                ] {
+                    if line.contains(m) {
+                        marks.entry(m).or_insert(at);
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(e) => return Err(e.into()),
         }
     }
     let _ = child.kill();
     let _ = child.wait();
-    let staged = staged.ok_or("timed out waiting for staging to complete")?;
-    let assigned = assigned.ok_or("staging finished without an assignment marker")?;
-    Ok((assigned - t0, staged - assigned))
+    let get = |m: &str| {
+        marks
+            .get(m)
+            .copied()
+            .ok_or(format!("timed out waiting for: {m}"))
+    };
+    let assigned = get("build assigned")?;
+    let staged = get("sandbox network decision")?;
+    let mut t = Timings {
+        dispatch: assigned - t0,
+        staging: staged - assigned,
+        ..Default::default()
+    };
+    if full {
+        let fin = get("builder finished")?;
+        let sent = get("build result sent")?;
+        t.pack = Some(sent - fin);
+        t.deliver = Some(get("build result acknowledged")? - sent);
+    }
+    Ok(t)
 }
 
 /// Cold-run phase breakdown from the hub and worker debug logs.
@@ -427,12 +531,17 @@ fn print_phases(wd: &Path) {
     }
 }
 
-fn report(run: u32, label: &str, dispatch: Duration, staging: Duration, nar_bytes: u64) {
-    #[allow(clippy::cast_precision_loss)]
-    let mbps = nar_bytes as f64 / 1e6 / staging.as_secs_f64();
+#[allow(clippy::cast_precision_loss)]
+fn report(run: u32, label: &str, t: &Timings, nar_bytes: u64, out_bytes: u64) {
+    let mbps = nar_bytes as f64 / 1e6 / t.staging.as_secs_f64();
     println!(
-        "run {run} ({label}): dispatch {dispatch:.2?}, staging {staging:.2?} ({mbps:.0} MB/s of nar)"
+        "run {run} ({label}): dispatch {:.2?}, staging {:.2?} ({mbps:.0} MB/s of nar)",
+        t.dispatch, t.staging
     );
+    if let (Some(pack), Some(deliver)) = (t.pack, t.deliver) {
+        let pm = out_bytes as f64 / 1e6 / pack.as_secs_f64();
+        println!("        outputs: pack {pack:.2?} ({pm:.0} MB/s), deliver {deliver:.2?}");
+    }
 }
 
 fn shutdown(setup: &mut Setup) {

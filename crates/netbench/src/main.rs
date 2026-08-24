@@ -11,6 +11,8 @@ use std::process::ExitCode;
 #[cfg(target_os = "linux")]
 mod bench;
 #[cfg(target_os = "linux")]
+mod nix;
+#[cfg(target_os = "linux")]
 mod ns;
 
 #[cfg(target_os = "linux")]
