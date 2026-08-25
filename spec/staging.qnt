@@ -10,9 +10,8 @@
 // owner still stages the path, Done once it is imported, Failed once the
 // owner gave up. A waiter whose claim failed takes the path over.
 //
-// An import is dispatched only after every reference is staged here
-// (valid input, or this build's own import dispatched before it), so the
-// import pool never waits on another build and FIFO order suffices.
+// An import is dispatched only after every reference is valid here (an
+// input or an own import that finished), so the import pool never waits.
 //
 //   quint run    spec/staging.qnt --invariant inv
 //   quint verify spec/staging.qnt --invariant inv --inductive-invariant indInv
@@ -112,23 +111,22 @@ module staging {
   }
 
   // start_import: a complete path goes to the pool once each reference
-  // is staged or already in the pool ahead of it.
+  // is staged.
   action dispatch(b: BuildId, p: Path): bool = all {
     phase.get(b) == Staging,
     pending.get(b).contains(p),
     complete.get(b).contains(p),
-    refsOf(p).subseteq(staged(b).union(running.get(b))),
+    refsOf(p).subseteq(staged(b)),
     pending' = pending.set(b, pending.get(b).exclude(Set(p))),
     running' = running.set(b, running.get(b).union(Set(p))),
     valid' = valid, claim' = claim, waits' = waits, closure' = closure, phase' = phase,
     inputs' = inputs, complete' = complete, done' = done,
   }
 
-  // run_import: after the pool jobs of its references, AddToStoreNar.
+  // run_import: AddToStoreNar.
   action daemonImport(b: BuildId, p: Path): bool = all {
     phase.get(b) == Staging,
     running.get(b).contains(p),
-    refsOf(p).intersect(running.get(b)) == Set(),
     if (refsOf(p).subseteq(valid)) all {
       valid' = valid.union(Set(p)),
       running' = running.set(b, running.get(b).exclude(Set(p))),
@@ -214,8 +212,8 @@ module staging {
     PATHS.exists(p => or {
       pending.get(b).contains(p) and not(complete.get(b).contains(p)),
       pending.get(b).contains(p) and complete.get(b).contains(p)
-        and refsOf(p).subseteq(staged(b).union(running.get(b))),
-      running.get(b).contains(p) and refsOf(p).intersect(running.get(b)) == Set(),
+        and refsOf(p).subseteq(staged(b)),
+      running.get(b).contains(p),
       waitingFor(b).contains(p)
         and waits.filter(w => w.build == b and w.path == p).forall(w => claimState(w) != Running),
     }),
@@ -262,7 +260,7 @@ module staging {
       running.get(b).union(done.get(b)).subseteq(complete.get(b)),
       complete.get(b).subseteq(owned(b)),
       // why the daemon never rejects
-      running.get(b).forall(p => refsOf(p).subseteq(staged(b).union(running.get(b)))),
+      running.get(b).forall(p => refsOf(p).subseteq(staged(b))),
     },
     phase.get(b) != Staging implies and {
       pending.get(b) == Set(), running.get(b) == Set(), waitingFor(b) == Set(),

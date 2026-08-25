@@ -130,7 +130,7 @@ async fn session_loop(
             }
             Some(w) = wake_rx.recv() => {
                 if let Some(build) = active.get_mut(&w.build_id) {
-                    let res = build.claim_settled(&w.path).await;
+                    let res = build.woken(&w.path).await;
                     advance_staging(active, &mut ready, &w.build_id, res, &env).await?;
                 }
                 continue;
@@ -215,11 +215,6 @@ async fn advance_staging(
             }
             let build = active.remove(id).unwrap();
             launch_build(env.ctx, build, env.out_tx, env.build_timeout);
-        }
-        StagingStatus::NeedResend(need) => {
-            env.out_tx
-                .send(msg(worker_message::Msg::Need(need)))
-                .await?;
         }
     }
     Ok(())

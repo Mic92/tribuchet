@@ -16,7 +16,7 @@ use zstd::stream::read::Decoder as ZstdDecoder;
 use chunks::ChunkStaging;
 use claims::{ClaimState, Claimed, Wait};
 pub(super) use claims::{Claims, Wake};
-use import_pool::{ImportHandle, ImportPool, ImportState};
+use import_pool::{ImportHandle, ImportPool};
 
 use super::pins;
 use super::{DaemonConn, WorkerCtx, unix_now};
@@ -30,10 +30,8 @@ use crate::tmpdir::unpack_tmp_dir;
 /// Where staging of one build stands after a hub message.
 pub(super) enum StagingStatus {
     InProgress,
-    /// Everything staged; start the build.
+    /// Everything staged. Start the build.
     Ready,
-    /// Paths or chunks to request again.
-    NeedResend(Need),
 }
 
 type Unpacker = (mpsc::Sender<Vec<u8>>, tokio::task::JoinHandle<Result<()>>);
@@ -136,7 +134,7 @@ impl ActiveBuild {
             paths: missing,
             hashes,
         };
-        Ok((Some(need), self.try_complete().await?))
+        Ok((Some(need), self.try_complete()))
     }
 
     async fn check_inputs(&mut self, offered: &[String]) -> Result<Vec<String>> {
@@ -254,29 +252,27 @@ impl ActiveBuild {
         }
     }
 
-    /// Done: the path is an input now. Failed: take it over.
-    pub(super) async fn claim_settled(
-        &mut self,
-        path: &str,
-    ) -> Result<(Option<Need>, StagingStatus)> {
-        let Some(state) = self.waits.get(path).and_then(Wait::settled) else {
-            return Ok((None, StagingStatus::InProgress));
-        };
-        self.waits.remove(path);
+    /// An own import finished or a claim this build waits on settled.
+    pub(super) async fn woken(&mut self, path: &str) -> Result<(Option<Need>, StagingStatus)> {
         let mut need = None;
-        match state {
-            ClaimState::Done => {
-                self.inputs.insert(path.to_string());
-                self.retry_parked().await?;
-            }
-            _ => {
-                if self.claim(path) {
-                    tracing::info!(path, "taking over input another build gave up on");
-                    need = self.need(vec![path.to_string()], Vec::new());
+        if let Some(handle) = self.imports.remove(path) {
+            need = self.import_finished(path, handle).await?;
+        } else if let Some(state) = self.waits.get(path).and_then(Wait::settled) {
+            self.waits.remove(path);
+            match state {
+                ClaimState::Done => {
+                    self.inputs.insert(path.to_string());
+                    self.retry_parked().await?;
+                }
+                _ => {
+                    if self.claim(path) {
+                        tracing::info!(path, "taking over input another build gave up on");
+                        need = self.need(vec![path.to_string()], Vec::new());
+                    }
                 }
             }
         }
-        Ok((need, self.try_complete().await?))
+        Ok((need, self.try_complete()))
     }
 
     /// Inline manifests for these are dropped, not an error.
@@ -308,62 +304,52 @@ impl ActiveBuild {
             drop(tx);
             task.await??;
             self.tmp_dir_done = true;
-            return self.try_complete().await;
+            return Ok(self.try_complete());
         }
         Ok(StagingStatus::InProgress)
     }
 
-    /// Wait for the dispatched imports. Imports that failed on corrupt
-    /// or vanished chunks are staged again instead of failing the
-    /// build. Returns the Need of that retry.
-    async fn collect_imports(&mut self) -> Result<Option<Need>> {
-        let mut failed = Vec::new();
-        let mut bad_chunks = 0;
-        let mut error = None;
-        for (path, handle) in mem::take(&mut self.imports) {
-            let (state, bad) = handle.finish().await?;
-            if let ImportState::Failed(e) = state {
-                bad_chunks += bad.len();
-                error.get_or_insert(e);
-                failed.push(path);
-                continue;
-            }
-            self.chunks.forget_path(&path);
-            self.infos.remove(&path);
-            self.settle(&path, ClaimState::Done);
-            self.inputs.insert(path);
-        }
-        let Some(e) = error else {
-            return Ok(None);
+    /// A finished import makes the path an input and lets parked
+    /// referrers dispatch. One that failed on corrupt or vanished
+    /// chunks is staged again instead of failing the build. Returns the
+    /// Need of that retry.
+    async fn import_finished(&mut self, path: &str, handle: ImportHandle) -> Result<Option<Need>> {
+        let Some((res, bad)) = handle.finish().await? else {
+            return Err(err_msg(format!("woken for unfinished import {path}")));
         };
-        // Without a bad chunk to blame a retry would fail the same way.
-        if bad_chunks == 0 || self.resend_rounds >= MAX_RESEND_ROUNDS {
-            return Err(err_msg(e));
+        if let Err(e) = res {
+            // Without a bad chunk to blame a retry would fail the same way.
+            if bad.is_empty() || self.resend_rounds >= MAX_RESEND_ROUNDS {
+                return Err(err_msg(e));
+            }
+            self.resend_rounds += 1;
+            tracing::warn!(
+                path,
+                bad_chunks = bad.len(),
+                "staging failed import again: {e}"
+            );
+            return self.restage(vec![path.to_string()]).await;
         }
-        self.resend_rounds += 1;
-        tracing::warn!(
-            paths = failed.len(),
-            bad_chunks,
-            "staging failed imports again: {e}"
-        );
-        self.restage(failed).await
+        self.chunks.forget_path(path);
+        self.infos.remove(path);
+        self.settle(path, ClaimState::Done);
+        self.inputs.insert(path.to_string());
+        self.retry_parked().await?;
+        Ok(None)
     }
 
     /// Staging finishes once the tmp dir is unpacked, every pending
     /// path is imported and every waited-on claim settled.
-    async fn try_complete(&mut self) -> Result<StagingStatus> {
-        if !self.tmp_dir_done || !self.pending.is_empty() {
-            return Ok(StagingStatus::InProgress);
+    fn try_complete(&self) -> StagingStatus {
+        let busy = !self.tmp_dir_done
+            || !self.pending.is_empty()
+            || !self.imports.is_empty()
+            || !self.waits.is_empty();
+        if busy {
+            StagingStatus::InProgress
+        } else {
+            StagingStatus::Ready
         }
-        while !self.imports.is_empty() {
-            if let Some(need) = self.collect_imports().await? {
-                return Ok(StagingStatus::NeedResend(need));
-            }
-        }
-        if !self.pending.is_empty() || !self.waits.is_empty() {
-            return Ok(StagingStatus::InProgress);
-        }
-        Ok(StagingStatus::Ready)
     }
 
     fn input_list(&self) -> Vec<String> {
