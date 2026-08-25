@@ -83,10 +83,6 @@
         // {
           treefmt = (treefmtFor pkgs).config.build.check self;
 
-          # Inductive proofs of the Quint models.
-          spec-staging = specCheck "staging";
-          spec-protocol = specCheck "protocol";
-
           # nixbot pushes this closure, so downstream CI fetches the
           # input sources from cache.thalheim.io instead of GitHub.
           flake-inputs = pkgs.linkFarm "flake-inputs" (
@@ -97,6 +93,10 @@
           );
         }
         // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          # Inductive proofs of the Quint models. Linux only: Apalache
+          # binds a fixed port, which unsandboxed darwin builds share.
+          spec-staging = specCheck "staging";
+          spec-protocol = specCheck "protocol";
           nixos-test-builds = pkgs.testers.runNixOSTest (
             import ./nix/test.nix {
               tribuchet = self.packages.x86_64-linux.default;
