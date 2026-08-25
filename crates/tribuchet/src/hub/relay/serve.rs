@@ -27,13 +27,14 @@ use crate::proto::{ChunkFrame, HubMessage, hub_message};
 pub(super) async fn serve_need(
     cache: &Arc<ChunkCache>,
     job: &Job,
-    sent: &[(Info, Recipe)],
+    sent: &[Arc<(Info, Recipe)>],
     needed: HashSet<Hash>,
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
 ) -> Result<()> {
     let t0 = Instant::now();
     let mut served: HashSet<Hash> = HashSet::new();
-    for (info, recipe) in sent {
+    for e in sent {
+        let (info, recipe) = &**e;
         let todo: HashSet<Hash> = recipe
             .iter()
             .map(|(h, _)| *h)

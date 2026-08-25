@@ -1,9 +1,10 @@
 //! Input staging: manifests inline in the assignment where cheap, late
 //! manifests as recipes complete, chunks on every Need.
 
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::future::pending;
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use futures_util::StreamExt as _;
 use futures_util::stream::FuturesUnordered;
@@ -46,6 +47,7 @@ impl WorkerSession {
 }
 
 type Computing<'a> = Pin<Box<dyn Future<Output = Result<(Info, Recipe)>> + Send + 'a>>;
+type Serving<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 
 pub(super) struct Staging<'a> {
     state: &'a HubState,
@@ -53,9 +55,13 @@ pub(super) struct Staging<'a> {
     sess: &'a WorkerSession,
     offered: HashSet<&'a str>,
     /// Manifests sent, in send order.
-    sent: Vec<(Info, Recipe)>,
+    sent: Vec<Arc<(Info, Recipe)>>,
     computing: HashSet<String>,
     tasks: FuturesUnordered<Computing<'a>>,
+    /// Chunk requests are answered one at a time while the relay keeps
+    /// reading the worker, so neither side blocks on a full peer.
+    queued: VecDeque<HashSet<Hash>>,
+    serving: Option<Serving<'a>>,
     first_need: bool,
 }
 
@@ -69,6 +75,8 @@ impl<'a> Staging<'a> {
             sent: Vec::new(),
             computing: HashSet::new(),
             tasks: FuturesUnordered::new(),
+            queued: VecDeque::new(),
+            serving: None,
             first_need: true,
         }
     }
@@ -93,7 +101,7 @@ impl<'a> Staging<'a> {
                 continue;
             };
             manifests.insert(info.store_path.clone(), manifest("", &info, &recipe));
-            self.sent.push((info, recipe));
+            self.sent.push(Arc::new((info, recipe)));
         }
         Ok(self
             .job
@@ -109,21 +117,57 @@ impl<'a> Staging<'a> {
             .collect())
     }
 
-    pub(super) fn has_computing(&self) -> bool {
-        !self.tasks.is_empty()
+    pub(super) fn busy(&self) -> bool {
+        !self.tasks.is_empty() || self.serving.is_some()
     }
 
-    /// Next late manifest, once its recipe is computed.
-    pub(super) async fn next_manifest(&mut self) -> Result<Manifest> {
-        let (info, recipe) = self
-            .tasks
-            .next()
+    /// Send the next late manifest or finish answering a Need,
+    /// whichever comes first. Cancel-safe.
+    pub(super) async fn progress(
+        &mut self,
+        out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
+    ) -> Result<()> {
+        tokio::select! {
+            Some(r) = self.tasks.next(), if !self.tasks.is_empty() => {
+                let (info, recipe) = r?;
+                let m = manifest(&self.job.id, &info, &recipe);
+                self.computing.remove(&info.store_path);
+                self.sent.push(Arc::new((info, recipe)));
+                send(out_tx, hub_message::Msg::Manifest(m)).await
+            }
+            r = poll_opt(&mut self.serving), if self.serving.is_some() => {
+                self.serving = None;
+                r?;
+                self.serve_next(out_tx);
+                Ok(())
+            }
+        }
+    }
+
+    fn serve_next(&mut self, out_tx: &mpsc::Sender<Result<HubMessage, Status>>) {
+        let Some(needed) = self.queued.pop_front() else {
+            return;
+        };
+        let cache = &self.state.chunks;
+        let job = self.job;
+        let sess = self.sess;
+        // Snapshot suffices: a Need only names chunks of manifests
+        // sent before it.
+        let sent = self.sent.clone();
+        let out_tx = out_tx.clone();
+        self.serving = Some(Box::pin(async move {
+            let _permit = sess.serving.acquire().await.expect("never closed");
+            serve_need(cache, job, &sent, needed, &out_tx).await?;
+            send(
+                &out_tx,
+                hub_message::Msg::Chunk(ChunkFrame {
+                    build_id: job.id.clone(),
+                    eof: true,
+                    ..Default::default()
+                }),
+            )
             .await
-            .ok_or_else(|| err_msg("no manifest computing"))??;
-        let m = manifest(&self.job.id, &info, &recipe);
-        self.computing.remove(&info.store_path);
-        self.sent.push((info, recipe));
-        Ok(m)
+        }));
     }
 
     pub(super) async fn handle_need(
@@ -151,9 +195,9 @@ impl<'a> Staging<'a> {
         // that failed) gets its manifest re-sent.
         let mut new = Vec::new();
         for p in n.paths {
-            if let Some((info, recipe)) = self.sent.iter().find(|(i, _)| i.store_path == p) {
+            if let Some(e) = self.sent.iter().find(|e| e.0.store_path == p) {
                 if !first {
-                    let m = manifest(&self.job.id, info, recipe);
+                    let m = manifest(&self.job.id, &e.0, &e.1);
                     send(out_tx, hub_message::Msg::Manifest(m)).await?;
                 }
             } else if self.computing.insert(p.clone()) {
@@ -170,18 +214,12 @@ impl<'a> Staging<'a> {
         if n.hashes.is_empty() {
             return Ok(());
         }
-        let needed: HashSet<Hash> = parse_hashes(&n.hashes)?.into_iter().collect();
-        let _permit = self.sess.serving.acquire().await.expect("never closed");
-        serve_need(cache, self.job, &self.sent, needed, out_tx).await?;
-        send(
-            out_tx,
-            hub_message::Msg::Chunk(ChunkFrame {
-                build_id: self.job.id.clone(),
-                eof: true,
-                ..Default::default()
-            }),
-        )
-        .await
+        self.queued
+            .push_back(parse_hashes(&n.hashes)?.into_iter().collect());
+        if self.serving.is_none() {
+            self.serve_next(out_tx);
+        }
+        Ok(())
     }
 
     fn update_known(&self, missing: &[String]) {
@@ -202,6 +240,13 @@ impl<'a> Staging<'a> {
                 known.remove(p);
             }
         }
+    }
+}
+
+async fn poll_opt(f: &mut Option<Serving<'_>>) -> Result<()> {
+    match f {
+        Some(f) => f.await,
+        None => pending().await,
     }
 }
 

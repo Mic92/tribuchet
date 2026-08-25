@@ -76,8 +76,8 @@ pub(super) async fn run_job(
 
     loop {
         let m = tokio::select! {
-            m = staging.next_manifest(), if staging.has_computing() => {
-                send(out_tx, hub_message::Msg::Manifest(m?)).await?;
+            r = staging.progress(out_tx), if staging.busy() => {
+                r?;
                 continue;
             }
             _ = abandon_check.tick(), if !cancel_sent => {
