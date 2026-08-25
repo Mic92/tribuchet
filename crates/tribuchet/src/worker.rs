@@ -37,7 +37,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use harmonia_store_remote::DaemonClient;
-use harmonia_utils_signature::SecretKey;
 use tokio::sync::{Semaphore, mpsc};
 
 use caps::host_system;
@@ -92,14 +91,11 @@ struct WorkerCtx {
     /// abort them. Keyed like the registry, since a resumed build's
     /// build_id changes while it runs.
     cancelled: Mutex<HashSet<String>>,
-    /// Input paths a build is currently importing. Other builds defer
-    /// to that import instead of requesting the same NAR again.
-    staging_inflight: Mutex<HashSet<String>>,
+    /// Input paths some build is importing. Other builds wait on it.
+    claims: build::Claims,
     /// Parallel daemon connections importing input NARs per build.
     import_jobs: usize,
-    /// Input chunk store. None when disabled or failed to open, in
-    /// which case inputs arrive as whole NARs.
-    chunks: Option<Arc<Mutex<ChunkStore>>>,
+    chunks: Arc<Mutex<ChunkStore>>,
 }
 
 impl WorkerCtx {
@@ -181,9 +177,6 @@ impl WorkerCtx {
     }
 }
 
-/// Load or create the worker's NAR signing key, stored in Nix's
-/// "name:base64" secret key format (nix-store --generate-binary-cache-key)
-/// so operators can inspect it with standard tooling.
 /// 1-minute load average for the heartbeat; informational only, the
 /// hub does not schedule on it.
 fn loadavg1() -> f64 {
@@ -203,28 +196,6 @@ fn hostname() -> String {
         "worker".into()
     } else {
         nodename.into_owned()
-    }
-}
-
-fn load_signing_key(state_dir: &Path) -> Result<SecretKey> {
-    let path = state_dir.join("signing.key");
-    if path.exists() {
-        fs::read_to_string(&path)
-            .map_err(io_ctx("reading", &path))?
-            .trim()
-            .parse::<SecretKey>()
-            .map_err(|e| {
-                err_msg(format!(
-                    "{}: {e}; expected Nix secret key format (name:base64); \
-                     delete the file to generate a fresh key",
-                    path.display()
-                ))
-            })
-    } else {
-        let key = SecretKey::generate(format!("{}-1", hostname()))
-            .map_err(|e| err_msg(format!("generating signing key: {e}")))?;
-        fsutil::write_secret(&path, format!("{key}\n").as_bytes())?;
-        Ok(key)
     }
 }
 
@@ -279,19 +250,11 @@ pub fn run(opts: WorkerConfig) -> Result<()> {
 }
 
 /// Validate the emulate map and register its systems.
-/// A store that fails to open costs dedup, not the worker.
-fn open_chunk_store(opts: &WorkerConfig) -> Option<Arc<Mutex<ChunkStore>>> {
-    if opts.chunk_store_bytes == 0 {
-        return None;
-    }
+fn open_chunk_store(opts: &WorkerConfig) -> Result<Arc<Mutex<ChunkStore>>> {
     let dir = opts.state_dir.join("chunks");
-    match ChunkStore::open(dir.clone(), opts.chunk_store_bytes) {
-        Ok(store) => Some(Arc::new(Mutex::new(store))),
-        Err(e) => {
-            tracing::warn!(error = %e, dir = %dir.display(), "chunk store disabled");
-            None
-        }
-    }
+    let store = ChunkStore::open(dir.clone(), opts.chunk_store_bytes)
+        .map_err(io_ctx("opening chunk store", &dir))?;
+    Ok(Arc::new(Mutex::new(store)))
 }
 
 fn resolve_emulators(opts: &mut WorkerConfig) -> Result<HashMap<String, PathBuf>> {
@@ -327,8 +290,6 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
     fs::set_permissions(&builds_dir, fs::Permissions::from_mode(0o711))
         .map_err(io_ctx("setting permissions on", &builds_dir))?;
     sweep_state_dir(&opts.state_dir);
-    // Arc: SecretKey is not Clone (zeroized on drop); build threads share it.
-    let signing_key = Arc::new(load_signing_key(&opts.state_dir)?);
     let mut opts = opts;
     if opts.systems.is_empty() {
         opts.systems.push(host_system());
@@ -375,12 +336,12 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
     let ctx = Arc::new(WorkerCtx {
         state_dir: opts.state_dir.clone(),
         sandbox_bin_sh: opts.sandbox_bin_sh.clone(),
-        secret_paths: vec![opts.key.clone(), opts.state_dir.join("signing.key")],
+        secret_paths: vec![opts.key.clone()],
         slots: Arc::new(Semaphore::new(opts.max_jobs.max(1) as usize)),
         import_jobs: opts.import_jobs.max(1) as usize,
-        chunks: open_chunk_store(&opts),
+        chunks: open_chunk_store(&opts)?,
         cancelled: Mutex::new(HashSet::new()),
-        staging_inflight: Mutex::new(HashSet::new()),
+        claims: build::Claims::default(),
         resumable: Mutex::new(HashMap::new()),
         emulators,
         fod_isolation,
@@ -399,14 +360,14 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
     sd::spawn_watchdog();
     spawn_resumable_reaper(ctx.clone());
     spawn_handover();
-    adopt_builds(&ctx, &signing_key).await;
+    adopt_builds(&ctx).await;
     sweep_orphaned_agent_builds(&ctx);
 
     // Reconnect with backoff: a hub restart must not drain the fleet.
     let mut backoff = Duration::from_secs(1);
     loop {
         let started = Instant::now();
-        match session::session(&opts, &signing_key, &ctx).await {
+        match session::session(&opts, &ctx).await {
             Ok(()) => unreachable!("session only returns on error"),
             Err(e) => tracing::warn!("hub session ended: {e:#}"),
         }

@@ -1,7 +1,6 @@
 //! Hub bootstrap: sockets, TLS, auth configuration and server startup.
 
 use std::fs;
-use std::io;
 use std::net::SocketAddr;
 use std::os::unix::fs as unix_fs;
 #[cfg(target_os = "macos")]
@@ -12,7 +11,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use harmonia_utils_signature::PublicKey;
 use nix::unistd::Group;
 use rustix::fs::Mode;
 use rustix::process::umask;
@@ -94,38 +92,6 @@ fn check_attach_socket_dir(socket: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Optional operator pinning of worker signing keys (one Nix-format
-/// "name:base64" public key per line, '#' comments; same syntax as
-/// nix.conf trusted-public-keys). Without it, output signatures only
-/// authenticate the TLS channel, not a particular worker.
-fn load_trusted_keys(config_dir: &Path) -> Result<Option<Arc<Vec<PublicKey>>>> {
-    match fs::read_to_string(config_dir.join("trusted-signing-keys")) {
-        Ok(data) => {
-            let mut keys = Vec::new();
-            for line in data.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                keys.push(line.parse::<PublicKey>().map_err(|e| {
-                    err_msg(format!("bad key in trusted-signing-keys: {line}: {e}"))
-                })?);
-            }
-            tracing::info!(count = keys.len(), "worker signing keys pinned");
-            Ok(Some(Arc::new(keys)))
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            tracing::warn!(
-                "no trusted-signing-keys file in {}; accepting any signing key from \
-                 transport-authenticated workers",
-                config_dir.display()
-            );
-            Ok(None)
-        }
-        Err(e) => Err(err_ctx("reading trusted-signing-keys")(e)),
-    }
-}
-
 fn configure_auth(
     cfg: &HubConfig,
     config_dir: &Path,
@@ -171,7 +137,7 @@ async fn run_async(cfg: HubConfig) -> Result<()> {
     let socket = cfg.socket.as_path();
     let listen = cfg.listen.as_str();
     let config_dir = cfg.config_dir.as_path();
-    let chunks = open_chunk_cache(&cfg);
+    let chunks = open_chunk_cache(&cfg)?;
 
     let state = Arc::new(HubState::new(
         Duration::from_secs(cfg.worker_grace_secs),
@@ -180,7 +146,6 @@ async fn run_async(cfg: HubConfig) -> Result<()> {
     ));
 
     let (tls, peer_auth) = configure_auth(&cfg, config_dir)?;
-    let trusted_keys = load_trusted_keys(config_dir)?;
 
     // Listeners come from systemd socket activation when available
     // (they survive hub restarts; clients queue instead of getting
@@ -215,7 +180,6 @@ async fn run_async(cfg: HubConfig) -> Result<()> {
             WorkerHubServer::new(WorkerSvc {
                 state: state.clone(),
                 auth: Arc::new(peer_auth),
-                trusted_keys,
             })
             .max_decoding_message_size(MAX_MSG_SIZE)
             .max_encoding_message_size(MAX_MSG_SIZE),
@@ -279,20 +243,12 @@ async fn run_async(cfg: HubConfig) -> Result<()> {
     }
 }
 
-/// A cache that fails to open costs re-compression, not the hub.
-fn open_chunk_cache(cfg: &HubConfig) -> Option<Arc<ChunkCache>> {
-    if cfg.chunk_cache_bytes == 0 {
-        return None;
-    }
+fn open_chunk_cache(cfg: &HubConfig) -> Result<Arc<ChunkCache>> {
     let dir = cfg
         .chunk_cache_dir
         .clone()
         .unwrap_or_else(default_chunk_cache_dir);
-    match ChunkCache::open(dir.clone(), cfg.chunk_cache_bytes) {
-        Ok(cache) => Some(Arc::new(cache)),
-        Err(e) => {
-            tracing::warn!(error = %e, dir = %dir.display(), "chunk cache disabled");
-            None
-        }
-    }
+    let cache = ChunkCache::open(dir.clone(), cfg.chunk_cache_bytes)
+        .map_err(io_ctx("opening chunk cache", &dir))?;
+    Ok(Arc::new(cache))
 }

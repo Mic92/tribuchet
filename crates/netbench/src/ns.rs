@@ -3,10 +3,11 @@
 //! and the worker (a private netns anchored on a holder process).
 
 use std::ffi::CString;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::ptr;
 
@@ -154,6 +155,93 @@ pub fn join_worker(ns: &WorkerNs, cmd: &mut Command, store_root: &str) {
             Ok(())
         });
     }
+}
+
+/// pre_exec: overlay a scratch upper dir on /nix/store so attach can
+/// unpack the output without touching the host store.
+pub fn writable_store(cmd: &mut Command, wd: &Path) -> io::Result<()> {
+    let upper = wd.join("upper");
+    let work = wd.join("work");
+    fs::create_dir_all(&upper)?;
+    fs::create_dir_all(&work)?;
+    let opts = CString::new(format!(
+        "lowerdir=/nix/store,upperdir={},workdir={},userxattr",
+        upper.display(),
+        work.display()
+    ))
+    .unwrap();
+    let dst = CString::new("/nix/store").unwrap();
+    let ty = CString::new("overlay").unwrap();
+    let root = CString::new("/").unwrap();
+    // SAFETY: only async-signal-safe syscalls.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::unshare(libc::CLONE_NEWNS) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::mount(
+                ptr::null(),
+                root.as_ptr(),
+                ptr::null(),
+                libc::MS_REC | libc::MS_PRIVATE,
+                ptr::null(),
+            ) != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::mount(
+                ty.as_ptr(),
+                dst.as_ptr(),
+                ty.as_ptr(),
+                0,
+                opts.as_ptr().cast(),
+            ) != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
+fn cgroup_dir(name: &str) -> io::Result<PathBuf> {
+    let own = fs::read_to_string("/proc/self/cgroup")?;
+    let rel = own
+        .lines()
+        .find_map(|l| l.strip_prefix("0::/"))
+        .ok_or_else(|| io::Error::other("no cgroup2 entry"))?;
+    let base = Path::new("/sys/fs/cgroup").join(rel);
+    let dir = base
+        .parent()
+        .filter(|_| base.ends_with("harness"))
+        .unwrap_or(&base)
+        .join(name);
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Move this process into a leaf cgroup of the delegated scope so
+/// siblings can enable controllers.
+pub fn enter_cgroup_self(name: &str) -> io::Result<()> {
+    fs::write(cgroup_dir(name)?.join("cgroup.procs"), "0")
+}
+
+/// pre_exec: start the child in its own sibling cgroup.
+pub fn enter_cgroup(cmd: &mut Command, name: &str) -> io::Result<()> {
+    let procs = CString::new(cgroup_dir(name)?.join("cgroup.procs").to_str().unwrap()).unwrap();
+    // SAFETY: only async-signal-safe syscalls.
+    unsafe {
+        cmd.pre_exec(move || {
+            let fd = libc::open(procs.as_ptr(), libc::O_WRONLY);
+            if fd < 0 || libc::write(fd, b"0".as_ptr().cast(), 1) != 1 {
+                return Err(io::Error::last_os_error());
+            }
+            libc::close(fd);
+            Ok(())
+        });
+    }
+    Ok(())
 }
 
 impl Drop for WorkerNs {

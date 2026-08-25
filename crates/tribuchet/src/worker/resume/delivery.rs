@@ -1,24 +1,22 @@
 //! Finished-result persistence and delivery: results survive worker
 //! restarts and dropped hub sessions until the hub acknowledges them.
 
+use std::collections::HashSet;
 use std::fs;
-use std::io::Read;
+use std::os::unix::fs::FileExt;
 use std::panic;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use harmonia_utils_signature::SecretKey;
 use tokio::sync::mpsc;
 
 use super::BuildState;
-use crate::chunkio::CHUNK_SIZE;
+use crate::chunker::parse_hashes;
+use crate::chunkstore::Hash;
 use crate::errors::{Result, chain, err_msg};
 use crate::fsutil::io_ctx;
-use crate::proto::{
-    BuildResult, ExtraPath, NarTransfer, OutputSignature, PathInfoMsg, WorkerMessage,
-    worker_message,
-};
+use crate::proto::{BuildResult, ChunkFrame, Manifest, PathInfoMsg, WorkerMessage, worker_message};
 use crate::worker::build::ActiveBuild;
 use crate::worker::logtail::LogTail;
 use crate::worker::{WorkerCtx, msg, remove_build_dir};
@@ -106,21 +104,35 @@ pub(in crate::worker) struct FinishedBuild {
     /// Recursive-nix closure-delta paths the builder registered with
     /// the worker daemon; empty for non-recursive builds.
     pub(in crate::worker) extras: Vec<PackedExtra>,
-    /// Build dir holding the packed NARs; removed after delivery.
+    /// Build dir holding the chunk frames, removed after delivery.
     pub(in crate::worker) dir: PathBuf,
     pub(in crate::worker) finished_at: Instant,
 }
 
-/// One closure-delta path: PathInfo from the worker daemon plus a
-/// PackedOutput-shaped signed envelope over `path:hex(nar_sha256)`.
+/// One NAR chunk as a zstd frame at `off..off+len` in a frames file.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(in crate::worker) struct OutChunk {
+    pub(in crate::worker) hash: Hash,
+    pub(in crate::worker) size: u32,
+    pub(in crate::worker) off: u64,
+    pub(in crate::worker) len: u32,
+}
+
+fn recipe(chunks: &[OutChunk]) -> (Vec<u8>, Vec<u64>) {
+    let hashes = chunks.iter().flat_map(|c| c.hash).collect();
+    let sizes = chunks.iter().map(|c| u64::from(c.size)).collect();
+    (hashes, sizes)
+}
+
+/// One closure-delta path: PathInfo from the worker daemon plus its chunks.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(in crate::worker) struct PackedExtra {
     /// Absolute store path of the registered extra.
     pub(in crate::worker) path: String,
-    pub(in crate::worker) nar_file: PathBuf,
+    pub(in crate::worker) frames_file: PathBuf,
+    pub(in crate::worker) chunks: Vec<OutChunk>,
     pub(in crate::worker) nar_sha256: Vec<u8>,
     pub(in crate::worker) nar_size: u64,
-    pub(in crate::worker) signature: String,
     pub(in crate::worker) references: Vec<String>,
     /// Existing daemon signatures (`name:base64`).
     pub(in crate::worker) sigs: Vec<String>,
@@ -133,9 +145,8 @@ pub(in crate::worker) struct PackedExtra {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(in crate::worker) struct PackedOutput {
     pub(in crate::worker) scratch: String,
-    pub(in crate::worker) nar_file: PathBuf,
-    pub(in crate::worker) nar_sha256: Vec<u8>,
-    pub(in crate::worker) signature: String,
+    pub(in crate::worker) frames_file: PathBuf,
+    pub(in crate::worker) chunks: Vec<OutChunk>,
     /// Store paths the NAR references (intersection with the
     /// candidate set: inputs, sibling outputs, proxy-added paths).
     #[serde(default)]
@@ -189,29 +200,26 @@ fn persist_finished(key: &str, build_id: &str, fin: &FinishedBuild) {
 pub(in crate::worker) fn execute_to_finished(
     build: &ActiveBuild,
     out_tx: &mpsc::Sender<WorkerMessage>,
-    signing_key: &SecretKey,
     timeout: Duration,
 ) -> FinishedBuild {
-    panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        build.execute(out_tx, signing_key, timeout)
-    }))
-    .unwrap_or_else(|_| Err(err_msg("build execution panicked")))
-    .unwrap_or_else(|e| {
-        let e = chain(&e);
-        tracing::error!("build execution failed: {e}");
-        FinishedBuild {
-            exit_code: 1,
-            error: e,
-            outputs: vec![],
-            extras: vec![],
-            dir: build.dir.clone(),
-            finished_at: Instant::now(),
-        }
-    })
+    panic::catch_unwind(panic::AssertUnwindSafe(|| build.execute(out_tx, timeout)))
+        .unwrap_or_else(|_| Err(err_msg("build execution panicked")))
+        .unwrap_or_else(|e| {
+            let e = chain(&e);
+            tracing::error!("build execution failed: {e}");
+            FinishedBuild {
+                exit_code: 1,
+                error: e,
+                outputs: vec![],
+                extras: vec![],
+                dir: build.dir.clone(),
+                finished_at: Instant::now(),
+            }
+        })
 }
 
-/// Send a finished build's result and output NARs. Blocking; runs on
-/// a blocking thread.
+/// Send a finished build's result. The hub follows up with
+/// NeedChunks. Blocking.
 fn deliver(
     fin: &FinishedBuild,
     build_id: &str,
@@ -223,64 +231,113 @@ fn deliver(
         extras: fin
             .extras
             .iter()
-            .map(|e| ExtraPath {
-                info: Some(PathInfoMsg {
-                    build_id: build_id.into(),
+            .map(|e| {
+                let (hashes, sizes) = recipe(&e.chunks);
+                Manifest {
+                    build_id: String::new(),
                     store_path: e.path.clone(),
-                    nar_sha256: e.nar_sha256.clone(),
-                    nar_size: e.nar_size,
-                    references: e.references.clone(),
-                    signatures: e.sigs.clone(),
-                    deriver: e.deriver.clone(),
-                    ca: e.ca.clone(),
-                }),
-                signature: e.signature.clone(),
+                    hashes,
+                    sizes,
+                    info: Some(PathInfoMsg {
+                        nar_sha256: e.nar_sha256.clone(),
+                        nar_size: e.nar_size,
+                        references: e.references.clone(),
+                        signatures: e.sigs.clone(),
+                        deriver: e.deriver.clone(),
+                        ca: e.ca.clone(),
+                    }),
+                }
             })
             .collect(),
         outputs: fin
             .outputs
             .iter()
-            .map(|o| OutputSignature {
-                store_path: o.scratch.clone(),
-                nar_sha256: o.nar_sha256.clone(),
-                signature: o.signature.clone(),
+            .map(|o| {
+                let (hashes, sizes) = recipe(&o.chunks);
+                Manifest {
+                    build_id: String::new(),
+                    store_path: o.scratch.clone(),
+                    info: None,
+                    hashes,
+                    sizes,
+                }
             })
             .collect(),
         error: fin.error.clone(),
     })))?;
-    for o in &fin.outputs {
-        stream_nar(out_tx, build_id, &o.scratch, &o.nar_file)?;
-    }
-    for e in &fin.extras {
-        stream_nar(out_tx, build_id, &e.path, &e.nar_file)?;
-    }
     Ok(())
 }
 
-/// Stream one NAR file to the hub in chunks, followed by an eof marker.
-fn stream_nar(
-    out_tx: &mpsc::Sender<WorkerMessage>,
+/// Answer the hub's Need: every needed chunk once, in recipe
+/// order across outputs then extras, then eof. Blocking.
+fn send_chunks(
+    fin: &FinishedBuild,
     build_id: &str,
-    store_path: &str,
-    nar_file: &Path,
+    mut needed: HashSet<Hash>,
+    out_tx: &mpsc::Sender<WorkerMessage>,
 ) -> Result<()> {
-    let mut f = fs::File::open(nar_file).map_err(io_ctx("opening", nar_file))?;
-    let mut buf = vec![0u8; CHUNK_SIZE];
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
+    let files = fin
+        .outputs
+        .iter()
+        .map(|o| (&o.frames_file, &o.chunks))
+        .chain(fin.extras.iter().map(|e| (&e.frames_file, &e.chunks)));
+    for (path, chunks) in files {
+        let f = fs::File::open(path).map_err(io_ctx("opening", path))?;
+        for c in chunks {
+            if !needed.remove(&c.hash) {
+                continue;
+            }
+            let mut frame = vec![0u8; c.len as usize];
+            f.read_exact_at(&mut frame, c.off)
+                .map_err(io_ctx("reading", path))?;
+            out_tx.blocking_send(msg(worker_message::Msg::Chunk(ChunkFrame {
+                build_id: build_id.into(),
+                hash: c.hash.to_vec(),
+                zstd: frame,
+                eof: false,
+            })))?;
         }
-        out_tx.blocking_send(msg(worker_message::Msg::Nar(NarTransfer::chunk(
-            build_id,
-            store_path,
-            buf[..n].to_vec(),
-        ))))?;
     }
-    out_tx.blocking_send(msg(worker_message::Msg::Nar(NarTransfer::eof(
-        build_id, store_path,
-    ))))?;
+    if !needed.is_empty() {
+        return Err(err_msg("hub asked for chunks outside the result recipes"));
+    }
+    out_tx.blocking_send(msg(worker_message::Msg::Chunk(ChunkFrame {
+        build_id: build_id.into(),
+        eof: true,
+        ..Default::default()
+    })))?;
     Ok(())
+}
+
+/// Serve a NeedChunks for a finished build on a blocking thread. A
+/// failure only logs: the hub times the session out and the result
+/// is redelivered on resume.
+pub(in crate::worker) fn serve_chunks(
+    ctx: &Arc<WorkerCtx>,
+    build_id: String,
+    hashes: &[u8],
+    out_tx: mpsc::Sender<WorkerMessage>,
+) {
+    let fin = {
+        let map = ctx.resumable.lock().unwrap();
+        map.values()
+            .find(|e| e.build_id == build_id)
+            .and_then(|e| e.finished.clone())
+    };
+    let Some(fin) = fin else {
+        tracing::warn!(id = build_id, "chunk request for an unknown build");
+        return;
+    };
+    let Ok(needed) = parse_hashes(hashes) else {
+        tracing::warn!(id = build_id, "misaligned chunk request");
+        return;
+    };
+    let needed: HashSet<Hash> = needed.into_iter().collect();
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = send_chunks(&fin, &build_id, needed, &out_tx) {
+            tracing::warn!(id = build_id, "sending output chunks failed: {}", chain(&e));
+        }
+    });
 }
 
 /// Drop a build whose result the hub confirmed: only now is it safe
@@ -332,7 +389,7 @@ pub(in crate::worker) fn try_deliver(ctx: &Arc<WorkerCtx>, key: &str) {
     }
     match result {
         Ok(()) => {
-            tracing::info!(id = build_id, "build result sent, awaiting ack");
+            tracing::info!(id = build_id, "build result sent, awaiting chunk request");
         }
         Err(e) => {
             tracing::warn!(

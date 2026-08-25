@@ -346,11 +346,10 @@ mod tests {
     use super::*;
 
     /// zstd-compressed NAR of a single regular file, as the hub streams it.
-    async fn zstd_nar_of_file(dir: &Path, body: &[u8]) -> Vec<u8> {
+    fn zstd_nar_of_file(dir: &Path, body: &[u8]) -> Vec<u8> {
         let src = dir.join("src");
         fs::write(&src, body).unwrap();
-        let mut nar = Vec::new();
-        nar::pack(&src, &mut nar).await.unwrap();
+        let nar = nar::pack::to_vec(&src).unwrap();
         zstd::encode_all(&nar[..], 3).unwrap()
     }
 
@@ -392,7 +391,7 @@ mod tests {
         fs::create_dir(&out).unwrap();
         fs::write(out.join("stale"), b"junk").unwrap();
 
-        let chunk = zstd_nar_of_file(dir.path(), b"fresh").await;
+        let chunk = zstd_nar_of_file(dir.path(), b"fresh");
         let mut unpackers = HashMap::default();
         deliver(&mut unpackers, &out_str, chunk).await.unwrap();
 

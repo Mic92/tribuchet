@@ -12,7 +12,6 @@ use std::sync::atomic::{self, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use harmonia_utils_signature::SecretKey;
 use tokio::sync::mpsc;
 
 use super::{ActiveBuild, pack_outputs_and_extras, unix_now};
@@ -38,7 +37,6 @@ impl ActiveBuild {
     pub(in crate::worker) fn execute(
         &self,
         out_tx: &mpsc::Sender<WorkerMessage>,
-        signing_key: &SecretKey,
         timeout: Duration,
     ) -> Result<FinishedBuild> {
         #[cfg(target_os = "macos")]
@@ -51,7 +49,7 @@ impl ActiveBuild {
             self.ctx.agents.acquire().ok_or_else(|| {
                 err_msg("no free build agent (max-jobs exceeds the agent count?)")
             })?;
-        let result = self.execute_on_agent(&socket, out_tx, signing_key, timeout);
+        let result = self.execute_on_agent(&socket, out_tx, timeout);
         self.ctx.agents.release(socket);
         result
     }
@@ -60,7 +58,6 @@ impl ActiveBuild {
         &self,
         socket: &Path,
         out_tx: &mpsc::Sender<WorkerMessage>,
-        signing_key: &SecretKey,
         timeout: Duration,
     ) -> Result<FinishedBuild> {
         let a = &self.assignment;
@@ -75,7 +72,7 @@ impl ActiveBuild {
             None,
             sandbox::SandboxSpec {
                 outputs: outputs.clone(),
-                store_inputs: self.inputs.clone(),
+                store_inputs: self.input_list(),
                 recursive_nix: self.ctx.recursive_nix,
                 ..sandbox::SandboxSpec::default()
             },
@@ -154,14 +151,7 @@ impl ActiveBuild {
             agent_socket: socket.to_path_buf(),
         };
         resume.persist(&self.dir)?;
-        let fin = supervise_agent(
-            &self.ctx,
-            &resume,
-            self.dir.clone(),
-            socket,
-            build,
-            signing_key,
-        );
+        let fin = supervise_agent(&self.ctx, &resume, self.dir.clone(), socket, build);
         log_done.store(true, Ordering::Relaxed);
         let _ = tailer.join();
         Ok(fin)
@@ -177,7 +167,7 @@ impl ActiveBuild {
         let spec = sandbox::prepare(
             a,
             &self.dir,
-            &self.inputs,
+            &self.input_list(),
             &sandbox::PrepareOpts {
                 bin_sh: self.ctx.sandbox_bin_sh.as_deref(),
                 secrets: &self.ctx.secret_paths,
@@ -210,7 +200,6 @@ pub(in crate::worker) fn supervise_agent(
     dir: PathBuf,
     socket: &Path,
     build: agents::AgentBuild,
-    signing_key: &SecretKey,
 ) -> FinishedBuild {
     let log_path = dir.join("build.log");
     // The exit notice arrives on the lease connection. Wait for it on
@@ -269,7 +258,6 @@ pub(in crate::worker) fn supervise_agent(
                     &st.spec,
                     None,
                     deadline,
-                    signing_key,
                     &st.build_id,
                 ))
             });

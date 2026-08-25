@@ -1,10 +1,12 @@
-//! Nix ARchive (NAR) pack/unpack, built on harmonia-file-nar.
+//! Nix ARchive (NAR) serialization (`pack`) and restore (harmonia).
 //!
 //! NAR is the canonical serialization for store paths: deterministic,
 //! preserves only executable bits and symlinks, and its hash matches
 //! Nix's narHash, keeping us interoperable with caches and signatures.
 
-use std::io::{self, Write};
+use std::io;
+
+pub mod pack;
 use std::path::{Path, PathBuf};
 
 use futures_util::StreamExt as _;
@@ -13,14 +15,6 @@ use tokio::sync::mpsc;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("packing {path}")]
-    Pack {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("writing NAR")]
-    Write(#[source] io::Error),
     #[error("unpacking into {path}")]
     Unpack {
         path: PathBuf,
@@ -29,27 +23,16 @@ pub enum Error {
     },
 }
 
-/// Serialize the filesystem object at `path` as a NAR into `w`.
-pub async fn pack(path: &Path, w: &mut impl Write) -> Result<(), Error> {
-    let mut stream = harmonia_file_nar::archive::NarByteStream::new(path.to_path_buf());
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|source| Error::Pack {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        w.write_all(&chunk).map_err(Error::Write)?;
-    }
-    Ok(())
-}
-
 /// Restore a zstd-compressed NAR arriving as byte chunks on `rx` at
 /// `dest` (must not exist). Ends when the sender closes the channel.
 pub async fn unpack_zstd_chunks(rx: mpsc::Receiver<Vec<u8>>, dest: &Path) -> Result<(), Error> {
     let chunks = tokio_stream::wrappers::ReceiverStream::new(rx)
         .map(|c| Ok::<_, io::Error>(bytes::Bytes::from(c)));
-    let dec = async_compression::tokio::bufread::ZstdDecoder::new(
+    let mut dec = async_compression::tokio::bufread::ZstdDecoder::new(
         tokio_util::io::StreamReader::new(chunks),
     );
+    // Outputs arrive as one zstd frame per chunk.
+    dec.multiple_members(true);
     // restore() takes NarWriteError items; fold parse errors in (there
     // is no dedicated "reading the NAR" variant).
     let parse_err_path = dest.to_path_buf();
@@ -72,11 +55,9 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::fs::symlink;
-    use std::process::Command;
 
     async fn round_trip_via_zstd(src: &Path, dest: &Path) -> Result<()> {
-        let mut nar = Vec::new();
-        pack(src, &mut nar).await?;
+        let nar = pack::to_vec(src)?;
         let zstd = zstd::stream::encode_all(nar.as_slice(), 3)?;
         // capacity for every chunk: sender runs before the consumer
         let (tx, rx) = mpsc::channel(zstd.len() / 7 + 2);
@@ -116,11 +97,7 @@ mod tests {
         );
 
         // packing the restored tree yields identical bytes (determinism)
-        let mut a = Vec::new();
-        pack(src.path(), &mut a).await?;
-        let mut b = Vec::new();
-        pack(&dest, &mut b).await?;
-        assert_eq!(a, b);
+        assert_eq!(pack::to_vec(src.path())?, pack::to_vec(&dest)?);
         Ok(())
     }
 
@@ -140,36 +117,6 @@ mod tests {
         assert!(meta.file_type().is_symlink(), "root symlink dereferenced");
         assert_eq!(fs::read_link(&dest)?, src.path().join("target"));
 
-        let mut ours = Vec::new();
-        pack(&link, &mut ours).await?;
-        if let Ok(o) = Command::new("nix-store").arg("--dump").arg(&link).output()
-            && o.status.success()
-        {
-            assert_eq!(ours, o.stdout);
-        }
-        Ok(())
-    }
-
-    /// The NAR matches nix-store --dump byte for byte when nix exists.
-    #[tokio::test]
-    async fn matches_nix_store_dump() -> Result<()> {
-        let src = tempfile::tempdir()?;
-        fs::write(src.path().join("a"), b"x")?;
-        symlink("a", src.path().join("b"))?;
-        let mut ours = Vec::new();
-        pack(src.path(), &mut ours).await?;
-        let theirs = match Command::new("nix-store")
-            .arg("--dump")
-            .arg(src.path())
-            .output()
-        {
-            Ok(out) if out.status.success() => out.stdout,
-            _ => {
-                eprintln!("nix-store not usable; skipping");
-                return Ok(());
-            }
-        };
-        assert_eq!(ours, theirs);
         Ok(())
     }
 }

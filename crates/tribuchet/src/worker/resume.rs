@@ -11,7 +11,6 @@ use std::time::Instant;
 
 use harmonia_store_path::StoreDir;
 use harmonia_store_remote::{DaemonClient, DaemonStore};
-use harmonia_utils_signature::SecretKey;
 
 use super::build::supervise_agent;
 use super::{DaemonConn, WorkerCtx, agents, remove_build_dir, sandbox};
@@ -19,14 +18,14 @@ use crate::errors::chain;
 use crate::fsutil::io_ctx;
 
 pub(super) use delivery::{
-    FinishedBuild, PackedExtra, PackedOutput, ResumableBuild, ack_delivery, execute_to_finished,
-    record_finished, spawn_resumable_reaper, try_deliver,
+    FinishedBuild, OutChunk, PackedExtra, PackedOutput, ResumableBuild, ack_delivery,
+    execute_to_finished, record_finished, serve_chunks, spawn_resumable_reaper, try_deliver,
 };
 
 /// Pick up builds a previous worker instance left behind: still
 /// running (their agent outlives the worker) or finished but
 /// undelivered. Anything stale is swept.
-pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>, signing_key: &Arc<SecretKey>) {
+pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>) {
     let Ok(entries) = fs::read_dir(ctx.state_dir.join("builds")) else {
         return;
     };
@@ -96,13 +95,12 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>, signing_key: &Arc<SecretK
         );
         let permit = ctx.slots.clone().try_acquire_owned().ok();
         let task_ctx = ctx.clone();
-        let signing_key = signing_key.clone();
         tokio::task::spawn_blocking(move || {
             let ctx = task_ctx;
             let key = st.dedupe_key.clone();
             let fin = {
                 let (socket, build) = agent;
-                let fin = supervise_agent(&ctx, &st, dir, &socket, build, &signing_key);
+                let fin = supervise_agent(&ctx, &st, dir, &socket, build);
                 ctx.agents.release(socket);
                 fin
             };

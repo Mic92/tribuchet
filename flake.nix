@@ -70,6 +70,13 @@
         let
           inherit (pkgs.stdenv.hostPlatform) system;
           prefix = p: nixpkgs.lib.mapAttrs' (n: nixpkgs.lib.nameValuePair "${p}-${n}");
+          specCheck =
+            name:
+            pkgs.runCommand "spec-${name}" { nativeBuildInputs = [ pkgs.quint ]; } ''
+              export HOME=$TMPDIR
+              quint verify ${./spec}/${name}.qnt --main ${name} --invariant inv --inductive-invariant indInv
+              touch $out
+            '';
         in
         prefix "package" self.packages.${system}
         // prefix "devshell" self.devShells.${system}
@@ -86,6 +93,10 @@
           );
         }
         // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          # Inductive proofs of the Quint models. Linux only: Apalache
+          # binds a fixed port, which unsandboxed darwin builds share.
+          spec-staging = specCheck "staging";
+          spec-protocol = specCheck "protocol";
           nixos-test-builds = pkgs.testers.runNixOSTest (
             import ./nix/test.nix {
               tribuchet = self.packages.x86_64-linux.default;

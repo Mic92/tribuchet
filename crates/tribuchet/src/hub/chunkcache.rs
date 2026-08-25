@@ -76,6 +76,10 @@ impl ChunkCache {
         Disposition::FirstSeen
     }
 
+    pub fn locate(&self, hash: &Hash) -> Option<FrameRef> {
+        self.inner.lock().unwrap().store.locate(hash)
+    }
+
     /// Locate every hash under one lock. None unless all are cached.
     pub fn locate_all(&self, hashes: &HashSet<Hash>) -> Option<Vec<(Hash, FrameRef)>> {
         let mut inner = self.inner.lock().unwrap();

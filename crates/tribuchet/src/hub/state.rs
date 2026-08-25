@@ -18,13 +18,6 @@ use super::metrics::Metrics;
 use crate::config::NixConfig;
 use crate::fsutil::io_ctx;
 
-/// How long a build waits for a platform we expect to come back: the
-/// startup window in which workers re-register after a hub restart, and
-/// the window a worker has to reconnect after its session drops (reload
-/// or crash). A platform we have never seen is declined immediately
-/// instead of waiting this out on every build.
-pub(super) const WORKER_GRACE: Duration = Duration::from_secs(30);
-
 use crate::proto::{AttachEvent, BuildRequest, attach_event};
 
 #[path = "state/replay.rs"]
@@ -82,7 +75,8 @@ pub(super) struct HubState {
     /// forever.
     pub(super) worker_caps: StdMutex<HashMap<u64, WorkerCaps>>,
     pub(super) next_worker_id: atomic::AtomicU64,
-    /// Grace period before an unservable build is declined or failed.
+    /// How long a build waits for a platform expected back (hub
+    /// restart, worker reconnect). Never-seen platforms decline at once.
     pub(super) worker_grace: Duration,
     /// Hub start time and the capabilities of workers whose session
     /// ended: together they tell `expected_deadline` which platforms are
@@ -97,8 +91,7 @@ pub(super) struct HubState {
     /// When set, the connected-worker set is mirrored to this nix.conf
     /// fragment on every register/deregister.
     pub(super) nix_config: Option<NixConfig>,
-    /// Staging chunk cache; None when disabled or failed to open.
-    pub(super) chunks: Option<Arc<ChunkCache>>,
+    pub(super) chunks: Arc<ChunkCache>,
 }
 
 #[derive(Clone)]
@@ -155,17 +148,11 @@ impl WorkerCaps {
     }
 }
 
-impl Default for HubState {
-    fn default() -> Self {
-        Self::new(WORKER_GRACE, None, None)
-    }
-}
-
 impl HubState {
     pub(super) fn new(
         worker_grace: Duration,
         nix_config: Option<NixConfig>,
-        chunks: Option<Arc<ChunkCache>>,
+        chunks: Arc<ChunkCache>,
     ) -> Self {
         Self {
             queue: Mutex::default(),
@@ -351,9 +338,17 @@ impl HubState {
 mod tests {
     use super::*;
 
+    impl HubState {
+        pub(in crate::hub) fn for_test(worker_grace: Duration) -> Self {
+            let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+            let cache = ChunkCache::open(dir.path().to_path_buf(), 1 << 20).unwrap();
+            Self::new(worker_grace, None, Arc::new(cache))
+        }
+    }
+
     #[tokio::test]
     async fn queued_job_fails_when_last_capable_worker_leaves() {
-        let state = HubState::default();
+        let state = HubState::for_test(Duration::from_secs(30));
         let replay = Arc::new(Replay::default());
         let job = Job {
             id: "j1".into(),
@@ -397,16 +392,16 @@ mod tests {
         // Within the startup window any platform is awaited (workers
         // have not re-registered yet); once it lapses a never-seen
         // platform with no departed worker declines at once.
-        let within = HubState::new(Duration::from_secs(30), None, None);
+        let within = HubState::for_test(Duration::from_secs(30));
         assert!(within.expected_deadline("aarch64-linux", &[]).is_some());
-        let lapsed = HubState::new(Duration::ZERO, None, None);
+        let lapsed = HubState::for_test(Duration::ZERO);
         assert!(lapsed.expected_deadline("aarch64-linux", &[]).is_none());
     }
 
     #[test]
     fn departed_worker_keeps_its_platform_expected() {
         // Past the startup window but inside the reconnect window.
-        let mut state = HubState::new(Duration::from_secs(30), None, None);
+        let mut state = HubState::for_test(Duration::from_secs(30));
         state.started_at = Instant::now().checked_sub(Duration::from_mins(1)).unwrap();
         state.record_departed(caps("x86_64-linux", &["kvm"]));
         let kvm = vec!["kvm".to_owned()];

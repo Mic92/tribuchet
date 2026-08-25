@@ -317,6 +317,7 @@ mod tests {
             tmp_dir_in_sandbox: "/build".into(),
             store_dir: "/nix/store".into(),
             fixed_output: false,
+            inputs: vec![],
         }
     }
 

@@ -53,22 +53,22 @@ GC by per-build temp roots. The worker must be a trusted daemon user
    later: required features). A system no connected worker serves is
    rejected immediately; otherwise submitters block and Nix's max-jobs
    bounds parallelism.
-3. Path negotiation: hub sends the input path list; the worker asks its
-   local nix-daemon (taking temp roots so GC cannot race the build) and
-   answers with the missing subset; the hub streams those as
-   zstd-compressed NARs plus their Nix db metadata (hash, size,
-   references, via the daemon protocol) read from the local store (hub is
-   colocated with the daemon, all inputs are valid locally).
+3. Staging: the assignment carries the input closure, with a manifest
+   (Nix db metadata plus chunk list) inline for paths the hub has
+   chunked before and does not know the worker to have. The worker asks
+   its nix-daemon (taking temp roots so GC cannot race the build) and
+   answers with one Need: the paths it lacks and the chunks its store
+   lacks. The hub streams manifests for those paths as it computes them
+   and the chunks of every Need (see Chunked staging).
 4. Worker imports missing inputs through its nix-daemon (which verifies
    the NAR hash and registers the path), constructs the sandbox, and
    executes `builder args…` with the env from build.json, cwd
    `/build`. Logs stream back live through hub to the shim's stdout/stderr
    (Nix shows them as ordinary build output).
-5. On success the worker NAR-packs every scratch output path (bounded in
-   size and by the build deadline), signs the NAR hashes with its
-   ed25519 key, and streams them back. The *hub* verifies each signature
-   against the worker's registered key (optionally pinned, see Security)
-   while relaying the compressed chunks. The shim unpacks into a temp
+5. On success the worker chunks every scratch output's NAR (bounded in
+   size and by the build deadline) and announces the chunk manifests.
+   The hub requests the chunks its cache lacks and assembles each NAR,
+   checking every chunk's BLAKE3 against the manifest as it relays. The shim unpacks into a temp
    path next to each scratch path and renames into place only after the
    verified end-of-stream event, then exits 0. Builder failure ⇒ shim
    exits with the builder's status; Nix reports a normal build failure.
@@ -134,8 +134,8 @@ Reference implementations: `nix/src/libstore/unix/build/` and
   profile).
 
 Accepted tradeoffs: no recursive-nix, sandbox parity is ours to maintain,
-trusted worker pool assumed (output authenticity still enforced via
-signatures).
+trusted worker pool assumed (output authenticity rests on the
+authenticated transport).
 
 ## Security
 
@@ -147,13 +147,9 @@ signatures).
   on each session, so WireGuard provides confidentiality/integrity
   and the tailnet provides identity (optionally gated to
   `tailscale-allowed-tags`).
-* Output authenticity: workers sign output NARs (ed25519); the hub
-  verifies while relaying. By default the key is the one the worker
-  registers over its authenticated session; with a `trusted-signing-keys` file in
-  the hub config dir (one Nix-format `name:base64` public key per line,
-  same syntax as nix.conf `trusted-public-keys`) registration is
-  restricted to pinned keys, so a stolen transport credential alone
-  cannot serve validly-signed outputs.
+* Output authenticity comes from the authenticated worker session
+  (mTLS or tailnet identity). The hub checks every output chunk against
+  the worker's manifest, the client's Nix computes narHash on import.
 * The attach socket is group-restricted to `nixbld` (the hub refuses to
   start without that group). Request validation pins every client-chosen
   path.
@@ -165,26 +161,22 @@ signatures).
 
 MVP targets 2–10 workers and a few clients: all scheduler state is in
 memory (no database). The hub's replay buffer is capped at 256 MiB per
-build and slow dedupe subscribers are dropped rather than buffered. The
-transfer protocol keeps a `oneof` payload, which chunked staging uses
-next to whole-NAR streaming.
+build and slow dedupe subscribers are dropped rather than buffered.
 
 ### Chunked staging
 
-For chunk-capable workers the hub sends per-path recipes (FastCDC
-chunk boundaries + blake3 hashes) instead of NARs; the worker answers
-with the union of chunks it lacks and only those are transferred.
+A manifest is a path's FastCDC chunk boundaries and BLAKE3 hashes; the
+worker answers with the chunks it lacks and only those are transferred.
 Warm workers skip most bytes this way and re-staging a cached closure
-costs milliseconds.
+costs one round trip. The hub remembers per session which paths a
+worker has, so repeat builds carry bare path names only.
 
 Both sides back this with an on-disk chunk store (hub:
-`chunk-cache-bytes`, worker: `chunk-store-bytes`, 10 GiB default, 0
-disables): append-only packs with S3-FIFO eviction, chosen over LRU
+`chunk-cache-bytes`, worker: `chunk-store-bytes`, 10 GiB default): append-only packs with S3-FIFO eviction, chosen over LRU
 because cold stagings are one-hit-wonder scans. The store is never a
 source of truth — a lost or corrupt chunk costs a re-transfer and the
 daemon's NAR-hash check backstops correctness, so the whole directory
-can be deleted at rest. Any chunk failure degrades to plain NAR
-resend.
+can be deleted at rest. A chunk evicted before use is requested again.
 
 Hub restarts cancel nothing, without any state handoff: on SIGTERM the
 hub exits immediately and the replacement reconstructs its state from

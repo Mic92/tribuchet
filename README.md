@@ -25,9 +25,8 @@ transfer, scheduling, and execution itself.
 - Hub scheduling with per-system queues and capability matching
   (`kvm`, `uid-range`, `big-parallel`, …); identical submissions share
   one build.
-- Only missing input paths travel, as zstd-compressed NARs; outputs
-  come back as worker-signed (ed25519) NARs with no store-path
-  rewriting.
+- Only content-defined chunks the other side lacks travel, in both
+  directions; no store-path rewriting.
 - Builds survive hub and worker restarts/reloads, so deploys don't
   kill in-flight builds; they're cancelled when the client goes away.
 - Sandboxing equivalent to Nix's own (Linux namespaces + per-build
@@ -94,10 +93,6 @@ where `tribuchet-attach` is a wrapper script:
 exec tribuchet attach "$1" --socket /run/tribuchet/hub.sock
 ```
 
-Optionally pin worker signing keys in
-`/etc/tribuchet/trusted-signing-keys` (one `name:base64` per line, same
-syntax as `trusted-public-keys`).
-
 ### 3. Workers
 
 Workers need a running nix-daemon of their own (inputs are imported
@@ -124,7 +119,7 @@ $ tribuchet worker --config /etc/tribuchet/worker.toml
 Hub and worker keep a chunk cache for input staging (10 GiB each by
 default, under `XDG_CACHE_HOME/tribuchet`): warm workers only receive
 chunks they don't already hold. Tune with `chunk-cache-bytes` (hub)
-and `chunk-store-bytes` (worker); 0 disables. The cache is safe to
+and `chunk-store-bytes` (worker). The cache is safe to
 delete whenever the process is stopped.
 
 The full set of options for both files is documented in
@@ -275,12 +270,12 @@ these rules, so a `deny` rule cannot break name resolution.
 2. The hub validates and dedupes the request, queues it for a worker
    serving that system and feature set.
 3. Path negotiation: the worker reports which input paths it already
-   has; the hub streams the missing ones as zstd NARs with their Nix db
-   metadata, imported on the worker through its nix-daemon.
+   has; the hub sends the missing ones as content-defined chunks the
+   worker lacks, imported on the worker through its nix-daemon.
 4. The worker runs the builder in its sandbox; logs stream live back to
    the client.
-5. Outputs are packed, signed, verified by the hub, and unpacked at the
-   scratch paths Nix provided; Nix finishes hashing and registration as
+5. Outputs come back as chunks the hub lacks, are assembled and
+   verified by the hub, and unpacked at the scratch paths Nix provided; Nix finishes hashing and registration as
    if the build had run locally.
 
 [`DESIGN.md`](DESIGN.md) describes the architecture, sandbox, security
