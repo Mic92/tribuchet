@@ -76,6 +76,13 @@
         // {
           treefmt = (treefmtFor pkgs).config.build.check self;
 
+          # Inductive proof of the worker staging model.
+          spec-staging = pkgs.runCommand "spec-staging" { nativeBuildInputs = [ pkgs.quint ]; } ''
+            export HOME=$TMPDIR
+            quint verify ${./spec/staging.qnt} --main staging --invariant inv --inductive-invariant indInv
+            touch $out
+          '';
+
           # nixbot pushes this closure, so downstream CI fetches the
           # input sources from cache.thalheim.io instead of GitHub.
           flake-inputs = pkgs.linkFarm "flake-inputs" (

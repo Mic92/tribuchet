@@ -72,7 +72,7 @@ impl ActiveBuild {
             None,
             sandbox::SandboxSpec {
                 outputs: outputs.clone(),
-                store_inputs: self.inputs.clone(),
+                store_inputs: self.input_list(),
                 recursive_nix: self.ctx.recursive_nix,
                 ..sandbox::SandboxSpec::default()
             },
@@ -167,7 +167,7 @@ impl ActiveBuild {
         let spec = sandbox::prepare(
             a,
             &self.dir,
-            &self.inputs,
+            &self.input_list(),
             &sandbox::PrepareOpts {
                 bin_sh: self.ctx.sandbox_bin_sh.as_deref(),
                 secrets: &self.ctx.secret_paths,

@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
-use super::build::{ActiveBuild, StagingStatus, validate_assignment};
+use super::build::{ActiveBuild, StagingStatus, Wake, validate_assignment};
 use super::caps::system_caps;
 use super::resume::{
     ResumableBuild, ack_delivery, execute_to_finished, record_finished, serve_chunks, try_deliver,
@@ -105,6 +105,7 @@ async fn session_loop(
     // Builds staged to completion but waiting for a free slot.
     let mut ready: VecDeque<String> = VecDeque::new();
     let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+    let (wake_tx, mut wake_rx) = mpsc::unbounded_channel::<Wake>();
     // One unfunded request beyond the free slots: the hub assigns and
     // stages the next build while every slot is busy, so a finishing
     // build hands its slot to a build that starts immediately instead
@@ -127,6 +128,13 @@ async fn session_loop(
                 }))).await?;
                 continue;
             }
+            Some(w) = wake_rx.recv() => {
+                if let Some(build) = active.get_mut(&w.build_id) {
+                    let res = build.claim_settled(&w.path).await;
+                    advance_staging(active, &mut ready, &w.build_id, res, &env).await?;
+                }
+                continue;
+            }
             m = inbound.message() => {
                 m?.ok_or_else(|| err_msg("hub closed the session"))?
             }
@@ -134,7 +142,9 @@ async fn session_loop(
         let Some(m) = m.msg else { continue };
         match m {
             hub_message::Msg::Assignment(a) => {
-                if let Some(id) = handle_assignment(a, active, &mut pending, out_tx, ctx).await? {
+                if let Some(id) =
+                    handle_assignment(a, active, &mut pending, &wake_tx, out_tx, ctx).await?
+                {
                     let res = active.get_mut(&id).unwrap().negotiate().await;
                     advance_staging(active, &mut ready, &id, res, &env).await?;
                 }
@@ -207,11 +217,6 @@ async fn advance_staging(
             launch_build(env.ctx, build, env.out_tx, env.build_timeout);
         }
         StagingStatus::NeedResend(need) => {
-            tracing::info!(
-                id,
-                count = need.paths.len(),
-                "re-requesting inputs another build failed to import"
-            );
             env.out_tx
                 .send(msg(worker_message::Msg::Need(need)))
                 .await?;
@@ -284,6 +289,7 @@ async fn handle_assignment(
     a: BuildAssignment,
     active: &mut HashMap<String, ActiveBuild>,
     pending: &mut Vec<tokio::sync::OwnedSemaphorePermit>,
+    wake: &mpsc::UnboundedSender<Wake>,
     out_tx: &mpsc::Sender<WorkerMessage>,
     ctx: &Arc<WorkerCtx>,
 ) -> Result<Option<String>> {
@@ -312,7 +318,7 @@ async fn handle_assignment(
         old.abort().await;
     }
     let build_id = a.build_id.clone();
-    match validate_assignment(&a).and_then(|()| ActiveBuild::new(a, ctx.clone())) {
+    match validate_assignment(&a).and_then(|()| ActiveBuild::new(a, ctx.clone(), wake.clone())) {
         Ok(mut b) => {
             b.permit = permit;
             active.insert(build_id.clone(), b);

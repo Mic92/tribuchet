@@ -91,9 +91,8 @@ struct WorkerCtx {
     /// abort them. Keyed like the registry, since a resumed build's
     /// build_id changes while it runs.
     cancelled: Mutex<HashSet<String>>,
-    /// Input paths a build is currently importing. Other builds defer
-    /// to that import instead of requesting the same NAR again.
-    staging_inflight: Mutex<HashSet<String>>,
+    /// Input paths some build is importing. Other builds wait on it.
+    claims: build::Claims,
     /// Parallel daemon connections importing input NARs per build.
     import_jobs: usize,
     chunks: Arc<Mutex<ChunkStore>>,
@@ -342,7 +341,7 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
         import_jobs: opts.import_jobs.max(1) as usize,
         chunks: open_chunk_store(&opts)?,
         cancelled: Mutex::new(HashSet::new()),
-        staging_inflight: Mutex::new(HashSet::new()),
+        claims: build::Claims::default(),
         resumable: Mutex::new(HashMap::new()),
         emulators,
         fod_isolation,

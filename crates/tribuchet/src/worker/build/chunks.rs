@@ -3,6 +3,7 @@
 //! frames as-is (the import decoder is multi-frame).
 
 use std::collections::HashMap;
+use std::mem;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -141,7 +142,7 @@ impl ChunkStaging {
 }
 
 impl ActiveBuild {
-    fn need(&mut self, paths: Vec<String>, hashes: Vec<u8>) -> Option<Need> {
+    pub(super) fn need(&mut self, paths: Vec<String>, hashes: Vec<u8>) -> Option<Need> {
         if paths.is_empty() && hashes.is_empty() {
             return None;
         }
@@ -250,19 +251,13 @@ impl ActiveBuild {
         Ok((need, self.try_complete().await?))
     }
 
-    /// Dispatch a complete path once every reference this build
-    /// imports is dispatched too (the daemon requires valid refs), then
-    /// retry paths parked on it.
+    /// The daemon rejects an import with an invalid reference, so a
+    /// complete path is parked until every reference is an input or
+    /// an own import dispatched before it (the pool gates on those).
     async fn start_chunk_import(&mut self, path: &str) -> Result<()> {
         let mut queue = vec![path.to_string()];
         while let Some(path) = queue.pop() {
-            let store_dir = StoreDir::default();
-            let info = &self.infos[&path];
-            let blocked = info.info.references.iter().any(|r| {
-                let r = store_dir.display(r).to_string();
-                r != path && self.pending.contains(&r)
-            });
-            if blocked {
+            if self.unstaged_ref(&path)?.is_some() {
                 self.parked.insert(path);
                 continue;
             }
@@ -270,6 +265,30 @@ impl ActiveBuild {
             queue.extend(self.parked.drain());
         }
         Ok(())
+    }
+
+    pub(super) async fn retry_parked(&mut self) -> Result<()> {
+        for p in mem::take(&mut self.parked) {
+            self.start_chunk_import(&p).await?;
+        }
+        Ok(())
+    }
+
+    fn unstaged_ref(&self, path: &str) -> Result<Option<String>> {
+        let store_dir = StoreDir::default();
+        for r in &self.infos[path].info.references {
+            let r = store_dir.display(r).to_string();
+            if r == path || self.inputs.contains(&r) || self.imports.contains_key(&r) {
+                continue;
+            }
+            if self.pending.contains(&r) || self.waits.contains_key(&r) {
+                return Ok(Some(r));
+            }
+            return Err(err_msg(format!(
+                "reference {r} of {path} is outside the input closure"
+            )));
+        }
+        Ok(None)
     }
 
     async fn dispatch_import(&mut self, path: &str) -> Result<()> {
