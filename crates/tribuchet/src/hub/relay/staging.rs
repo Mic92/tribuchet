@@ -14,6 +14,7 @@ use tonic::Status;
 
 use super::send;
 use super::serve::{compute_recipe, serve_need};
+use crate::chunker::parse_hashes;
 use crate::chunkio;
 use crate::chunkstore::Hash;
 use crate::errors::{Result, err_ctx, err_msg};
@@ -169,14 +170,7 @@ impl<'a> Staging<'a> {
         if n.hashes.is_empty() {
             return Ok(());
         }
-        if !n.hashes.len().is_multiple_of(32) {
-            return Err(err_msg("misaligned Need hashes"));
-        }
-        let needed: HashSet<Hash> = n
-            .hashes
-            .chunks_exact(32)
-            .map(|h| h.try_into().unwrap())
-            .collect();
+        let needed: HashSet<Hash> = parse_hashes(&n.hashes)?.into_iter().collect();
         let _permit = self.sess.serving.acquire().await.expect("never closed");
         serve_need(cache, self.job, &self.sent, needed, out_tx).await?;
         send(

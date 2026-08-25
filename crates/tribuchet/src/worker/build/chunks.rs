@@ -1,20 +1,18 @@
 //! Worker-side chunk staging. A path dispatches to the import pool
-//! once every recipe chunk sits in the store, fed the stored zstd
-//! frames as-is (the import decoder is multi-frame).
+//! once every recipe chunk sits in the store.
 
 use std::collections::HashMap;
 use std::mem;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use zstd::bulk::decompress;
-
 use harmonia_store_path::StoreDir;
 use tokio::sync::{mpsc, watch};
 use tokio::task::spawn_blocking;
 
 use super::import_pool::{ImportHandle, ImportJob, ImportPool, ImportState};
 use super::{ActiveBuild, StagingStatus};
+use crate::chunker::{Recipe, decode_chunk, parse_recipe};
 use crate::chunkstore::{ChunkStore, Hash};
 use crate::errors::{Result, err_ctx, err_msg};
 use crate::proto::{ChunkFrame, MAX_NAR_BYTES, MAX_RESEND_ROUNDS, Manifest, Need};
@@ -23,7 +21,7 @@ use crate::store::parse_path_info;
 pub(super) struct ChunkStaging {
     store: Arc<Mutex<ChunkStore>>,
     /// path -> ordered recipe, kept until the import succeeded
-    recipes: HashMap<String, Vec<(Hash, u64)>>,
+    recipes: HashMap<String, Recipe>,
     /// chunk -> paths waiting on it
     waiters: HashMap<Hash, Vec<String>>,
     /// path -> distinct chunks still missing from the store
@@ -48,21 +46,14 @@ impl ChunkStaging {
         hashes: &[u8],
         sizes: &[u64],
     ) -> Result<(Vec<u8>, bool)> {
-        if !hashes.len().is_multiple_of(32) || hashes.len() / 32 != sizes.len() {
-            return Err(err_msg(format!("malformed manifest for {path}")));
-        }
-        let recipe: Vec<(Hash, u64)> = hashes
-            .chunks_exact(32)
-            .zip(sizes)
-            .map(|(h, s)| (h.try_into().unwrap(), *s))
-            .collect();
+        let recipe = parse_recipe(&path, hashes, sizes)?;
         let need = self.await_missing(&path, &recipe);
         let ready = !self.remaining.contains_key(&path);
         self.recipes.insert(path, recipe);
         Ok((need, ready))
     }
 
-    fn await_missing(&mut self, path: &str, recipe: &[(Hash, u64)]) -> Vec<u8> {
+    fn await_missing(&mut self, path: &str, recipe: &[(Hash, usize)]) -> Vec<u8> {
         let store = self.store.lock().unwrap();
         let mut need: Vec<u8> = Vec::new();
         let mut missing = 0;
@@ -129,7 +120,7 @@ impl ChunkStaging {
         Ok(ready)
     }
 
-    fn recipe(&self, path: &str) -> Result<Vec<(Hash, u64)>> {
+    fn recipe(&self, path: &str) -> Result<Recipe> {
         self.recipes
             .get(path)
             .cloned()
@@ -336,7 +327,7 @@ impl ActiveBuild {
 /// in the store so a retry requests them again.
 fn feed_import(
     store: &Mutex<ChunkStore>,
-    recipe: &[(Hash, u64)],
+    recipe: &[(Hash, usize)],
     tx: &mpsc::Sender<Bytes>,
 ) -> Vec<Hash> {
     let mut bad = Vec::new();
@@ -356,10 +347,9 @@ fn feed_import(
     bad
 }
 
-fn read_verified(store: &Mutex<ChunkStore>, hash: &Hash, size: u64) -> Option<Vec<u8>> {
+fn read_verified(store: &Mutex<ChunkStore>, hash: &Hash, size: usize) -> Option<Vec<u8>> {
     let frame = store.lock().unwrap().locate(hash)?.read().ok()?;
-    let raw = decompress(&frame, usize::try_from(size).ok()?).ok()?;
-    (raw.len() as u64 == size && blake3::hash(&raw).as_bytes() == hash).then_some(raw)
+    decode_chunk(&frame, hash, size).ok()
 }
 
 #[cfg(test)]
@@ -381,7 +371,7 @@ mod tests {
             s.insert(liar, &compress(b"not what the hash says", 3).unwrap())
                 .unwrap();
         }
-        let recipe = [(good_hash, good.len() as u64), (liar, 22), (missing, 1)];
+        let recipe = [(good_hash, good.len()), (liar, 22), (missing, 1)];
         let (tx, mut rx) = mpsc::channel(8);
         let bad = feed_import(&store, &recipe, &tx);
         assert_eq!(bad, vec![liar, missing]);

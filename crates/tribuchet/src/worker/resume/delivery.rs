@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use super::BuildState;
+use crate::chunker::parse_hashes;
 use crate::chunkstore::Hash;
 use crate::errors::{Result, chain, err_msg};
 use crate::fsutil::io_ctx;
@@ -327,10 +328,11 @@ pub(in crate::worker) fn serve_chunks(
         tracing::warn!(id = build_id, "chunk request for an unknown build");
         return;
     };
-    let needed: HashSet<Hash> = hashes
-        .chunks_exact(32)
-        .map(|h| h.try_into().unwrap())
-        .collect();
+    let Ok(needed) = parse_hashes(hashes) else {
+        tracing::warn!(id = build_id, "misaligned chunk request");
+        return;
+    };
+    let needed: HashSet<Hash> = needed.into_iter().collect();
     tokio::task::spawn_blocking(move || {
         if let Err(e) = send_chunks(&fin, &build_id, needed, &out_tx) {
             tracing::warn!(id = build_id, "sending output chunks failed: {}", chain(&e));

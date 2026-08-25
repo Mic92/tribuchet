@@ -9,18 +9,18 @@ use tonic::Status;
 
 use super::extras::{ExtraImport, start_extra};
 use super::{msg_name, recv, send};
-use crate::chunker::MAX_SIZE;
+use crate::chunker::{Recipe, decode_chunk, parse_recipe};
 use crate::chunkstore::Hash;
 use crate::errors::{Result, err_ctx, err_msg};
 use crate::hub::chunkcache::ChunkCache;
 use crate::hub::state::{HubState, Job};
 use crate::proto::{
-    HubMessage, MAX_NAR_BYTES, Manifest, Need, OutputNar, attach_event, hub_message, worker_message,
+    HubMessage, Manifest, Need, OutputNar, attach_event, hub_message, worker_message,
 };
 
 pub(super) struct Announced {
     store_path: String,
-    recipe: Vec<(Hash, usize)>,
+    recipe: Recipe,
 }
 
 impl Announced {
@@ -28,24 +28,6 @@ impl Announced {
         let recipe = parse_recipe(&store_path, hashes, sizes)?;
         Ok(Self { store_path, recipe })
     }
-}
-
-fn parse_recipe(path: &str, hashes: &[u8], sizes: &[u64]) -> Result<Vec<(Hash, usize)>> {
-    if !hashes.len().is_multiple_of(32) || hashes.len() / 32 != sizes.len() {
-        return Err(err_msg(format!("malformed recipe for {path}")));
-    }
-    let mut total = 0u64;
-    hashes
-        .chunks_exact(32)
-        .zip(sizes)
-        .map(|(h, s)| {
-            total += s;
-            if *s > MAX_SIZE as u64 || total > MAX_NAR_BYTES {
-                return Err(err_msg(format!("oversized recipe for {path}")));
-            }
-            Ok((h.try_into().unwrap(), usize::try_from(*s).unwrap()))
-        })
-        .collect()
 }
 
 /// Checked to be exactly the requested set: a missing output is a
@@ -105,10 +87,7 @@ impl ChunkSource<'_> {
                 .and_then(|f| f.read().ok())
                 .ok_or_else(|| err_msg("output chunk evicted from the cache mid-delivery"))?
         };
-        let raw = zstd::bulk::decompress(&frame, size).map_err(err_ctx("decompressing chunk"))?;
-        if raw.len() != size || blake3::hash(&raw).as_bytes() != hash {
-            return Err(err_msg("output chunk does not match its recipe"));
-        }
+        decode_chunk(&frame, hash, size).map_err(err_ctx("output chunk"))?;
         Ok(frame)
     }
 
