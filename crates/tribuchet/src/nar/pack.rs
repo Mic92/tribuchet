@@ -19,7 +19,7 @@ pub enum Piece<'a> {
     Body { data: &'a [u8], last: bool },
 }
 
-pub const BODY_MIN: u32 = 16 * 1024;
+pub const BODY_MIN: usize = 16 * 1024;
 
 /// Nix appends this on case-insensitive filesystems; the dumper
 /// strips it again.
@@ -109,7 +109,7 @@ fn node(out: &mut Emitter, path: &Path, meta: &fs::Metadata) -> io::Result<()> {
 fn file(out: &mut Emitter, path: &Path, size: u64) -> io::Result<()> {
     out.len(size);
     let mut f = fs::File::open(path)?;
-    if size < u64::from(BODY_MIN) {
+    if size < BODY_MIN as u64 {
         let start = out.buf.len();
         // Bounded by `size`: a file that grew meanwhile must not
         // corrupt the framing.

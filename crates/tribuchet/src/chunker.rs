@@ -15,15 +15,15 @@ use crate::nar::pack::{BODY_MIN, Piece, pack};
 use crate::proto::MAX_NAR_BYTES;
 use crate::rt;
 
-const CDC_MIN: u32 = BODY_MIN;
-const CDC_AVG: u32 = 64 * 1024;
-const CDC_MAX: u32 = 256 * 1024;
+const CDC_MIN: usize = BODY_MIN;
+const CDC_AVG: usize = 64 * 1024;
+const CDC_MAX: usize = 256 * 1024;
 
 /// Upper bound of one chunk's plaintext on the wire. `Chunker::emit`
 /// enforces it for everything produced, `Recipe::parse` for everything
 /// accepted, so receivers can size buffers from the announced length.
 pub const MAX_CHUNK_BYTES: usize = 1024 * 1024;
-const _: () = assert!(CDC_MAX as usize <= MAX_CHUNK_BYTES);
+const _: () = assert!(CDC_MAX <= MAX_CHUNK_BYTES);
 
 pub struct Chunk {
     pub hash: Hash,
@@ -106,7 +106,7 @@ impl<F: FnMut(Chunk) -> Result<bool>> Chunker<F> {
         match piece {
             Piece::Framing(b) => {
                 self.lit.extend_from_slice(b);
-                if self.lit.len() >= CDC_MAX as usize {
+                if self.lit.len() >= CDC_MAX {
                     return self.flush_lit();
                 }
                 Ok(true)
@@ -125,7 +125,7 @@ impl<F: FnMut(Chunk) -> Result<bool>> Chunker<F> {
                 // is final. One drain at the end: draining per cut
                 // would memmove the tail quadratically.
                 let mut start = 0;
-                while self.body.len() - start >= CDC_MAX as usize {
+                while self.body.len() - start >= CDC_MAX {
                     let cut = start + first_cut(&self.body[start..]);
                     if !self.emit(self.body[start..cut].to_vec())? {
                         return Ok(false);
