@@ -1,51 +1,53 @@
 # Tribuchet
 
 Remote build execution for Nix, built on the experimental
-`external-builders` feature: a hub next to the nix-daemon hands builds
-to remote workers, which run them in their own sandboxes and stream
+`external-builders` feature. A hub next to the nix-daemon hands builds
+to remote workers. Workers run them in their own sandboxes and stream
 logs and outputs back to the waiting `nix build`.
 
 ![Architecture](docs/architecture.svg)
 
 > **Status: experimental.** It depends on Nix's experimental
-> `external-builders` feature (plus a small patch for uid-range builds)
-> and the protocol and configuration may still change.
+> `external-builders` feature (plus a small patch for uid-range builds).
+> Protocol and configuration may still change.
 
 ## Why not `--builders` / the SSH build hook?
 
 The classic remote build protocol needs SSH reachability into every
-builder, Nix installed there, and copies closures without scheduling.
-tribuchet receives the complete build environment from Nix and owns
-transfer, scheduling, and execution itself.
+builder and Nix installed there, and it copies closures without any
+scheduling. Tribuchet receives the complete build environment from Nix
+and owns transfer, scheduling and execution itself.
 
 ## Features
 
 - Workers dial the hub over gRPC with mutual TLS, so they can sit
-  behind NAT and register the systems and features they serve.
+  behind NAT. They register the systems and features they serve.
 - Hub scheduling with per-system queues and capability matching
-  (`kvm`, `uid-range`, `big-parallel`, …); identical submissions share
+  (`kvm`, `uid-range`, `big-parallel`, …). Identical submissions share
   one build.
-- Only content-defined chunks the other side lacks travel, in both
-  directions; no store-path rewriting.
-- Builds survive hub and worker restarts/reloads, so deploys don't
-  kill in-flight builds; they're cancelled when the client goes away.
-- Sandboxing equivalent to Nix's own (Linux namespaces + per-build
-  cgroup limits, macOS Seatbelt under per-build users), plus `uid-range` builds and
-  cross-system user-mode emulation.
-- Fixed-output derivations get network through [presto-pasta]
-  (embedded user-mode NAT) in an otherwise isolated network namespace,
-  with an optional allow/deny flow policy (`fod-network` in
-  worker.toml).
-- Live build logs across reloads/restarts, with max-log-size,
-  max-silent-time, and timeout enforcement.
-- NixOS and nix-darwin modules for both services.
+- Inputs and outputs travel as content-defined chunks, and only the
+  chunks the other side lacks. No store-path rewriting.
+- Builds survive hub and worker restarts and reloads, so deploys don't
+  kill in-flight builds. A build is cancelled when its `nix build`
+  goes away.
+- Sandboxing equivalent to Nix's own: Linux namespaces with per-build
+  cgroup limits, macOS Seatbelt under per-build users. Adds
+  `uid-range` builds and cross-system user-mode emulation.
+- Fixed-output derivations get network through [presto-pasta], an
+  embedded user-mode NAT, in an otherwise isolated network namespace.
+  An optional allow/deny flow policy (`fod-network`) filters
+  destinations.
+- Live build logs across reloads and restarts, with `max-log-size`,
+  `max-silent-time` and timeout enforcement.
+- NixOS and nix-darwin modules for both services, and an OCI worker
+  image for hosts without Nix.
 
 [presto-pasta]: https://github.com/Mic92/presto-pasta
 
 ## Getting started
 
-tribuchet is one binary with four subcommands: `hub`, `worker`,
-`attach` (the shim Nix execs), and `ca`.
+Tribuchet is one binary with four subcommands: `hub`, `worker`,
+`attach` (the shim Nix execs) and `ca`.
 
 ### 1. Certificates
 
@@ -58,16 +60,15 @@ $ tribuchet ca issue hub     --dir ./ca   # SAN must match the hub address worke
 $ tribuchet ca issue worker  --dir ./ca   # one per worker
 ```
 
-The hub reads `ca/{hub.crt,hub.key,ca.crt}` from `<config-dir>/ca`
-(default `/etc/tribuchet/ca`); each worker gets `ca.crt` plus its own
+The hub reads `hub.crt`, `hub.key` and `ca.crt` from `<config-dir>/ca`
+(default `/etc/tribuchet/ca`). Each worker gets `ca.crt` plus its own
 key pair (default `/var/lib/tribuchet/tls/`).
 
-Alternatively, set `auth = "tailscale"` on both sides to skip TLS
-entirely: the worker dials `http://<hub-tailnet-name>:7437`, the hub
-looks the peer up against tailscaled's LocalAPI on each connection
-(so anything not on the tailnet is rejected) and uses the node name
-as the worker identity. Gate registration to specific ACL tags with
-`tailscale-allowed-tags = ["tag:tribuchet-worker"]`.
+Alternatively set `auth = "tailscale"` on both sides to skip TLS. The
+worker dials `http://<hub-tailnet-name>:7437`. The hub looks each peer
+up in tailscaled's LocalAPI, rejects anything not on the tailnet, and
+uses the node name as the worker identity. Restrict registration to
+ACL tags with `tailscale-allowed-tags = ["tag:tribuchet-worker"]`.
 
 ### 2. Hub (on the machine running nix-daemon)
 
@@ -95,11 +96,11 @@ exec tribuchet attach "$1" --socket /run/tribuchet/hub.sock
 
 ### 3. Workers
 
-Workers need a running nix-daemon of their own (inputs are imported
-through it and protected from garbage collection by temp roots). The
-worker runs unprivileged and leases every build to a per-uid agent
-service (set up by the NixOS and nix-darwin modules), which owns the
-builder process and its uid block.
+A worker needs its own nix-daemon. Inputs are imported through it and
+held by temp roots against garbage collection. The worker runs
+unprivileged and leases each build to a per-uid agent service (set up
+by the NixOS and nix-darwin modules) that owns the builder process and
+its uid block.
 
 `/etc/tribuchet/worker.toml`:
 
@@ -116,19 +117,18 @@ aarch64-linux = "/path/to/static/qemu-aarch64"
 $ tribuchet worker --config /etc/tribuchet/worker.toml
 ```
 
-Hub and worker keep a chunk cache for input staging (10 GiB each by
-default, under `XDG_CACHE_HOME/tribuchet`): warm workers only receive
-chunks they don't already hold. Tune with `chunk-cache-bytes` (hub)
-and `chunk-store-bytes` (worker). The cache is safe to
-delete whenever the process is stopped.
+Hub and worker each keep a chunk cache under `XDG_CACHE_HOME/tribuchet`,
+10 GiB by default. A warm worker only receives chunks it does not
+hold. Tune with `chunk-cache-bytes` (hub) and `chunk-store-bytes`
+(worker). The cache can be deleted while the process is stopped.
 
-The full set of options for both files is documented in
+All options for both files are documented in
 [`crates/tribuchet/src/config.rs`](crates/tribuchet/src/config.rs).
 
-The worker's TLS paths can be overridden with the `TRIBUCHET_CA_CERT`,
-`TRIBUCHET_CERT` and `TRIBUCHET_KEY` environment variables, e.g. to
-point at a key delivered by systemd `LoadCredential` (the NixOS
-module's `services.tribuchet-worker.keyFile` does this).
+The worker's TLS paths can be overridden with `TRIBUCHET_CA_CERT`,
+`TRIBUCHET_CERT` and `TRIBUCHET_KEY`, e.g. to point at a key delivered
+by systemd `LoadCredential`. The NixOS module's
+`services.tribuchet-worker.keyFile` does this.
 
 ### NixOS
 
@@ -158,27 +158,26 @@ Import `tribuchet.nixosModules.default` (flake input
 }
 ```
 
-The hub unit is socket-activated; the worker unit reloads instead of
+The hub unit is socket-activated. The worker unit reloads instead of
 restarting on package or settings changes, so running builds survive
 deploys.
 
 ### macOS (nix-darwin)
 
 `tribuchet.darwinModules.default` provides the same two services for
-launchd: the hub adopts its sockets from launchd, the worker daemon
-execs through a stable symlink that activation flips and SIGHUPs, again
-keeping builds alive across upgrades.
+launchd. The hub adopts its sockets from launchd. The worker daemon
+execs through a stable symlink that activation flips and then SIGHUPs,
+which again keeps builds alive across upgrades.
 
 ### Container
 
 For hosts without Nix the flake builds an OCI image,
 `packages.x86_64-linux.worker-image`. It carries its own Nix store,
-starts a nix-daemon and the worker, and spawns its build agents based
-on `spawn-agents` and `agent-uid-base` in worker.toml. No added
-capabilities are needed, but the sandbox creates namespaces and
-mounts, which the default runtime seccomp profile forbids. Use the
-profile from `packages.x86_64-linux.seccomp-profile` and unmask
-/proc:
+starts a nix-daemon and the worker, and spawns build agents according
+to `spawn-agents` and `agent-uid-base` in worker.toml. It needs no
+added capabilities, but the sandbox creates namespaces and mounts,
+which the default runtime seccomp profile forbids. Use the profile
+from `packages.x86_64-linux.seccomp-profile` and unmask /proc:
 
 ```console
 $ podman run -d --name tribuchet-worker \
@@ -189,8 +188,8 @@ $ podman run -d --name tribuchet-worker \
     tribuchet-worker:latest
 ```
 
-The extra syscall rule the sandbox needs is also available on its own
-in [`nix/seccomp-additions.json`](nix/seccomp-additions.json), to
+The one extra syscall rule the sandbox needs is also available on its
+own in [`nix/seccomp-additions.json`](nix/seccomp-additions.json), to
 append to a base profile of your choice.
 
 For docker replace `unmask=ALL` with `systempaths=unconfined`. On
@@ -204,13 +203,13 @@ volume is only a cache. The daemon garbage-collects it via the
 
 ## Fixed-output network policy
 
-On Linux workers with `/dev/net/tun`, fixed-output builds run in
-a private network namespace and get outbound connectivity through the
-embedded [presto-pasta] user-mode NAT. The worker's loopback services
-and abstract sockets are never reachable from there. On top of that,
-the optional `fod-network` setting filters which destinations such
-builds may connect to. It lives in the worker's freeform settings, so
-with the NixOS module it is plain Nix:
+On Linux workers with `/dev/net/tun`, fixed-output builds run in a
+private network namespace and reach the outside through the embedded
+[presto-pasta] user-mode NAT. The worker's loopback services and
+abstract sockets are never reachable from there. On top of that the
+optional `fod-network` setting filters which destinations such builds
+may connect to. It lives in the worker's freeform settings, so with
+the NixOS module it is plain Nix:
 
 ```nix
 services.tribuchet-worker.settings.fod-network = {
@@ -243,43 +242,46 @@ services.tribuchet-worker.settings.fod-network = {
 };
 ```
 
-Without the module, the same structure goes into worker.toml as a
+Without the module the same structure goes into worker.toml as a
 `[fod-network]` table with `[[fod-network.rules]]` entries.
 
 Each rule matches on the destination of a new outbound connection:
 
 - `dst`: `"any"`, `"private"` (everything non-public: loopback,
   RFC 1918, link-local, ULA, CGNAT, multicast), a single IP, or a CIDR
-  like `"192.0.2.0/24"` / `"2001:db8::/32"`.
-- `proto`: `"tcp"`, `"udp"`, or `"any"`.
+  like `"192.0.2.0/24"` or `"2001:db8::/32"`.
+- `proto`: `"tcp"`, `"udp"` or `"any"`.
 - `ports`: destination ports, single (`"443"`) or inclusive ranges
-  (`"8000-8999"`); empty or omitted means any port.
+  (`"8000-8999"`). Empty or omitted means any port.
 
 Rules are evaluated in order for every new flow before a host socket
-is created; denied connections simply never leave the sandbox (TCP
-SYNs get no answer). Rules are IP-based on purpose — hostname rules
-would only apply to whatever a name resolves to at connect time and
-are trivially bypassed by a build resolving names itself. DNS lookups
-are forwarded to the host resolver by presto-pasta independently of
-these rules, so a `deny` rule cannot break name resolution.
+is created. Denied connections never leave the sandbox: a TCP SYN gets
+no answer. Rules are IP-based on purpose. Hostname rules would only
+apply to whatever a name resolves to at connect time, and a build
+resolving names itself bypasses them trivially. presto-pasta forwards
+DNS lookups to the host resolver independently of these rules, so a
+`deny` rule cannot break name resolution.
 
 ## How a build flows
 
-1. Nix execs `tribuchet attach build.json`; the shim submits the build
+1. Nix execs `tribuchet attach build.json`. The shim submits the build
    to the hub over the unix socket.
-2. The hub validates and dedupes the request, queues it for a worker
-   serving that system and feature set.
-3. Path negotiation: the worker reports which input paths it already
-   has; the hub sends the missing ones as content-defined chunks the
-   worker lacks, imported on the worker through its nix-daemon.
-4. The worker runs the builder in its sandbox; logs stream live back to
-   the client.
-5. Outputs come back as chunks the hub lacks, are assembled and
-   verified by the hub, and unpacked at the scratch paths Nix provided; Nix finishes hashing and registration as
-   if the build had run locally.
+2. The hub validates and dedupes the request and queues it for a
+   worker serving that system and feature set.
+3. The assignment lists the input closure. The worker answers with the
+   paths and chunks it lacks, the hub streams those chunks, and the
+   worker imports the paths through its nix-daemon.
+4. The worker runs the builder in its sandbox. Logs stream live back
+   to `nix build`.
+5. The worker announces each output's chunk list. The hub fetches the
+   chunks it lacks, assembles and verifies the NAR, and unpacks it at
+   the scratch path Nix provided. Nix finishes hashing and
+   registration as if the build had run locally.
 
 [`DESIGN.md`](DESIGN.md) describes the architecture, sandbox, security
-model, and failure handling in detail.
+model and failure handling in detail. [`spec/`](spec/) holds Quint
+models of worker staging and the transfer protocol, proven as flake
+checks.
 
 ## Development
 
@@ -290,11 +292,12 @@ $ cargo clippy --all-targets
 $ nix build .#checks.x86_64-linux.nixos-test-builds     # end-to-end VM test (hub + worker)
 $ nix build .#checks.x86_64-linux.nixos-test-nspawn     # NixOS-container build in the sandbox
 $ nix build .#checks.x86_64-linux.nixos-test-lifecycle  # daemon restart/reload/stop sequence
+$ nix build .#checks.x86_64-linux.spec-protocol         # inductive proof of spec/protocol.qnt
 ```
 
-The VM test exercises remote builds, hub/worker restarts and reloads
-mid-build, cancellation, log limits, uid-range and emulated builds, and
-fixed-output networking.
+The VM tests exercise remote builds, hub and worker restarts and
+reloads mid-build, cancellation, log limits, uid-range and emulated
+builds, and fixed-output networking.
 
 ## License
 
