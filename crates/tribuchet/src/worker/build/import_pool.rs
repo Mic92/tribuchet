@@ -61,8 +61,8 @@ pub(super) struct ImportJob {
 
 /// N tasks with one daemon connection each, so imports overlap the
 /// download and each other instead of serializing behind one
-/// AddToStoreNar. The hub sends recipes references before referrers, so a
-/// job's gates always point at jobs queued earlier: FIFO dispatch
+/// AddToStoreNar. A path is only dispatched once its references are,
+/// so a job's gates always point at jobs queued earlier: FIFO dispatch
 /// cannot deadlock on a gate.
 pub(super) struct ImportPool {
     pub(super) job_tx: mpsc::Sender<ImportJob>,

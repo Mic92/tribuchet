@@ -150,7 +150,7 @@ impl ActiveBuild {
         for p in offered {
             // Only real store paths may become bind-mount sources; a
             // compromised hub must not get the worker's own files
-            // (signing key, TLS key) mounted into a sandbox.
+            // (TLS key) mounted into a sandbox.
             let sp: StorePath = store_dir
                 .parse(p)
                 .map_err(err_ctx(format!("offered path {p:?} is not a store path")))?;

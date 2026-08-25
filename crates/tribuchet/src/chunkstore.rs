@@ -355,7 +355,6 @@ mod tests {
         ChunkStore::open(dir.to_path_buf(), budget).unwrap()
     }
 
-    /// locate + read, the two-phase form of the old `get`.
     fn get(s: &mut ChunkStore, hash: &Hash) -> Option<Vec<u8>> {
         s.locate(hash)?.read().ok()
     }

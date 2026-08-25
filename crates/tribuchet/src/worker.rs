@@ -1,12 +1,12 @@
 //! `tribuchet worker`: dials the hub over mTLS, imports input paths
 //! into the local /nix/store via the Nix daemon, executes builds in a
-//! local sandbox, signs and returns output NARs.
+//! local sandbox and returns the outputs as chunks.
 //!
-//! Inputs the local store already has (per the daemon) are reused;
-//! missing ones are imported from hub NAR streams with AddToStoreNar,
-//! so they are registered in the Nix database and protected from GC
-//! by per-build temp roots. The worker user must be trusted by the
-//! local nix-daemon (inputs are imported without signature checks).
+//! Inputs the local store already has are reused. Missing ones are
+//! assembled from chunks and imported with AddToStoreNar, so they are
+//! registered in the Nix database and protected from GC by per-build
+//! temp roots. The worker user must be trusted by the local nix-daemon
+//! (inputs are imported without signature checks).
 //!
 //! Runs up to `--max-jobs` builds concurrently over one hub session.
 
@@ -221,13 +221,6 @@ fn sweep_state_dir(state_dir: &Path) {
             fsutil::remove_path_all(&dir);
         }
     }
-    // Input caching moved into the real /nix/store (daemon import);
-    // clear the legacy cache directory left by older versions.
-    let legacy = state_dir.join("store");
-    if legacy.symlink_metadata().is_ok() {
-        tracing::info!("removing legacy input cache {}", legacy.display());
-        fsutil::remove_path_all(&legacy);
-    }
 }
 
 pub(crate) fn unix_now() -> u64 {
@@ -397,14 +390,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sweep_removes_stale_builds_and_legacy_cache() -> Result<()> {
+    fn sweep_removes_stale_builds_and_keeps_adoptable_ones() -> Result<()> {
         let state = tempfile::tempdir()?;
         fs::create_dir_all(state.path().join("builds/deadbeef"))?;
-        // legacy input cache from pre-daemon-import versions: must go
-        fs::create_dir_all(state.path().join("store/zzz-good"))?;
+        fs::create_dir_all(state.path().join("builds/adopt"))?;
+        fs::write(state.path().join("builds/adopt/state.json"), "{}")?;
         sweep_state_dir(state.path());
         assert!(!state.path().join("builds/deadbeef").exists());
-        assert!(!state.path().join("store").exists());
+        assert!(state.path().join("builds/adopt").exists());
         Ok(())
     }
 }
