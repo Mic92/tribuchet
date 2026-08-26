@@ -129,7 +129,7 @@ in
           into its single global slot pool and hides the
           submit/dispatch/result/next-admit round trip. The surplus just
           parks in the hub queue (an attach process plus a build goal on
-          this host, no NAR staged until dispatch).
+          this host, nothing staged until dispatch).
         '';
       };
       maxJobsCap = lib.mkOption {

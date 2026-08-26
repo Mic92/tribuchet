@@ -97,8 +97,8 @@ pub struct SandboxSpec {
     /// binfmt::INTERP_PATH and registered in a per-userns binfmt_misc
     /// instance.
     pub emulator: Option<PathBuf>,
-    /// Secret files the build must never read (worker signing/TLS
-    /// keys). Defense in depth, the mount namespace already hides them.
+    /// Secret files the build must never read (the worker TLS
+    /// key). Defense in depth, the mount namespace already hides them.
     pub deny_read: Vec<PathBuf>,
     /// Sandbox has the host daemon socket bind-mounted in; the
     /// closure-delta producer also consults this flag.

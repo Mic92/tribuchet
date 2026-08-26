@@ -7,10 +7,11 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use harmonia_store_path::StoreDir;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::spawn_blocking;
 
-use super::import_pool::{ImportHandle, ImportJob, ImportPool, ImportState};
+use super::claims::Wake;
+use super::import_pool::{ImportHandle, ImportJob, ImportPool};
 use super::{ActiveBuild, StagingStatus};
 use crate::chunker::{Recipe, decode_chunk, parse_recipe};
 use crate::chunkstore::{ChunkStore, Hash};
@@ -153,7 +154,7 @@ impl ActiveBuild {
     ) -> Result<(Option<Need>, StagingStatus)> {
         let hashes = self.take_manifest(m).await?;
         let need = self.need(Vec::new(), hashes);
-        Ok((need, self.try_complete().await?))
+        Ok((need, self.try_complete()))
     }
 
     /// A manifest for a pending path: dispatch it if complete, else
@@ -239,12 +240,11 @@ impl ActiveBuild {
                 self.start_chunk_import(&p).await?;
             }
         }
-        Ok((need, self.try_complete().await?))
+        Ok((need, self.try_complete()))
     }
 
     /// The daemon rejects an import with an invalid reference, so a
-    /// complete path is parked until every reference is an input or
-    /// an own import dispatched before it (the pool gates on those).
+    /// complete path is parked until every reference is an input.
     async fn start_chunk_import(&mut self, path: &str) -> Result<()> {
         let mut queue = vec![path.to_string()];
         while let Some(path) = queue.pop() {
@@ -269,10 +269,13 @@ impl ActiveBuild {
         let store_dir = StoreDir::default();
         for r in &self.infos[path].info.references {
             let r = store_dir.display(r).to_string();
-            if r == path || self.inputs.contains(&r) || self.imports.contains_key(&r) {
+            if r == path || self.inputs.contains(&r) {
                 continue;
             }
-            if self.pending.contains(&r) || self.waits.contains_key(&r) {
+            if self.pending.contains(&r)
+                || self.imports.contains_key(&r)
+                || self.waits.contains_key(&r)
+            {
                 return Ok(Some(r));
             }
             return Err(err_msg(format!(
@@ -288,36 +291,27 @@ impl ActiveBuild {
             return Err(err_msg(format!("chunk-ready path {path} was not pending")));
         }
         let info = self.infos[path].clone();
-        let store_dir = StoreDir::default();
-        let gates = info
-            .info
-            .references
-            .iter()
-            .filter_map(|r| self.imports.get(&store_dir.display(r).to_string()))
-            .map(|h| h.done.clone())
-            .collect();
         let (tx, rx) = mpsc::channel::<Bytes>(8);
-        let (done_tx, done_rx) = watch::channel(ImportState::Running);
+        let (result_tx, result) = oneshot::channel();
+        let wake = Wake {
+            build_id: self.assignment.build_id.clone(),
+            path: path.to_string(),
+        };
         let jobs = self.ctx.import_jobs;
         let pool = self.pool.get_or_insert_with(|| ImportPool::spawn(jobs));
         pool.job_tx
             .send(ImportJob {
                 info,
                 rx,
-                gates,
-                done: done_tx,
+                result: result_tx,
+                wake: (self.wake.clone(), wake),
             })
             .await
             .map_err(|_| err_msg("import pool gone"))?;
         let store = self.chunks.store.clone();
         let feeder = spawn_blocking(move || feed_import(&store, &recipe, &tx));
-        self.imports.insert(
-            path.to_string(),
-            ImportHandle {
-                done: done_rx,
-                feeder,
-            },
-        );
+        self.imports
+            .insert(path.to_string(), ImportHandle { result, feeder });
         Ok(())
     }
 }

@@ -178,7 +178,10 @@ def hub_build(systems: list[str]) -> None:
                 f"nixpkgs={nixpkgs}",
                 "--argstr",
                 "runId",
-                os.environ["GITHUB_RUN_ID"],
+                # Re-runs share GITHUB_RUN_ID; without the attempt the
+                # previous attempt's outputs get substituted from the CI
+                # cache and the hub never sees a build.
+                f"{os.environ['GITHUB_RUN_ID']}-{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}",
                 "--arg",
                 "systems",
                 "[ " + " ".join(f'"{s}"' for s in systems) + " ]",

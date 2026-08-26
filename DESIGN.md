@@ -18,7 +18,7 @@ lets us own transfer, scheduling, and execution.
 
 Nix hands the external builder *scratch* output paths and expects them to
 be populated on exit. The worker sandbox writes to the very same scratch
-paths; the shim unpacks the returned NARs at those paths unchanged. Nix
+paths; the shim unpacks the returned outputs at those paths unchanged. Nix
 then performs self-reference rewriting, hashing, and registration itself.
 No store-path rewriting in tribuchet and no drvPath needed. Workers run a
 nix-daemon of their own: inputs are imported through it (AddToStoreNar),
@@ -202,9 +202,9 @@ wait on disk until a worker starts again (or expire undelivered).
 
 * Workers run up to `max-jobs` concurrent builds over one session.
 * The hub's tmp-dir tar and the worker's unpack walk their trees
-  through directory fds with O_NOFOLLOW, but NAR pack/unpack go through
-  harmonia-file-nar, which resolves paths; output packing therefore
-  trusts that nothing rewrites the finished build's output tree while
+  through directory fds with O_NOFOLLOW, but output packing (our NAR
+  serializer) and unpacking (harmonia-file-nar) resolve paths. Output
+  packing therefore trusts that nothing rewrites the finished build's output tree while
   it is being packed (builds run under disjoint uids, so only root or
   the same build could).
 * Stopping the worker does not stop its running builds (KillMode=
@@ -222,7 +222,8 @@ wait on disk until a worker starts again (or expire undelivered).
   dedupe behaviour).
 * The Linux builder keeps the worker's kernel uid (remapped in the user
   namespace); there is no dedicated unprivileged build user yet.
-* Input NARs are not verified against an expected content hash; the
+* Input chunks are verified against the hub's manifest and the daemon
+  checks the NAR hash the hub declared, but both come from the hub: the
   worker trusts the mTLS-authenticated hub for input content.
 
 ## Deployment
