@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use harmonia_store_path::StoreDir;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::spawn_blocking;
 
 use super::claims::Wake;
 use super::import_pool::{ImportHandle, ImportJob, ImportPool};
@@ -148,18 +147,18 @@ impl ActiveBuild {
         })
     }
 
-    pub(in crate::worker) async fn feed_manifest(
+    pub(in crate::worker) fn feed_manifest(
         &mut self,
-        m: Manifest,
+        m: &Manifest,
     ) -> Result<(Option<Need>, StagingStatus)> {
-        let hashes = self.take_manifest(m).await?;
+        let hashes = self.take_manifest(m)?;
         let need = self.need(Vec::new(), hashes);
         Ok((need, self.try_complete()))
     }
 
     /// A manifest for a pending path: dispatch it if complete, else
     /// return the chunk hashes to request.
-    pub(super) async fn take_manifest(&mut self, m: Manifest) -> Result<Vec<u8>> {
+    pub(super) fn take_manifest(&mut self, m: &Manifest) -> Result<Vec<u8>> {
         if !self.pending.contains(&m.store_path) {
             if self.tolerated(&m.store_path) {
                 return Ok(Vec::new());
@@ -186,7 +185,7 @@ impl ActiveBuild {
             .chunks
             .add_recipe(m.store_path.clone(), &m.hashes, &m.sizes)?;
         if ready {
-            self.start_chunk_import(&m.store_path).await?;
+            self.start_chunk_import(&m.store_path)?;
         }
         Ok(hashes)
     }
@@ -194,7 +193,7 @@ impl ActiveBuild {
     /// Put imported-but-failed paths back to pending and await their
     /// chunks again: forgotten ones are re-requested, paths still
     /// complete dispatch right away.
-    pub(super) async fn restage(&mut self, paths: Vec<String>) -> Result<Option<Need>> {
+    pub(super) fn restage(&mut self, paths: Vec<String>) -> Result<Option<Need>> {
         let mut hashes = Vec::new();
         let mut ready = Vec::new();
         for path in paths {
@@ -206,14 +205,14 @@ impl ActiveBuild {
             self.pending.insert(path);
         }
         for path in ready {
-            self.start_chunk_import(&path).await?;
+            self.start_chunk_import(&path)?;
         }
         Ok(self.need(Vec::new(), hashes))
     }
 
-    pub(in crate::worker) async fn feed_chunk(
+    pub(in crate::worker) fn feed_chunk(
         &mut self,
-        c: ChunkFrame,
+        c: &ChunkFrame,
     ) -> Result<(Option<Need>, StagingStatus)> {
         let mut need = None;
         if c.eof {
@@ -231,13 +230,13 @@ impl ActiveBuild {
                     tracing::warn!(chunks = hashes.len() / 32, "chunks lost, requesting again");
                 }
                 for p in ready {
-                    self.start_chunk_import(&p).await?;
+                    self.start_chunk_import(&p)?;
                 }
                 need = self.need(Vec::new(), hashes);
             }
         } else {
             for p in self.chunks.ingest(&c.hash, &c.zstd)? {
-                self.start_chunk_import(&p).await?;
+                self.start_chunk_import(&p)?;
             }
         }
         Ok((need, self.try_complete()))
@@ -245,22 +244,22 @@ impl ActiveBuild {
 
     /// The daemon rejects an import with an invalid reference, so a
     /// complete path is parked until every reference is an input.
-    async fn start_chunk_import(&mut self, path: &str) -> Result<()> {
+    fn start_chunk_import(&mut self, path: &str) -> Result<()> {
         let mut queue = vec![path.to_string()];
         while let Some(path) = queue.pop() {
             if self.unstaged_ref(&path)?.is_some() {
                 self.parked.insert(path);
                 continue;
             }
-            self.dispatch_import(&path).await?;
+            self.dispatch_import(&path)?;
             queue.extend(self.parked.drain());
         }
         Ok(())
     }
 
-    pub(super) async fn retry_parked(&mut self) -> Result<()> {
+    pub(super) fn retry_parked(&mut self) -> Result<()> {
         for p in mem::take(&mut self.parked) {
-            self.start_chunk_import(&p).await?;
+            self.start_chunk_import(&p)?;
         }
         Ok(())
     }
@@ -285,13 +284,12 @@ impl ActiveBuild {
         Ok(None)
     }
 
-    async fn dispatch_import(&mut self, path: &str) -> Result<()> {
+    fn dispatch_import(&mut self, path: &str) -> Result<()> {
         let recipe = self.chunks.recipe(path)?;
         if !self.pending.remove(path) {
             return Err(err_msg(format!("chunk-ready path {path} was not pending")));
         }
         let info = self.infos[path].clone();
-        let (tx, rx) = mpsc::channel::<Bytes>(8);
         let (result_tx, result) = oneshot::channel();
         let wake = Wake {
             build_id: self.assignment.build_id.clone(),
@@ -302,16 +300,14 @@ impl ActiveBuild {
         pool.job_tx
             .send(ImportJob {
                 info,
-                rx,
+                store: self.chunks.store.clone(),
+                recipe,
                 result: result_tx,
                 wake: (self.wake.clone(), wake),
             })
-            .await
             .map_err(|_| err_msg("import pool gone"))?;
-        let store = self.chunks.store.clone();
-        let feeder = spawn_blocking(move || feed_import(&store, &recipe, &tx));
         self.imports
-            .insert(path.to_string(), ImportHandle { result, feeder });
+            .insert(path.to_string(), ImportHandle { result });
         Ok(())
     }
 }
@@ -319,7 +315,7 @@ impl ActiveBuild {
 /// Stream a recipe's chunks, decompressed and verified, to the import.
 /// Returns the chunks found corrupt or missing, after forgetting them
 /// in the store so a retry requests them again.
-fn feed_import(
+pub(super) fn feed_import(
     store: &Mutex<ChunkStore>,
     recipe: &[(Hash, usize)],
     tx: &mpsc::Sender<Bytes>,

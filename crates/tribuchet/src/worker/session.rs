@@ -130,7 +130,7 @@ async fn session_loop(
             }
             Some(w) = wake_rx.recv() => {
                 if let Some(build) = active.get_mut(&w.build_id) {
-                    let res = build.woken(&w.path).await;
+                    let res = build.woken(&w.path);
                     advance_staging(active, &mut ready, &mut pending, &w.build_id, res, &env).await?;
                 }
                 continue;
@@ -159,14 +159,14 @@ async fn session_loop(
             hub_message::Msg::Manifest(m) => {
                 let id = m.build_id.clone();
                 if let Some(build) = active.get_mut(&id) {
-                    let res = build.feed_manifest(m).await;
+                    let res = build.feed_manifest(&m);
                     advance_staging(active, &mut ready, &mut pending, &id, res, &env).await?;
                 }
             }
             hub_message::Msg::Chunk(c) => {
                 let id = c.build_id.clone();
                 if let Some(build) = active.get_mut(&id) {
-                    let res = build.feed_chunk(c).await;
+                    let res = build.feed_chunk(&c);
                     advance_staging(active, &mut ready, &mut pending, &id, res, &env).await?;
                 }
             }

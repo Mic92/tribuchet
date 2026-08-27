@@ -123,7 +123,7 @@ impl ActiveBuild {
         let mut hashes = Vec::new();
         for m in inputs {
             if m.info.is_some() {
-                hashes.extend(self.take_manifest(m).await?);
+                hashes.extend(self.take_manifest(&m)?);
             }
         }
         if !hashes.is_empty() {
@@ -253,16 +253,16 @@ impl ActiveBuild {
     }
 
     /// An own import finished or a claim this build waits on settled.
-    pub(super) async fn woken(&mut self, path: &str) -> Result<(Option<Need>, StagingStatus)> {
+    pub(super) fn woken(&mut self, path: &str) -> Result<(Option<Need>, StagingStatus)> {
         let mut need = None;
         if let Some(handle) = self.imports.remove(path) {
-            need = self.import_finished(path, handle).await?;
+            need = self.import_finished(path, handle)?;
         } else if let Some(state) = self.waits.get(path).and_then(Wait::settled) {
             self.waits.remove(path);
             match state {
                 ClaimState::Done => {
                     self.inputs.insert(path.to_string());
-                    self.retry_parked().await?;
+                    self.retry_parked()?;
                 }
                 _ => {
                     if self.claim(path) {
@@ -313,8 +313,8 @@ impl ActiveBuild {
     /// referrers dispatch. One that failed on corrupt or vanished
     /// chunks is staged again instead of failing the build. Returns the
     /// Need of that retry.
-    async fn import_finished(&mut self, path: &str, handle: ImportHandle) -> Result<Option<Need>> {
-        let Some((res, bad)) = handle.finish().await? else {
+    fn import_finished(&mut self, path: &str, handle: ImportHandle) -> Result<Option<Need>> {
+        let Some((res, bad)) = handle.finish()? else {
             return Err(err_msg(format!("woken for unfinished import {path}")));
         };
         if let Err(e) = res {
@@ -328,13 +328,13 @@ impl ActiveBuild {
                 bad_chunks = bad.len(),
                 "staging failed import again: {e}"
             );
-            return self.restage(vec![path.to_string()]).await;
+            return self.restage(vec![path.to_string()]);
         }
         self.chunks.forget_path(path);
         self.infos.remove(path);
         self.settle(path, ClaimState::Done);
         self.inputs.insert(path.to_string());
-        self.retry_parked().await?;
+        self.retry_parked()?;
         Ok(None)
     }
 
