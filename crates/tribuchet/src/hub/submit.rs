@@ -3,7 +3,6 @@
 use std::collections::HashSet;
 use std::path::{Component, Path};
 use std::sync::Arc;
-use std::time::Instant;
 
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -11,7 +10,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use super::metrics::Metrics;
-use super::state::{HubState, Inflight, Job, Replay};
+use super::state::{HubState, Inflight, Job, Replay, Servability};
 use crate::proto::{
     AttachEvent, BuildMessage, BuildRequest, DECLINE_EXIT_CODE, attach_event, attach_hub_server,
     build_message,
@@ -135,10 +134,6 @@ impl AttachSvc {
         system: &str,
         features: &[String],
     ) -> Option<Response<BuildStream>> {
-        let servable = || {
-            let caps = self.state.worker_caps.lock().unwrap();
-            caps.values().any(|c| c.serves(system, features))
-        };
         let decline = || {
             tracing::info!(system, "no capable worker; declining");
             Metrics::inc(&self.state.metrics.declined);
@@ -148,30 +143,21 @@ impl AttachSvc {
             }));
             Response::new(ReceiverStream::new(rx))
         };
-        if servable() {
-            return None;
-        }
-        // A platform no worker is expected to (re)serve declines at once.
-        let Some(deadline) = self.state.expected_deadline(system, features) else {
-            return Some(decline());
-        };
-        tracing::info!(system, "no capable worker yet; waiting");
         loop {
-            // Arm the wakeup before re-checking, else a worker
-            // registering in the gap would be missed.
+            // Arm the wakeup before checking, else a worker registering
+            // in the gap would be missed.
             let notified = self.state.caps_changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if servable() {
-                return None;
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                return Some(decline());
-            }
+            let deadline = match self.state.servability(system, features) {
+                Servability::Now => return None,
+                Servability::Never => return Some(decline()),
+                Servability::ExpectedBy(at) => at,
+            };
+            tracing::info!(system, "no capable worker yet; waiting");
             tokio::select! {
                 () = &mut notified => {}
-                () = tokio::time::sleep(deadline - now) => {}
+                () = tokio::time::sleep_until(deadline.into()) => {}
             }
         }
     }
@@ -230,7 +216,6 @@ impl attach_hub_server::AttachHub for AttachSvc {
                 replay,
                 listing: std::sync::Mutex::new(Some(listing)),
                 attempts: 0,
-                requeued_at: None,
             };
             tracing::info!(id = job.id, system = job.req.system, "queueing build");
             Metrics::inc(&self.state.metrics.submitted);

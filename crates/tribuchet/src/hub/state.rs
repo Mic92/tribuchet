@@ -54,9 +54,6 @@ pub(super) struct Job {
     /// Times the job went back to the queue after its worker session
     /// died; capped so a crash-looping build cannot bounce forever.
     pub(super) attempts: u32,
-    /// Set on requeue: protects the job from fail_unservable() while
-    /// its worker reconnects (reload or crash respawn).
-    pub(super) requeued_at: Option<Instant>,
 }
 
 impl Job {
@@ -64,6 +61,12 @@ impl Job {
     pub(super) fn unlist(&self) {
         drop(self.listing.lock().unwrap().take());
     }
+}
+
+pub(super) enum Servability {
+    Now,
+    ExpectedBy(Instant),
+    Never,
 }
 
 pub(super) struct HubState {
@@ -221,10 +224,23 @@ impl HubState {
         departed.push((caps, now));
     }
 
-    /// If this platform is not servable right now but we expect a
-    /// capable worker back, the instant to wait until; `None` means
-    /// nothing we know of will ever serve it, so decline immediately.
-    pub(super) fn expected_deadline(&self, system: &str, features: &[String]) -> Option<Instant> {
+    /// Whether a platform can be built now, once an expected worker is
+    /// back, or never.
+    pub(super) fn servability(&self, system: &str, features: &[String]) -> Servability {
+        if self
+            .worker_caps
+            .lock()
+            .unwrap()
+            .values()
+            .any(|c| c.serves(system, features))
+        {
+            return Servability::Now;
+        }
+        self.expected_deadline(system, features)
+            .map_or(Servability::Never, Servability::ExpectedBy)
+    }
+
+    fn expected_deadline(&self, system: &str, features: &[String]) -> Option<Instant> {
         let now = Instant::now();
         // During the startup window no worker has re-registered yet, so
         // every platform is awaited; afterwards only one a worker served
@@ -266,8 +282,8 @@ impl HubState {
         }
     }
 
-    /// Take a queued job `worker` can resume, regardless of RequestJob
-    /// credits. Each held key is honoured once.
+    /// Take a queued job `worker` can resume, regardless of its
+    /// capacity. Each held key is honoured once.
     pub(super) async fn take_job_by_key(&self, worker: u64) -> Option<Job> {
         let mut queue = self.queue.lock().await;
         let mut held = self.held.lock().unwrap();
@@ -280,11 +296,9 @@ impl HubState {
 
     /// Put a job back in the queue after its worker session died,
     /// telling attach clients to drop any half-streamed output NARs
-    /// (the next attempt re-streams them from the start). A delayed
-    /// fail_unservable() covers the case where no worker ever returns.
+    /// (the next attempt re-streams them from the start).
     pub(super) async fn requeue(self: &Arc<Self>, mut job: Job) {
         job.attempts += 1;
-        job.requeued_at = Some(Instant::now());
         for path in job.req.outputs.values() {
             job.replay
                 .publish(attach_event::Event::OutputRestart(path.clone()))
@@ -292,26 +306,25 @@ impl HubState {
         }
         self.queue.lock().await.push_back(job);
         self.notify.notify_waiters();
-        self.recheck_unservable();
+        self.fail_unservable().await;
     }
 
-    /// Re-run fail_unservable once the grace of protected jobs lapsed.
-    fn recheck_unservable(self: &Arc<Self>) {
+    /// Fail queued jobs nothing will serve, and re-run when the latest
+    /// expected worker is due.
+    pub(super) async fn fail_unservable(self: &Arc<Self>) {
+        let Some(mut due) = self.fail_unservable_now().await else {
+            return;
+        };
         let state = self.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(state.worker_grace + Duration::from_secs(1)).await;
-                if !state.fail_unservable_now().await {
-                    break;
+                tokio::time::sleep_until((due + Duration::from_secs(1)).into()).await;
+                match state.fail_unservable_now().await {
+                    Some(next) => due = next,
+                    None => break,
                 }
             }
         });
-    }
-
-    pub(super) async fn fail_unservable(self: &Arc<Self>) {
-        if self.fail_unservable_now().await {
-            self.recheck_unservable();
-        }
     }
 
     pub(super) async fn finish(&self, job: &Job) {
@@ -319,28 +332,20 @@ impl HubState {
         job.replay.finish().await;
     }
 
-    /// Fail queued jobs no connected worker can serve. The submission
-    /// check alone is not enough: the capable worker can disconnect
-    /// while the job sits in the queue, which would strand it forever.
-    /// True if jobs were kept only because of a grace period.
-    async fn fail_unservable_now(&self) -> bool {
-        let caps: Vec<WorkerCaps> = self.worker_caps.lock().unwrap().values().cloned().collect();
+    /// Returns the latest deadline a kept job is still waiting for.
+    async fn fail_unservable_now(&self) -> Option<Instant> {
         let mut queue = self.queue.lock().await;
         let mut kept = VecDeque::with_capacity(queue.len());
         let mut failed = Vec::new();
-        let mut recheck = false;
+        let mut due: Option<Instant> = None;
         for j in queue.drain(..) {
-            let protected = j
-                .requeued_at
-                .is_some_and(|t| t.elapsed() < self.worker_grace)
-                || self.expected_deadline(&j.req.system, &j.features).is_some();
-            if caps.iter().any(|c| c.serves(&j.req.system, &j.features)) {
-                kept.push_back(j);
-            } else if protected {
-                recheck = true;
-                kept.push_back(j);
-            } else {
-                failed.push(j);
+            match self.servability(&j.req.system, &j.features) {
+                Servability::Now => kept.push_back(j),
+                Servability::ExpectedBy(at) => {
+                    due = Some(due.map_or(at, |d| d.max(at)));
+                    kept.push_back(j);
+                }
+                Servability::Never => failed.push(j),
             }
         }
         *queue = kept;
@@ -358,7 +363,7 @@ impl HubState {
                 .await;
             self.finish(&job).await;
         }
-        recheck
+        due
     }
 }
 
@@ -387,7 +392,6 @@ mod tests {
             replay,
             listing: StdMutex::default(),
             attempts: 0,
-            requeued_at: None,
         }
     }
 

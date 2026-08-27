@@ -471,7 +471,6 @@ mod tests {
             replay: Arc::new(Replay::default()),
             listing: Default::default(),
             attempts: 0,
-            requeued_at: None,
         }
     }
 
