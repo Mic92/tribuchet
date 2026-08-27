@@ -116,7 +116,7 @@ impl Agent {
             let _ = kill_process_group(pgid, Signal::KILL);
         }
         if self.dedicated_uid {
-            kill_own_uid_processes(self.confinement.exempt_pid());
+            kill_own_uid_processes();
         }
         self.confinement.kill_block();
     }
@@ -378,7 +378,6 @@ fn handle_cleanup(agent: &Arc<Agent>, conn: &UnixStream, req: &CleanupRequest) -
     framing::send_reply(conn, reply::Reply::Empty(Empty {}), &[])?;
     tracing::info!(id = build.id, "cleanup done");
     if agent.dedicated_uid {
-        agent.confinement.shutdown();
         process::exit(0);
     }
     Ok(())
@@ -467,16 +466,15 @@ fn notify_exit(conn: &UnixStream, exit: &(Mutex<Option<i32>>, Condvar)) -> Resul
     )?)
 }
 
-/// Kill every process of the agent's uid except the agent itself and
-/// the `exempt` pid: catches setsid escapes from the process-group
-/// kill and leftovers from a previous build. kill(-1) would take the
-/// agent down too.
-fn kill_own_uid_processes(exempt: Option<i32>) {
+/// Kill every process of the agent's uid except the agent itself:
+/// catches setsid escapes from the process-group kill and leftovers
+/// from a previous build. kill(-1) would take the agent down too.
+fn kill_own_uid_processes() {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let others = platform::own_uid_pids()
             .into_iter()
-            .filter(|&pid| pid != process::id().cast_signed() && Some(pid) != exempt)
+            .filter(|&pid| pid != process::id().cast_signed())
             .collect::<Vec<_>>();
         if others.is_empty() {
             return;

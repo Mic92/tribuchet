@@ -29,13 +29,6 @@ impl Confinement {
     }
 
     pub(super) fn kill_block(&self) {}
-
-    pub(super) fn shutdown(&self) {}
-
-    /// Nothing to exempt from the kill sweep.
-    pub(super) fn exempt_pid(&self) -> Option<i32> {
-        None
-    }
 }
 
 /// The agent runs the builder as its own uid, so it unpacks the tmp

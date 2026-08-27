@@ -21,7 +21,6 @@ use std::path::{Path, PathBuf};
 use std::process::{self, Stdio};
 use std::process::{Child, Command};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 use std::{env, slice, thread};
 
 use rustix::io::{FdFlags, fcntl_setfd};
@@ -31,7 +30,7 @@ use rustix::net::{
     SocketType, recvmsg, send, socketpair,
 };
 use rustix::process::getuid;
-use rustix::process::{Gid, Pid, PidfdFlags, Signal, Uid, kill_process, pidfd_open};
+use rustix::process::{Gid, Pid, PidfdFlags, Uid, pidfd_open};
 use rustix::thread::{
     LinkNameSpaceType, move_into_link_name_space, set_thread_gid, set_thread_uid,
 };
@@ -63,7 +62,7 @@ pub(super) struct Confinement {
 
 struct Userns {
     /// Pausing child that keeps the namespace alive.
-    holder: UsernsHolder,
+    /// keeps the namespace alive after the holder process exited
     fd: OwnedFd,
     uid_base: u32,
 }
@@ -79,36 +78,14 @@ impl Confinement {
         })
     }
 
+    /// `kill(-1)` as root of the user namespace: the kernel signals
+    /// exactly the processes it has CAP_KILL over, i.e. the block.
     pub(super) fn kill_block(&self) {
-        let Some(ns) = &self.userns else { return };
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if uid_range_pids(ns.uid_base, UID_COUNT).is_empty() {
-                return;
-            }
-            if let Err(e) = run_in_userns(self, "kill-block", &[]) {
-                tracing::warn!("uid block kill sweep: {}", chain(&e));
-                return;
-            }
-            if Instant::now() > deadline {
-                tracing::warn!("uid block processes survived the kill sweep");
-                return;
-            }
-            thread::sleep(Duration::from_millis(100));
+        if self.userns.is_some()
+            && let Err(e) = run_in_userns(self, "kill-block", &[])
+        {
+            tracing::warn!("uid block kill: {}", chain(&e));
         }
-    }
-
-    pub(super) fn shutdown(&self) {
-        if let Some(ns) = &self.userns {
-            ns.holder.kill();
-        }
-    }
-
-    /// The userns holder must survive the kill sweep.
-    pub(super) fn exempt_pid(&self) -> Option<i32> {
-        self.userns
-            .as_ref()
-            .and_then(|ns| i32::try_from(ns.holder.pid()).ok())
     }
 }
 
@@ -361,18 +338,12 @@ pub fn fs_helper_stage() -> ! {
         move_into_link_name_space(ns.as_fd(), Some(LinkNameSpaceType::User))
             .map_err(err_ctx("joining the agent user namespace"))?;
         if op.to_str() == Some("kill-block") {
-            // "0 <base> <count>"
-            let map = fs::read_to_string("/proc/self/uid_map")?;
-            let base: u32 = map
-                .split_whitespace()
-                .nth(1)
-                .and_then(|b| b.parse().ok())
-                .ok_or_else(|| msg("unexpected uid_map"))?;
-            for pid in uid_range_pids(base, UID_COUNT) {
-                if let Some(pid) = Pid::from_raw(pid) {
-                    let _ = kill_process(pid, Signal::KILL);
-                }
-            }
+            // As in-ns root: still the agent's uid otherwise, and
+            // kill(-1) would reach the agent by uid match.
+            set_thread_gid(Gid::from_raw(0)).map_err(err_ctx("setgid 0 in the ns"))?;
+            set_thread_uid(Uid::from_raw(0)).map_err(err_ctx("setuid 0 in the ns"))?;
+            // ESRCH when nothing was left. SAFETY: plain syscall.
+            let _ = unsafe { libc::kill(-1, libc::SIGKILL) };
             return Ok(());
         }
         if op.to_str() == Some("unpack") {
@@ -435,11 +406,9 @@ impl Userns {
             uid_count = UID_COUNT,
             "agent user namespace mapped"
         );
-        Ok(Self {
-            holder,
-            fd,
-            uid_base,
-        })
+        // the fd keeps the mapped namespace
+        drop(holder);
+        Ok(Self { fd, uid_base })
     }
 }
 
@@ -492,10 +461,7 @@ pub(super) fn oom_killed(confinement: &Confinement, build_id: &str) -> bool {
 
 /// Pids whose real uid is this uid, from /proc.
 pub(super) fn own_uid_pids() -> Vec<i32> {
-    uid_range_pids(getuid().as_raw(), 1)
-}
-
-fn uid_range_pids(base: u32, count: u32) -> Vec<i32> {
+    let uid = getuid().as_raw();
     let Ok(entries) = fs::read_dir("/proc") else {
         tracing::warn!("reading /proc failed, kill sweep degraded to the process group");
         return Vec::new();
@@ -509,10 +475,8 @@ fn uid_range_pids(base: u32, count: u32) -> Vec<i32> {
             if field("State:")?.trim_start().starts_with('Z') {
                 return None;
             }
-            let uid: u32 = field("Uid:")?.split_whitespace().next()?.parse().ok()?;
-            (base..base.saturating_add(count))
-                .contains(&uid)
-                .then_some(pid)
+            let real: u32 = field("Uid:")?.split_whitespace().next()?.parse().ok()?;
+            (real == uid).then_some(pid)
         })
         .collect()
 }
@@ -523,13 +487,12 @@ mod tests {
 
     #[test]
     fn confined_agent_refuses_an_unsandboxed_start() -> Result<()> {
-        let Ok((holder, fd)) = UsernsHolder::new() else {
+        let Ok((_holder, fd)) = UsernsHolder::new() else {
             eprintln!("skipping: cannot create a user namespace here");
             return Ok(());
         };
         let confinement = Confinement {
             userns: Some(Userns {
-                holder,
                 fd,
                 uid_base: 65536,
             }),
