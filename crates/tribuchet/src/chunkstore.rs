@@ -75,6 +75,7 @@ pub struct ChunkStore {
     main_bytes: u64,
     ghost: VecDeque<u64>,
     ghost_set: HashSet<u64>,
+    pins: HashMap<Hash, u32>,
     next_id: u64,
 }
 
@@ -98,6 +99,7 @@ impl ChunkStore {
             main_bytes: 0,
             ghost: VecDeque::new(),
             ghost_set: HashSet::new(),
+            pins: HashMap::new(),
             next_id: 0,
         };
         store.load()?;
@@ -160,9 +162,31 @@ impl ChunkStore {
     pub fn locate(&mut self, hash: &Hash) -> Option<FrameRef> {
         let entry = self.map.get_mut(hash)?;
         entry.freq = (entry.freq + 1).min(FREQ_MAX);
+        self.peek(hash)
+    }
+
+    pub fn peek(&mut self, hash: &Hash) -> Option<FrameRef> {
+        let entry = self.map.get(hash)?;
         let (pack, offset, len) = (entry.pack, entry.offset, entry.len);
         let file = self.reader(pack).ok()?.clone();
         Some(FrameRef { file, offset, len })
+    }
+
+    pub fn pin(&mut self, hashes: impl IntoIterator<Item = Hash>) {
+        for h in hashes {
+            *self.pins.entry(h).or_default() += 1;
+        }
+    }
+
+    pub fn unpin(&mut self, hashes: impl IntoIterator<Item = Hash>) {
+        for h in hashes {
+            if let Some(n) = self.pins.get_mut(&h) {
+                *n -= 1;
+                if *n == 0 {
+                    self.pins.remove(&h);
+                }
+            }
+        }
     }
 
     /// Admit one zstd frame. A ghost hit goes straight to main.
@@ -234,7 +258,9 @@ impl ChunkStore {
     }
 
     fn evict(&mut self) -> io::Result<()> {
-        while self.small_bytes + self.main_bytes > self.budget {
+        let mut passes = self.small.len() + self.main.len() + 2;
+        while self.small_bytes + self.main_bytes > self.budget && passes > 0 {
+            passes -= 1;
             if self.small_bytes > self.budget / SMALL_FRACTION {
                 if self.small.is_empty() {
                     self.seal(Queue::Small)?;
@@ -270,7 +296,7 @@ impl ChunkStore {
             if entry.pack != id {
                 continue;
             }
-            if entry.freq == 0 {
+            if entry.freq == 0 && !self.pins.contains_key(&hash) {
                 self.map.remove(&hash);
                 if queue == Queue::Small {
                     self.ghost_push(hash);
@@ -279,7 +305,7 @@ impl ChunkStore {
             }
             let freq = match queue {
                 Queue::Small => entry.freq,
-                Queue::Main => entry.freq - 1,
+                Queue::Main => entry.freq.saturating_sub(1),
             };
             let (pack, offset, len) = (entry.pack, entry.offset, entry.len);
             let frame = self.frame(pack, offset, len)?;
@@ -433,6 +459,36 @@ mod tests {
         let mut s = store(dir.path(), 1 << 20);
         assert_eq!(get(&mut s, &ha).unwrap(), fa);
         assert!(get(&mut s, &hb).is_none());
+    }
+
+    #[test]
+    fn pinned_survives_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = store(dir.path(), 64 << 20);
+        s.seal_bytes = 64 << 10;
+        let frame = vec![0u8; 8 << 10];
+        let pinned: Vec<Hash> = (0..20u8).map(h).collect();
+        for p in &pinned {
+            s.insert(*p, &frame).unwrap();
+        }
+        s.pin(pinned.clone());
+        s.budget = 128 << 10;
+        for n in 20..200u8 {
+            s.insert(h(n), &frame).unwrap();
+        }
+        assert!(
+            pinned.iter().all(|p| s.peek(p).is_some()),
+            "pinned chunk evicted"
+        );
+        assert!(s.peek(&h(20)).is_none());
+        s.unpin(pinned.clone());
+        for n in 200..255u8 {
+            s.insert(h(n), &frame).unwrap();
+        }
+        assert!(
+            pinned.iter().any(|p| s.peek(p).is_none()),
+            "unpinned chunks never evicted"
+        );
     }
 
     /// One-hit wonders age out with zero copies while a re-hit chunk

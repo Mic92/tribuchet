@@ -47,6 +47,13 @@ impl ChunkStaging {
         sizes: &[u64],
     ) -> Result<(Vec<u8>, bool)> {
         let recipe = parse_recipe(&path, hashes, sizes)?;
+        if let Some(old) = self.recipes.remove(&path) {
+            self.unpin(&old);
+        }
+        self.store
+            .lock()
+            .unwrap()
+            .pin(recipe.iter().map(|(h, _)| *h));
         let need = self.await_missing(&path, &recipe);
         let ready = !self.remaining.contains_key(&path);
         self.recipes.insert(path, recipe);
@@ -128,7 +135,25 @@ impl ChunkStaging {
     }
 
     pub(super) fn forget_path(&mut self, path: &str) {
-        self.recipes.remove(path);
+        if let Some(r) = self.recipes.remove(path) {
+            self.unpin(&r);
+        }
+    }
+
+    fn unpin(&self, recipe: &[(Hash, usize)]) {
+        self.store
+            .lock()
+            .unwrap()
+            .unpin(recipe.iter().map(|(h, _)| *h));
+    }
+}
+
+impl Drop for ChunkStaging {
+    fn drop(&mut self) {
+        let mut store = self.store.lock().unwrap();
+        for r in self.recipes.values() {
+            store.unpin(r.iter().map(|(h, _)| *h));
+        }
     }
 }
 
@@ -338,7 +363,7 @@ pub(super) fn feed_import(
 }
 
 fn read_verified(store: &Mutex<ChunkStore>, hash: &Hash, size: usize) -> Option<Vec<u8>> {
-    let frame = store.lock().unwrap().locate(hash)?.read().ok()?;
+    let frame = store.lock().unwrap().peek(hash)?.read().ok()?;
     decode_chunk(&frame, hash, size).ok()
 }
 
