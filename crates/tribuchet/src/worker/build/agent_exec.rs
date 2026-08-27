@@ -73,7 +73,7 @@ impl ActiveBuild {
             sandbox::SandboxSpec {
                 outputs: outputs.clone(),
                 store_inputs: self.input_list(),
-                recursive_nix: self.ctx.recursive_nix,
+                recursive_nix: self.recursive_nix(),
                 ..sandbox::SandboxSpec::default()
             },
         );
@@ -162,6 +162,13 @@ impl ActiveBuild {
     /// The Linux sandbox spec sent with the StartRequest. The agent
     /// fills in its scratch paths, user namespace and uid block before
     /// spawning the setup stage with it.
+    fn recursive_nix(&self) -> bool {
+        self.ctx.recursive_nix
+            && crate::build_json::required_system_features(&self.assignment.env)
+                .iter()
+                .any(|f| f == "recursive-nix")
+    }
+
     #[cfg(target_os = "linux")]
     fn build_spec(&self) -> Result<sandbox::SandboxSpec> {
         let a = &self.assignment;
@@ -178,7 +185,7 @@ impl ActiveBuild {
                 emulator: self.ctx.emulators.get(&a.system).map(PathBuf::as_path),
                 net_isolation: self.ctx.fod_isolation,
                 net_policy: self.ctx.fod_network.clone(),
-                recursive_nix: self.ctx.recursive_nix,
+                recursive_nix: self.recursive_nix(),
                 nix_daemon_socket: None,
             },
         )?;
@@ -255,13 +262,8 @@ pub(in crate::worker) fn supervise_agent(
         let packed = agents::finish(socket, &st.build_id)
             .map_err(err_ctx("finishing the build on its agent"))
             .and_then(|()| {
-                tokio::runtime::Handle::current().block_on(pack_outputs_and_extras(
-                    &dir,
-                    &st.spec,
-                    None,
-                    deadline,
-                    &st.build_id,
-                ))
+                tokio::runtime::Handle::current()
+                    .block_on(pack_outputs_and_extras(&dir, &st.spec, None, deadline))
             });
         match packed {
             Ok((o, e)) => (0, String::new(), o, e),

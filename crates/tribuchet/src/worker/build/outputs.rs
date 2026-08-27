@@ -19,7 +19,6 @@ use super::super::resume::{OutChunk, PackedExtra, PackedOutput};
 use super::super::sandbox;
 use super::store_base;
 use crate::chunker::{Chunk, chunk_store_path};
-use crate::errors::chain;
 use crate::errors::{Result, err_ctx, err_msg};
 use crate::fsutil::io_ctx;
 use crate::proto::MAX_NAR_BYTES;
@@ -32,13 +31,11 @@ pub(in crate::worker) async fn pack_outputs_and_extras(
     spec: &sandbox::SandboxSpec,
     pack_root: Option<&OwnedFd>,
     deadline: Instant,
-    build_id: &str,
 ) -> Result<(Vec<PackedOutput>, Vec<PackedExtra>)> {
     let extra_candidates = if spec.recursive_nix {
-        query_all_valid_paths().await.unwrap_or_else(|e| {
-            tracing::warn!(id = build_id, "queryAllValidPaths failed: {}", chain(&e));
-            BTreeSet::new()
-        })
+        query_all_valid_paths()
+            .await
+            .map_err(err_ctx("queryAllValidPaths"))?
     } else {
         BTreeSet::new()
     };
@@ -46,10 +43,7 @@ pub(in crate::worker) async fn pack_outputs_and_extras(
     let extras = if spec.recursive_nix {
         pack_extras(dir, &packed, &spec.store_inputs, &spec.outputs, deadline)
             .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(id = build_id, "packing extras failed: {}", chain(&e));
-                Vec::new()
-            })
+            .map_err(err_ctx("packing recursive-nix extras"))?
     } else {
         Vec::new()
     };
