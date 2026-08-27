@@ -77,6 +77,17 @@
               quint verify ${./spec}/${name}.qnt --main ${name} --invariant inv --inductive-invariant indInv
               touch $out
             '';
+          # variants modelling known-wrong relay shapes must stay refutable
+          specRefute =
+            main:
+            pkgs.runCommand "spec-refute-${main}" { nativeBuildInputs = [ pkgs.quint ]; } ''
+              export HOME=$TMPDIR
+              if quint run ${./spec}/protocol.qnt --main ${main} --invariant inv --max-samples 50000 --max-steps 60; then
+                echo "${main}: expected an invariant violation" >&2
+                exit 1
+              fi
+              touch $out
+            '';
         in
         prefix "package" self.packages.${system}
         // prefix "devshell" self.devShells.${system}
@@ -97,6 +108,8 @@
           # binds a fixed port, which unsandboxed darwin builds share.
           spec-staging = specCheck "staging";
           spec-protocol = specCheck "protocol";
+          spec-refute-hubBlock = specRefute "hubBlock";
+          spec-refute-hubDrop = specRefute "hubDrop";
           nixos-test-builds = pkgs.testers.runNixOSTest (
             import ./nix/test.nix {
               tribuchet = self.packages.x86_64-linux.default;
