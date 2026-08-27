@@ -56,6 +56,8 @@ pub(super) struct Staging<'a> {
     offered: HashSet<&'a str>,
     /// Manifests sent, in send order.
     sent: Vec<Arc<(Info, Recipe)>>,
+    /// Computed, not yet on the wire. Paths stay in `computing` meanwhile.
+    unsent: VecDeque<(Info, Recipe)>,
     computing: HashSet<String>,
     tasks: FuturesUnordered<Computing<'a>>,
     /// Chunk requests are answered one at a time while the relay keeps
@@ -73,6 +75,7 @@ impl<'a> Staging<'a> {
             sess,
             offered: job.req.input_paths.iter().map(String::as_str).collect(),
             sent: Vec::new(),
+            unsent: VecDeque::new(),
             computing: HashSet::new(),
             tasks: FuturesUnordered::new(),
             queued: VecDeque::new(),
@@ -118,22 +121,30 @@ impl<'a> Staging<'a> {
     }
 
     pub(super) fn busy(&self) -> bool {
-        !self.tasks.is_empty() || self.serving.is_some()
+        !self.tasks.is_empty() || !self.unsent.is_empty() || self.serving.is_some()
     }
 
     /// Send the next late manifest or finish answering a Need,
-    /// whichever comes first. Cancel-safe.
+    /// whichever comes first. Cancel-safe: run_job drops this future
+    /// whenever another select! branch wins, so state only changes
+    /// once nothing is left to await (spec/protocol.qnt, HUB = queue).
     pub(super) async fn progress(
         &mut self,
         out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
     ) -> Result<()> {
         tokio::select! {
-            Some(r) = self.tasks.next(), if !self.tasks.is_empty() => {
-                let (info, recipe) = r?;
+            permit = out_tx.reserve(), if !self.unsent.is_empty() => {
+                let permit = permit.map_err(|_| err_msg("worker connection lost"))?;
+                let (info, recipe) = self.unsent.pop_front().expect("guarded");
                 let m = manifest(&self.job.id, &info, &recipe);
                 self.computing.remove(&info.store_path);
                 self.sent.push(Arc::new((info, recipe)));
-                send(out_tx, hub_message::Msg::Manifest(m)).await
+                permit.send(Ok(HubMessage { msg: Some(hub_message::Msg::Manifest(m)) }));
+                Ok(())
+            }
+            Some(r) = self.tasks.next(), if !self.tasks.is_empty() => {
+                self.unsent.push_back(r?);
+                Ok(())
             }
             r = poll_opt(&mut self.serving), if self.serving.is_some() => {
                 self.serving = None;
@@ -400,7 +411,11 @@ pub(super) async fn stream_tmp_dir(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+    use crate::hub::state::Replay;
+    use crate::proto::{BuildRequest, CancelBuild};
 
     fn sized(path: &str, refs: &[&str], nar_size: u64) -> Info {
         Info {
@@ -440,6 +455,59 @@ mod tests {
         let lib = "/nix/store/bbb-keyring";
         let ordered = order_by_references(vec![info(lib, &[dep, lib]), info(dep, &[])]);
         assert_eq!(seq(&ordered), vec![dep, lib]);
+    }
+
+    fn test_job() -> Job {
+        Job {
+            id: "0123456789abcdef0123456789abcdef".into(),
+            key: "k".into(),
+            req: BuildRequest::default(),
+            tmp_dir_pack: Arc::new(Vec::new()),
+            features: vec![],
+            replay: Arc::new(Replay::default()),
+            attempts: 0,
+            requeued_at: None,
+        }
+    }
+
+    /// A manifest computed while the session channel is full must still
+    /// reach the worker once it drains, though run_job's select! keeps
+    /// dropping progress() meanwhile, and run_job must not block on it.
+    #[tokio::test]
+    async fn manifest_survives_full_channel() {
+        let state = HubState::for_test(Duration::from_secs(1));
+        let job = test_job();
+        let sess = WorkerSession::new();
+        let mut staging = Staging::new(&state, &job, &sess);
+        let path = "/nix/store/00000000000000000000000000000000-x";
+        staging.computing.insert(path.into());
+        staging.tasks.push(Box::pin(async move {
+            Ok((info(path, &[]), Arc::new(Vec::new())))
+        }));
+
+        let (out_tx, mut out_rx) = mpsc::channel(1);
+        let filler = hub_message::Msg::Cancel(CancelBuild::default());
+        send(&out_tx, filler).await.unwrap();
+
+        // Same shape as run_job's loop. The tick stands in for in_rx.
+        let mut tick = tokio::time::interval(Duration::from_millis(5));
+        let mut ticks = 0;
+        while ticks < 10 {
+            tokio::select! {
+                r = staging.progress(&out_tx), if staging.busy() => r.unwrap(),
+                _ = tick.tick() => ticks += 1,
+            }
+        }
+        assert!(staging.busy(), "manifest lost");
+        out_rx.recv().await.unwrap().unwrap();
+        staging.progress(&out_tx).await.unwrap();
+        drop(out_tx);
+        match out_rx.recv().await.expect("manifest lost").unwrap().msg {
+            Some(hub_message::Msg::Manifest(m)) => assert_eq!(m.store_path, path),
+            other => panic!("expected manifest, got {other:?}"),
+        }
+        assert_eq!(staging.sent.len(), 1);
+        assert!(!staging.computing.contains(path));
     }
 
     #[test]
