@@ -301,13 +301,22 @@ impl HubState {
         }
     }
 
-    pub(super) async fn finish(&self, job: &Job) {
+    pub(super) async fn unlist(&self, job: &Job) {
         let mut inflight = self.inflight.lock().await;
-        inflight.by_key.remove(&job.key);
-        for p in job.req.outputs.values() {
-            inflight.by_path.remove(p);
+        if inflight
+            .by_key
+            .get(&job.key)
+            .is_some_and(|r| Arc::ptr_eq(r, &job.replay))
+        {
+            inflight.by_key.remove(&job.key);
+            for p in job.req.outputs.values() {
+                inflight.by_path.remove(p);
+            }
         }
-        drop(inflight);
+    }
+
+    pub(super) async fn finish(&self, job: &Job) {
+        self.unlist(job).await;
         job.replay.finish().await;
     }
 
