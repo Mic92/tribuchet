@@ -145,6 +145,7 @@ message BuildAssignment {
   repeated Manifest inputs = 11;
   // Dispatched via resumable_keys without consuming a RequestJob.
   bool credit_free = 12;
+  repeated string required_features = 13;
 }
 
 message TmpDirArchive {
@@ -222,7 +223,10 @@ message BuildRequest {
   repeated string input_paths = 6;
   string tmp_dir_in_sandbox = 7;
   string store_dir = 8;
+  // Grants network in the sandbox (fixed-output or __impure).
   bool fixed_output = 9;
+  // requiredSystemFeatures, resolved by attach from env or .attrs.json.
+  repeated string required_features = 10;
 }
 
 message AttachEvent {

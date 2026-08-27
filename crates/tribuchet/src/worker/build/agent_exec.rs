@@ -40,7 +40,7 @@ impl ActiveBuild {
         timeout: Duration,
     ) -> Result<FinishedBuild> {
         #[cfg(target_os = "macos")]
-        if requires_uid_range(&self.assignment.env) {
+        if requires_uid_range(&self.assignment) {
             return Err(err_msg(
                 "the uid-range feature is only supported on Linux workers",
             ));
@@ -164,7 +164,9 @@ impl ActiveBuild {
     /// spawning the setup stage with it.
     fn recursive_nix(&self) -> bool {
         self.ctx.recursive_nix
-            && crate::build_json::required_system_features(&self.assignment.env)
+            && self
+                .assignment
+                .required_features
                 .iter()
                 .any(|f| f == "recursive-nix")
     }
@@ -172,7 +174,7 @@ impl ActiveBuild {
     #[cfg(target_os = "linux")]
     fn build_spec(&self) -> Result<sandbox::SandboxSpec> {
         let a = &self.assignment;
-        let uid_count = if requires_uid_range(&a.env) { 65536 } else { 1 };
+        let uid_count = if requires_uid_range(a) { 65536 } else { 1 };
         let spec = sandbox::prepare(
             a,
             &self.dir,

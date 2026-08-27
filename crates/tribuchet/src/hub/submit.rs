@@ -11,7 +11,6 @@ use tonic::{Request, Response, Status, Streaming};
 
 use super::metrics::Metrics;
 use super::state::{HubState, Job, Replay};
-use crate::build_json;
 use crate::proto::{
     AttachEvent, BuildMessage, BuildRequest, DECLINE_EXIT_CODE, attach_event, attach_hub_server,
     build_message,
@@ -231,7 +230,7 @@ impl attach_hub_server::AttachHub for AttachSvc {
         let tmp_dir_pack = Arc::new(tmp_dir_pack);
         let key = dedupe_key(&req, &tmp_dir_pack);
 
-        let features = build_json::required_system_features(&req.env);
+        let features = req.required_features.clone();
         if let Some(declined) = self.await_capable_worker(&req.system, &features).await {
             return Ok(declined);
         }
@@ -305,6 +304,7 @@ mod tests {
             tmp_dir_in_sandbox: "/build".into(),
             store_dir: "/nix/store".into(),
             fixed_output: false,
+            required_features: vec![],
         }
     }
 

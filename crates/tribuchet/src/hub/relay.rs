@@ -65,6 +65,7 @@ pub(super) async fn run_job(
             dedupe_key: job.key.clone(),
             inputs,
             credit_free,
+            required_features: job.features.clone(),
         }),
     )
     .await?;

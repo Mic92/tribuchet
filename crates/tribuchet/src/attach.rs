@@ -20,7 +20,7 @@ use tonic::Code;
 use tonic::transport::{Endpoint, Uri};
 use tower::service_fn;
 
-use crate::build_json::BuildJson;
+use crate::build_json::{BuildJson, required_system_features};
 use crate::chunkio;
 use crate::errors::{Error, Result, chain, err_ctx, err_msg};
 use crate::nar;
@@ -59,7 +59,9 @@ async fn run_async(build: BuildJson, socket: PathBuf, build_json_path: PathBuf) 
         tracing::info!("diverted store; declining so Nix builds locally");
         return Ok(DECLINE_EXIT_CODE);
     }
-    let fixed_output = build.is_fixed_output();
+    let attrs = build.attrs();
+    let fixed_output = build.network_allowed(attrs.as_ref());
+    let required_features = required_system_features(&build.env, attrs.as_ref());
     tracing::info!(fixed_output, system = %build.system, "submitting build");
     let req = BuildRequest {
         system: build.system,
@@ -71,6 +73,7 @@ async fn run_async(build: BuildJson, socket: PathBuf, build_json_path: PathBuf) 
         tmp_dir_in_sandbox: build.tmp_dir_in_sandbox.to_string_lossy().into_owned(),
         store_dir: build.store_dir,
         fixed_output,
+        required_features,
     };
     // Packed once and resent verbatim on every reconnect attempt.
     // Nix places everything the builder consumes in topTmpDir/build.

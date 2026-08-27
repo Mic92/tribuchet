@@ -3,7 +3,6 @@
 //! `nix/src/libstore/unix/build/external-derivation-builder.cc`.
 
 use std::collections::BTreeMap;
-use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -56,27 +55,42 @@ impl BuildJson {
         Ok(parsed)
     }
 
-    /// Whether this is a fixed-output derivation, granted network in
-    /// the sandbox. Nix sets `NIX_OUTPUT_CHECKED=1` for exactly the
-    /// fixed-output case; build.json carries no output hash, and only
-    /// classic FODs expose `outputHash` in their env.
-    pub fn is_fixed_output(&self) -> bool {
-        self.env.get("NIX_OUTPUT_CHECKED").map(String::as_str) == Some("1")
+    pub fn attrs(&self) -> Option<serde_json::Value> {
+        self.env.get("NIX_ATTRS_JSON_FILE")?;
+        let data = fs::read(self.top_tmp_dir.join("build/.attrs.json")).ok()?;
+        serde_json::from_slice(&data).ok()
+    }
+
+    /// Fixed-output or `__impure`, like Nix's `!isSandboxed()`.
+    pub fn network_allowed(&self, attrs: Option<&serde_json::Value>) -> bool {
+        flag(&self.env, attrs, "NIX_OUTPUT_CHECKED") || flag(&self.env, attrs, "__impure")
     }
 }
 
-/// `requiredSystemFeatures` of a derivation environment, from the
-/// plain space-separated variable or the structured-attrs `__json`
-/// blob.
-pub fn required_system_features(env: &HashMap<String, String>) -> Vec<String> {
+/// A boolean derivation attr from the env (`"1"`) or structured attrs.
+pub fn flag(
+    env: &BTreeMap<String, String>,
+    attrs: Option<&serde_json::Value>,
+    name: &str,
+) -> bool {
+    env.get(name).map(String::as_str) == Some("1")
+        || attrs
+            .and_then(|a| a.get(name))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+}
+
+/// `requiredSystemFeatures` from the plain env var or structured attrs.
+pub fn required_system_features(
+    env: &BTreeMap<String, String>,
+    attrs: Option<&serde_json::Value>,
+) -> Vec<String> {
     if let Some(features) = env.get("requiredSystemFeatures") {
         return features.split_whitespace().map(str::to_owned).collect();
     }
-    if let Some(json) = env.get("__json")
-        && let Ok(attrs) = serde_json::from_str::<serde_json::Value>(json)
-        && let Some(features) = attrs
-            .get("requiredSystemFeatures")
-            .and_then(|v| v.as_array())
+    if let Some(features) = attrs
+        .and_then(|a| a.get("requiredSystemFeatures"))
+        .and_then(|v| v.as_array())
     {
         return features
             .iter()
@@ -92,21 +106,24 @@ mod tests {
 
     #[test]
     fn system_features_from_plain_env() {
-        let env = HashMap::from([(
+        let env = BTreeMap::from([(
             "requiredSystemFeatures".to_owned(),
             "kvm big-parallel".to_owned(),
         )]);
-        assert_eq!(required_system_features(&env), ["kvm", "big-parallel"]);
+        assert_eq!(
+            required_system_features(&env, None),
+            ["kvm", "big-parallel"]
+        );
     }
 
     #[test]
     fn system_features_from_structured_attrs() {
-        let env = HashMap::from([(
-            "__json".to_owned(),
-            r#"{"requiredSystemFeatures":["kvm"]}"#.to_owned(),
-        )]);
-        assert_eq!(required_system_features(&env), ["kvm"]);
-        assert!(required_system_features(&HashMap::new()).is_empty());
+        let attrs = serde_json::json!({"requiredSystemFeatures": ["kvm"]});
+        assert_eq!(
+            required_system_features(&BTreeMap::new(), Some(&attrs)),
+            ["kvm"]
+        );
+        assert!(required_system_features(&BTreeMap::new(), None).is_empty());
     }
 
     fn doc(env: &serde_json::Value) -> BuildJson {
@@ -126,10 +143,12 @@ mod tests {
     }
 
     #[test]
-    fn fixed_output_detection() {
-        assert!(!doc(&serde_json::json!({})).is_fixed_output());
-        assert!(doc(&serde_json::json!({"NIX_OUTPUT_CHECKED": "1"})).is_fixed_output());
-        // outputHash alone does not grant network; only Nix's flag does
-        assert!(!doc(&serde_json::json!({"outputHash": "sha256-..."})).is_fixed_output());
+    fn network_detection() {
+        assert!(!doc(&serde_json::json!({})).network_allowed(None));
+        assert!(doc(&serde_json::json!({"NIX_OUTPUT_CHECKED": "1"})).network_allowed(None));
+        assert!(!doc(&serde_json::json!({"outputHash": "sha256-..."})).network_allowed(None));
+        assert!(doc(&serde_json::json!({"__impure": "1"})).network_allowed(None));
+        let attrs = serde_json::json!({"__impure": true});
+        assert!(doc(&serde_json::json!({})).network_allowed(Some(&attrs)));
     }
 }

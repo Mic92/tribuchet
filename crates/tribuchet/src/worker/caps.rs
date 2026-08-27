@@ -1,21 +1,17 @@
 //! Advertised system capabilities and feature probing.
 
-use std::collections::HashMap;
 use std::env::consts;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 
 use super::WorkerCtx;
-use crate::build_json::required_system_features;
 use crate::config::WorkerConfig;
-use crate::proto::SystemCaps;
+use crate::proto::{BuildAssignment, SystemCaps};
 
 /// Nix's `uid-range` system feature: a full 65536-uid range with the
 /// builder as in-namespace root (containers, systemd-nspawn).
-pub(super) fn requires_uid_range(env: &HashMap<String, String>) -> bool {
-    required_system_features(env)
-        .iter()
-        .any(|f| f == "uid-range")
+pub(super) fn requires_uid_range(a: &BuildAssignment) -> bool {
+    a.required_features.iter().any(|f| f == "uid-range")
 }
 
 /// System features this worker can honor, advertised to the hub for
@@ -82,23 +78,10 @@ mod tests {
 
     #[test]
     fn uid_range_detection() {
-        let mut env = HashMap::new();
-        assert!(!requires_uid_range(&env));
-        env.insert(
-            "requiredSystemFeatures".into(),
-            "big-parallel uid-range".into(),
-        );
-        assert!(requires_uid_range(&env));
-
-        let mut env = HashMap::new();
-        env.insert(
-            "__json".into(),
-            r#"{"requiredSystemFeatures":["uid-range"]}"#.into(),
-        );
-        assert!(requires_uid_range(&env));
-        let mut env = HashMap::new();
-        env.insert("__json".into(), r#"{"outputHash":"x"}"#.into());
-        assert!(!requires_uid_range(&env));
+        let mut a = BuildAssignment::default();
+        assert!(!requires_uid_range(&a));
+        a.required_features = vec!["big-parallel".into(), "uid-range".into()];
+        assert!(requires_uid_range(&a));
     }
 
     #[test]
