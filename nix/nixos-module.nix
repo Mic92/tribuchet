@@ -380,9 +380,9 @@ in
             Group = "tribuchet-agent-%i";
             StateDirectory = "tribuchet/a%i";
             # Traverse-only for the worker and the uid block: the
-            # per-build scratch dirs under it are world-writable for
-            # the block, but their names are unguessable build ids and
-            # the missing read bit hides them.
+            # per-build scratch dirs under scratch/ are world-writable
+            # for the block, but their names are random and the missing
+            # read bit hides them.
             StateDirectoryMode = "0711";
             # Writing the uid/gid maps of the agent's pre-mapped user
             # namespace needs CAP_SETUID/CAP_SETGID over the uid block;

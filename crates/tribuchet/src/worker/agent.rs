@@ -82,9 +82,9 @@ struct Build {
     id: String,
     /// Builder pid, also its process group.
     pid: i32,
-    /// Scratch dir the build runs in (`<state>/scratch/build`).
+    /// Scratch dir the build runs in (`<scratch_root>/build`).
     dir: PathBuf,
-    /// Whole per-build tree removed by Cleanup (`<state>/scratch`).
+    /// Whole per-build tree removed by Cleanup (`<state>/scratch/<random>`).
     scratch_root: PathBuf,
     /// Private sandbox root under the scratch dir (Linux namespace
     /// builds); outputs land below it instead of at their store paths.
@@ -261,11 +261,17 @@ fn handle_start(
         // not tamper with this one. The uid holds nothing else.
         agent.kill_sweep(None);
 
-        // Short fixed name keeps sandbox socket paths within sun_path.
-        let scratch_root = agent.state_dir.join("scratch");
+        // unguessable name under a traverse-only parent, short for sun_path
+        let scratch_parent = agent.state_dir.join("scratch");
+        platform::clean_scratch(&agent.confinement, &scratch_parent)?;
+        fs::create_dir_all(&scratch_parent).map_err(io_ctx("creating", &scratch_parent))?;
+        fs::set_permissions(&scratch_parent, fs::Permissions::from_mode(0o711))
+            .map_err(io_ctx("setting permissions on", &scratch_parent))?;
+        let mut rnd = [0u8; 8];
+        getrandom::fill(&mut rnd).map_err(|e| msg(format!("randomness: {e}")))?;
+        let scratch_root = scratch_parent.join(hex::encode(rnd));
         let build_dir = scratch_root.join("build");
-        platform::clean_scratch(&agent.confinement, &scratch_root)?;
-        fs::create_dir_all(&scratch_root).map_err(io_ctx("creating", &scratch_root))?;
+        fs::create_dir(&scratch_root).map_err(io_ctx("creating", &scratch_root))?;
         platform::stage_tmp_dir(&agent.confinement, &scratch_root, &build_dir, tmp_pack)
             .map_err(err_ctx("staging the tmp dir"))?;
 
