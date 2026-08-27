@@ -106,7 +106,7 @@ async fn read_submission(
 /// identical submissions share a build. A key built from output paths
 /// alone would let a colliding (or crafted) request attach to another
 /// client's build.
-pub(super) fn dedupe_key(req: &BuildRequest) -> String {
+pub(super) fn dedupe_key(req: &BuildRequest, tmp_dir_pack: &[u8]) -> String {
     fn feed(h: &mut Sha256, s: &str) {
         h.update((s.len() as u64).to_le_bytes());
         h.update(s.as_bytes());
@@ -147,6 +147,7 @@ pub(super) fn dedupe_key(req: &BuildRequest) -> String {
     feed(&mut h, &req.store_dir);
     feed(&mut h, &req.tmp_dir_in_sandbox);
     h.update([u8::from(req.fixed_output)]);
+    h.update(Sha256::digest(tmp_dir_pack));
     hex::encode(h.finalize())
 }
 
@@ -228,7 +229,7 @@ impl attach_hub_server::AttachHub for AttachSvc {
         }
         validate_request(&req)?;
         let tmp_dir_pack = Arc::new(tmp_dir_pack);
-        let key = dedupe_key(&req);
+        let key = dedupe_key(&req, &tmp_dir_pack);
 
         let features = build_json::required_system_features(&req.env);
         if let Some(declined) = self.await_capable_worker(&req.system, &features).await {
@@ -351,14 +352,15 @@ mod tests {
 
     #[test]
     fn dedupe_key_binds_full_request() {
-        let a = dedupe_key(&base_request());
-        assert_eq!(a, dedupe_key(&base_request()));
+        let a = dedupe_key(&base_request(), b"");
+        assert_eq!(a, dedupe_key(&base_request(), b""));
         let mut req = base_request();
         req.args = vec!["-c".into(), "false".into()];
-        assert_ne!(a, dedupe_key(&req));
+        assert_ne!(a, dedupe_key(&req, b""));
         let mut req = base_request();
         req.env.insert("X".into(), "1".into());
-        assert_ne!(a, dedupe_key(&req));
+        assert_ne!(a, dedupe_key(&req, b""));
+        assert_ne!(a, dedupe_key(&base_request(), b"other .attrs.sh"));
     }
 
     /// Strings shifted between adjacent sections must not collide:
@@ -372,6 +374,6 @@ mod tests {
         let mut b = base_request();
         b.args = vec!["-c".into()];
         b.env = [("K".to_string(), "V".to_string())].into();
-        assert_ne!(dedupe_key(&a), dedupe_key(&b));
+        assert_ne!(dedupe_key(&a, b""), dedupe_key(&b, b""));
     }
 }
