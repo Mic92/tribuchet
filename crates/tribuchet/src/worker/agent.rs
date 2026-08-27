@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
-use std::os::fd::OwnedFd;
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -63,6 +63,8 @@ pub use platform::{FS_HELPER_ARG, fs_helper_stage};
 pub struct Options {
     /// Unix socket to bind when launchd did not pass one.
     pub socket: Option<PathBuf>,
+    /// Listening socket inherited from a spawning worker.
+    pub listen_fd: Option<RawFd>,
     /// Per-agent state dir holding one scratch dir per build.
     pub state_dir: PathBuf,
     /// Uid allowed to lease builds, defaulting to the agent's own uid
@@ -122,7 +124,7 @@ impl Agent {
 
 pub fn run(opts: &Options) -> Result<()> {
     let confinement = platform::Confinement::init(opts)?;
-    let (listener, activated) = listener(opts.socket.as_deref())?;
+    let (listener, activated) = listener(opts)?;
     fs::create_dir_all(&opts.state_dir).map_err(err_ctx(format!(
         "creating state dir {}",
         opts.state_dir.display()
@@ -192,11 +194,18 @@ fn report(conn: &UnixStream, e: &Error) {
 /// Service-manager-activated listener (launchd socket named "agent",
 /// or the systemd socket unit's fd) or a self-bound one for
 /// development and tests. The bool is true for the activated case.
-fn listener(socket: Option<&Path>) -> Result<(UnixListener, bool), Error> {
+fn listener(opts: &Options) -> Result<(UnixListener, bool), Error> {
     if let Some(l) = platform::activated_unix_listener()? {
         return Ok((l, true));
     }
-    let path = socket.ok_or_else(|| msg("no activated socket and no --socket given"))?;
+    if let Some(fd) = opts.listen_fd {
+        // SAFETY: the spawning worker passed this fd for us to own.
+        return Ok((unsafe { UnixListener::from_raw_fd(fd) }, false));
+    }
+    let path = opts
+        .socket
+        .as_deref()
+        .ok_or_else(|| msg("no activated socket and no --socket given"))?;
     let _ = fs::remove_file(path);
     let l = sockpath::bind(path).map_err(err_ctx(format!("binding {}", path.display())))?;
     Ok((l, false))

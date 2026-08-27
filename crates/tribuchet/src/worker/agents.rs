@@ -6,14 +6,11 @@
 //! over fresh connections, so they work from any worker generation.
 
 use std::fs;
-use std::io;
 
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::thread;
-use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
 use std::fmt::Write as _;
@@ -26,7 +23,7 @@ use sandbox_proto::agent::{
 };
 use sandbox_proto::framing;
 
-use crate::errors::{Result, err_msg};
+use crate::errors::{Result, err_ctx, err_msg};
 use crate::sockpath;
 
 /// SBPL string literal escaping: a quote or backslash in an
@@ -222,27 +219,10 @@ impl AgentBuild {
 }
 
 fn connect(socket: &Path) -> Result<UnixStream> {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        match sockpath::connect(socket) {
-            Ok(c) => return Ok(c),
-            Err(e)
-                if Instant::now() < deadline
-                    && matches!(
-                        e.kind(),
-                        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-                    ) =>
-            {
-                thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => {
-                return Err(err_msg(format!(
-                    "connecting to the build agent at {}: {e}",
-                    socket.display()
-                )));
-            }
-        }
-    }
+    sockpath::connect(socket).map_err(err_ctx(format!(
+        "connecting to the build agent at {}",
+        socket.display()
+    )))
 }
 
 /// Fire a control call that replies with an empty message.
@@ -305,7 +285,7 @@ pub(super) fn shutdown(socket: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::time::Duration;
+    use std::os::fd::IntoRawFd;
     use std::{env, thread};
 
     use crate::tmpdir::pack_zstd_dir;
@@ -316,21 +296,17 @@ mod tests {
     fn spawn_test_agent(dir: &Path) -> Result<(PathBuf, PathBuf)> {
         let socket = dir.join("agent.sock");
         let state_dir = dir.join("state");
-        {
-            let socket = socket.clone();
-            thread::spawn(move || {
-                let _ = agent::run(&agent::Options {
-                    socket: Some(socket),
-                    state_dir,
-                    worker_uid: None,
-                    uid_base: None,
-                    dedicated_uid: false,
-                });
+        let listener = sockpath::bind(&socket)?;
+        thread::spawn(move || {
+            let _ = agent::run(&agent::Options {
+                socket: None,
+                listen_fd: Some(listener.into_raw_fd()),
+                state_dir,
+                worker_uid: None,
+                uid_base: None,
+                dedicated_uid: false,
             });
-        }
-        while !socket.exists() {
-            thread::sleep(Duration::from_millis(10));
-        }
+        });
         // build dir carrying .attrs.json, like the client pack
         let build = dir.join("top/build");
         fs::create_dir_all(&build)?;

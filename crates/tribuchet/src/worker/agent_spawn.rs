@@ -4,17 +4,20 @@
 
 use std::fs;
 use std::io;
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::fs::chown as chown_path;
+use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::ExitStatus;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use std::{env, thread};
 
 use crate::errors::{Result, chain, err_ctx, err_msg};
 use crate::fsutil::io_ctx;
 use crate::sockpath;
+use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
 use rustix::process::{Gid, Uid};
 use rustix::process::{geteuid, getuid};
 use rustix::thread::{
@@ -28,6 +31,9 @@ const UID_BLOCK: u32 = 65536;
 /// One spawned agent slot.
 struct Slot {
     socket: PathBuf,
+    /// Bound by the worker and inherited by every agent generation, so
+    /// connections queue instead of failing between restarts.
+    listener: UnixListener,
     state_dir: PathBuf,
     /// Uid the agent runs as, None to stay on the worker uid.
     uid: Option<u32>,
@@ -36,7 +42,7 @@ struct Slot {
 }
 
 /// Spawn `count` agents under `<state_dir>/agents` and return their
-/// socket paths once they accept connections.
+/// socket paths.
 pub fn spawn(state_dir: &Path, count: u32, uid_base: Option<u32>) -> Result<Vec<PathBuf>> {
     if count == 0 {
         return Err(err_msg("spawn-agents must be at least 1"));
@@ -62,8 +68,13 @@ pub fn spawn(state_dir: &Path, count: u32, uid_base: Option<u32>) -> Result<Vec<
     for i in 1..=count {
         let dir = base_dir.join(i.to_string());
         fs::create_dir_all(&dir).map_err(io_ctx("creating", &dir))?;
+        let socket = dir.join("agent.sock");
+        let _ = fs::remove_file(&socket);
+        let listener =
+            sockpath::bind(&socket).map_err(err_ctx(format!("binding {}", socket.display())))?;
         let slot = Slot {
-            socket: dir.join("agent.sock"),
+            socket,
+            listener,
             state_dir: dir.clone(),
             uid: uid_base.map(|b| b + i - 1),
             uid_base: uid_base.map(|b| b + i * UID_BLOCK),
@@ -72,14 +83,12 @@ pub fn spawn(state_dir: &Path, count: u32, uid_base: Option<u32>) -> Result<Vec<
             chown_path(&dir, Some(uid), Some(uid))
                 .map_err(err_ctx(format!("chowning {}", dir.display())))?;
         }
-        let _ = fs::remove_file(&slot.socket);
         sockets.push(slot.socket.clone());
         thread::spawn({
             let exe = exe.clone();
             move || supervise(&exe, &slot)
         });
     }
-    wait_for_sockets(&sockets)?;
     tracing::info!(
         count,
         uid_isolation = uid_base.is_some(),
@@ -103,10 +112,11 @@ fn supervise(exe: &Path, slot: &Slot) {
 }
 
 fn run_once(exe: &Path, slot: &Slot) -> Result<ExitStatus> {
+    let fd = slot.listener.as_raw_fd();
     let mut cmd = Command::new(exe);
     cmd.arg("agent")
-        .arg("--socket")
-        .arg(&slot.socket)
+        .arg("--listen-fd")
+        .arg(fd.to_string())
         .arg("--state-dir")
         .arg(&slot.state_dir)
         .arg("--worker-uid")
@@ -114,10 +124,21 @@ fn run_once(exe: &Path, slot: &Slot) -> Result<ExitStatus> {
     if let Some(base) = slot.uid_base {
         cmd.arg("--uid-base").arg(base.to_string());
     }
-    if let Some(uid) = slot.uid {
+    if slot.uid.is_some() {
         cmd.arg("--dedicated-uid");
-        // SAFETY: only async-signal-safe calls before exec.
-        unsafe { cmd.pre_exec(move || confine_to(uid)) };
+    }
+    let uid = slot.uid;
+    // SAFETY: only async-signal-safe calls before exec.
+    unsafe {
+        cmd.pre_exec(move || {
+            // inherit the listener across exec
+            let l = BorrowedFd::borrow_raw(fd);
+            fcntl_setfd(l, fcntl_getfd(l)? - FdFlags::CLOEXEC)?;
+            match uid {
+                Some(uid) => confine_to(uid),
+                None => Ok(()),
+            }
+        });
     }
     cmd.spawn()
         .map_err(err_ctx(format!("spawning {}", exe.display())))?
@@ -149,26 +170,6 @@ fn confine_to(uid: u32) -> io::Result<()> {
         CapabilitySet::CHOWN,
     ] {
         configure_capability_in_ambient_set(cap, true)?;
-    }
-    Ok(())
-}
-
-/// Wait until every agent socket accepts a connection.
-fn wait_for_sockets(sockets: &[PathBuf]) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    for socket in sockets {
-        loop {
-            if sockpath::connect(socket).is_ok() {
-                break;
-            }
-            if Instant::now() >= deadline {
-                return Err(err_msg(format!(
-                    "agent socket {} did not come up",
-                    socket.display()
-                )));
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
     }
     Ok(())
 }
