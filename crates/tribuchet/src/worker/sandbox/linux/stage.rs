@@ -559,16 +559,6 @@ fn register_binfmt(line: &str) -> io::Result<()> {
 /// initial namespace that EPERMs on hosts with finite hard limits
 /// (GitHub runners cap RLIMIT_CORE).
 fn apply_process_limits(system: &str) -> io::Result<()> {
-    let hard = getrlimit(Resource::Nproc).maximum;
-    let limit = Some(hard.unwrap_or(u64::MAX).min(4096));
-    setrlimit(
-        Resource::Nproc,
-        Rlimit {
-            current: limit,
-            maximum: limit,
-        },
-    )
-    .map_err(ioerr("setting RLIMIT_NPROC"))?;
     let hard = getrlimit(Resource::Core).maximum;
     setrlimit(
         Resource::Core,
