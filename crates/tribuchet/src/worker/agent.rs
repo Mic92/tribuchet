@@ -321,9 +321,6 @@ fn handle_adopt(agent: &Arc<Agent>, conn: &UnixStream, req: &AdoptRequest) -> Re
         }),
         &[],
     )?;
-    if exit_code.is_some() {
-        return Ok(());
-    }
     notify_exit(conn, &exit)
 }
 
