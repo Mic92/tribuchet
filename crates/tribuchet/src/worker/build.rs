@@ -9,7 +9,7 @@ use std::sync::Arc;
 use harmonia_store_path::{StoreDir, StorePath, StorePathSet};
 use harmonia_store_path_info::ValidPathInfo;
 use harmonia_store_remote::{DaemonClient, DaemonStore};
-use tokio::sync::{OwnedSemaphorePermit, mpsc};
+use tokio::sync::mpsc;
 use tokio::task::spawn_blocking;
 use zstd::stream::read::Decoder as ZstdDecoder;
 
@@ -19,7 +19,7 @@ pub(super) use claims::{Claims, Wake};
 use import_pool::{ImportHandle, ImportPool};
 
 use super::pins;
-use super::{DaemonConn, WorkerCtx, unix_now};
+use super::{DaemonConn, Slot, WorkerCtx, unix_now};
 use crate::chunkio::ChannelReader;
 use crate::errors::chain;
 use crate::errors::{Result, err_ctx, err_msg};
@@ -40,8 +40,8 @@ pub(super) struct ActiveBuild {
     pub(super) assignment: BuildAssignment,
     pub(super) dir: PathBuf, // state_dir/builds/<id>
     pub(super) ctx: Arc<WorkerCtx>,
-    /// Job slot; drops back to `WorkerCtx::slots` with the build.
-    pub(super) permit: Option<OwnedSemaphorePermit>,
+    /// None while staged as lookahead beyond the free slots.
+    pub(super) slot: Option<Slot>,
     /// Input store paths valid in /nix/store (bind-mount sources).
     inputs: HashSet<String>,
     /// Paths this build claimed and imports, removed at dispatch.
@@ -95,7 +95,7 @@ impl ActiveBuild {
             assignment,
             dir,
             ctx,
-            permit: None,
+            slot: None,
             inputs: HashSet::new(),
             pending: HashSet::new(),
             infos: HashMap::new(),
@@ -404,6 +404,8 @@ pub(super) use outputs::pack_outputs_and_extras;
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::store::{STORE_DIR, valid_store_path};
 
@@ -411,13 +413,12 @@ mod tests {
         BuildAssignment {
             build_id: "0123456789abcdef0123456789abcdef".into(),
             dedupe_key: "test-key".into(),
-            credit_free: false,
             required_features: vec![],
             local_networking: false,
             system: "x86_64-linux".into(),
             builder: "/nix/store/00000000000000000000000000000000-bash/bin/bash".into(),
             args: vec![],
-            env: Default::default(),
+            env: BTreeMap::default(),
             outputs: [(
                 "out".to_string(),
                 "/nix/store/00000000000000000000000000000000-out".to_string(),

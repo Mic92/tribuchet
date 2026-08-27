@@ -1,5 +1,5 @@
 //! Generated gRPC types for the tribuchet protocol.
-#![expect(
+#![allow(
     clippy::pedantic,
     clippy::large_enum_variant,
     reason = "tonic-generated code"

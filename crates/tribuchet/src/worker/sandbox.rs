@@ -302,6 +302,7 @@ mod platform;
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::{error, result};
     type Result<T> = result::Result<T, Box<dyn error::Error>>;
 
@@ -309,14 +310,13 @@ mod tests {
         BuildAssignment {
             build_id: "0123456789abcdef0123456789abcdef".into(),
             dedupe_key: "k".into(),
-            credit_free: false,
             required_features: vec![],
             local_networking: false,
             system: "x86_64-linux".into(),
             builder: "/nix/store/00000000000000000000000000000000-b/bin/b".into(),
             args: vec![],
-            env: Default::default(),
-            outputs: Default::default(),
+            env: BTreeMap::default(),
+            outputs: BTreeMap::default(),
             tmp_dir_in_sandbox: "/build".into(),
             store_dir: "/nix/store".into(),
             fixed_output: false,

@@ -415,6 +415,7 @@ pub(super) async fn stream_tmp_dir(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     use std::time::Duration;
 
     use super::*;
@@ -469,7 +470,7 @@ mod tests {
             tmp_dir_pack: Arc::new(Vec::new()),
             features: vec![],
             replay: Arc::new(Replay::default()),
-            listing: Default::default(),
+            listing: Mutex::default(),
             attempts: 0,
         }
     }

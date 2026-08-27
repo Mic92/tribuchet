@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -141,7 +141,7 @@ fn msg_build_id(msg: &worker_message::Msg) -> Option<&str> {
 async fn route_loop(
     mut in_rx: mpsc::Receiver<WorkerMessage>,
     router: Router,
-    req_tx: mpsc::Sender<()>,
+    capacity: Arc<AtomicU32>,
     state: Arc<HubState>,
     worker: u64,
 ) {
@@ -158,11 +158,9 @@ async fn route_loop(
             Ok(Some(WorkerMessage { msg: Some(m) })) => m,
             Ok(Some(WorkerMessage { msg: None })) => continue,
         };
-        if matches!(m, worker_message::Msg::RequestJob(_)) {
-            // try_send: routing must never block behind a request flood;
-            // a worker with more outstanding requests than the channel
-            // holds is misbehaving and only loses its own slots
-            let _ = req_tx.try_send(());
+        if let worker_message::Msg::RequestJob(r) = &m {
+            capacity.store(r.capacity, Ordering::SeqCst);
+            state.notify.notify_waiters();
             continue;
         }
         if let worker_message::Msg::Heartbeat(h) = &m {
@@ -276,44 +274,39 @@ async fn worker_loop(
         .lock()
         .unwrap()
         .insert(worker_id, register.resumable_keys.iter().cloned().collect());
-    // each received RequestJob funds at most one assignment
-    let (req_tx, mut req_rx) = mpsc::channel::<()>(1024);
-    let route = tokio::spawn(route_loop(
+    // The worker's last declared free capacity, decremented per
+    // dispatch until its next declaration replaces it.
+    let capacity = Arc::new(AtomicU32::new(0));
+    let mut route = tokio::spawn(route_loop(
         in_rx,
         router.clone(),
-        req_tx.clone(),
+        capacity.clone(),
         state.clone(),
         worker_id,
     ));
     let sess = Arc::new(WorkerSession::new());
 
-    let mut credits: usize = 0;
     'outer: loop {
-        let (job, credit_free) = loop {
+        let job = loop {
             if out_tx.is_closed() || route.is_finished() {
                 break 'outer;
             }
-            while req_rx.try_recv().is_ok() {
-                credits += 1;
-            }
+            // resumed builds already occupy their slot on the worker
             if let Some(job) = state.take_job_by_key(worker_id).await {
-                break (job, true);
+                break job;
             }
-            if credits > 0
+            if capacity.load(Ordering::SeqCst) > 0
                 && let Some(job) = state.take_job(&caps, worker_id).await
             {
-                credits -= 1;
-                break (job, false);
+                capacity.fetch_sub(1, Ordering::SeqCst);
+                break job;
             }
             // notify_waiters() wakes only current waiters; the timeout
             // closes the race between checking the queue and awaiting.
             tokio::select! {
                 () = state.notify.notified() => {}
                 () = tokio::time::sleep(Duration::from_secs(1)) => {}
-                r = req_rx.recv() => match r {
-                    Some(()) => credits += 1,
-                    None => break 'outer, // route_loop ended: worker gone
-                },
+                _ = &mut route => break 'outer,
             }
         };
         tracing::info!(
@@ -336,8 +329,6 @@ async fn worker_loop(
             out_tx.clone(),
             in_rx,
             sess.clone(),
-            req_tx.clone(),
-            credit_free,
         ));
     }
     // Builds in flight fail through their closed router channels.
@@ -349,7 +340,6 @@ async fn worker_loop(
 }
 
 /// Run one dispatched job and settle it: finish, requeue or fail.
-#[allow(clippy::too_many_arguments)]
 async fn supervise_job(
     state: Arc<HubState>,
     job: Job,
@@ -357,20 +347,9 @@ async fn supervise_job(
     out_tx: mpsc::Sender<Result<HubMessage, Status>>,
     in_rx: mpsc::Receiver<worker_message::Msg>,
     sess: Arc<WorkerSession>,
-    refund: mpsc::Sender<()>,
-    credit_free: bool,
 ) {
     let mut dispatched = false;
-    let res = run_job(
-        &state,
-        &job,
-        &out_tx,
-        in_rx,
-        sess,
-        credit_free,
-        &mut dispatched,
-    )
-    .await;
+    let res = run_job(&state, &job, &out_tx, in_rx, sess, &mut dispatched).await;
     router.unregister(&job.id);
     // run_job counts the build verdict. Only session/hub-side errors
     // reach the branches below.
@@ -378,31 +357,16 @@ async fn supervise_job(
         state.finish(&job).await;
         return;
     };
+    let err = chain(&err);
+    // Neither a dead session nor a failure before the worker saw the
+    // assignment is a build verdict: requeue so this worker (by dedupe
+    // key) or another one picks it up.
     let session_dead = router.is_closed() || out_tx.is_closed();
-    if !dispatched && !session_dead {
-        if !credit_free {
-            let _ = refund.try_send(());
-        }
-        if job.attempts < MAX_JOB_ATTEMPTS {
-            tracing::warn!(
-                id = job.id,
-                "dispatch failed before assignment; requeueing: {}",
-                chain(&err)
-            );
-            state.requeue(job).await;
-            return;
-        }
-    }
-    // A dead worker session is not a build verdict: requeue so
-    // the worker (or its replacement) can resume the build by
-    // dedupe key, or another worker can start over.
-    if session_dead && job.attempts < MAX_JOB_ATTEMPTS {
-        let err = chain(&err);
-        tracing::warn!(id = job.id, "worker session lost; requeueing build: {err}");
+    if (session_dead || !dispatched) && job.attempts < MAX_JOB_ATTEMPTS {
+        tracing::warn!(id = job.id, "dispatch lost, requeueing build: {err}");
         Metrics::inc(&state.metrics.requeued);
         state.requeue(job).await;
     } else {
-        let err = chain(&err);
         tracing::warn!(id = job.id, "build failed: {err}");
         Metrics::inc(&state.metrics.failed);
         // The session is still up and may hold a half-staged or

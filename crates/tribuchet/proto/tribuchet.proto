@@ -18,8 +18,8 @@ message WorkerMessage {
     BuildResult result = 4;
     // Output chunks answering the hub's Need, then one eof.
     ChunkFrame chunk = 5;
-    // One free build slot: the hub answers each request with at most
-    // one BuildAssignment (worker-side admission).
+    // Worker-side admission: how many more assignments the worker
+    // accepts right now. Level-triggered: each one replaces the last.
     RequestJob request_job = 6;
     // Answer to a BuildAssignment whose dedupe_key matches a build the
     // worker already runs (or has finished but not delivered): the hub
@@ -37,7 +37,9 @@ message Resumed {
   string build_id = 1;
 }
 
-message RequestJob {}
+message RequestJob {
+  uint32 capacity = 1;
+}
 
 message HubMessage {
   oneof msg {
@@ -143,10 +145,8 @@ message BuildAssignment {
   // build_id. Keys the worker's resume bookkeeping.
   string dedupe_key = 10;
   repeated Manifest inputs = 11;
-  // Dispatched via resumable_keys without consuming a RequestJob.
-  bool credit_free = 12;
-  repeated string required_features = 13;
-  bool local_networking = 14;
+  repeated string required_features = 12;
+  bool local_networking = 13;
 }
 
 message TmpDirArchive {

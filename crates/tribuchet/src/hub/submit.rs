@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::path::{Component, Path};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -214,7 +214,7 @@ impl attach_hub_server::AttachHub for AttachSvc {
                 tmp_dir_pack,
                 features,
                 replay,
-                listing: std::sync::Mutex::new(Some(listing)),
+                listing: Mutex::new(Some(listing)),
                 attempts: 0,
             };
             tracing::info!(id = job.id, system = job.req.system, "queueing build");
@@ -234,6 +234,7 @@ impl attach_hub_server::AttachHub for AttachSvc {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     /// 32-char base32 hash part for synthetic store paths.
     const H: &str = "00000000000000000000000000000000";
@@ -243,7 +244,7 @@ mod tests {
             system: "x86_64-linux".into(),
             builder: format!("/nix/store/{H}-bash/bin/bash"),
             args: vec!["-c".into(), "true".into()],
-            env: Default::default(),
+            env: BTreeMap::default(),
             outputs: [("out".to_string(), format!("/nix/store/{H}-out"))].into(),
             input_paths: vec![format!("/nix/store/{H}-dep")],
             tmp_dir_in_sandbox: "/build".into(),
