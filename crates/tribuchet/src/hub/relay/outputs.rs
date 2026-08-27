@@ -2,7 +2,7 @@
 //! lacks, then assemble each NAR from cache frames plus arriving
 //! chunks, verifying every chunk's BLAKE3 against the recipe.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 use tokio::sync::mpsc;
 use tonic::Status;
@@ -35,7 +35,7 @@ impl Announced {
 /// store paths on the client.
 pub(super) fn verify_set(
     reported: Vec<Manifest>,
-    requested: &HashMap<String, String>,
+    requested: &BTreeMap<String, String>,
 ) -> Result<Vec<Announced>> {
     let mut out = Vec::with_capacity(reported.len());
     let mut seen = HashSet::new();

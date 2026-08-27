@@ -97,7 +97,7 @@ impl ActiveBuild {
             build_id: a.build_id.clone(),
             builder: a.builder.clone(),
             args: a.args.clone(),
-            env: a.env.clone(),
+            env: a.env.clone().into_iter().collect(),
             tmp_dir_in_sandbox: a.tmp_dir_in_sandbox.clone(),
             profile,
             sandbox_json,

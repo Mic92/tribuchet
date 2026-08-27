@@ -5,6 +5,7 @@ use std::path::{Component, Path};
 use std::sync::Arc;
 use std::time::Instant;
 
+use prost::Message;
 use sha2::{Digest, Sha256};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
@@ -101,52 +102,14 @@ async fn read_submission(
     }
 }
 
-/// Dedupe key: hash of the full canonicalized request, so only truly
-/// identical submissions share a build. A key built from output paths
-/// alone would let a colliding (or crafted) request attach to another
-/// client's build.
+/// Hash of the whole request plus the tmp dir pack. prost maps are
+/// BTreeMaps, so the encoding is deterministic.
 pub(super) fn dedupe_key(req: &BuildRequest, tmp_dir_pack: &[u8]) -> String {
-    fn feed(h: &mut Sha256, s: &str) {
-        h.update((s.len() as u64).to_le_bytes());
-        h.update(s.as_bytes());
-    }
-    // Each variable-length section is preceded by its element count;
-    // without it, an args tail and an env entry (for example) would
-    // feed identical bytes and two different requests could collide.
-    fn count(h: &mut Sha256, n: usize) {
-        h.update((n as u64).to_le_bytes());
-    }
     let mut h = Sha256::new();
-    feed(&mut h, &req.system);
-    feed(&mut h, &req.builder);
-    count(&mut h, req.args.len());
-    for a in &req.args {
-        feed(&mut h, a);
-    }
-    let mut env: Vec<_> = req.env.iter().collect();
-    env.sort();
-    count(&mut h, env.len());
-    for (k, v) in env {
-        feed(&mut h, k);
-        feed(&mut h, v);
-    }
-    let mut outs: Vec<_> = req.outputs.iter().collect();
-    outs.sort();
-    count(&mut h, outs.len());
-    for (k, v) in outs {
-        feed(&mut h, k);
-        feed(&mut h, v);
-    }
-    let mut inputs: Vec<_> = req.input_paths.iter().collect();
-    inputs.sort();
-    count(&mut h, inputs.len());
-    for p in inputs {
-        feed(&mut h, p);
-    }
-    feed(&mut h, &req.store_dir);
-    feed(&mut h, &req.tmp_dir_in_sandbox);
-    h.update([u8::from(req.fixed_output), u8::from(req.local_networking)]);
-    h.update(Sha256::digest(tmp_dir_pack));
+    let buf = req.encode_to_vec();
+    h.update((buf.len() as u64).to_le_bytes());
+    h.update(&buf);
+    h.update(tmp_dir_pack);
     hex::encode(h.finalize())
 }
 
@@ -288,7 +251,6 @@ impl attach_hub_server::AttachHub for AttachSvc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     /// 32-char base32 hash part for synthetic store paths.
     const H: &str = "00000000000000000000000000000000";
@@ -298,7 +260,7 @@ mod tests {
             system: "x86_64-linux".into(),
             builder: format!("/nix/store/{H}-bash/bin/bash"),
             args: vec!["-c".into(), "true".into()],
-            env: HashMap::default(),
+            env: Default::default(),
             outputs: [("out".to_string(), format!("/nix/store/{H}-out"))].into(),
             input_paths: vec![format!("/nix/store/{H}-dep")],
             tmp_dir_in_sandbox: "/build".into(),

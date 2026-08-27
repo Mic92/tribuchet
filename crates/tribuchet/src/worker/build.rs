@@ -417,7 +417,7 @@ mod tests {
             system: "x86_64-linux".into(),
             builder: "/nix/store/00000000000000000000000000000000-bash/bin/bash".into(),
             args: vec![],
-            env: HashMap::default(),
+            env: Default::default(),
             outputs: [(
                 "out".to_string(),
                 "/nix/store/00000000000000000000000000000000-out".to_string(),
