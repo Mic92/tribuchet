@@ -34,7 +34,9 @@ pub(in crate::worker) fn spawn_resumable_reaper(ctx: Arc<WorkerCtx>) {
                 let mut map = ctx.resumable.lock().unwrap();
                 map.retain(|key, e| match &e.finished {
                     Some(fin)
-                        if !e.delivering && e.serving == 0 && fin.finished_at.elapsed() > TTL =>
+                        if !e.delivering
+                            && Arc::strong_count(fin) == 1
+                            && fin.finished_at.elapsed() > TTL =>
                     {
                         expired.push((key.clone(), fin.dir.clone()));
                         false
@@ -64,11 +66,10 @@ pub(in crate::worker) struct ResumableBuild {
     /// build *finishes* may not be the one that assigned it. None for
     /// a freshly re-adopted build no session has assigned yet.
     pub(in crate::worker) out_tx: Option<mpsc::Sender<WorkerMessage>>,
-    pub(in crate::worker) finished: Option<FinishedBuild>,
+    pub(in crate::worker) finished: Option<Arc<FinishedBuild>>,
     /// A delivery is in flight; a concurrent re-assignment must not
     /// start a second one.
     pub(in crate::worker) delivering: bool,
-    pub(in crate::worker) serving: u32,
     /// Build dir holding build.log, for log replay on resume.
     pub(in crate::worker) dir: PathBuf,
     /// Replays the log to the resumed session; joined before the
@@ -85,6 +86,7 @@ impl ResumableBuild {
         dir: PathBuf,
         finished: Option<FinishedBuild>,
     ) {
+        let finished = finished.map(Arc::new);
         ctx.resumable.lock().unwrap().insert(
             key,
             Self {
@@ -92,7 +94,6 @@ impl ResumableBuild {
                 out_tx: None,
                 finished,
                 delivering: false,
-                serving: 0,
                 dir,
                 log_tail: None,
             },
@@ -100,7 +101,6 @@ impl ResumableBuild {
     }
 }
 
-#[derive(Clone)]
 pub(in crate::worker) struct FinishedBuild {
     pub(in crate::worker) exit_code: i32,
     pub(in crate::worker) error: String,
@@ -166,7 +166,7 @@ pub(in crate::worker) fn record_finished(ctx: &Arc<WorkerCtx>, key: &str, fin: F
         if let Some(e) = map.get_mut(key) {
             // build_id may have changed via a resume assignment meanwhile
             persist_finished(key, &e.build_id, &fin);
-            e.finished = Some(fin);
+            e.finished = Some(Arc::new(fin));
         }
     }
     // A cancel flag the abort loop did not get to consume (the build
@@ -320,28 +320,22 @@ pub(in crate::worker) fn serve_chunks(
     hashes: &[u8],
     out_tx: mpsc::Sender<WorkerMessage>,
 ) {
-    let found = {
-        let mut map = ctx.resumable.lock().unwrap();
-        map.iter_mut()
-            .find(|(_, e)| e.build_id == build_id)
-            .and_then(|(k, e)| {
-                let fin = e.finished.clone()?;
-                e.serving += 1;
-                Some((k.clone(), fin))
-            })
-    };
-    let Some((key, fin)) = found else {
+    // holding the Arc keeps the reaper off the build dir
+    let fin = ctx
+        .resumable
+        .lock()
+        .unwrap()
+        .values()
+        .find(|e| e.build_id == build_id)
+        .and_then(|e| e.finished.clone());
+    let Some(fin) = fin else {
         tracing::warn!(id = build_id, "chunk request for an unknown build");
         return;
     };
-    let ctx = ctx.clone();
     let hashes = hashes.to_vec();
     tokio::task::spawn_blocking(move || {
         let res = parse_hashes(&hashes)
             .and_then(|needed| send_chunks(&fin, &build_id, needed.into_iter().collect(), &out_tx));
-        if let Some(e) = ctx.resumable.lock().unwrap().get_mut(&key) {
-            e.serving -= 1;
-        }
         if let Err(e) = res {
             let err = chain(&e);
             tracing::warn!(id = build_id, "sending output chunks failed: {err}");
