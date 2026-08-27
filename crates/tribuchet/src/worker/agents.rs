@@ -42,12 +42,17 @@ fn sb_escape(s: &str) -> Result<String> {
     Ok(s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-/// The seatbelt profile the agent applies to the builder. Reads stay
-/// broad (matching Nix's Darwin sandbox) except for the worker's key
-/// material. Writes are scoped to the agent's scratch dir (via the
-/// [`SCRATCH_DIR_PARAM`] parameter, filled in agent-side) and the
-/// scratch output store paths. Unfiltered `(allow signal)` would let
-/// builds signal other agent-uid processes, most notably the agent.
+/// Nix's Darwin sandbox profiles, vendored verbatim from
+/// `src/libstore/darwin/build/` so updates are a file copy.
+#[cfg(target_os = "macos")]
+const NIX_SANDBOX_DEFAULTS: &str = include_str!("seatbelt/sandbox-defaults.sb");
+#[cfg(target_os = "macos")]
+const NIX_SANDBOX_NETWORK: &str = include_str!("seatbelt/sandbox-network.sb");
+
+/// Nix's baseline with its tmp dir parameters bound to the agent's
+/// scratch dir ([`SCRATCH_DIR_PARAM`], filled in agent-side), broad
+/// reads minus the worker's key material instead of Nix's per-closure
+/// list, and writes to the scratch output store paths.
 #[cfg(target_os = "macos")]
 pub(super) fn seatbelt_profile(
     outputs: &[String],
@@ -55,24 +60,25 @@ pub(super) fn seatbelt_profile(
     network: bool,
     local_network: bool,
 ) -> Result<String> {
+    let scratch = format!("(param \"{SCRATCH_DIR_PARAM}\")");
+    let defaults = NIX_SANDBOX_DEFAULTS
+        .replace("(param \"_GLOBAL_TMP_DIR\")", &scratch)
+        .replace("(param \"_NIX_BUILD_TOP\")", &scratch)
+        .replace(
+            "(param \"_ALLOW_LOCAL_NETWORKING\")",
+            if local_network { "#t" } else { "#f" },
+        );
     let mut profile = String::from(
-        "(version 1)\n\
-         (deny default)\n\
-         (allow process*)\n\
-         (allow signal (target same-sandbox))\n\
-         (allow sysctl-read)\n\
-         (allow ipc-posix*)\n\
-         (allow ipc-sysv*)\n\
-         (allow system-socket)\n\
-         (allow pseudo-tty)\n\
-         (allow mach-lookup)\n\
-         (allow file-read*)\n\
-         (allow file-ioctl)\n",
+        "(version 1)
+",
     );
-    writeln!(
-        profile,
-        "(allow network-inbound network-outbound (subpath (param \"{SCRATCH_DIR_PARAM}\")))"
-    )?;
+    profile.push_str(&defaults);
+    // tribuchet does not enumerate the input closure
+    profile.push_str(
+        "(allow file-read* process-exec file-ioctl)
+         (allow mach-lookup)
+",
+    );
     for secret in deny_read {
         // Seatbelt matches path filters against the canonical vnode
         // path; the configured paths usually live under /var, which
@@ -91,39 +97,21 @@ pub(super) fn seatbelt_profile(
             )?;
         }
     }
-    writeln!(
-        profile,
-        "(allow file-write*\n  (subpath (param \"{SCRATCH_DIR_PARAM}\"))"
-    )?;
     // Outputs are created fresh at their real store paths, /nix is not
     // a symlink, so the literal form is already the vnode path.
+    profile.push_str(
+        "(allow file-read* file-write* process-exec
+",
+    );
     for path in outputs {
         writeln!(profile, "  (subpath \"{}\")", sb_escape(path)?)?;
     }
-    for dev in [
-        "/dev/null",
-        "/dev/zero",
-        "/dev/random",
-        "/dev/urandom",
-        "/dev/tty",
-        "/dev/stdout",
-        "/dev/stderr",
-        "/dev/ptmx",
-        "/dev/dtracehelper",
-    ] {
-        writeln!(profile, "  (literal \"{dev}\")")?;
-    }
-    profile.push_str("  (subpath \"/dev/fd\")\n");
-    profile.push_str("  (regex #\"^/dev/pty[a-z]+\")\n  (regex #\"^/dev/ttys[0-9]+\")\n");
-    profile.push_str(")\n");
+    profile.push_str(
+        ")
+",
+    );
     if network {
-        profile.push_str("(allow network*)\n");
-    } else if local_network {
-        profile.push_str(
-            "(allow network* (remote ip \"localhost:*\"))\n\
-             (allow network-inbound (local ip \"*:*\"))\n\
-             (allow network-outbound (remote unix-socket (path-literal \"/private/var/run/mDNSResponder\")))\n",
-        );
+        profile.push_str(NIX_SANDBOX_NETWORK);
     }
     Ok(profile)
 }
