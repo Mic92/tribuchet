@@ -311,6 +311,7 @@ mod tests {
             dedupe_key: "k".into(),
             credit_free: false,
             required_features: vec![],
+            local_networking: false,
             system: "x86_64-linux".into(),
             builder: "/nix/store/00000000000000000000000000000000-b/bin/b".into(),
             args: vec![],

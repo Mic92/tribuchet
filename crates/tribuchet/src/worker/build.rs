@@ -405,6 +405,7 @@ mod tests {
             dedupe_key: "test-key".into(),
             credit_free: false,
             required_features: vec![],
+            local_networking: false,
             system: "x86_64-linux".into(),
             builder: "/nix/store/00000000000000000000000000000000-bash/bin/bash".into(),
             args: vec![],

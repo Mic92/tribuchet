@@ -66,6 +66,7 @@ pub(super) async fn run_job(
             inputs,
             credit_free,
             required_features: job.features.clone(),
+            local_networking: req.local_networking,
         }),
     )
     .await?;

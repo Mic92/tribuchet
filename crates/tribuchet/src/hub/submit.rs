@@ -145,7 +145,7 @@ pub(super) fn dedupe_key(req: &BuildRequest, tmp_dir_pack: &[u8]) -> String {
     }
     feed(&mut h, &req.store_dir);
     feed(&mut h, &req.tmp_dir_in_sandbox);
-    h.update([u8::from(req.fixed_output)]);
+    h.update([u8::from(req.fixed_output), u8::from(req.local_networking)]);
     h.update(Sha256::digest(tmp_dir_pack));
     hex::encode(h.finalize())
 }
@@ -305,6 +305,7 @@ mod tests {
             store_dir: "/nix/store".into(),
             fixed_output: false,
             required_features: vec![],
+            local_networking: false,
         }
     }
 

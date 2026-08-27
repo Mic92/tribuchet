@@ -68,11 +68,7 @@ impl BuildJson {
 }
 
 /// A boolean derivation attr from the env (`"1"`) or structured attrs.
-pub fn flag(
-    env: &BTreeMap<String, String>,
-    attrs: Option<&serde_json::Value>,
-    name: &str,
-) -> bool {
+pub fn flag(env: &BTreeMap<String, String>, attrs: Option<&serde_json::Value>, name: &str) -> bool {
     env.get(name).map(String::as_str) == Some("1")
         || attrs
             .and_then(|a| a.get(name))

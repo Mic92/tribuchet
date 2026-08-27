@@ -20,7 +20,7 @@ use tonic::Code;
 use tonic::transport::{Endpoint, Uri};
 use tower::service_fn;
 
-use crate::build_json::{BuildJson, required_system_features};
+use crate::build_json::{BuildJson, flag, required_system_features};
 use crate::chunkio;
 use crate::errors::{Error, Result, chain, err_ctx, err_msg};
 use crate::nar;
@@ -62,6 +62,7 @@ async fn run_async(build: BuildJson, socket: PathBuf, build_json_path: PathBuf) 
     let attrs = build.attrs();
     let fixed_output = build.network_allowed(attrs.as_ref());
     let required_features = required_system_features(&build.env, attrs.as_ref());
+    let local_networking = flag(&build.env, attrs.as_ref(), "__darwinAllowLocalNetworking");
     tracing::info!(fixed_output, system = %build.system, "submitting build");
     let req = BuildRequest {
         system: build.system,
@@ -74,6 +75,7 @@ async fn run_async(build: BuildJson, socket: PathBuf, build_json_path: PathBuf) 
         store_dir: build.store_dir,
         fixed_output,
         required_features,
+        local_networking,
     };
     // Packed once and resent verbatim on every reconnect attempt.
     // Nix places everything the builder consumes in topTmpDir/build.

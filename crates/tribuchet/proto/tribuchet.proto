@@ -146,6 +146,7 @@ message BuildAssignment {
   // Dispatched via resumable_keys without consuming a RequestJob.
   bool credit_free = 12;
   repeated string required_features = 13;
+  bool local_networking = 14;
 }
 
 message TmpDirArchive {
@@ -227,6 +228,8 @@ message BuildRequest {
   bool fixed_output = 9;
   // requiredSystemFeatures, resolved by attach from env or .attrs.json.
   repeated string required_features = 10;
+  // __darwinAllowLocalNetworking
+  bool local_networking = 11;
 }
 
 message AttachEvent {

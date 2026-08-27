@@ -68,7 +68,12 @@ impl ActiveBuild {
         // carries the full input and network configuration.
         #[cfg(target_os = "macos")]
         let (profile, sandbox_json, spec) = (
-            agents::seatbelt_profile(&outputs, &self.ctx.secret_paths, a.fixed_output)?,
+            agents::seatbelt_profile(
+                &outputs,
+                &self.ctx.secret_paths,
+                a.fixed_output,
+                a.local_networking,
+            )?,
             None,
             sandbox::SandboxSpec {
                 outputs: outputs.clone(),

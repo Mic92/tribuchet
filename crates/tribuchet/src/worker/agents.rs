@@ -53,6 +53,7 @@ pub(super) fn seatbelt_profile(
     outputs: &[String],
     deny_read: &[PathBuf],
     network: bool,
+    local_network: bool,
 ) -> Result<String> {
     let mut profile = String::from(
         "(version 1)\n\
@@ -60,10 +61,18 @@ pub(super) fn seatbelt_profile(
          (allow process*)\n\
          (allow signal (target same-sandbox))\n\
          (allow sysctl-read)\n\
+         (allow ipc-posix*)\n\
+         (allow ipc-sysv*)\n\
+         (allow system-socket)\n\
+         (allow pseudo-tty)\n\
          (allow mach-lookup)\n\
          (allow file-read*)\n\
          (allow file-ioctl)\n",
     );
+    writeln!(
+        profile,
+        "(allow network-inbound network-outbound (subpath (param \"{SCRATCH_DIR_PARAM}\")))"
+    )?;
     for secret in deny_read {
         // Seatbelt matches path filters against the canonical vnode
         // path; the configured paths usually live under /var, which
@@ -97,12 +106,24 @@ pub(super) fn seatbelt_profile(
         "/dev/random",
         "/dev/urandom",
         "/dev/tty",
+        "/dev/stdout",
+        "/dev/stderr",
+        "/dev/ptmx",
+        "/dev/dtracehelper",
     ] {
         writeln!(profile, "  (literal \"{dev}\")")?;
     }
+    profile.push_str("  (subpath \"/dev/fd\")\n");
+    profile.push_str("  (regex #\"^/dev/pty[a-z]+\")\n  (regex #\"^/dev/ttys[0-9]+\")\n");
     profile.push_str(")\n");
     if network {
-        profile.push_str("(allow network*)\n(allow system-socket)\n");
+        profile.push_str("(allow network*)\n");
+    } else if local_network {
+        profile.push_str(
+            "(allow network* (remote ip \"localhost:*\"))\n\
+             (allow network-inbound (local ip \"*:*\"))\n\
+             (allow network-outbound (remote unix-socket (path-literal \"/private/var/run/mDNSResponder\")))\n",
+        );
     }
     Ok(profile)
 }
@@ -430,7 +451,7 @@ mod tests {
             ),
             outputs.clone(),
         );
-        req.profile = seatbelt_profile(&outputs, &[secret], false)?;
+        req.profile = seatbelt_profile(&outputs, &[secret], false, false)?;
         let log_w = fs::OpenOptions::new()
             .create(true)
             .append(true)
