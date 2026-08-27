@@ -422,8 +422,16 @@ mod tests {
         let state = HubState::for_test(Duration::ZERO);
         let replay = Arc::new(Replay::default());
         let _rx = replay.subscribe().await;
-        state.queue.lock().await.push_back(queued("x86_64-linux", replay));
-        state.held.lock().unwrap().insert(7, ["k1".to_string()].into());
+        state
+            .queue
+            .lock()
+            .await
+            .push_back(queued("x86_64-linux", replay));
+        state
+            .held
+            .lock()
+            .unwrap()
+            .insert(7, ["k1".to_string()].into());
         let c = caps("x86_64-linux", &[]);
         assert!(state.take_job(&c, 8).await.is_none());
         assert!(state.take_job(&c, 7).await.is_some());

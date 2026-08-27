@@ -45,14 +45,17 @@ pub fn spawn(state_dir: &Path, count: u32, uid_base: Option<u32>) -> Result<Vec<
     let root = geteuid().is_root();
     let uid_base = match (uid_base, root) {
         (Some(b), true) => Some(b),
+        (Some(_), false) if cfg!(target_os = "linux") => {
+            return Err(err_msg("agent-uid-base needs a root worker"));
+        }
+        (None, _) if cfg!(target_os = "linux") => {
+            return Err(err_msg("spawn-agents needs agent-uid-base on Linux"));
+        }
         (Some(_), false) => {
             tracing::warn!("agent-uid-base ignored: the worker is not root, builds share its uid");
             None
         }
-        (None, _) => {
-            tracing::warn!("no agent-uid-base: builds share the worker uid");
-            None
-        }
+        (None, _) => None,
     };
     let base_dir = state_dir.join("agents");
     let mut sockets = Vec::new();
