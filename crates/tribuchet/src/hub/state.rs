@@ -236,21 +236,22 @@ impl HubState {
     }
 
     pub(super) async fn take_job(&self, caps: &WorkerCaps) -> Option<Job> {
-        let job = {
-            let mut queue = self.queue.lock().await;
-            let pos = queue
-                .iter()
-                .position(|j| caps.serves(&j.req.system, &j.features))?;
-            queue.remove(pos)?
-        };
-        // Abandoned while queued (every attach client gone): drop it
-        // here, at the moment it would have occupied a build slot.
-        if !job.replay.has_subscribers().await {
+        loop {
+            let job = {
+                let mut queue = self.queue.lock().await;
+                let pos = queue
+                    .iter()
+                    .position(|j| caps.serves(&j.req.system, &j.features))?;
+                queue.remove(pos)?
+            };
+            // Abandoned while queued (every attach client gone): drop it
+            // here, at the moment it would have occupied a build slot.
+            if job.replay.has_subscribers().await {
+                return Some(job);
+            }
             tracing::info!(id = job.id, "dropping queued build: no client attached");
             self.finish(&job).await;
-            return None;
         }
-        Some(job)
     }
 
     /// Take a queued job whose dedupe key is in `keys` (builds the

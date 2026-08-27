@@ -237,9 +237,9 @@ impl attach_hub_server::AttachHub for AttachSvc {
         }
 
         let mut inflight = self.state.inflight.lock().await;
-        let replay = if let Some(replay) = inflight.by_key.get(&key) {
+        let (replay, rx) = if let Some(replay) = inflight.by_key.get(&key) {
             tracing::info!(key, "deduplicating build submission");
-            replay.clone()
+            (replay.clone(), None)
         } else {
             // A different request claiming an in-flight scratch path
             // would race the other client's unpack at the same dest.
@@ -251,6 +251,7 @@ impl attach_hub_server::AttachHub for AttachSvc {
                 }
             }
             let replay = Arc::new(Replay::default());
+            let rx = replay.subscribe().await;
             inflight.by_key.insert(key.clone(), replay.clone());
             for p in req.outputs.values() {
                 inflight.by_path.insert(p.clone(), key.clone());
@@ -269,16 +270,18 @@ impl attach_hub_server::AttachHub for AttachSvc {
             Metrics::inc(&self.state.metrics.submitted);
             self.state.queue.lock().await.push_back(job);
             self.state.notify.notify_waiters();
-            replay
+            (replay, Some(rx))
         };
-        // Subscribe outside the global inflight lock: the snapshot clone
-        // of a large backlog must not stall every other submission.
         drop(inflight);
         // Close the check-then-queue race: the last capable worker may
         // have disconnected (and swept the queue) between the capability
         // check above and the push.
         self.state.fail_unservable().await;
-        let rx = replay.subscribe().await;
+        let rx = if let Some(rx) = rx {
+            rx
+        } else {
+            replay.subscribe().await
+        };
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 }
