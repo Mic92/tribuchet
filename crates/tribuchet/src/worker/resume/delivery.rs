@@ -33,7 +33,9 @@ pub(in crate::worker) fn spawn_resumable_reaper(ctx: Arc<WorkerCtx>) {
             {
                 let mut map = ctx.resumable.lock().unwrap();
                 map.retain(|key, e| match &e.finished {
-                    Some(fin) if !e.delivering && fin.finished_at.elapsed() > TTL => {
+                    Some(fin)
+                        if !e.delivering && e.serving == 0 && fin.finished_at.elapsed() > TTL =>
+                    {
                         expired.push((key.clone(), fin.dir.clone()));
                         false
                     }
@@ -66,6 +68,7 @@ pub(in crate::worker) struct ResumableBuild {
     /// A delivery is in flight; a concurrent re-assignment must not
     /// start a second one.
     pub(in crate::worker) delivering: bool,
+    pub(in crate::worker) serving: u32,
     /// Build dir holding build.log, for log replay on resume.
     pub(in crate::worker) dir: PathBuf,
     /// Replays the log to the resumed session; joined before the
@@ -89,6 +92,7 @@ impl ResumableBuild {
                 out_tx: None,
                 finished,
                 delivering: false,
+                serving: 0,
                 dir,
                 log_tail: None,
             },
@@ -309,33 +313,44 @@ fn send_chunks(
     Ok(())
 }
 
-/// Serve a NeedChunks for a finished build on a blocking thread. A
-/// failure only logs: the hub times the session out and the result
-/// is redelivered on resume.
+/// Serve a NeedChunks for a finished build on a blocking thread.
 pub(in crate::worker) fn serve_chunks(
     ctx: &Arc<WorkerCtx>,
     build_id: String,
     hashes: &[u8],
     out_tx: mpsc::Sender<WorkerMessage>,
 ) {
-    let fin = {
-        let map = ctx.resumable.lock().unwrap();
-        map.values()
-            .find(|e| e.build_id == build_id)
-            .and_then(|e| e.finished.clone())
+    let found = {
+        let mut map = ctx.resumable.lock().unwrap();
+        map.iter_mut()
+            .find(|(_, e)| e.build_id == build_id)
+            .and_then(|(k, e)| {
+                let fin = e.finished.clone()?;
+                e.serving += 1;
+                Some((k.clone(), fin))
+            })
     };
-    let Some(fin) = fin else {
+    let Some((key, fin)) = found else {
         tracing::warn!(id = build_id, "chunk request for an unknown build");
         return;
     };
-    let Ok(needed) = parse_hashes(hashes) else {
-        tracing::warn!(id = build_id, "misaligned chunk request");
-        return;
-    };
-    let needed: HashSet<Hash> = needed.into_iter().collect();
+    let ctx = ctx.clone();
+    let hashes = hashes.to_vec();
     tokio::task::spawn_blocking(move || {
-        if let Err(e) = send_chunks(&fin, &build_id, needed, &out_tx) {
-            tracing::warn!(id = build_id, "sending output chunks failed: {}", chain(&e));
+        let res = parse_hashes(&hashes)
+            .and_then(|needed| send_chunks(&fin, &build_id, needed.into_iter().collect(), &out_tx));
+        if let Some(e) = ctx.resumable.lock().unwrap().get_mut(&key) {
+            e.serving -= 1;
+        }
+        if let Err(e) = res {
+            let err = chain(&e);
+            tracing::warn!(id = build_id, "sending output chunks failed: {err}");
+            let _ = out_tx.blocking_send(msg(worker_message::Msg::Result(BuildResult {
+                build_id,
+                exit_code: 1,
+                error: format!("worker could not serve output chunks: {err}"),
+                ..Default::default()
+            })));
         }
     });
 }

@@ -347,6 +347,7 @@ fn launch_build(
             out_tx: Some(out_tx.clone()),
             finished: None,
             delivering: false,
+            serving: 0,
             dir: build.dir.clone(),
             // execute() streams the log live itself
             log_tail: None,
