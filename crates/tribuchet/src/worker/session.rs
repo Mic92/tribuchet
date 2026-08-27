@@ -131,7 +131,7 @@ async fn session_loop(
             Some(w) = wake_rx.recv() => {
                 if let Some(build) = active.get_mut(&w.build_id) {
                     let res = build.woken(&w.path).await;
-                    advance_staging(active, &mut ready, &w.build_id, res, &env).await?;
+                    advance_staging(active, &mut ready, &mut pending, &w.build_id, res, &env).await?;
                 }
                 continue;
             }
@@ -146,28 +146,28 @@ async fn session_loop(
                     handle_assignment(a, active, &mut pending, &wake_tx, out_tx, ctx).await?
                 {
                     let res = active.get_mut(&id).unwrap().negotiate().await;
-                    advance_staging(active, &mut ready, &id, res, &env).await?;
+                    advance_staging(active, &mut ready, &mut pending, &id, res, &env).await?;
                 }
             }
             hub_message::Msg::TmpDir(t) => {
                 let id = t.build_id.clone();
                 if let Some(build) = active.get_mut(&id) {
                     let res = build.feed_tmp_dir(t).await.map(|s| (None, s));
-                    advance_staging(active, &mut ready, &id, res, &env).await?;
+                    advance_staging(active, &mut ready, &mut pending, &id, res, &env).await?;
                 }
             }
             hub_message::Msg::Manifest(m) => {
                 let id = m.build_id.clone();
                 if let Some(build) = active.get_mut(&id) {
                     let res = build.feed_manifest(m).await;
-                    advance_staging(active, &mut ready, &id, res, &env).await?;
+                    advance_staging(active, &mut ready, &mut pending, &id, res, &env).await?;
                 }
             }
             hub_message::Msg::Chunk(c) => {
                 let id = c.build_id.clone();
                 if let Some(build) = active.get_mut(&id) {
                     let res = build.feed_chunk(c).await;
-                    advance_staging(active, &mut ready, &id, res, &env).await?;
+                    advance_staging(active, &mut ready, &mut pending, &id, res, &env).await?;
                 }
             }
             hub_message::Msg::Cancel(c) => handle_cancel(c, active, out_tx, ctx).await?,
@@ -185,6 +185,7 @@ async fn session_loop(
 async fn advance_staging(
     active: &mut HashMap<String, ActiveBuild>,
     ready: &mut VecDeque<String>,
+    pending: &mut Vec<tokio::sync::OwnedSemaphorePermit>,
     id: &str,
     res: Result<(Option<Need>, StagingStatus)>,
     env: &LaunchEnv<'_>,
@@ -201,17 +202,18 @@ async fn advance_staging(
     match status {
         StagingStatus::InProgress => {}
         StagingStatus::Ready => {
-            // The lookahead assignment carries no permit. Grab a free
-            // slot (funding its advertisement ourselves) or queue
-            // until one frees.
+            // lookahead assignment: no permit yet
             let build = active.get_mut(id).unwrap();
             if build.permit.is_none() {
-                let Ok(p) = env.ctx.slots.clone().try_acquire_owned() else {
+                if let Some(p) = pending.pop() {
+                    build.permit = Some(p);
+                } else if let Ok(p) = env.ctx.slots.clone().try_acquire_owned() {
+                    build.permit = Some(p);
+                    env.out_tx.send(request_job()).await?;
+                } else {
                     ready.push_back(id.to_string());
                     return Ok(());
-                };
-                build.permit = Some(p);
-                env.out_tx.send(request_job()).await?;
+                }
             }
             let build = active.remove(id).unwrap();
             launch_build(env.ctx, build, env.out_tx, env.build_timeout);
