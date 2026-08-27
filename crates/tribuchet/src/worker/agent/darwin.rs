@@ -27,6 +27,10 @@ impl Confinement {
         Ok(Self)
     }
 
+    pub(super) fn kill_block(&self) {}
+
+    pub(super) fn shutdown(&self) {}
+
     /// Nothing to exempt from the kill sweep.
     pub(super) fn exempt_pid(&self) -> Option<i32> {
         None

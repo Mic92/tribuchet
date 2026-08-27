@@ -11,6 +11,7 @@ use std::process::{Child, Command, Stdio};
 
 use rustix::event::pause;
 use rustix::io::{FdFlags, fcntl_setfd};
+use rustix::process::{Pid, Signal, WaitOptions, kill_process, waitpid};
 use rustix::thread::{UnshareFlags, unshare_unsafe};
 
 #[derive(Debug, thiserror::Error)]
@@ -76,6 +77,13 @@ impl UsernsHolder {
     /// Pid of the holder child, for /proc/<pid>/{uid_map,gid_map}.
     pub(in crate::worker) fn pid(&self) -> u32 {
         self.child.id()
+    }
+
+    pub(in crate::worker) fn kill(&self) {
+        if let Some(pid) = Pid::from_raw(self.child.id().cast_signed()) {
+            let _ = kill_process(pid, Signal::KILL);
+            let _ = waitpid(Some(pid), WaitOptions::empty());
+        }
     }
 }
 

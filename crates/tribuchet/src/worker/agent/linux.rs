@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::{self, Stdio};
 use std::process::{Child, Command};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use std::{env, slice, thread};
 
 use rustix::io::{FdFlags, fcntl_setfd};
@@ -30,7 +31,7 @@ use rustix::net::{
     SocketType, recvmsg, send, socketpair,
 };
 use rustix::process::getuid;
-use rustix::process::{Gid, Pid, PidfdFlags, Uid, pidfd_open};
+use rustix::process::{Gid, Pid, PidfdFlags, Signal, Uid, kill_process, pidfd_open};
 use rustix::thread::{
     LinkNameSpaceType, move_into_link_name_space, set_thread_gid, set_thread_uid,
 };
@@ -76,6 +77,31 @@ impl Confinement {
             userns: opts.uid_base.map(Userns::create).transpose()?,
             cgroup_base,
         })
+    }
+
+    pub(super) fn kill_block(&self) {
+        let Some(ns) = &self.userns else { return };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if uid_range_pids(ns.uid_base, UID_COUNT).is_empty() {
+                return;
+            }
+            if let Err(e) = run_in_userns(self, "kill-block", &[]) {
+                tracing::warn!("uid block kill sweep: {}", chain(&e));
+                return;
+            }
+            if Instant::now() > deadline {
+                tracing::warn!("uid block processes survived the kill sweep");
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    pub(super) fn shutdown(&self) {
+        if let Some(ns) = &self.userns {
+            ns.holder.kill();
+        }
     }
 
     /// The userns holder must survive the kill sweep.
@@ -334,6 +360,21 @@ pub fn fs_helper_stage() -> ! {
         let op = args.next().ok_or_else(|| msg("missing op"))?;
         move_into_link_name_space(ns.as_fd(), Some(LinkNameSpaceType::User))
             .map_err(err_ctx("joining the agent user namespace"))?;
+        if op.to_str() == Some("kill-block") {
+            // "0 <base> <count>"
+            let map = fs::read_to_string("/proc/self/uid_map")?;
+            let base: u32 = map
+                .split_whitespace()
+                .nth(1)
+                .and_then(|b| b.parse().ok())
+                .ok_or_else(|| msg("unexpected uid_map"))?;
+            for pid in uid_range_pids(base, UID_COUNT) {
+                if let Some(pid) = Pid::from_raw(pid) {
+                    let _ = kill_process(pid, Signal::KILL);
+                }
+            }
+            return Ok(());
+        }
         if op.to_str() == Some("unpack") {
             // Become in-ns root so the unpacked files belong to the
             // uid block instead of the agent's unmapped uid.
@@ -451,7 +492,10 @@ pub(super) fn oom_killed(confinement: &Confinement, build_id: &str) -> bool {
 
 /// Pids whose real uid is this uid, from /proc.
 pub(super) fn own_uid_pids() -> Vec<i32> {
-    let uid = getuid().as_raw();
+    uid_range_pids(getuid().as_raw(), 1)
+}
+
+fn uid_range_pids(base: u32, count: u32) -> Vec<i32> {
     let Ok(entries) = fs::read_dir("/proc") else {
         tracing::warn!("reading /proc failed, kill sweep degraded to the process group");
         return Vec::new();
@@ -461,14 +505,14 @@ pub(super) fn own_uid_pids() -> Vec<i32> {
         .filter_map(|e| {
             let pid: i32 = e.file_name().to_str()?.parse().ok()?;
             let status = fs::read_to_string(e.path().join("status")).ok()?;
-            let real_uid: u32 = status
-                .lines()
-                .find_map(|l| l.strip_prefix("Uid:"))?
-                .split_whitespace()
-                .next()?
-                .parse()
-                .ok()?;
-            (real_uid == uid).then_some(pid)
+            let field = |name| status.lines().find_map(|l| l.strip_prefix(name));
+            if field("State:")?.trim_start().starts_with('Z') {
+                return None;
+            }
+            let uid: u32 = field("Uid:")?.split_whitespace().next()?.parse().ok()?;
+            (base..base.saturating_add(count))
+                .contains(&uid)
+                .then_some(pid)
         })
         .collect()
 }

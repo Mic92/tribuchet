@@ -116,6 +116,7 @@ impl Agent {
         if self.dedicated_uid {
             kill_own_uid_processes(self.confinement.exempt_pid());
         }
+        self.confinement.kill_block();
     }
 }
 
@@ -367,6 +368,7 @@ fn handle_cleanup(agent: &Arc<Agent>, conn: &UnixStream, req: &CleanupRequest) -
     framing::send_reply(conn, reply::Reply::Empty(Empty {}), &[])?;
     tracing::info!(id = build.id, "cleanup done");
     if agent.dedicated_uid {
+        agent.confinement.shutdown();
         process::exit(0);
     }
     Ok(())
