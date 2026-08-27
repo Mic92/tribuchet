@@ -43,10 +43,12 @@ pub(super) async fn run_job(
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
     mut in_rx: mpsc::Receiver<worker_message::Msg>,
     sess: Arc<WorkerSession>,
+    dispatched: &mut bool,
 ) -> Result<()> {
     let req = &job.req;
     let mut staging = Staging::new(state, job, &sess);
     let inputs = staging.assignment_inputs().await?;
+    *dispatched = true;
     send(
         out_tx,
         hub_message::Msg::Assignment(BuildAssignment {

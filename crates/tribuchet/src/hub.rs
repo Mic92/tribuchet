@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -98,6 +98,7 @@ impl Drop for CapsGuard {
 #[derive(Default, Clone)]
 struct Router {
     builds: Arc<Mutex<HashMap<String, mpsc::Sender<worker_message::Msg>>>>,
+    closed: Arc<AtomicBool>,
 }
 
 impl Router {
@@ -112,7 +113,12 @@ impl Router {
     }
 
     fn close_all(&self) {
+        self.closed.store(true, Ordering::SeqCst);
         self.builds.lock().unwrap().clear();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
     }
 }
 
@@ -263,7 +269,7 @@ async fn worker_loop(
     let mut resumable: HashSet<String> = register.resumable_keys.iter().cloned().collect();
     // each received RequestJob funds at most one assignment
     let (req_tx, mut req_rx) = mpsc::channel::<()>(1024);
-    let route = tokio::spawn(route_loop(in_rx, router.clone(), req_tx));
+    let route = tokio::spawn(route_loop(in_rx, router.clone(), req_tx.clone()));
     let sess = Arc::new(WorkerSession::new());
 
     let mut credits: usize = 0;
@@ -313,8 +319,10 @@ async fn worker_loop(
         let router = router.clone();
         let out_tx = out_tx.clone();
         let sess = sess.clone();
+        let refund = req_tx.clone();
         tokio::spawn(async move {
-            let res = run_job(&state, &job, &out_tx, in_rx, sess).await;
+            let mut dispatched = false;
+            let res = run_job(&state, &job, &out_tx, in_rx, sess, &mut dispatched).await;
             router.unregister(&job.id);
             // run_job counts the build verdict; only session/hub-side
             // errors reach the branches below.
@@ -322,10 +330,24 @@ async fn worker_loop(
                 state.finish(&job).await;
                 return;
             };
+            let session_dead = router.is_closed() || out_tx.is_closed();
+            if !dispatched && !session_dead {
+                // The worker never saw the id: its credit is unspent.
+                let _ = refund.try_send(());
+                if job.attempts < MAX_JOB_ATTEMPTS {
+                    tracing::warn!(
+                        id = job.id,
+                        "dispatch failed before assignment; requeueing: {}",
+                        chain(&err)
+                    );
+                    state.requeue(job).await;
+                    return;
+                }
+            }
             // A dead worker session is not a build verdict: requeue so
             // the worker (or its replacement) can resume the build by
             // dedupe key, or another worker can start over.
-            if out_tx.is_closed() && job.attempts < MAX_JOB_ATTEMPTS {
+            if session_dead && job.attempts < MAX_JOB_ATTEMPTS {
                 let err = chain(&err);
                 tracing::warn!(id = job.id, "worker session lost; requeueing build: {err}");
                 Metrics::inc(&state.metrics.requeued);
