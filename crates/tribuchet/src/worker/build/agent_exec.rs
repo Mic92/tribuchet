@@ -126,7 +126,7 @@ impl ActiveBuild {
             spec.root = build
                 .scratch_dir
                 .parent()
-                .ok_or_else(|| err_msg("agent scratch dir has no parent"))?
+                .unwrap_or(&build.scratch_dir)
                 .join("root");
         }
 
@@ -150,7 +150,9 @@ impl ActiveBuild {
             deadline_unix: unix_now() + timeout.as_secs(),
             agent_socket: socket.to_path_buf(),
         };
-        resume.persist(&self.dir)?;
+        if let Err(e) = resume.persist(&self.dir) {
+            tracing::warn!(id = a.build_id, "persisting resume state: {}", chain(&e));
+        }
         let fin = supervise_agent(&self.ctx, &resume, self.dir.clone(), socket, build);
         log_done.store(true, Ordering::Relaxed);
         let _ = tailer.join();

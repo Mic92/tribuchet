@@ -130,8 +130,10 @@ pub(super) fn sweep_orphaned_agent_builds(ctx: &Arc<WorkerCtx>) {
         // Cleanup is slow. Run it in the background, with the agent
         // reserved, so the hub connection is not delayed.
         ctx.agents.reserve(&socket);
+        let permit = ctx.slots.clone().try_acquire_owned().ok();
         let ctx = ctx.clone();
         tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             let _ = agents::kill(&socket, &id);
             if let Err(e) = agents::cleanup(&socket, &id) {
                 tracing::warn!(id, "orphaned build cleanup failed: {}", chain(&e));

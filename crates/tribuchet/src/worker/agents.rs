@@ -6,11 +6,14 @@
 //! over fresh connections, so they work from any worker generation.
 
 use std::fs;
+use std::io;
 
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
 use std::fmt::Write as _;
@@ -23,7 +26,7 @@ use sandbox_proto::agent::{
 };
 use sandbox_proto::framing;
 
-use crate::errors::{Result, err_ctx, err_msg};
+use crate::errors::{Result, err_msg};
 use crate::sockpath;
 
 /// SBPL string literal escaping: a quote or backslash in an
@@ -107,12 +110,14 @@ pub(super) fn seatbelt_profile(
 /// Free agent sockets. One build per agent, so the pool size is the
 /// worker's effective max-jobs.
 pub(super) struct AgentPool {
+    all: Vec<PathBuf>,
     free: Mutex<Vec<PathBuf>>,
 }
 
 impl AgentPool {
     pub(super) fn new(sockets: Vec<PathBuf>) -> Self {
         Self {
+            all: sockets.clone(),
             free: Mutex::new(sockets),
         }
     }
@@ -124,7 +129,9 @@ impl AgentPool {
     }
 
     pub(super) fn release(&self, socket: PathBuf) {
-        self.free.lock().unwrap().push(socket);
+        if self.all.contains(&socket) {
+            self.free.lock().unwrap().push(socket);
+        }
     }
 
     /// Take a specific agent out of the pool: an adopted build already
@@ -206,10 +213,27 @@ impl AgentBuild {
 }
 
 fn connect(socket: &Path) -> Result<UnixStream> {
-    sockpath::connect(socket).map_err(err_ctx(format!(
-        "connecting to the build agent at {}",
-        socket.display()
-    )))
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match sockpath::connect(socket) {
+            Ok(c) => return Ok(c),
+            Err(e)
+                if Instant::now() < deadline
+                    && matches!(
+                        e.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                    ) =>
+            {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                return Err(err_msg(format!(
+                    "connecting to the build agent at {}: {e}",
+                    socket.display()
+                )));
+            }
+        }
+    }
 }
 
 /// Fire a control call that replies with an empty message.
