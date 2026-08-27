@@ -344,13 +344,14 @@ fn handle_kill(agent: &Arc<Agent>, conn: &UnixStream, req: &KillRequest) -> Resu
 }
 
 fn handle_finish(agent: &Arc<Agent>, conn: &UnixStream, req: &FinishRequest) -> Result<()> {
-    let (outputs, root) = {
+    let (outputs, root, pid) = {
         let current = agent.current.lock().unwrap();
         match current.as_ref() {
-            Some(b) if b.id == req.build_id => (b.outputs.clone(), b.sandbox_root.clone()),
+            Some(b) if b.id == req.build_id => (b.outputs.clone(), b.sandbox_root.clone(), b.pid),
             _ => return Ok(framing::send_error(conn, ERROR_UNKNOWN_BUILD)?),
         }
     };
+    agent.kill_sweep(Some(pid));
     platform::finish(&agent.confinement, root.as_deref(), &outputs);
     framing::send_reply(conn, reply::Reply::Empty(Empty {}), &[]).map_err(Error::Framing)
 }
