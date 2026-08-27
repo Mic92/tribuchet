@@ -25,8 +25,8 @@ use crate::chunkio;
 use crate::errors::{Error, Result, chain, err_ctx, err_msg};
 use crate::nar;
 use crate::proto::{
-    BuildMessage, BuildRequest, MAX_MSG_SIZE, OutputNar, TmpDirChunk, attach_event,
-    attach_hub_client::AttachHubClient, build_message,
+    BuildMessage, BuildRequest, DECLINE_EXIT_CODE, MAX_MSG_SIZE, OutputNar, TmpDirChunk,
+    attach_event, attach_hub_client::AttachHubClient, build_message,
 };
 use crate::rt;
 use crate::tmpdir;
@@ -51,6 +51,14 @@ const RECONNECT_ATTEMPTS: u32 = 30;
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
 async fn run_async(build: BuildJson, socket: PathBuf, build_json_path: PathBuf) -> Result<i32> {
+    if build
+        .real_store_dir
+        .as_deref()
+        .is_some_and(|r| r != build.store_dir)
+    {
+        tracing::info!("diverted store; declining so Nix builds locally");
+        return Ok(DECLINE_EXIT_CODE);
+    }
     let fixed_output = build.is_fixed_output();
     tracing::info!(fixed_output, system = %build.system, "submitting build");
     let req = BuildRequest {

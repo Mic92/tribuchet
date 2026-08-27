@@ -34,6 +34,8 @@ pub struct BuildJson {
     pub top_tmp_dir: PathBuf,
     pub tmp_dir_in_sandbox: PathBuf,
     pub store_dir: String,
+    #[serde(default)]
+    pub real_store_dir: Option<String>,
     pub system: String,
     pub input_paths: Vec<String>,
     /// Output name -> scratch store path. The same scratch paths must be
