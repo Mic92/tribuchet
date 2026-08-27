@@ -2,16 +2,15 @@
 
 use std::collections::HashSet;
 use std::path::{Component, Path};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
 
+use prost::Message;
 use sha2::{Digest, Sha256};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use super::metrics::Metrics;
-use super::state::{HubState, Job, Replay};
-use crate::build_json;
+use super::state::{HubState, Inflight, Job, Replay, Servability};
 use crate::proto::{
     AttachEvent, BuildMessage, BuildRequest, DECLINE_EXIT_CODE, attach_event, attach_hub_server,
     build_message,
@@ -102,51 +101,14 @@ async fn read_submission(
     }
 }
 
-/// Dedupe key: hash of the full canonicalized request, so only truly
-/// identical submissions share a build. A key built from output paths
-/// alone would let a colliding (or crafted) request attach to another
-/// client's build.
-pub(super) fn dedupe_key(req: &BuildRequest) -> String {
-    fn feed(h: &mut Sha256, s: &str) {
-        h.update((s.len() as u64).to_le_bytes());
-        h.update(s.as_bytes());
-    }
-    // Each variable-length section is preceded by its element count;
-    // without it, an args tail and an env entry (for example) would
-    // feed identical bytes and two different requests could collide.
-    fn count(h: &mut Sha256, n: usize) {
-        h.update((n as u64).to_le_bytes());
-    }
+/// Hash of the whole request plus the tmp dir pack. prost maps are
+/// BTreeMaps, so the encoding is deterministic.
+pub(super) fn dedupe_key(req: &BuildRequest, tmp_dir_pack: &[u8]) -> String {
     let mut h = Sha256::new();
-    feed(&mut h, &req.system);
-    feed(&mut h, &req.builder);
-    count(&mut h, req.args.len());
-    for a in &req.args {
-        feed(&mut h, a);
-    }
-    let mut env: Vec<_> = req.env.iter().collect();
-    env.sort();
-    count(&mut h, env.len());
-    for (k, v) in env {
-        feed(&mut h, k);
-        feed(&mut h, v);
-    }
-    let mut outs: Vec<_> = req.outputs.iter().collect();
-    outs.sort();
-    count(&mut h, outs.len());
-    for (k, v) in outs {
-        feed(&mut h, k);
-        feed(&mut h, v);
-    }
-    let mut inputs: Vec<_> = req.input_paths.iter().collect();
-    inputs.sort();
-    count(&mut h, inputs.len());
-    for p in inputs {
-        feed(&mut h, p);
-    }
-    feed(&mut h, &req.store_dir);
-    feed(&mut h, &req.tmp_dir_in_sandbox);
-    h.update([u8::from(req.fixed_output)]);
+    let buf = req.encode_to_vec();
+    h.update((buf.len() as u64).to_le_bytes());
+    h.update(&buf);
+    h.update(tmp_dir_pack);
     hex::encode(h.finalize())
 }
 
@@ -172,10 +134,6 @@ impl AttachSvc {
         system: &str,
         features: &[String],
     ) -> Option<Response<BuildStream>> {
-        let servable = || {
-            let caps = self.state.worker_caps.lock().unwrap();
-            caps.values().any(|c| c.serves(system, features))
-        };
         let decline = || {
             tracing::info!(system, "no capable worker; declining");
             Metrics::inc(&self.state.metrics.declined);
@@ -185,30 +143,21 @@ impl AttachSvc {
             }));
             Response::new(ReceiverStream::new(rx))
         };
-        if servable() {
-            return None;
-        }
-        // A platform no worker is expected to (re)serve declines at once.
-        let Some(deadline) = self.state.expected_deadline(system, features) else {
-            return Some(decline());
-        };
-        tracing::info!(system, "no capable worker yet; waiting");
         loop {
-            // Arm the wakeup before re-checking, else a worker
-            // registering in the gap would be missed.
+            // Arm the wakeup before checking, else a worker registering
+            // in the gap would be missed.
             let notified = self.state.caps_changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if servable() {
-                return None;
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                return Some(decline());
-            }
+            let deadline = match self.state.servability(system, features) {
+                Servability::Now => return None,
+                Servability::Never => return Some(decline()),
+                Servability::ExpectedBy(at) => at,
+            };
+            tracing::info!(system, "no capable worker yet; waiting");
             tokio::select! {
                 () = &mut notified => {}
-                () = tokio::time::sleep(deadline - now) => {}
+                () = tokio::time::sleep_until(deadline.into()) => {}
             }
         }
     }
@@ -228,56 +177,56 @@ impl attach_hub_server::AttachHub for AttachSvc {
         }
         validate_request(&req)?;
         let tmp_dir_pack = Arc::new(tmp_dir_pack);
-        let key = dedupe_key(&req);
+        let key = dedupe_key(&req, &tmp_dir_pack);
 
-        let features = build_json::required_system_features(&req.env);
+        let features = req.required_features.clone();
         if let Some(declined) = self.await_capable_worker(&req.system, &features).await {
             return Ok(declined);
         }
 
-        let mut inflight = self.state.inflight.lock().await;
-        let replay = if let Some(replay) = inflight.by_key.get(&key) {
+        let existing = self
+            .state
+            .inflight
+            .lock()
+            .unwrap()
+            .by_key
+            .get(&key)
+            .cloned();
+        let rx = if let Some(replay) = existing {
             tracing::info!(key, "deduplicating build submission");
-            replay.clone()
+            replay.subscribe().await
         } else {
+            let replay = Arc::new(Replay::default());
+            let rx = replay.subscribe().await;
+            let paths = req.outputs.values().cloned().collect();
             // A different request claiming an in-flight scratch path
             // would race the other client's unpack at the same dest.
-            for p in req.outputs.values() {
-                if inflight.by_path.contains_key(p) {
-                    return Err(Status::failed_precondition(format!(
-                        "output path {p} is part of a different in-flight build"
-                    )));
-                }
-            }
-            let replay = Arc::new(Replay::default());
-            inflight.by_key.insert(key.clone(), replay.clone());
-            for p in req.outputs.values() {
-                inflight.by_path.insert(p.clone(), key.clone());
-            }
+            let listing =
+                Inflight::list(&self.state.inflight, &key, paths, &replay).ok_or_else(|| {
+                    Status::failed_precondition(
+                        "an output path is part of a different in-flight build",
+                    )
+                })?;
             let job = Job {
                 id: new_id(),
                 key,
                 req,
                 tmp_dir_pack,
                 features,
-                replay: replay.clone(),
+                replay,
+                listing: Mutex::new(Some(listing)),
                 attempts: 0,
-                requeued_at: None,
             };
             tracing::info!(id = job.id, system = job.req.system, "queueing build");
             Metrics::inc(&self.state.metrics.submitted);
             self.state.queue.lock().await.push_back(job);
             self.state.notify.notify_waiters();
-            replay
+            rx
         };
-        // Subscribe outside the global inflight lock: the snapshot clone
-        // of a large backlog must not stall every other submission.
-        drop(inflight);
         // Close the check-then-queue race: the last capable worker may
         // have disconnected (and swept the queue) between the capability
         // check above and the push.
         self.state.fail_unservable().await;
-        let rx = replay.subscribe().await;
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 }
@@ -285,7 +234,7 @@ impl attach_hub_server::AttachHub for AttachSvc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     /// 32-char base32 hash part for synthetic store paths.
     const H: &str = "00000000000000000000000000000000";
@@ -295,12 +244,14 @@ mod tests {
             system: "x86_64-linux".into(),
             builder: format!("/nix/store/{H}-bash/bin/bash"),
             args: vec!["-c".into(), "true".into()],
-            env: HashMap::default(),
+            env: BTreeMap::default(),
             outputs: [("out".to_string(), format!("/nix/store/{H}-out"))].into(),
             input_paths: vec![format!("/nix/store/{H}-dep")],
             tmp_dir_in_sandbox: "/build".into(),
             store_dir: "/nix/store".into(),
             fixed_output: false,
+            required_features: vec![],
+            local_networking: false,
         }
     }
 
@@ -351,14 +302,15 @@ mod tests {
 
     #[test]
     fn dedupe_key_binds_full_request() {
-        let a = dedupe_key(&base_request());
-        assert_eq!(a, dedupe_key(&base_request()));
+        let a = dedupe_key(&base_request(), b"");
+        assert_eq!(a, dedupe_key(&base_request(), b""));
         let mut req = base_request();
         req.args = vec!["-c".into(), "false".into()];
-        assert_ne!(a, dedupe_key(&req));
+        assert_ne!(a, dedupe_key(&req, b""));
         let mut req = base_request();
         req.env.insert("X".into(), "1".into());
-        assert_ne!(a, dedupe_key(&req));
+        assert_ne!(a, dedupe_key(&req, b""));
+        assert_ne!(a, dedupe_key(&base_request(), b"other .attrs.sh"));
     }
 
     /// Strings shifted between adjacent sections must not collide:
@@ -372,6 +324,6 @@ mod tests {
         let mut b = base_request();
         b.args = vec!["-c".into()];
         b.env = [("K".to_string(), "V".to_string())].into();
-        assert_ne!(dedupe_key(&a), dedupe_key(&b));
+        assert_ne!(dedupe_key(&a, b""), dedupe_key(&b, b""));
     }
 }

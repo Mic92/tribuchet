@@ -1,5 +1,5 @@
-//! The Linux build agent's user namespace: a re-exec'd holder child
-//! (unshared via pre_exec) keeps it alive for the agent's lifetime.
+//! The Linux build agent's user namespace: created by a re-exec'd
+//! holder child (unshared via pre_exec), kept alive by an fd.
 
 use std::env;
 use std::fs;

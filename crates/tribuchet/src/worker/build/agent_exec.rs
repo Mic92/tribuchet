@@ -40,7 +40,7 @@ impl ActiveBuild {
         timeout: Duration,
     ) -> Result<FinishedBuild> {
         #[cfg(target_os = "macos")]
-        if requires_uid_range(&self.assignment.env) {
+        if requires_uid_range(&self.assignment) {
             return Err(err_msg(
                 "the uid-range feature is only supported on Linux workers",
             ));
@@ -68,12 +68,17 @@ impl ActiveBuild {
         // carries the full input and network configuration.
         #[cfg(target_os = "macos")]
         let (profile, sandbox_json, spec) = (
-            agents::seatbelt_profile(&outputs, &self.ctx.secret_paths, a.fixed_output)?,
+            agents::seatbelt_profile(
+                &outputs,
+                &self.ctx.secret_paths,
+                a.fixed_output,
+                a.local_networking,
+            )?,
             None,
             sandbox::SandboxSpec {
                 outputs: outputs.clone(),
                 store_inputs: self.input_list(),
-                recursive_nix: self.ctx.recursive_nix,
+                recursive_nix: self.recursive_nix(),
                 ..sandbox::SandboxSpec::default()
             },
         );
@@ -92,7 +97,7 @@ impl ActiveBuild {
             build_id: a.build_id.clone(),
             builder: a.builder.clone(),
             args: a.args.clone(),
-            env: a.env.clone(),
+            env: a.env.clone().into_iter().collect(),
             tmp_dir_in_sandbox: a.tmp_dir_in_sandbox.clone(),
             profile,
             sandbox_json,
@@ -126,7 +131,7 @@ impl ActiveBuild {
             spec.root = build
                 .scratch_dir
                 .parent()
-                .ok_or_else(|| err_msg("agent scratch dir has no parent"))?
+                .unwrap_or(&build.scratch_dir)
                 .join("root");
         }
 
@@ -150,7 +155,9 @@ impl ActiveBuild {
             deadline_unix: unix_now() + timeout.as_secs(),
             agent_socket: socket.to_path_buf(),
         };
-        resume.persist(&self.dir)?;
+        if let Err(e) = resume.persist(&self.dir) {
+            tracing::warn!(id = a.build_id, "persisting resume state: {}", chain(&e));
+        }
         let fin = supervise_agent(&self.ctx, &resume, self.dir.clone(), socket, build);
         log_done.store(true, Ordering::Relaxed);
         let _ = tailer.join();
@@ -160,10 +167,19 @@ impl ActiveBuild {
     /// The Linux sandbox spec sent with the StartRequest. The agent
     /// fills in its scratch paths, user namespace and uid block before
     /// spawning the setup stage with it.
+    fn recursive_nix(&self) -> bool {
+        self.ctx.recursive_nix
+            && self
+                .assignment
+                .required_features
+                .iter()
+                .any(|f| f == "recursive-nix")
+    }
+
     #[cfg(target_os = "linux")]
     fn build_spec(&self) -> Result<sandbox::SandboxSpec> {
         let a = &self.assignment;
-        let uid_count = if requires_uid_range(&a.env) { 65536 } else { 1 };
+        let uid_count = if requires_uid_range(a) { 65536 } else { 1 };
         let spec = sandbox::prepare(
             a,
             &self.dir,
@@ -176,7 +192,7 @@ impl ActiveBuild {
                 emulator: self.ctx.emulators.get(&a.system).map(PathBuf::as_path),
                 net_isolation: self.ctx.fod_isolation,
                 net_policy: self.ctx.fod_network.clone(),
-                recursive_nix: self.ctx.recursive_nix,
+                recursive_nix: self.recursive_nix(),
                 nix_daemon_socket: None,
             },
         )?;
@@ -253,13 +269,8 @@ pub(in crate::worker) fn supervise_agent(
         let packed = agents::finish(socket, &st.build_id)
             .map_err(err_ctx("finishing the build on its agent"))
             .and_then(|()| {
-                tokio::runtime::Handle::current().block_on(pack_outputs_and_extras(
-                    &dir,
-                    &st.spec,
-                    None,
-                    deadline,
-                    &st.build_id,
-                ))
+                tokio::runtime::Handle::current()
+                    .block_on(pack_outputs_and_extras(&dir, &st.spec, None, deadline))
             });
         match packed {
             Ok((o, e)) => (0, String::new(), o, e),

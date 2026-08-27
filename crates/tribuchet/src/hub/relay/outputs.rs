@@ -2,7 +2,7 @@
 //! lacks, then assemble each NAR from cache frames plus arriving
 //! chunks, verifying every chunk's BLAKE3 against the recipe.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 use tokio::sync::mpsc;
 use tonic::Status;
@@ -10,7 +10,7 @@ use tonic::Status;
 use super::extras::{ExtraImport, start_extra};
 use super::{msg_name, recv, send};
 use crate::chunker::{Recipe, decode_chunk, parse_recipe};
-use crate::chunkstore::Hash;
+use crate::chunkstore::{Hash, PinGuard};
 use crate::errors::{Result, err_ctx, err_msg};
 use crate::hub::chunkcache::ChunkCache;
 use crate::hub::state::{HubState, Job};
@@ -35,7 +35,7 @@ impl Announced {
 /// store paths on the client.
 pub(super) fn verify_set(
     reported: Vec<Manifest>,
-    requested: &HashMap<String, String>,
+    requested: &BTreeMap<String, String>,
 ) -> Result<Vec<Announced>> {
     let mut out = Vec::with_capacity(reported.len());
     let mut seen = HashSet::new();
@@ -73,21 +73,31 @@ pub(super) fn parse_extras(reported: Vec<Manifest>) -> Result<Vec<(Announced, Ma
 struct ChunkSource<'a> {
     cache: &'a ChunkCache,
     needed: HashSet<Hash>,
+    _pin: PinGuard,
     in_rx: &'a mut mpsc::Receiver<worker_message::Msg>,
 }
 
 impl ChunkSource<'_> {
     /// The chunk's zstd frame, plaintext verified against the recipe.
+    /// The delivery's hashes are pinned, so repeats read back from the
+    /// cache.
     async fn get(&mut self, hash: &Hash, size: usize) -> Result<Vec<u8>> {
         let frame = if self.needed.remove(hash) {
-            self.receive(hash).await?
-        } else {
+            let frame = self.receive(hash).await?;
+            decode_chunk(&frame, hash, size).map_err(err_ctx("output chunk"))?;
             self.cache
+                .admit(*hash, &frame)
+                .map_err(|e| err_msg(format!("caching output chunk: {e}")))?;
+            frame
+        } else {
+            let frame = self
+                .cache
                 .locate(hash)
                 .and_then(|f| f.read().ok())
-                .ok_or_else(|| err_msg("output chunk evicted from the cache mid-delivery"))?
+                .ok_or_else(|| err_msg("pinned output chunk missing from the cache"))?;
+            decode_chunk(&frame, hash, size).map_err(err_ctx("cached output chunk"))?;
+            frame
         };
-        decode_chunk(&frame, hash, size).map_err(err_ctx("output chunk"))?;
         Ok(frame)
     }
 
@@ -104,7 +114,6 @@ impl ChunkSource<'_> {
         if c.hash != hash[..] {
             return Err(err_msg("worker sent output chunks out of recipe order"));
         }
-        self.cache.admit(*hash, &c.zstd);
         Ok(c.zstd)
     }
 
@@ -128,13 +137,16 @@ pub(super) async fn deliver_outputs(
     extras: Vec<(Announced, Manifest)>,
 ) -> Result<()> {
     let cache = &*state.chunks;
+    let all = || {
+        outputs
+            .iter()
+            .chain(extras.iter().map(|(a, _)| a))
+            .flat_map(|a| &a.recipe)
+    };
+    let pin = cache.pin(all().map(|(h, _)| *h));
     let mut needed = HashSet::new();
     let mut hashes = Vec::new();
-    for (h, _) in outputs
-        .iter()
-        .chain(extras.iter().map(|(a, _)| a))
-        .flat_map(|a| &a.recipe)
-    {
+    for (h, _) in all() {
         if !needed.contains(h) && cache.locate(h).is_none() {
             needed.insert(*h);
             hashes.extend_from_slice(h);
@@ -157,6 +169,7 @@ pub(super) async fn deliver_outputs(
     let mut src = ChunkSource {
         cache,
         needed,
+        _pin: pin,
         in_rx,
     };
     for a in &outputs {

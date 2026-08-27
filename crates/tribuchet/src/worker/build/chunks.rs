@@ -8,13 +8,12 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use harmonia_store_path::StoreDir;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::spawn_blocking;
 
 use super::claims::Wake;
 use super::import_pool::{ImportHandle, ImportJob, ImportPool};
 use super::{ActiveBuild, StagingStatus};
 use crate::chunker::{Recipe, decode_chunk, parse_recipe};
-use crate::chunkstore::{ChunkStore, Hash};
+use crate::chunkstore::{ChunkStore, Hash, PinGuard};
 use crate::errors::{Result, err_ctx, err_msg};
 use crate::proto::{ChunkFrame, MAX_NAR_BYTES, MAX_RESEND_ROUNDS, Manifest, Need};
 use crate::store::parse_path_info;
@@ -22,7 +21,8 @@ use crate::store::parse_path_info;
 pub(super) struct ChunkStaging {
     store: Arc<Mutex<ChunkStore>>,
     /// path -> ordered recipe, kept until the import succeeded
-    recipes: HashMap<String, Recipe>,
+    /// staged recipe and the pin keeping its chunks until imported
+    recipes: HashMap<String, (Recipe, PinGuard)>,
     /// chunk -> paths waiting on it
     waiters: HashMap<Hash, Vec<String>>,
     /// path -> distinct chunks still missing from the store
@@ -48,9 +48,14 @@ impl ChunkStaging {
         sizes: &[u64],
     ) -> Result<(Vec<u8>, bool)> {
         let recipe = parse_recipe(&path, hashes, sizes)?;
+        let pin = self
+            .store
+            .lock()
+            .unwrap()
+            .pin(recipe.iter().map(|(h, _)| *h));
         let need = self.await_missing(&path, &recipe);
         let ready = !self.remaining.contains_key(&path);
-        self.recipes.insert(path, recipe);
+        self.recipes.insert(path, (recipe, pin));
         Ok((need, ready))
     }
 
@@ -86,7 +91,7 @@ impl ChunkStaging {
         let mut need = Vec::new();
         let mut ready = Vec::new();
         for path in stuck {
-            let recipe = self.recipes[&path].clone();
+            let recipe = self.recipes[&path].0.clone();
             need.extend(self.await_missing(&path, &recipe));
             if !self.remaining.contains_key(&path) {
                 ready.push(path);
@@ -124,7 +129,7 @@ impl ChunkStaging {
     fn recipe(&self, path: &str) -> Result<Recipe> {
         self.recipes
             .get(path)
-            .cloned()
+            .map(|(r, _)| r.clone())
             .ok_or_else(|| err_msg(format!("no recipe for ready path {path}")))
     }
 
@@ -148,18 +153,18 @@ impl ActiveBuild {
         })
     }
 
-    pub(in crate::worker) async fn feed_manifest(
+    pub(in crate::worker) fn feed_manifest(
         &mut self,
-        m: Manifest,
+        m: &Manifest,
     ) -> Result<(Option<Need>, StagingStatus)> {
-        let hashes = self.take_manifest(m).await?;
+        let hashes = self.take_manifest(m)?;
         let need = self.need(Vec::new(), hashes);
         Ok((need, self.try_complete()))
     }
 
     /// A manifest for a pending path: dispatch it if complete, else
     /// return the chunk hashes to request.
-    pub(super) async fn take_manifest(&mut self, m: Manifest) -> Result<Vec<u8>> {
+    pub(super) fn take_manifest(&mut self, m: &Manifest) -> Result<Vec<u8>> {
         if !self.pending.contains(&m.store_path) {
             if self.tolerated(&m.store_path) {
                 return Ok(Vec::new());
@@ -186,7 +191,7 @@ impl ActiveBuild {
             .chunks
             .add_recipe(m.store_path.clone(), &m.hashes, &m.sizes)?;
         if ready {
-            self.start_chunk_import(&m.store_path).await?;
+            self.start_chunk_import(&m.store_path)?;
         }
         Ok(hashes)
     }
@@ -194,7 +199,7 @@ impl ActiveBuild {
     /// Put imported-but-failed paths back to pending and await their
     /// chunks again: forgotten ones are re-requested, paths still
     /// complete dispatch right away.
-    pub(super) async fn restage(&mut self, paths: Vec<String>) -> Result<Option<Need>> {
+    pub(super) fn restage(&mut self, paths: Vec<String>) -> Result<Option<Need>> {
         let mut hashes = Vec::new();
         let mut ready = Vec::new();
         for path in paths {
@@ -206,14 +211,14 @@ impl ActiveBuild {
             self.pending.insert(path);
         }
         for path in ready {
-            self.start_chunk_import(&path).await?;
+            self.start_chunk_import(&path)?;
         }
         Ok(self.need(Vec::new(), hashes))
     }
 
-    pub(in crate::worker) async fn feed_chunk(
+    pub(in crate::worker) fn feed_chunk(
         &mut self,
-        c: ChunkFrame,
+        c: &ChunkFrame,
     ) -> Result<(Option<Need>, StagingStatus)> {
         let mut need = None;
         if c.eof {
@@ -231,13 +236,13 @@ impl ActiveBuild {
                     tracing::warn!(chunks = hashes.len() / 32, "chunks lost, requesting again");
                 }
                 for p in ready {
-                    self.start_chunk_import(&p).await?;
+                    self.start_chunk_import(&p)?;
                 }
                 need = self.need(Vec::new(), hashes);
             }
         } else {
             for p in self.chunks.ingest(&c.hash, &c.zstd)? {
-                self.start_chunk_import(&p).await?;
+                self.start_chunk_import(&p)?;
             }
         }
         Ok((need, self.try_complete()))
@@ -245,22 +250,22 @@ impl ActiveBuild {
 
     /// The daemon rejects an import with an invalid reference, so a
     /// complete path is parked until every reference is an input.
-    async fn start_chunk_import(&mut self, path: &str) -> Result<()> {
+    fn start_chunk_import(&mut self, path: &str) -> Result<()> {
         let mut queue = vec![path.to_string()];
         while let Some(path) = queue.pop() {
             if self.unstaged_ref(&path)?.is_some() {
                 self.parked.insert(path);
                 continue;
             }
-            self.dispatch_import(&path).await?;
+            self.dispatch_import(&path)?;
             queue.extend(self.parked.drain());
         }
         Ok(())
     }
 
-    pub(super) async fn retry_parked(&mut self) -> Result<()> {
+    pub(super) fn retry_parked(&mut self) -> Result<()> {
         for p in mem::take(&mut self.parked) {
-            self.start_chunk_import(&p).await?;
+            self.start_chunk_import(&p)?;
         }
         Ok(())
     }
@@ -285,13 +290,12 @@ impl ActiveBuild {
         Ok(None)
     }
 
-    async fn dispatch_import(&mut self, path: &str) -> Result<()> {
+    fn dispatch_import(&mut self, path: &str) -> Result<()> {
         let recipe = self.chunks.recipe(path)?;
         if !self.pending.remove(path) {
             return Err(err_msg(format!("chunk-ready path {path} was not pending")));
         }
         let info = self.infos[path].clone();
-        let (tx, rx) = mpsc::channel::<Bytes>(8);
         let (result_tx, result) = oneshot::channel();
         let wake = Wake {
             build_id: self.assignment.build_id.clone(),
@@ -302,16 +306,14 @@ impl ActiveBuild {
         pool.job_tx
             .send(ImportJob {
                 info,
-                rx,
+                store: self.chunks.store.clone(),
+                recipe,
                 result: result_tx,
                 wake: (self.wake.clone(), wake),
             })
-            .await
             .map_err(|_| err_msg("import pool gone"))?;
-        let store = self.chunks.store.clone();
-        let feeder = spawn_blocking(move || feed_import(&store, &recipe, &tx));
         self.imports
-            .insert(path.to_string(), ImportHandle { result, feeder });
+            .insert(path.to_string(), ImportHandle { result });
         Ok(())
     }
 }
@@ -319,7 +321,7 @@ impl ActiveBuild {
 /// Stream a recipe's chunks, decompressed and verified, to the import.
 /// Returns the chunks found corrupt or missing, after forgetting them
 /// in the store so a retry requests them again.
-fn feed_import(
+pub(super) fn feed_import(
     store: &Mutex<ChunkStore>,
     recipe: &[(Hash, usize)],
     tx: &mpsc::Sender<Bytes>,
@@ -342,7 +344,7 @@ fn feed_import(
 }
 
 fn read_verified(store: &Mutex<ChunkStore>, hash: &Hash, size: usize) -> Option<Vec<u8>> {
-    let frame = store.lock().unwrap().locate(hash)?.read().ok()?;
+    let frame = store.lock().unwrap().peek(hash)?.read().ok()?;
     decode_chunk(&frame, hash, size).ok()
 }
 

@@ -93,7 +93,7 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>) {
             dir.clone(),
             None,
         );
-        let permit = ctx.slots.clone().try_acquire_owned().ok();
+        let slot = ctx.try_slot();
         let task_ctx = ctx.clone();
         tokio::task::spawn_blocking(move || {
             let ctx = task_ctx;
@@ -106,7 +106,7 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>) {
             };
             // Roots live until the outputs are packed.
             drop(gc_roots);
-            drop(permit);
+            drop(slot);
             record_finished(&ctx, &key, fin);
         });
     }
@@ -130,8 +130,10 @@ pub(super) fn sweep_orphaned_agent_builds(ctx: &Arc<WorkerCtx>) {
         // Cleanup is slow. Run it in the background, with the agent
         // reserved, so the hub connection is not delayed.
         ctx.agents.reserve(&socket);
+        let slot = ctx.try_slot();
         let ctx = ctx.clone();
         tokio::task::spawn_blocking(move || {
+            let _slot = slot;
             let _ = agents::kill(&socket, &id);
             if let Err(e) = agents::cleanup(&socket, &id) {
                 tracing::warn!(id, "orphaned build cleanup failed: {}", chain(&e));
@@ -158,7 +160,12 @@ async fn re_root_inputs(spec: &sandbox::SandboxSpec) -> Option<DaemonConn> {
             return None;
         }
     };
-    for path in &spec.store_inputs {
+    let outputs = if cfg!(target_os = "macos") {
+        &spec.outputs[..]
+    } else {
+        &[]
+    };
+    for path in spec.store_inputs.iter().chain(outputs) {
         let sp = match store_dir.parse(path) {
             Ok(sp) => sp,
             Err(e) => {

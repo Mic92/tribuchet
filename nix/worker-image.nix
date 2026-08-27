@@ -10,6 +10,7 @@
   cacert,
   bashInteractive,
   coreutils,
+  tini,
 }:
 let
   entrypoint = writeShellScript "tribuchet-worker-entrypoint" ''
@@ -39,7 +40,11 @@ dockerTools.buildLayeredImage {
     mkdir -p tmp var/lib/tribuchet/worker etc/tribuchet nix/var/nix
   '';
   config = {
-    Entrypoint = [ entrypoint ];
+    Entrypoint = [
+      "${tini}/bin/tini"
+      "--"
+      entrypoint
+    ];
     Env = [
       "SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt"
       "PATH=/bin"

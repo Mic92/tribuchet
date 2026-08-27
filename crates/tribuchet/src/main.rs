@@ -67,6 +67,9 @@ enum Command {
         /// Unix socket to bind when not socket-activated.
         #[arg(long)]
         socket: Option<PathBuf>,
+        /// Inherited listening socket (worker-spawned agents).
+        #[arg(long)]
+        listen_fd: Option<i32>,
         /// Directory for per-build scratch dirs.
         #[arg(long)]
         state_dir: PathBuf,
@@ -131,12 +134,14 @@ fn run() -> Result<(), errors::Error> {
         Command::Ca { action } => Ok(ca::run(action)?),
         Command::Agent {
             socket,
+            listen_fd,
             state_dir,
             worker_uid,
             uid_base,
             dedicated_uid,
         } => Ok(worker::agent::run(&worker::agent::Options {
             socket,
+            listen_fd,
             state_dir,
             worker_uid,
             uid_base,

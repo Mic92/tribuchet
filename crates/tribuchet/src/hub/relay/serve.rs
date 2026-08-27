@@ -69,8 +69,12 @@ fn cores() -> usize {
 static PACK_PERMITS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(cores()));
 
 /// Serve a recipe from the in-memory cache or pack and chunk the NAR.
-pub(super) async fn compute_recipe(cache: &ChunkCache, store_path: &str) -> Result<Recipe> {
-    if let Some(r) = cache.recipe(store_path) {
+pub(super) async fn compute_recipe(
+    cache: &ChunkCache,
+    store_path: &str,
+    nar_sha256: &[u8],
+) -> Result<Recipe> {
+    if let Some(r) = cache.recipe(store_path, nar_sha256) {
         return Ok(r);
     }
     let _permit = PACK_PERMITS.acquire().await.expect("pack semaphore closed");
@@ -93,7 +97,7 @@ pub(super) async fn compute_recipe(cache: &ChunkCache, store_path: &str) -> Resu
         "recipe computed"
     );
     let recipe = Arc::new(recipe);
-    cache.store_recipe(store_path.to_string(), recipe.clone());
+    cache.store_recipe(store_path.to_string(), nar_sha256.to_vec(), recipe.clone());
     Ok(recipe)
 }
 
@@ -180,7 +184,10 @@ fn frame_for(cache: &ChunkCache, chunk: &Chunk) -> Result<Vec<u8>> {
     };
     let frame = compress(&chunk.data, 3).map_err(err_ctx("compressing chunk"))?;
     if admit {
-        cache.admit(chunk.hash, &frame);
+        // only loses future hits
+        if let Err(e) = cache.admit(chunk.hash, &frame) {
+            tracing::warn!(error = %e, "chunk cache write failed");
+        }
     }
     Ok(frame)
 }
@@ -195,7 +202,7 @@ mod tests {
         let cache = ChunkCache::open(dir.path().to_path_buf(), 1 << 20).unwrap();
         let a: Hash = [1; 32];
         let b: Hash = [2; 32];
-        cache.admit(a, &compress(b"hello", 3).unwrap());
+        cache.admit(a, &compress(b"hello", 3).unwrap()).unwrap();
 
         let (tx, mut rx) = mpsc::channel(8);
 

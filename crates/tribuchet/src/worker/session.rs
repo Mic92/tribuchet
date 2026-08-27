@@ -14,13 +14,14 @@ use super::caps::system_caps;
 use super::resume::{
     ResumableBuild, ack_delivery, execute_to_finished, record_finished, serve_chunks, try_deliver,
 };
-use super::{WorkerCtx, hostname, loadavg1, msg, request_job};
+use super::{WorkerCtx, hostname, loadavg1, msg};
 use crate::chunkio;
 use crate::config::{Auth, WorkerConfig};
 use crate::errors::{Error, Result, chain, err_ctx, err_msg};
 use crate::proto::{
     BuildAssignment, BuildResult, CancelBuild, Heartbeat, HubMessage, MAX_MSG_SIZE, Need, Register,
-    Resumed, WorkerMessage, hub_message, worker_hub_client::WorkerHubClient, worker_message,
+    RequestJob, Resumed, WorkerMessage, hub_message, worker_hub_client::WorkerHubClient,
+    worker_message,
 };
 
 pub(super) async fn session(opts: &WorkerConfig, ctx: &Arc<WorkerCtx>) -> Result<()> {
@@ -100,37 +101,33 @@ async fn session_loop(
         out_tx,
         build_timeout,
     };
-    // Permits already funded to the hub but not yet assigned back.
-    let mut pending = Vec::new();
     // Builds staged to completion but waiting for a free slot.
     let mut ready: VecDeque<String> = VecDeque::new();
     let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
     let (wake_tx, mut wake_rx) = mpsc::unbounded_channel::<Wake>();
-    // One unfunded request beyond the free slots: the hub assigns and
-    // stages the next build while every slot is busy, so a finishing
-    // build hands its slot to a build that starts immediately instead
-    // of waiting a round trip plus staging.
-    out_tx.send(request_job()).await?;
+    declare_capacity(active, &ready, &env).await?;
     loop {
         let m = tokio::select! {
-            permit = ctx.slots.clone().acquire_owned() => {
-                let permit = permit.expect("slots never closed");
-                grant_slot(permit, active, &mut ready, &mut pending, &env);
-                out_tx.send(request_job()).await?;
+            () = ctx.slot_freed.notified() => {
+                grant_slots(active, &mut ready, &env);
+                declare_capacity(active, &ready, &env).await?;
                 continue;
             }
             _ = heartbeat.tick() => {
-                let occupied = max_jobs as usize - ctx.slots.available_permits();
-                let running = occupied.saturating_sub(pending.len() + active.len());
+                let staging = active.values().filter(|b| b.slot.is_some()).count();
+                let running = (max_jobs as usize)
+                    .saturating_sub(ctx.slots.available_permits() + staging);
                 out_tx.send(msg(worker_message::Msg::Heartbeat(Heartbeat {
                     running_jobs: u32::try_from(running).unwrap_or(u32::MAX),
                     load1: loadavg1(),
+                    resumable_keys: ctx.resumable_keys(),
                 }))).await?;
+                declare_capacity(active, &ready, &env).await?;
                 continue;
             }
             Some(w) = wake_rx.recv() => {
                 if let Some(build) = active.get_mut(&w.build_id) {
-                    let res = build.woken(&w.path).await;
+                    let res = build.woken(&w.path);
                     advance_staging(active, &mut ready, &w.build_id, res, &env).await?;
                 }
                 continue;
@@ -142,12 +139,11 @@ async fn session_loop(
         let Some(m) = m.msg else { continue };
         match m {
             hub_message::Msg::Assignment(a) => {
-                if let Some(id) =
-                    handle_assignment(a, active, &mut pending, &wake_tx, out_tx, ctx).await?
-                {
+                if let Some(id) = handle_assignment(a, active, &wake_tx, out_tx, ctx).await? {
                     let res = active.get_mut(&id).unwrap().negotiate().await;
                     advance_staging(active, &mut ready, &id, res, &env).await?;
                 }
+                declare_capacity(active, &ready, &env).await?;
             }
             hub_message::Msg::TmpDir(t) => {
                 let id = t.build_id.clone();
@@ -159,18 +155,21 @@ async fn session_loop(
             hub_message::Msg::Manifest(m) => {
                 let id = m.build_id.clone();
                 if let Some(build) = active.get_mut(&id) {
-                    let res = build.feed_manifest(m).await;
+                    let res = build.feed_manifest(&m);
                     advance_staging(active, &mut ready, &id, res, &env).await?;
                 }
             }
             hub_message::Msg::Chunk(c) => {
                 let id = c.build_id.clone();
                 if let Some(build) = active.get_mut(&id) {
-                    let res = build.feed_chunk(c).await;
+                    let res = build.feed_chunk(&c);
                     advance_staging(active, &mut ready, &id, res, &env).await?;
                 }
             }
-            hub_message::Msg::Cancel(c) => handle_cancel(c, active, out_tx, ctx).await?,
+            hub_message::Msg::Cancel(c) => {
+                handle_cancel(c, active, out_tx, ctx).await?;
+                declare_capacity(active, &ready, &env).await?;
+            }
             hub_message::Msg::Need(n) => {
                 serve_chunks(ctx, n.build_id, &n.hashes, out_tx.clone());
             }
@@ -179,6 +178,23 @@ async fn session_loop(
             }
         }
     }
+}
+
+/// Free slots, plus one lookahead build staged while every slot is
+/// busy so a finishing build hands over without a round trip.
+async fn declare_capacity(
+    active: &HashMap<String, ActiveBuild>,
+    ready: &VecDeque<String>,
+    env: &LaunchEnv<'_>,
+) -> Result<()> {
+    let lookahead = ready.is_empty() && active.values().all(|b| b.slot.is_some());
+    let capacity = env.ctx.slots.available_permits() + usize::from(lookahead);
+    env.out_tx
+        .send(msg(worker_message::Msg::RequestJob(RequestJob {
+            capacity: u32::try_from(capacity).unwrap_or(u32::MAX),
+        })))
+        .await?;
+    Ok(())
 }
 
 /// Act on a staging step: forward a Need, launch, or abort.
@@ -190,7 +206,10 @@ async fn advance_staging(
     env: &LaunchEnv<'_>,
 ) -> Result<()> {
     let status = match res {
-        Err(e) => return abort_active(active, id, env.out_tx, &e).await,
+        Err(e) => {
+            abort_active(active, id, env.out_tx, &e).await?;
+            return declare_capacity(active, ready, env).await;
+        }
         Ok((need, status)) => {
             if let Some(n) = need {
                 env.out_tx.send(msg(worker_message::Msg::Need(n))).await?;
@@ -201,20 +220,17 @@ async fn advance_staging(
     match status {
         StagingStatus::InProgress => {}
         StagingStatus::Ready => {
-            // The lookahead assignment carries no permit. Grab a free
-            // slot (funding its advertisement ourselves) or queue
-            // until one frees.
             let build = active.get_mut(id).unwrap();
-            if build.permit.is_none() {
-                let Ok(p) = env.ctx.slots.clone().try_acquire_owned() else {
-                    ready.push_back(id.to_string());
-                    return Ok(());
-                };
-                build.permit = Some(p);
-                env.out_tx.send(request_job()).await?;
+            if build.slot.is_none() {
+                build.slot = env.ctx.try_slot();
+            }
+            if build.slot.is_none() {
+                ready.push_back(id.to_string());
+                return Ok(());
             }
             let build = active.remove(id).unwrap();
             launch_build(env.ctx, build, env.out_tx, env.build_timeout);
+            declare_capacity(active, ready, env).await?;
         }
     }
     Ok(())
@@ -256,26 +272,24 @@ struct LaunchEnv<'a> {
     build_timeout: Duration,
 }
 
-/// Hand a freed slot to a staged build waiting for one, or advertise
-/// it to the hub as pending.
-fn grant_slot(
-    permit: tokio::sync::OwnedSemaphorePermit,
+/// Hand freed slots to staged builds waiting for one.
+fn grant_slots(
     active: &mut HashMap<String, ActiveBuild>,
     ready: &mut VecDeque<String>,
-    pending: &mut Vec<tokio::sync::OwnedSemaphorePermit>,
     env: &LaunchEnv<'_>,
 ) {
-    let mut permit = Some(permit);
-    while let Some(id) = ready.pop_front() {
+    while let Some(id) = ready.front() {
         // cancel may have removed it from active
-        if let Some(mut build) = active.remove(&id) {
-            build.permit = permit.take();
-            launch_build(env.ctx, build, env.out_tx, env.build_timeout);
+        let Some(build) = active.get_mut(id) else {
+            ready.pop_front();
+            continue;
+        };
+        let Some(slot) = env.ctx.try_slot() else {
             break;
-        }
-    }
-    if let Some(p) = permit {
-        pending.push(p);
+        };
+        build.slot = Some(slot);
+        let build = active.remove(&ready.pop_front().unwrap()).unwrap();
+        launch_build(env.ctx, build, env.out_tx, env.build_timeout);
     }
 }
 
@@ -283,7 +297,6 @@ fn grant_slot(
 async fn handle_assignment(
     a: BuildAssignment,
     active: &mut HashMap<String, ActiveBuild>,
-    pending: &mut Vec<tokio::sync::OwnedSemaphorePermit>,
     wake: &mpsc::UnboundedSender<Wake>,
     out_tx: &mpsc::Sender<WorkerMessage>,
     ctx: &Arc<WorkerCtx>,
@@ -303,9 +316,6 @@ async fn handle_assignment(
         tokio::task::spawn_blocking(move || try_deliver(&ctx, &a.dedupe_key));
         return Ok(None);
     }
-    // Resumed assignments are credit-free on the hub, so never funded
-    // a permit into `pending`.
-    let permit = pending.pop();
     tracing::info!(id = a.build_id, "build assigned");
     // build ids are never reused; a duplicate is a confused hub
     if let Some(old) = active.remove(&a.build_id) {
@@ -315,7 +325,7 @@ async fn handle_assignment(
     let build_id = a.build_id.clone();
     match validate_assignment(&a).and_then(|()| ActiveBuild::new(a, ctx.clone(), wake.clone())) {
         Ok(mut b) => {
-            b.permit = permit;
+            b.slot = ctx.try_slot();
             active.insert(build_id.clone(), b);
             Ok(Some(build_id))
         }

@@ -33,7 +33,11 @@ pub(in crate::worker) fn spawn_resumable_reaper(ctx: Arc<WorkerCtx>) {
             {
                 let mut map = ctx.resumable.lock().unwrap();
                 map.retain(|key, e| match &e.finished {
-                    Some(fin) if !e.delivering && fin.finished_at.elapsed() > TTL => {
+                    Some(fin)
+                        if !e.delivering
+                            && Arc::strong_count(fin) == 1
+                            && fin.finished_at.elapsed() > TTL =>
+                    {
                         expired.push((key.clone(), fin.dir.clone()));
                         false
                     }
@@ -62,7 +66,7 @@ pub(in crate::worker) struct ResumableBuild {
     /// build *finishes* may not be the one that assigned it. None for
     /// a freshly re-adopted build no session has assigned yet.
     pub(in crate::worker) out_tx: Option<mpsc::Sender<WorkerMessage>>,
-    pub(in crate::worker) finished: Option<FinishedBuild>,
+    pub(in crate::worker) finished: Option<Arc<FinishedBuild>>,
     /// A delivery is in flight; a concurrent re-assignment must not
     /// start a second one.
     pub(in crate::worker) delivering: bool,
@@ -82,6 +86,7 @@ impl ResumableBuild {
         dir: PathBuf,
         finished: Option<FinishedBuild>,
     ) {
+        let finished = finished.map(Arc::new);
         ctx.resumable.lock().unwrap().insert(
             key,
             Self {
@@ -96,7 +101,6 @@ impl ResumableBuild {
     }
 }
 
-#[derive(Clone)]
 pub(in crate::worker) struct FinishedBuild {
     pub(in crate::worker) exit_code: i32,
     pub(in crate::worker) error: String,
@@ -162,7 +166,7 @@ pub(in crate::worker) fn record_finished(ctx: &Arc<WorkerCtx>, key: &str, fin: F
         if let Some(e) = map.get_mut(key) {
             // build_id may have changed via a resume assignment meanwhile
             persist_finished(key, &e.build_id, &fin);
-            e.finished = Some(fin);
+            e.finished = Some(Arc::new(fin));
         }
     }
     // A cancel flag the abort loop did not get to consume (the build
@@ -309,33 +313,38 @@ fn send_chunks(
     Ok(())
 }
 
-/// Serve a NeedChunks for a finished build on a blocking thread. A
-/// failure only logs: the hub times the session out and the result
-/// is redelivered on resume.
+/// Serve a NeedChunks for a finished build on a blocking thread.
 pub(in crate::worker) fn serve_chunks(
     ctx: &Arc<WorkerCtx>,
     build_id: String,
     hashes: &[u8],
     out_tx: mpsc::Sender<WorkerMessage>,
 ) {
-    let fin = {
-        let map = ctx.resumable.lock().unwrap();
-        map.values()
-            .find(|e| e.build_id == build_id)
-            .and_then(|e| e.finished.clone())
-    };
+    // holding the Arc keeps the reaper off the build dir
+    let fin = ctx
+        .resumable
+        .lock()
+        .unwrap()
+        .values()
+        .find(|e| e.build_id == build_id)
+        .and_then(|e| e.finished.clone());
     let Some(fin) = fin else {
         tracing::warn!(id = build_id, "chunk request for an unknown build");
         return;
     };
-    let Ok(needed) = parse_hashes(hashes) else {
-        tracing::warn!(id = build_id, "misaligned chunk request");
-        return;
-    };
-    let needed: HashSet<Hash> = needed.into_iter().collect();
+    let hashes = hashes.to_vec();
     tokio::task::spawn_blocking(move || {
-        if let Err(e) = send_chunks(&fin, &build_id, needed, &out_tx) {
-            tracing::warn!(id = build_id, "sending output chunks failed: {}", chain(&e));
+        let res = parse_hashes(&hashes)
+            .and_then(|needed| send_chunks(&fin, &build_id, needed.into_iter().collect(), &out_tx));
+        if let Err(e) = res {
+            let err = chain(&e);
+            tracing::warn!(id = build_id, "sending output chunks failed: {err}");
+            let _ = out_tx.blocking_send(msg(worker_message::Msg::Result(BuildResult {
+                build_id,
+                exit_code: 1,
+                error: format!("worker could not serve output chunks: {err}"),
+                ..Default::default()
+            })));
         }
     });
 }

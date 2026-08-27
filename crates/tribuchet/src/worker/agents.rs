@@ -39,27 +39,42 @@ fn sb_escape(s: &str) -> Result<String> {
     Ok(s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-/// The seatbelt profile the agent applies to the builder. Reads stay
-/// broad (matching Nix's Darwin sandbox) except for the worker's key
-/// material. Writes are scoped to the agent's scratch dir (via the
-/// [`SCRATCH_DIR_PARAM`] parameter, filled in agent-side) and the
-/// scratch output store paths. Unfiltered `(allow signal)` would let
-/// builds signal other agent-uid processes, most notably the agent.
+/// Nix's Darwin sandbox profiles, vendored verbatim from
+/// `src/libstore/darwin/build/` so updates are a file copy.
+#[cfg(target_os = "macos")]
+const NIX_SANDBOX_DEFAULTS: &str = include_str!("seatbelt/sandbox-defaults.sb");
+#[cfg(target_os = "macos")]
+const NIX_SANDBOX_NETWORK: &str = include_str!("seatbelt/sandbox-network.sb");
+
+/// Nix's baseline with its tmp dir parameters bound to the agent's
+/// scratch dir ([`SCRATCH_DIR_PARAM`], filled in agent-side), broad
+/// reads minus the worker's key material instead of Nix's per-closure
+/// list, and writes to the scratch output store paths.
 #[cfg(target_os = "macos")]
 pub(super) fn seatbelt_profile(
     outputs: &[String],
     deny_read: &[PathBuf],
     network: bool,
+    local_network: bool,
 ) -> Result<String> {
+    let scratch = format!("(param \"{SCRATCH_DIR_PARAM}\")");
+    let defaults = NIX_SANDBOX_DEFAULTS
+        .replace("(param \"_GLOBAL_TMP_DIR\")", &scratch)
+        .replace("(param \"_NIX_BUILD_TOP\")", &scratch)
+        .replace(
+            "(param \"_ALLOW_LOCAL_NETWORKING\")",
+            if local_network { "#t" } else { "#f" },
+        );
     let mut profile = String::from(
-        "(version 1)\n\
-         (deny default)\n\
-         (allow process*)\n\
-         (allow signal (target same-sandbox))\n\
-         (allow sysctl-read)\n\
-         (allow mach-lookup)\n\
-         (allow file-read*)\n\
-         (allow file-ioctl)\n",
+        "(version 1)
+",
+    );
+    profile.push_str(&defaults);
+    // tribuchet does not enumerate the input closure
+    profile.push_str(
+        "(allow file-read* process-exec file-ioctl)
+         (allow mach-lookup)
+",
     );
     for secret in deny_read {
         // Seatbelt matches path filters against the canonical vnode
@@ -79,27 +94,21 @@ pub(super) fn seatbelt_profile(
             )?;
         }
     }
-    writeln!(
-        profile,
-        "(allow file-write*\n  (subpath (param \"{SCRATCH_DIR_PARAM}\"))"
-    )?;
     // Outputs are created fresh at their real store paths, /nix is not
     // a symlink, so the literal form is already the vnode path.
+    profile.push_str(
+        "(allow file-read* file-write* process-exec
+",
+    );
     for path in outputs {
         writeln!(profile, "  (subpath \"{}\")", sb_escape(path)?)?;
     }
-    for dev in [
-        "/dev/null",
-        "/dev/zero",
-        "/dev/random",
-        "/dev/urandom",
-        "/dev/tty",
-    ] {
-        writeln!(profile, "  (literal \"{dev}\")")?;
-    }
-    profile.push_str(")\n");
+    profile.push_str(
+        ")
+",
+    );
     if network {
-        profile.push_str("(allow network*)\n(allow system-socket)\n");
+        profile.push_str(NIX_SANDBOX_NETWORK);
     }
     Ok(profile)
 }
@@ -107,12 +116,14 @@ pub(super) fn seatbelt_profile(
 /// Free agent sockets. One build per agent, so the pool size is the
 /// worker's effective max-jobs.
 pub(super) struct AgentPool {
+    all: Vec<PathBuf>,
     free: Mutex<Vec<PathBuf>>,
 }
 
 impl AgentPool {
     pub(super) fn new(sockets: Vec<PathBuf>) -> Self {
         Self {
+            all: sockets.clone(),
             free: Mutex::new(sockets),
         }
     }
@@ -124,7 +135,9 @@ impl AgentPool {
     }
 
     pub(super) fn release(&self, socket: PathBuf) {
-        self.free.lock().unwrap().push(socket);
+        if self.all.contains(&socket) {
+            self.free.lock().unwrap().push(socket);
+        }
     }
 
     /// Take a specific agent out of the pool: an adopted build already
@@ -272,7 +285,7 @@ pub(super) fn shutdown(socket: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::time::Duration;
+    use std::os::fd::IntoRawFd;
     use std::{env, thread};
 
     use crate::tmpdir::pack_zstd_dir;
@@ -283,21 +296,17 @@ mod tests {
     fn spawn_test_agent(dir: &Path) -> Result<(PathBuf, PathBuf)> {
         let socket = dir.join("agent.sock");
         let state_dir = dir.join("state");
-        {
-            let socket = socket.clone();
-            thread::spawn(move || {
-                let _ = agent::run(&agent::Options {
-                    socket: Some(socket),
-                    state_dir,
-                    worker_uid: None,
-                    uid_base: None,
-                    dedicated_uid: false,
-                });
+        let listener = sockpath::bind(&socket)?;
+        thread::spawn(move || {
+            let _ = agent::run(&agent::Options {
+                socket: None,
+                listen_fd: Some(listener.into_raw_fd()),
+                state_dir,
+                worker_uid: None,
+                uid_base: None,
+                dedicated_uid: false,
             });
-        }
-        while !socket.exists() {
-            thread::sleep(Duration::from_millis(10));
-        }
+        });
         // build dir carrying .attrs.json, like the client pack
         let build = dir.join("top/build");
         fs::create_dir_all(&build)?;
@@ -406,7 +415,7 @@ mod tests {
             ),
             outputs.clone(),
         );
-        req.profile = seatbelt_profile(&outputs, &[secret], false)?;
+        req.profile = seatbelt_profile(&outputs, &[secret], false, false)?;
         let log_w = fs::OpenOptions::new()
             .create(true)
             .append(true)

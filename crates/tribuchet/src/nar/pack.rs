@@ -93,6 +93,11 @@ fn node(out: &mut Emitter, path: &Path, meta: &fs::Metadata) -> io::Result<()> {
         out.str(b"symlink");
         out.str(b"target");
         out.str(fs::read_link(path)?.as_os_str().as_bytes());
+    } else if !ft.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{}: unsupported file type", path.display()),
+        ));
     } else {
         out.str(b"regular");
         if meta.permissions().mode() & 0o100 != 0 {
@@ -267,6 +272,13 @@ mod tests {
             _ => return,
         };
         assert_eq!(to_vec(t.path()).unwrap(), out);
+    }
+
+    #[test]
+    fn fifo_is_rejected() {
+        let t = tempfile::tempdir().unwrap();
+        nix::unistd::mkfifo(&t.path().join("p"), nix::sys::stat::Mode::S_IRWXU).unwrap();
+        assert!(to_vec(t.path()).is_err());
     }
 
     #[test]

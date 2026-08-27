@@ -9,7 +9,7 @@ use std::sync::Arc;
 use harmonia_store_path::{StoreDir, StorePath, StorePathSet};
 use harmonia_store_path_info::ValidPathInfo;
 use harmonia_store_remote::{DaemonClient, DaemonStore};
-use tokio::sync::{OwnedSemaphorePermit, mpsc};
+use tokio::sync::mpsc;
 use tokio::task::spawn_blocking;
 use zstd::stream::read::Decoder as ZstdDecoder;
 
@@ -19,7 +19,7 @@ pub(super) use claims::{Claims, Wake};
 use import_pool::{ImportHandle, ImportPool};
 
 use super::pins;
-use super::{DaemonConn, WorkerCtx, unix_now};
+use super::{DaemonConn, Slot, WorkerCtx, unix_now};
 use crate::chunkio::ChannelReader;
 use crate::errors::chain;
 use crate::errors::{Result, err_ctx, err_msg};
@@ -40,8 +40,8 @@ pub(super) struct ActiveBuild {
     pub(super) assignment: BuildAssignment,
     pub(super) dir: PathBuf, // state_dir/builds/<id>
     pub(super) ctx: Arc<WorkerCtx>,
-    /// Job slot; drops back to `WorkerCtx::slots` with the build.
-    pub(super) permit: Option<OwnedSemaphorePermit>,
+    /// None while staged as lookahead beyond the free slots.
+    pub(super) slot: Option<Slot>,
     /// Input store paths valid in /nix/store (bind-mount sources).
     inputs: HashSet<String>,
     /// Paths this build claimed and imports, removed at dispatch.
@@ -95,7 +95,7 @@ impl ActiveBuild {
             assignment,
             dir,
             ctx,
-            permit: None,
+            slot: None,
             inputs: HashSet::new(),
             pending: HashSet::new(),
             infos: HashMap::new(),
@@ -123,7 +123,7 @@ impl ActiveBuild {
         let mut hashes = Vec::new();
         for m in inputs {
             if m.info.is_some() {
-                hashes.extend(self.take_manifest(m).await?);
+                hashes.extend(self.take_manifest(&m)?);
             }
         }
         if !hashes.is_empty() {
@@ -217,6 +217,14 @@ impl ActiveBuild {
                 missing.push(p.clone());
             }
         }
+        if cfg!(target_os = "macos") {
+            for p in self.assignment.outputs.values() {
+                let sp = store_dir
+                    .parse(p)
+                    .map_err(err_ctx(format!("output {p:?} is not a store path")))?;
+                add_temp_root(&mut daemon, p, &sp).await?;
+            }
+        }
         self.daemon = Some(daemon);
         Ok(missing)
     }
@@ -253,16 +261,16 @@ impl ActiveBuild {
     }
 
     /// An own import finished or a claim this build waits on settled.
-    pub(super) async fn woken(&mut self, path: &str) -> Result<(Option<Need>, StagingStatus)> {
+    pub(super) fn woken(&mut self, path: &str) -> Result<(Option<Need>, StagingStatus)> {
         let mut need = None;
         if let Some(handle) = self.imports.remove(path) {
-            need = self.import_finished(path, handle).await?;
+            need = self.import_finished(path, handle)?;
         } else if let Some(state) = self.waits.get(path).and_then(Wait::settled) {
             self.waits.remove(path);
             match state {
                 ClaimState::Done => {
                     self.inputs.insert(path.to_string());
-                    self.retry_parked().await?;
+                    self.retry_parked()?;
                 }
                 _ => {
                     if self.claim(path) {
@@ -313,8 +321,8 @@ impl ActiveBuild {
     /// referrers dispatch. One that failed on corrupt or vanished
     /// chunks is staged again instead of failing the build. Returns the
     /// Need of that retry.
-    async fn import_finished(&mut self, path: &str, handle: ImportHandle) -> Result<Option<Need>> {
-        let Some((res, bad)) = handle.finish().await? else {
+    fn import_finished(&mut self, path: &str, handle: ImportHandle) -> Result<Option<Need>> {
+        let Some((res, bad)) = handle.finish()? else {
             return Err(err_msg(format!("woken for unfinished import {path}")));
         };
         if let Err(e) = res {
@@ -328,13 +336,13 @@ impl ActiveBuild {
                 bad_chunks = bad.len(),
                 "staging failed import again: {e}"
             );
-            return self.restage(vec![path.to_string()]).await;
+            return self.restage(vec![path.to_string()]);
         }
         self.chunks.forget_path(path);
         self.infos.remove(path);
         self.settle(path, ClaimState::Done);
         self.inputs.insert(path.to_string());
-        self.retry_parked().await?;
+        self.retry_parked()?;
         Ok(None)
     }
 
@@ -396,6 +404,8 @@ pub(super) use outputs::pack_outputs_and_extras;
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::store::{STORE_DIR, valid_store_path};
 
@@ -403,10 +413,12 @@ mod tests {
         BuildAssignment {
             build_id: "0123456789abcdef0123456789abcdef".into(),
             dedupe_key: "test-key".into(),
+            required_features: vec![],
+            local_networking: false,
             system: "x86_64-linux".into(),
             builder: "/nix/store/00000000000000000000000000000000-bash/bin/bash".into(),
             args: vec![],
-            env: HashMap::default(),
+            env: BTreeMap::default(),
             outputs: [(
                 "out".to_string(),
                 "/nix/store/00000000000000000000000000000000-out".to_string(),

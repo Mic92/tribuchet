@@ -63,6 +63,7 @@ required-features = ["e2e"]
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 
 [build-dependencies]
 tonic-prost-build.workspace = true

@@ -43,10 +43,12 @@ pub(super) async fn run_job(
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
     mut in_rx: mpsc::Receiver<worker_message::Msg>,
     sess: Arc<WorkerSession>,
+    dispatched: &mut bool,
 ) -> Result<()> {
     let req = &job.req;
     let mut staging = Staging::new(state, job, &sess);
     let inputs = staging.assignment_inputs().await?;
+    *dispatched = true;
     send(
         out_tx,
         hub_message::Msg::Assignment(BuildAssignment {
@@ -61,6 +63,8 @@ pub(super) async fn run_job(
             fixed_output: req.fixed_output,
             dedupe_key: job.key.clone(),
             inputs,
+            required_features: job.features.clone(),
+            local_networking: req.local_networking,
         }),
     )
     .await?;
@@ -87,6 +91,7 @@ pub(super) async fn run_job(
                     > CANCEL_GRACE
                 {
                     tracing::info!(id = job.id, "no attach client left; cancelling build");
+                    job.unlist();
                     send(
                         out_tx,
                         hub_message::Msg::Cancel(CancelBuild {

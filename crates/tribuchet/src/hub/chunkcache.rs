@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::chunkstore::{ChunkStore, FrameRef, Hash};
+use crate::chunkstore::{ChunkStore, FrameRef, Hash, PinGuard};
 
 /// Bound on remembered first-sightings, ~16 MB of RAM.
 const SEEN_CAP: usize = 256 * 1024;
@@ -42,7 +42,8 @@ struct Inner {
     store: ChunkStore,
     seen: VecDeque<Hash>,
     seen_set: HashSet<Hash>,
-    recipes: HashMap<String, Recipe>,
+    /// keyed with the nar_sha256 it was computed for
+    recipes: HashMap<String, (Vec<u8>, Recipe)>,
     recipe_order: VecDeque<String>,
 }
 
@@ -76,6 +77,10 @@ impl ChunkCache {
         Disposition::FirstSeen
     }
 
+    pub fn pin(&self, hashes: impl IntoIterator<Item = Hash>) -> PinGuard {
+        self.inner.lock().unwrap().store.pin(hashes)
+    }
+
     pub fn locate(&self, hash: &Hash) -> Option<FrameRef> {
         self.inner.lock().unwrap().store.locate(hash)
     }
@@ -89,13 +94,23 @@ impl ChunkCache {
             .collect()
     }
 
-    pub fn recipe(&self, store_path: &str) -> Option<Recipe> {
-        self.inner.lock().unwrap().recipes.get(store_path).cloned()
+    pub fn has_recipe(&self, store_path: &str) -> bool {
+        self.inner.lock().unwrap().recipes.contains_key(store_path)
     }
 
-    pub fn store_recipe(&self, store_path: String, recipe: Recipe) {
+    pub fn recipe(&self, store_path: &str, nar_sha256: &[u8]) -> Option<Recipe> {
+        let inner = self.inner.lock().unwrap();
+        let (h, r) = inner.recipes.get(store_path)?;
+        (h == nar_sha256).then(|| r.clone())
+    }
+
+    pub fn store_recipe(&self, store_path: String, nar_sha256: Vec<u8>, recipe: Recipe) {
         let mut inner = self.inner.lock().unwrap();
-        if inner.recipes.insert(store_path.clone(), recipe).is_none() {
+        if inner
+            .recipes
+            .insert(store_path.clone(), (nar_sha256, recipe))
+            .is_none()
+        {
             inner.recipe_order.push_back(store_path);
         }
         while inner.recipe_order.len() > RECIPE_CAP {
@@ -104,11 +119,24 @@ impl ChunkCache {
         }
     }
 
-    /// A cache write failure only loses future hits.
-    pub fn admit(&self, hash: Hash, frame: &[u8]) {
-        let mut inner = self.inner.lock().unwrap();
-        if let Err(e) = inner.store.insert(hash, frame) {
-            tracing::warn!(error = %e, "chunk cache write failed");
-        }
+    pub fn admit(&self, hash: Hash, frame: &[u8]) -> io::Result<()> {
+        self.inner.lock().unwrap().store.insert(hash, frame)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[test]
+    fn recipe_is_bound_to_nar_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ChunkCache::open(dir.path().to_path_buf(), 1 << 20).unwrap();
+        let r: Recipe = Arc::new(vec![([1; 32], 5)]);
+        c.store_recipe("/nix/store/p".into(), vec![1], r.clone());
+        assert!(c.recipe("/nix/store/p", &[1]).is_some());
+        assert!(c.recipe("/nix/store/p", &[2]).is_none());
     }
 }

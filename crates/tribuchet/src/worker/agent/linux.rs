@@ -62,7 +62,7 @@ pub(super) struct Confinement {
 
 struct Userns {
     /// Pausing child that keeps the namespace alive.
-    holder: UsernsHolder,
+    /// keeps the namespace alive after the holder process exited
     fd: OwnedFd,
     uid_base: u32,
 }
@@ -78,11 +78,14 @@ impl Confinement {
         })
     }
 
-    /// The userns holder must survive the kill sweep.
-    pub(super) fn exempt_pid(&self) -> Option<i32> {
-        self.userns
-            .as_ref()
-            .and_then(|ns| i32::try_from(ns.holder.pid()).ok())
+    /// `kill(-1)` as root of the user namespace: the kernel signals
+    /// exactly the processes it has CAP_KILL over, i.e. the block.
+    pub(super) fn kill_block(&self) {
+        if self.userns.is_some()
+            && let Err(e) = run_in_userns(self, "kill-block", &[])
+        {
+            tracing::warn!("uid block kill: {}", chain(&e));
+        }
     }
 }
 
@@ -334,6 +337,15 @@ pub fn fs_helper_stage() -> ! {
         let op = args.next().ok_or_else(|| msg("missing op"))?;
         move_into_link_name_space(ns.as_fd(), Some(LinkNameSpaceType::User))
             .map_err(err_ctx("joining the agent user namespace"))?;
+        if op.to_str() == Some("kill-block") {
+            // As in-ns root: still the agent's uid otherwise, and
+            // kill(-1) would reach the agent by uid match.
+            set_thread_gid(Gid::from_raw(0)).map_err(err_ctx("setgid 0 in the ns"))?;
+            set_thread_uid(Uid::from_raw(0)).map_err(err_ctx("setuid 0 in the ns"))?;
+            // ESRCH when nothing was left. SAFETY: plain syscall.
+            let _ = unsafe { libc::kill(-1, libc::SIGKILL) };
+            return Ok(());
+        }
         if op.to_str() == Some("unpack") {
             // Become in-ns root so the unpacked files belong to the
             // uid block instead of the agent's unmapped uid.
@@ -394,11 +406,9 @@ impl Userns {
             uid_count = UID_COUNT,
             "agent user namespace mapped"
         );
-        Ok(Self {
-            holder,
-            fd,
-            uid_base,
-        })
+        // the fd keeps the mapped namespace
+        drop(holder);
+        Ok(Self { fd, uid_base })
     }
 }
 
@@ -461,14 +471,12 @@ pub(super) fn own_uid_pids() -> Vec<i32> {
         .filter_map(|e| {
             let pid: i32 = e.file_name().to_str()?.parse().ok()?;
             let status = fs::read_to_string(e.path().join("status")).ok()?;
-            let real_uid: u32 = status
-                .lines()
-                .find_map(|l| l.strip_prefix("Uid:"))?
-                .split_whitespace()
-                .next()?
-                .parse()
-                .ok()?;
-            (real_uid == uid).then_some(pid)
+            let field = |name| status.lines().find_map(|l| l.strip_prefix(name));
+            if field("State:")?.trim_start().starts_with('Z') {
+                return None;
+            }
+            let real: u32 = field("Uid:")?.split_whitespace().next()?.parse().ok()?;
+            (real == uid).then_some(pid)
         })
         .collect()
 }
@@ -479,13 +487,12 @@ mod tests {
 
     #[test]
     fn confined_agent_refuses_an_unsandboxed_start() -> Result<()> {
-        let Ok((holder, fd)) = UsernsHolder::new() else {
+        let Ok((_holder, fd)) = UsernsHolder::new() else {
             eprintln!("skipping: cannot create a user namespace here");
             return Ok(());
         };
         let confinement = Confinement {
             userns: Some(Userns {
-                holder,
                 fd,
                 uid_base: 65536,
             }),

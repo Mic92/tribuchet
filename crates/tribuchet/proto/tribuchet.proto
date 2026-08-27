@@ -18,8 +18,8 @@ message WorkerMessage {
     BuildResult result = 4;
     // Output chunks answering the hub's Need, then one eof.
     ChunkFrame chunk = 5;
-    // One free build slot: the hub answers each request with at most
-    // one BuildAssignment (worker-side admission).
+    // Worker-side admission: how many more assignments the worker
+    // accepts right now. Level-triggered: each one replaces the last.
     RequestJob request_job = 6;
     // Answer to a BuildAssignment whose dedupe_key matches a build the
     // worker already runs (or has finished but not delivered): the hub
@@ -37,7 +37,9 @@ message Resumed {
   string build_id = 1;
 }
 
-message RequestJob {}
+message RequestJob {
+  uint32 capacity = 1;
+}
 
 message HubMessage {
   oneof msg {
@@ -124,6 +126,8 @@ message Register {
 message Heartbeat {
   uint32 running_jobs = 1;
   double load1 = 2;
+  // Current Register.resumable_keys. Keys not listed are no longer held.
+  repeated string resumable_keys = 3;
 }
 
 message BuildAssignment {
@@ -141,6 +145,8 @@ message BuildAssignment {
   // build_id. Keys the worker's resume bookkeeping.
   string dedupe_key = 10;
   repeated Manifest inputs = 11;
+  repeated string required_features = 12;
+  bool local_networking = 13;
 }
 
 message TmpDirArchive {
@@ -218,7 +224,12 @@ message BuildRequest {
   repeated string input_paths = 6;
   string tmp_dir_in_sandbox = 7;
   string store_dir = 8;
+  // Grants network in the sandbox (fixed-output or __impure).
   bool fixed_output = 9;
+  // requiredSystemFeatures, resolved by attach from env or .attrs.json.
+  repeated string required_features = 10;
+  // __darwinAllowLocalNetworking
+  bool local_networking = 11;
 }
 
 message AttachEvent {

@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
@@ -45,6 +45,28 @@ pub fn write_secret(path: &Path, data: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
+/// `remove_dir_all` that chmods read-only directories first.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+pub fn force_remove_dir_all(path: &Path) -> io::Result<()> {
+    match fs::remove_dir_all(path) {
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {}
+        r => return r,
+    }
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        let Ok(meta) = fs::symlink_metadata(&p) else {
+            continue;
+        };
+        if meta.is_dir() {
+            let _ = fs::set_permissions(&p, fs::Permissions::from_mode(meta.mode() | 0o700));
+            if let Ok(rd) = fs::read_dir(&p) {
+                stack.extend(rd.flatten().map(|e| e.path()));
+            }
+        }
+    }
+    fs::remove_dir_all(path)
+}
+
 /// Remove whatever is at `path` without following a symlink at `path`.
 pub fn remove_path_all(path: &Path) {
     match fs::symlink_metadata(path) {
@@ -55,5 +77,22 @@ pub fn remove_path_all(path: &Path) {
             let _ = fs::remove_file(path);
         }
         Err(_) => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn force_remove_read_only_tree() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("ro/inner");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("f"), b"x").unwrap();
+        fs::set_permissions(t.path().join("ro/inner"), fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(t.path().join("ro"), fs::Permissions::from_mode(0o555)).unwrap();
+        force_remove_dir_all(&t.path().join("ro")).unwrap();
+        assert!(!t.path().join("ro").exists());
     }
 }

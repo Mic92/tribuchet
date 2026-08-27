@@ -341,8 +341,6 @@ in
       // forEachAgent (i: {
         isSystemUser = true;
         group = agentUser i;
-        # /dev/kvm for kvm-requiring builds
-        extraGroups = [ "kvm" ];
       });
       users.groups = {
         tribuchet = { };
@@ -374,15 +372,19 @@ in
           # Exiting after every build is the agent's normal lifecycle,
           # not a crash loop.
           unitConfig.StartLimitIntervalSec = 0;
+          # The agent lives for one build and is socket-activated per
+          # lease, so not restarting it here is a graceful drain: the
+          # next lease runs the new ExecStart.
+          restartIfChanged = false;
           serviceConfig = {
             ExecStart = "${agentStart} %i";
             User = "tribuchet-agent-%i";
             Group = "tribuchet-agent-%i";
             StateDirectory = "tribuchet/a%i";
             # Traverse-only for the worker and the uid block: the
-            # per-build scratch dirs under it are world-writable for
-            # the block, but their names are unguessable build ids and
-            # the missing read bit hides them.
+            # per-build scratch dirs under scratch/ are world-writable
+            # for the block, but their names are random and the missing
+            # read bit hides them.
             StateDirectoryMode = "0711";
             # Writing the uid/gid maps of the agent's pre-mapped user
             # namespace needs CAP_SETUID/CAP_SETGID over the uid block;

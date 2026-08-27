@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use harmonia_store_remote::DaemonClient;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 
 use caps::host_system;
 use logtail::spawn_log_tail;
@@ -48,7 +48,7 @@ use crate::config::WorkerConfig;
 use crate::errors::{Result, err_ctx, err_msg};
 use crate::fsutil::io_ctx;
 use crate::netpolicy::NetPolicy;
-use crate::proto::{BuildAssignment, RequestJob, WorkerMessage, worker_message};
+use crate::proto::{BuildAssignment, WorkerMessage, worker_message};
 use crate::{fsutil, rt, sd};
 
 /// Connection to the local nix-daemon; one per active build so its
@@ -63,9 +63,10 @@ struct WorkerCtx {
     /// Files a build must never read even where DAC would allow it
     /// (macOS Seatbelt deny rules; Linux relies on the mount namespace).
     secret_paths: Vec<PathBuf>,
-    /// One permit per concurrent build; the session loop turns free
-    /// permits into RequestJob credits.
+    /// One permit per concurrent build.
     slots: Arc<Semaphore>,
+    /// A `Slot` dropped. The session loop re-declares capacity.
+    slot_freed: Notify,
     /// dedupe_key -> build past staging; survives session loss so a
     /// replacement hub can resume instead of rebuilding.
     resumable: Mutex<HashMap<String, ResumableBuild>>,
@@ -233,8 +234,26 @@ fn msg(m: worker_message::Msg) -> WorkerMessage {
     WorkerMessage { msg: Some(m) }
 }
 
-fn request_job() -> WorkerMessage {
-    msg(worker_message::Msg::RequestJob(RequestJob {}))
+/// A build slot. Dropping it wakes the session loop.
+pub(crate) struct Slot {
+    _permit: OwnedSemaphorePermit,
+    ctx: Arc<WorkerCtx>,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.ctx.slot_freed.notify_one();
+    }
+}
+
+impl WorkerCtx {
+    fn try_slot(self: &Arc<Self>) -> Option<Slot> {
+        let permit = self.slots.clone().try_acquire_owned().ok()?;
+        Some(Slot {
+            _permit: permit,
+            ctx: self.clone(),
+        })
+    }
 }
 
 pub fn run(opts: WorkerConfig) -> Result<()> {
@@ -331,6 +350,7 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
         sandbox_bin_sh: opts.sandbox_bin_sh.clone(),
         secret_paths: vec![opts.key.clone()],
         slots: Arc::new(Semaphore::new(opts.max_jobs.max(1) as usize)),
+        slot_freed: Notify::new(),
         import_jobs: opts.import_jobs.max(1) as usize,
         chunks: open_chunk_store(&opts)?,
         cancelled: Mutex::new(HashSet::new()),

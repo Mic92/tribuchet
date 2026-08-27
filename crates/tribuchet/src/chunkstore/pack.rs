@@ -33,7 +33,7 @@ impl PackWriter {
     pub(super) fn create(dir: &Path, id: u64) -> io::Result<Self> {
         let file = OpenOptions::new()
             .create_new(true)
-            .append(true)
+            .write(true)
             .open(pack_path(dir, id))?;
         Ok(Self {
             file,
@@ -43,13 +43,16 @@ impl PackWriter {
         })
     }
 
-    /// Append one record. Returns the payload offset.
+    /// Append one record at the tracked end, so a failed partial write
+    /// is overwritten by the next record. Returns the payload offset.
     pub(super) fn append(&mut self, hash: &Hash, frame: &[u8]) -> io::Result<u64> {
         let len = u32::try_from(frame.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "oversized chunk frame"))?;
-        self.file.write_all(&len.to_le_bytes())?;
-        self.file.write_all(hash)?;
-        self.file.write_all(frame)?;
+        let mut rec = Vec::with_capacity(HEADER_LEN + frame.len());
+        rec.extend_from_slice(&len.to_le_bytes());
+        rec.extend_from_slice(hash);
+        rec.extend_from_slice(frame);
+        self.file.write_all_at(&rec, self.len)?;
         let offset = self.len + HEADER;
         self.len += HEADER + u64::from(len);
         self.entries.push((*hash, offset, len));
@@ -59,6 +62,8 @@ impl PackWriter {
     /// Fsync the data and write the sidecar index. The index is the
     /// seal marker: a pack without one is recovered by scanning.
     pub(super) fn seal(self, dir: &Path) -> io::Result<()> {
+        // drop a torn tail left by a failed last append
+        self.file.set_len(self.len)?;
         self.file.sync_data()?;
         write_index(dir, self.id, &self.entries)
     }

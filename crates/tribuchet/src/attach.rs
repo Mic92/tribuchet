@@ -20,13 +20,13 @@ use tonic::Code;
 use tonic::transport::{Endpoint, Uri};
 use tower::service_fn;
 
-use crate::build_json::BuildJson;
+use crate::build_json::{BuildJson, flag, required_system_features};
 use crate::chunkio;
 use crate::errors::{Error, Result, chain, err_ctx, err_msg};
 use crate::nar;
 use crate::proto::{
-    BuildMessage, BuildRequest, MAX_MSG_SIZE, OutputNar, TmpDirChunk, attach_event,
-    attach_hub_client::AttachHubClient, build_message,
+    BuildMessage, BuildRequest, DECLINE_EXIT_CODE, MAX_MSG_SIZE, OutputNar, TmpDirChunk,
+    attach_event, attach_hub_client::AttachHubClient, build_message,
 };
 use crate::rt;
 use crate::tmpdir;
@@ -51,7 +51,18 @@ const RECONNECT_ATTEMPTS: u32 = 30;
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
 async fn run_async(build: BuildJson, socket: PathBuf, build_json_path: PathBuf) -> Result<i32> {
-    let fixed_output = build.is_fixed_output();
+    if build
+        .real_store_dir
+        .as_deref()
+        .is_some_and(|r| r != build.store_dir)
+    {
+        tracing::info!("diverted store; declining so Nix builds locally");
+        return Ok(DECLINE_EXIT_CODE);
+    }
+    let attrs = build.attrs();
+    let fixed_output = build.network_allowed(attrs.as_ref());
+    let required_features = required_system_features(&build.env, attrs.as_ref());
+    let local_networking = flag(&build.env, attrs.as_ref(), "__darwinAllowLocalNetworking");
     tracing::info!(fixed_output, system = %build.system, "submitting build");
     let req = BuildRequest {
         system: build.system,
@@ -63,6 +74,8 @@ async fn run_async(build: BuildJson, socket: PathBuf, build_json_path: PathBuf) 
         tmp_dir_in_sandbox: build.tmp_dir_in_sandbox.to_string_lossy().into_owned(),
         store_dir: build.store_dir,
         fixed_output,
+        required_features,
+        local_networking,
     };
     // Packed once and resent verbatim on every reconnect attempt.
     // Nix places everything the builder consumes in topTmpDir/build.

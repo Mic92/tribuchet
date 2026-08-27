@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
-use std::os::fd::OwnedFd;
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -63,6 +63,8 @@ pub use platform::{FS_HELPER_ARG, fs_helper_stage};
 pub struct Options {
     /// Unix socket to bind when launchd did not pass one.
     pub socket: Option<PathBuf>,
+    /// Listening socket inherited from a spawning worker.
+    pub listen_fd: Option<RawFd>,
     /// Per-agent state dir holding one scratch dir per build.
     pub state_dir: PathBuf,
     /// Uid allowed to lease builds, defaulting to the agent's own uid
@@ -82,9 +84,9 @@ struct Build {
     id: String,
     /// Builder pid, also its process group.
     pid: i32,
-    /// Scratch dir the build runs in (`<state>/scratch/build`).
+    /// Scratch dir the build runs in (`<scratch_root>/build`).
     dir: PathBuf,
-    /// Whole per-build tree removed by Cleanup (`<state>/scratch`).
+    /// Whole per-build tree removed by Cleanup (`<state>/scratch/<random>`).
     scratch_root: PathBuf,
     /// Private sandbox root under the scratch dir (Linux namespace
     /// builds); outputs land below it instead of at their store paths.
@@ -114,14 +116,15 @@ impl Agent {
             let _ = kill_process_group(pgid, Signal::KILL);
         }
         if self.dedicated_uid {
-            kill_own_uid_processes(self.confinement.exempt_pid());
+            kill_own_uid_processes();
         }
+        self.confinement.kill_block();
     }
 }
 
 pub fn run(opts: &Options) -> Result<()> {
     let confinement = platform::Confinement::init(opts)?;
-    let (listener, activated) = listener(opts.socket.as_deref())?;
+    let (listener, activated) = listener(opts)?;
     fs::create_dir_all(&opts.state_dir).map_err(err_ctx(format!(
         "creating state dir {}",
         opts.state_dir.display()
@@ -191,11 +194,18 @@ fn report(conn: &UnixStream, e: &Error) {
 /// Service-manager-activated listener (launchd socket named "agent",
 /// or the systemd socket unit's fd) or a self-bound one for
 /// development and tests. The bool is true for the activated case.
-fn listener(socket: Option<&Path>) -> Result<(UnixListener, bool), Error> {
+fn listener(opts: &Options) -> Result<(UnixListener, bool), Error> {
     if let Some(l) = platform::activated_unix_listener()? {
         return Ok((l, true));
     }
-    let path = socket.ok_or_else(|| msg("no activated socket and no --socket given"))?;
+    if let Some(fd) = opts.listen_fd {
+        // SAFETY: the spawning worker passed this fd for us to own.
+        return Ok((unsafe { UnixListener::from_raw_fd(fd) }, false));
+    }
+    let path = opts
+        .socket
+        .as_deref()
+        .ok_or_else(|| msg("no activated socket and no --socket given"))?;
     let _ = fs::remove_file(path);
     let l = sockpath::bind(path).map_err(err_ctx(format!("binding {}", path.display())))?;
     Ok((l, false))
@@ -261,11 +271,17 @@ fn handle_start(
         // not tamper with this one. The uid holds nothing else.
         agent.kill_sweep(None);
 
-        // Short fixed name keeps sandbox socket paths within sun_path.
-        let scratch_root = agent.state_dir.join("scratch");
+        // unguessable name under a traverse-only parent, short for sun_path
+        let scratch_parent = agent.state_dir.join("scratch");
+        platform::clean_scratch(&agent.confinement, &scratch_parent)?;
+        fs::create_dir_all(&scratch_parent).map_err(io_ctx("creating", &scratch_parent))?;
+        fs::set_permissions(&scratch_parent, fs::Permissions::from_mode(0o711))
+            .map_err(io_ctx("setting permissions on", &scratch_parent))?;
+        let mut rnd = [0u8; 8];
+        getrandom::fill(&mut rnd).map_err(|e| msg(format!("randomness: {e}")))?;
+        let scratch_root = scratch_parent.join(hex::encode(rnd));
         let build_dir = scratch_root.join("build");
-        platform::clean_scratch(&agent.confinement, &scratch_root)?;
-        fs::create_dir_all(&scratch_root).map_err(io_ctx("creating", &scratch_root))?;
+        fs::create_dir(&scratch_root).map_err(io_ctx("creating", &scratch_root))?;
         platform::stage_tmp_dir(&agent.confinement, &scratch_root, &build_dir, tmp_pack)
             .map_err(err_ctx("staging the tmp dir"))?;
 
@@ -321,9 +337,6 @@ fn handle_adopt(agent: &Arc<Agent>, conn: &UnixStream, req: &AdoptRequest) -> Re
         }),
         &[],
     )?;
-    if exit_code.is_some() {
-        return Ok(());
-    }
     notify_exit(conn, &exit)
 }
 
@@ -340,13 +353,14 @@ fn handle_kill(agent: &Arc<Agent>, conn: &UnixStream, req: &KillRequest) -> Resu
 }
 
 fn handle_finish(agent: &Arc<Agent>, conn: &UnixStream, req: &FinishRequest) -> Result<()> {
-    let (outputs, root) = {
+    let (outputs, root, pid) = {
         let current = agent.current.lock().unwrap();
         match current.as_ref() {
-            Some(b) if b.id == req.build_id => (b.outputs.clone(), b.sandbox_root.clone()),
+            Some(b) if b.id == req.build_id => (b.outputs.clone(), b.sandbox_root.clone(), b.pid),
             _ => return Ok(framing::send_error(conn, ERROR_UNKNOWN_BUILD)?),
         }
     };
+    agent.kill_sweep(Some(pid));
     platform::finish(&agent.confinement, root.as_deref(), &outputs);
     framing::send_reply(conn, reply::Reply::Empty(Empty {}), &[]).map_err(Error::Framing)
 }
@@ -452,16 +466,15 @@ fn notify_exit(conn: &UnixStream, exit: &(Mutex<Option<i32>>, Condvar)) -> Resul
     )?)
 }
 
-/// Kill every process of the agent's uid except the agent itself and
-/// the `exempt` pid: catches setsid escapes from the process-group
-/// kill and leftovers from a previous build. kill(-1) would take the
-/// agent down too.
-fn kill_own_uid_processes(exempt: Option<i32>) {
+/// Kill every process of the agent's uid except the agent itself:
+/// catches setsid escapes from the process-group kill and leftovers
+/// from a previous build. kill(-1) would take the agent down too.
+fn kill_own_uid_processes() {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let others = platform::own_uid_pids()
             .into_iter()
-            .filter(|&pid| pid != process::id().cast_signed() && Some(pid) != exempt)
+            .filter(|&pid| pid != process::id().cast_signed())
             .collect::<Vec<_>>();
         if others.is_empty() {
             return;

@@ -1,7 +1,12 @@
 //! Buffered per-build event replay for dedupe subscribers.
 
+use std::mem;
+use std::time::Duration;
+
 use tokio::sync::{Mutex, mpsc};
 use tonic::Status;
+
+const SUB_STALL: Duration = Duration::from_mins(1);
 
 use super::{EventTx, MAX_REPLAY_BYTES, SUB_CHANNEL_SLACK};
 use crate::proto::{AttachEvent, attach_event};
@@ -43,16 +48,13 @@ impl Replay {
         let sz = event_size(&ev);
         let ev = AttachEvent { event: Some(ev) };
         let mut inner = self.inner.lock().await;
-        // try_send: a subscriber that stopped reading is dropped (its
-        // attach errors out) instead of buffering unboundedly.
-        inner.subs.retain(|tx| match tx.try_send(Ok(ev.clone())) {
-            Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                tracing::warn!("dropping attach subscriber that fell too far behind");
-                false
+        for tx in mem::take(&mut inner.subs) {
+            match tokio::time::timeout(SUB_STALL, tx.send(Ok(ev.clone()))).await {
+                Ok(Ok(())) => inner.subs.push(tx),
+                Ok(Err(_)) => {}
+                Err(_) => tracing::warn!("dropping attach subscriber that stalled"),
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
-        });
+        }
         if inner.overflowed {
             return;
         }
@@ -115,5 +117,35 @@ impl Replay {
     pub(in crate::hub) async fn has_subscribers(&self) -> bool {
         let inner = self.inner.lock().await;
         inner.subs.iter().any(|tx| !tx.is_closed())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_subscriber_paces_publish() {
+        let replay = Arc::new(Replay::default());
+        let mut rx = replay.subscribe().await;
+        let n = SUB_CHANNEL_SLACK + 10;
+        let publisher = {
+            let replay = replay.clone();
+            tokio::spawn(async move {
+                for _ in 0..n {
+                    replay
+                        .publish(attach_event::Event::Log(b"x".to_vec()))
+                        .await;
+                }
+            })
+        };
+        for _ in 0..n {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            rx.recv().await.unwrap().unwrap();
+        }
+        publisher.await.unwrap();
+        assert!(replay.has_subscribers().await);
     }
 }

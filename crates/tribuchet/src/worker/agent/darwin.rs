@@ -15,6 +15,7 @@ use sandbox_proto::agent::{SCRATCH_DIR_PARAM, StartRequest};
 
 use super::{Build, Error, Options, make_readable, spawn_plain, stage_scratch};
 use crate::errors::{Result, err_ctx};
+use crate::fsutil::force_remove_dir_all;
 use crate::sd;
 
 /// Per-agent confinement state. macOS confinement is per build (the
@@ -27,10 +28,7 @@ impl Confinement {
         Ok(Self)
     }
 
-    /// Nothing to exempt from the kill sweep.
-    pub(super) fn exempt_pid(&self) -> Option<i32> {
-        None
-    }
+    pub(super) fn kill_block(&self) {}
 }
 
 /// The agent runs the builder as its own uid, so it unpacks the tmp
@@ -67,7 +65,7 @@ pub(super) fn finish(_confinement: &Confinement, _root: Option<&Path>, outputs: 
 /// Remove a stale scratch tree before a new build. The agent's own
 /// uid owns everything, so a plain removal suffices.
 pub(super) fn clean_scratch(_confinement: &Confinement, scratch_root: &Path) -> Result<()> {
-    match fs::remove_dir_all(scratch_root) {
+    match force_remove_dir_all(scratch_root) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e.into()),
         _ => Ok(()),
     }
@@ -76,10 +74,19 @@ pub(super) fn clean_scratch(_confinement: &Confinement, scratch_root: &Path) -> 
 /// Remove the build's scratch tree and its store-path outputs; the
 /// sticky store dir lets the owning agent delete them.
 pub(super) fn cleanup(_confinement: &Confinement, build: &Build) {
-    let _ = fs::remove_dir_all(&build.scratch_root);
+    if let Err(e) = force_remove_dir_all(&build.scratch_root)
+        && e.kind() != io::ErrorKind::NotFound
+    {
+        tracing::warn!("removing {}: {e}", build.scratch_root.display());
+    }
     for out in &build.outputs {
-        let _ = fs::remove_dir_all(out);
-        let _ = fs::remove_file(out);
+        let out = Path::new(out);
+        if let Err(e) = force_remove_dir_all(out)
+            && e.kind() != io::ErrorKind::NotFound
+            && fs::remove_file(out).is_err()
+        {
+            tracing::warn!("removing {}: {e}", out.display());
+        }
     }
 }
 
