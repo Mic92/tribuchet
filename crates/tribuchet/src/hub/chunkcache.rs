@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::chunkstore::{ChunkStore, FrameRef, Hash};
+use crate::chunkstore::{ChunkStore, FrameRef, Hash, PinGuard};
 
 /// Bound on remembered first-sightings, ~16 MB of RAM.
 const SEEN_CAP: usize = 256 * 1024;
@@ -77,6 +77,10 @@ impl ChunkCache {
         Disposition::FirstSeen
     }
 
+    pub fn pin(&self, hashes: impl IntoIterator<Item = Hash>) -> PinGuard {
+        self.inner.lock().unwrap().store.pin(hashes)
+    }
+
     pub fn locate(&self, hash: &Hash) -> Option<FrameRef> {
         self.inner.lock().unwrap().store.locate(hash)
     }
@@ -115,12 +119,8 @@ impl ChunkCache {
         }
     }
 
-    /// A cache write failure only loses future hits.
-    pub fn admit(&self, hash: Hash, frame: &[u8]) {
-        let mut inner = self.inner.lock().unwrap();
-        if let Err(e) = inner.store.insert(hash, frame) {
-            tracing::warn!(error = %e, "chunk cache write failed");
-        }
+    pub fn admit(&self, hash: Hash, frame: &[u8]) -> io::Result<()> {
+        self.inner.lock().unwrap().store.insert(hash, frame)
     }
 }
 

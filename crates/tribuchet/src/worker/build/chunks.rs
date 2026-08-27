@@ -13,7 +13,7 @@ use super::claims::Wake;
 use super::import_pool::{ImportHandle, ImportJob, ImportPool};
 use super::{ActiveBuild, StagingStatus};
 use crate::chunker::{Recipe, decode_chunk, parse_recipe};
-use crate::chunkstore::{ChunkStore, Hash};
+use crate::chunkstore::{ChunkStore, Hash, PinGuard};
 use crate::errors::{Result, err_ctx, err_msg};
 use crate::proto::{ChunkFrame, MAX_NAR_BYTES, MAX_RESEND_ROUNDS, Manifest, Need};
 use crate::store::parse_path_info;
@@ -21,7 +21,8 @@ use crate::store::parse_path_info;
 pub(super) struct ChunkStaging {
     store: Arc<Mutex<ChunkStore>>,
     /// path -> ordered recipe, kept until the import succeeded
-    recipes: HashMap<String, Recipe>,
+    /// staged recipe and the pin keeping its chunks until imported
+    recipes: HashMap<String, (Recipe, PinGuard)>,
     /// chunk -> paths waiting on it
     waiters: HashMap<Hash, Vec<String>>,
     /// path -> distinct chunks still missing from the store
@@ -47,16 +48,14 @@ impl ChunkStaging {
         sizes: &[u64],
     ) -> Result<(Vec<u8>, bool)> {
         let recipe = parse_recipe(&path, hashes, sizes)?;
-        if let Some(old) = self.recipes.remove(&path) {
-            self.unpin(&old);
-        }
-        self.store
+        let pin = self
+            .store
             .lock()
             .unwrap()
             .pin(recipe.iter().map(|(h, _)| *h));
         let need = self.await_missing(&path, &recipe);
         let ready = !self.remaining.contains_key(&path);
-        self.recipes.insert(path, recipe);
+        self.recipes.insert(path, (recipe, pin));
         Ok((need, ready))
     }
 
@@ -92,7 +91,7 @@ impl ChunkStaging {
         let mut need = Vec::new();
         let mut ready = Vec::new();
         for path in stuck {
-            let recipe = self.recipes[&path].clone();
+            let recipe = self.recipes[&path].0.clone();
             need.extend(self.await_missing(&path, &recipe));
             if !self.remaining.contains_key(&path) {
                 ready.push(path);
@@ -130,30 +129,12 @@ impl ChunkStaging {
     fn recipe(&self, path: &str) -> Result<Recipe> {
         self.recipes
             .get(path)
-            .cloned()
+            .map(|(r, _)| r.clone())
             .ok_or_else(|| err_msg(format!("no recipe for ready path {path}")))
     }
 
     pub(super) fn forget_path(&mut self, path: &str) {
-        if let Some(r) = self.recipes.remove(path) {
-            self.unpin(&r);
-        }
-    }
-
-    fn unpin(&self, recipe: &[(Hash, usize)]) {
-        self.store
-            .lock()
-            .unwrap()
-            .unpin(recipe.iter().map(|(h, _)| *h));
-    }
-}
-
-impl Drop for ChunkStaging {
-    fn drop(&mut self) {
-        let mut store = self.store.lock().unwrap();
-        for r in self.recipes.values() {
-            store.unpin(r.iter().map(|(h, _)| *h));
-        }
+        self.recipes.remove(path);
     }
 }
 

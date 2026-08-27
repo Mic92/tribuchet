@@ -184,7 +184,10 @@ fn frame_for(cache: &ChunkCache, chunk: &Chunk) -> Result<Vec<u8>> {
     };
     let frame = compress(&chunk.data, 3).map_err(err_ctx("compressing chunk"))?;
     if admit {
-        cache.admit(chunk.hash, &frame);
+        // only loses future hits
+        if let Err(e) = cache.admit(chunk.hash, &frame) {
+            tracing::warn!(error = %e, "chunk cache write failed");
+        }
     }
     Ok(frame)
 }
@@ -199,7 +202,7 @@ mod tests {
         let cache = ChunkCache::open(dir.path().to_path_buf(), 1 << 20).unwrap();
         let a: Hash = [1; 32];
         let b: Hash = [2; 32];
-        cache.admit(a, &compress(b"hello", 3).unwrap());
+        cache.admit(a, &compress(b"hello", 3).unwrap()).unwrap();
 
         let (tx, mut rx) = mpsc::channel(8);
 
