@@ -47,9 +47,14 @@ impl PackWriter {
     pub(super) fn append(&mut self, hash: &Hash, frame: &[u8]) -> io::Result<u64> {
         let len = u32::try_from(frame.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "oversized chunk frame"))?;
-        self.file.write_all(&len.to_le_bytes())?;
-        self.file.write_all(hash)?;
-        self.file.write_all(frame)?;
+        let mut rec = Vec::with_capacity(HEADER_LEN + frame.len());
+        rec.extend_from_slice(&len.to_le_bytes());
+        rec.extend_from_slice(hash);
+        rec.extend_from_slice(frame);
+        if let Err(e) = self.file.write_all(&rec) {
+            let _ = self.file.set_len(self.len);
+            return Err(e);
+        }
         let offset = self.len + HEADER;
         self.len += HEADER + u64::from(len);
         self.entries.push((*hash, offset, len));
