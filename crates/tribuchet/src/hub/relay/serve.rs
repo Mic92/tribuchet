@@ -69,8 +69,12 @@ fn cores() -> usize {
 static PACK_PERMITS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(cores()));
 
 /// Serve a recipe from the in-memory cache or pack and chunk the NAR.
-pub(super) async fn compute_recipe(cache: &ChunkCache, store_path: &str) -> Result<Recipe> {
-    if let Some(r) = cache.recipe(store_path) {
+pub(super) async fn compute_recipe(
+    cache: &ChunkCache,
+    store_path: &str,
+    nar_sha256: &[u8],
+) -> Result<Recipe> {
+    if let Some(r) = cache.recipe(store_path, nar_sha256) {
         return Ok(r);
     }
     let _permit = PACK_PERMITS.acquire().await.expect("pack semaphore closed");
@@ -93,7 +97,7 @@ pub(super) async fn compute_recipe(cache: &ChunkCache, store_path: &str) -> Resu
         "recipe computed"
     );
     let recipe = Arc::new(recipe);
-    cache.store_recipe(store_path.to_string(), recipe.clone());
+    cache.store_recipe(store_path.to_string(), nar_sha256.to_vec(), recipe.clone());
     Ok(recipe)
 }
 

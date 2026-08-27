@@ -93,14 +93,18 @@ impl<'a> Staging<'a> {
                 .req
                 .input_paths
                 .iter()
-                .filter(|p| !known.contains(*p) && self.state.chunks.recipe(p).is_some())
+                .filter(|p| !known.contains(*p) && self.state.chunks.has_recipe(p))
                 .cloned()
                 .collect()
         };
         let infos = order_by_references(query_path_infos(&self.state.daemon_pool, &upfront).await?);
         let mut manifests: HashMap<String, Manifest> = HashMap::new();
         for info in infos {
-            let Some(recipe) = self.state.chunks.recipe(&info.store_path) else {
+            let Some(recipe) = self
+                .state
+                .chunks
+                .recipe(&info.store_path, &info.msg.nar_sha256)
+            else {
                 continue;
             };
             manifests.insert(info.store_path.clone(), manifest("", &info, &recipe));
@@ -218,7 +222,7 @@ impl<'a> Staging<'a> {
         let cache = &self.state.chunks;
         for info in order_by_references(query_path_infos(&self.state.daemon_pool, &new).await?) {
             self.tasks.push(Box::pin(async move {
-                let recipe = compute_recipe(cache, &info.store_path).await?;
+                let recipe = compute_recipe(cache, &info.store_path, &info.msg.nar_sha256).await?;
                 Ok((info, recipe))
             }));
         }

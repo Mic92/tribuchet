@@ -42,7 +42,8 @@ struct Inner {
     store: ChunkStore,
     seen: VecDeque<Hash>,
     seen_set: HashSet<Hash>,
-    recipes: HashMap<String, Recipe>,
+    /// keyed with the nar_sha256 it was computed for
+    recipes: HashMap<String, (Vec<u8>, Recipe)>,
     recipe_order: VecDeque<String>,
 }
 
@@ -89,13 +90,23 @@ impl ChunkCache {
             .collect()
     }
 
-    pub fn recipe(&self, store_path: &str) -> Option<Recipe> {
-        self.inner.lock().unwrap().recipes.get(store_path).cloned()
+    pub fn has_recipe(&self, store_path: &str) -> bool {
+        self.inner.lock().unwrap().recipes.contains_key(store_path)
     }
 
-    pub fn store_recipe(&self, store_path: String, recipe: Recipe) {
+    pub fn recipe(&self, store_path: &str, nar_sha256: &[u8]) -> Option<Recipe> {
+        let inner = self.inner.lock().unwrap();
+        let (h, r) = inner.recipes.get(store_path)?;
+        (h == nar_sha256).then(|| r.clone())
+    }
+
+    pub fn store_recipe(&self, store_path: String, nar_sha256: Vec<u8>, recipe: Recipe) {
         let mut inner = self.inner.lock().unwrap();
-        if inner.recipes.insert(store_path.clone(), recipe).is_none() {
+        if inner
+            .recipes
+            .insert(store_path.clone(), (nar_sha256, recipe))
+            .is_none()
+        {
             inner.recipe_order.push_back(store_path);
         }
         while inner.recipe_order.len() > RECIPE_CAP {
@@ -110,5 +121,22 @@ impl ChunkCache {
         if let Err(e) = inner.store.insert(hash, frame) {
             tracing::warn!(error = %e, "chunk cache write failed");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[test]
+    fn recipe_is_bound_to_nar_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ChunkCache::open(dir.path().to_path_buf(), 1 << 20).unwrap();
+        let r: Recipe = Arc::new(vec![([1; 32], 5)]);
+        c.store_recipe("/nix/store/p".into(), vec![1], r.clone());
+        assert!(c.recipe("/nix/store/p", &[1]).is_some());
+        assert!(c.recipe("/nix/store/p", &[2]).is_none());
     }
 }
