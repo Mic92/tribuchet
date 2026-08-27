@@ -278,11 +278,26 @@ impl HubState {
         }
         self.queue.lock().await.push_back(job);
         self.notify.notify_waiters();
+        self.recheck_unservable();
+    }
+
+    /// Re-run fail_unservable once the grace of protected jobs lapsed.
+    fn recheck_unservable(self: &Arc<Self>) {
         let state = self.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(state.worker_grace + Duration::from_secs(1)).await;
-            state.fail_unservable().await;
+            loop {
+                tokio::time::sleep(state.worker_grace + Duration::from_secs(1)).await;
+                if !state.fail_unservable_now().await {
+                    break;
+                }
+            }
         });
+    }
+
+    pub(super) async fn fail_unservable(self: &Arc<Self>) {
+        if self.fail_unservable_now().await {
+            self.recheck_unservable();
+        }
     }
 
     pub(super) async fn finish(&self, job: &Job) {
@@ -298,19 +313,22 @@ impl HubState {
     /// Fail queued jobs no connected worker can serve. The submission
     /// check alone is not enough: the capable worker can disconnect
     /// while the job sits in the queue, which would strand it forever.
-    pub(super) async fn fail_unservable(&self) {
+    /// True if jobs were kept only because of a grace period.
+    async fn fail_unservable_now(&self) -> bool {
         let caps: Vec<WorkerCaps> = self.worker_caps.lock().unwrap().values().cloned().collect();
         let mut queue = self.queue.lock().await;
         let mut kept = VecDeque::with_capacity(queue.len());
         let mut failed = Vec::new();
+        let mut recheck = false;
         for j in queue.drain(..) {
-            // Requeued jobs get a grace period: their worker is mid
-            // reload/restart and will re-announce them; a delayed
-            // recheck is scheduled at requeue time.
             let protected = j
                 .requeued_at
-                .is_some_and(|t| t.elapsed() < self.worker_grace);
-            if protected || caps.iter().any(|c| c.serves(&j.req.system, &j.features)) {
+                .is_some_and(|t| t.elapsed() < self.worker_grace)
+                || self.expected_deadline(&j.req.system, &j.features).is_some();
+            if caps.iter().any(|c| c.serves(&j.req.system, &j.features)) {
+                kept.push_back(j);
+            } else if protected {
+                recheck = true;
                 kept.push_back(j);
             } else {
                 failed.push(j);
@@ -331,6 +349,7 @@ impl HubState {
                 .await;
             self.finish(&job).await;
         }
+        recheck
     }
 }
 
@@ -346,9 +365,42 @@ mod tests {
         }
     }
 
+    fn queued(system: &str, replay: Arc<Replay>) -> Job {
+        Job {
+            id: "j1".into(),
+            key: "k1".into(),
+            req: BuildRequest {
+                system: system.into(),
+                ..Default::default()
+            },
+            tmp_dir_pack: Arc::new(Vec::new()),
+            features: vec![],
+            replay,
+            attempts: 0,
+            requeued_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_job_survives_worker_restart_within_grace() {
+        let mut state = Arc::new(HubState::for_test(Duration::from_secs(30)));
+        Arc::get_mut(&mut state).unwrap().started_at =
+            Instant::now().checked_sub(Duration::from_mins(1)).unwrap();
+        let replay = Arc::new(Replay::default());
+        let _rx = replay.subscribe().await;
+        state
+            .queue
+            .lock()
+            .await
+            .push_back(queued("x86_64-linux", replay));
+        state.record_departed(caps("x86_64-linux", &[]));
+        state.fail_unservable().await;
+        assert_eq!(state.queue.lock().await.len(), 1);
+    }
+
     #[tokio::test]
     async fn queued_job_fails_when_last_capable_worker_leaves() {
-        let state = HubState::for_test(Duration::from_secs(30));
+        let state = Arc::new(HubState::for_test(Duration::ZERO));
         let replay = Arc::new(Replay::default());
         let job = Job {
             id: "j1".into(),
