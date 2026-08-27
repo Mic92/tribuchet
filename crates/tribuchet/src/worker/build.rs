@@ -217,6 +217,14 @@ impl ActiveBuild {
                 missing.push(p.clone());
             }
         }
+        if cfg!(target_os = "macos") {
+            for p in self.assignment.outputs.values() {
+                let sp = store_dir
+                    .parse(p)
+                    .map_err(err_ctx(format!("output {p:?} is not a store path")))?;
+                add_temp_root(&mut daemon, p, &sp).await?;
+            }
+        }
         self.daemon = Some(daemon);
         Ok(missing)
     }

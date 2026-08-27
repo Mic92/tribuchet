@@ -160,7 +160,12 @@ async fn re_root_inputs(spec: &sandbox::SandboxSpec) -> Option<DaemonConn> {
             return None;
         }
     };
-    for path in &spec.store_inputs {
+    let outputs = if cfg!(target_os = "macos") {
+        &spec.outputs[..]
+    } else {
+        &[]
+    };
+    for path in spec.store_inputs.iter().chain(outputs) {
         let sp = match store_dir.parse(path) {
             Ok(sp) => sp,
             Err(e) => {
