@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::env::consts;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 
 use super::WorkerCtx;
@@ -20,9 +21,9 @@ pub(super) fn requires_uid_range(env: &HashMap<String, String>) -> bool {
 /// System features this worker can honor, advertised to the hub for
 /// scheduling. Mirrors Nix's defaults. Emulated systems get only the
 /// baseline: kvm is an x86 device to an emulated guest, and uid-range
-/// and recursive-nix under emulation are untested. uid-range comes
-/// from the agent's pre-mapped user namespace, which every Linux
-/// worker has.
+/// and recursive-nix under emulation are untested. uid-range needs the
+/// delegated cgroup that spawned agents lack. The builder opens
+/// /dev/kvm as a groupless block uid, so the node must be 0666.
 fn local_features(native: bool, opts: &WorkerConfig) -> Vec<String> {
     let mut features = vec![
         "nixos-test".to_owned(),
@@ -30,15 +31,22 @@ fn local_features(native: bool, opts: &WorkerConfig) -> Vec<String> {
         "big-parallel".to_owned(),
     ];
     if cfg!(target_os = "linux") && native {
-        if Path::new("/dev/kvm").exists() {
+        if kvm_usable(Path::new("/dev/kvm")) {
             features.push("kvm".to_owned());
         }
-        features.push("uid-range".to_owned());
+        if opts.spawn_agents == 0 {
+            features.push("uid-range".to_owned());
+        }
     }
     if native && opts.recursive_nix {
         features.push("recursive-nix".to_owned());
     }
     features
+}
+
+fn kvm_usable(dev: &Path) -> bool {
+    dev.metadata()
+        .is_ok_and(|m| m.permissions().mode() & 0o006 == 0o006)
 }
 
 /// Per-system capability list for Register; native systems get the

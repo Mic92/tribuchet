@@ -341,8 +341,6 @@ in
       // forEachAgent (i: {
         isSystemUser = true;
         group = agentUser i;
-        # /dev/kvm for kvm-requiring builds
-        extraGroups = [ "kvm" ];
       });
       users.groups = {
         tribuchet = { };
