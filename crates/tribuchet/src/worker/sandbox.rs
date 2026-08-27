@@ -309,6 +309,7 @@ mod tests {
         BuildAssignment {
             build_id: "0123456789abcdef0123456789abcdef".into(),
             dedupe_key: "k".into(),
+            credit_free: false,
             system: "x86_64-linux".into(),
             builder: "/nix/store/00000000000000000000000000000000-b/bin/b".into(),
             args: vec![],

@@ -83,6 +83,8 @@ pub(super) struct HubState {
     /// still worth waiting for after a restart or a worker drop.
     pub(super) started_at: Instant,
     pub(super) departed: StdMutex<Vec<(WorkerCaps, Instant)>>,
+    /// worker id -> dedupe keys it can resume
+    pub(super) held: StdMutex<HashMap<u64, HashSet<String>>>,
     /// Woken when worker capabilities change so waiting submissions
     /// re-check servability without polling.
     pub(super) caps_changed: Notify,
@@ -167,6 +169,7 @@ impl HubState {
             worker_grace,
             started_at: Instant::now(),
             departed: StdMutex::default(),
+            held: StdMutex::default(),
             caps_changed: Notify::default(),
             metrics: Metrics::default(),
             nix_config,
@@ -235,13 +238,18 @@ impl HubState {
             .max()
     }
 
-    pub(super) async fn take_job(&self, caps: &WorkerCaps) -> Option<Job> {
+    pub(super) async fn take_job(&self, caps: &WorkerCaps, worker: u64) -> Option<Job> {
         loop {
             let job = {
                 let mut queue = self.queue.lock().await;
+                let held = self.held.lock().unwrap();
+                let elsewhere = |key: &str| {
+                    held.iter()
+                        .any(|(id, keys)| *id != worker && keys.contains(key))
+                };
                 let pos = queue
                     .iter()
-                    .position(|j| caps.serves(&j.req.system, &j.features))?;
+                    .position(|j| caps.serves(&j.req.system, &j.features) && !elsewhere(&j.key))?;
                 queue.remove(pos)?
             };
             // Abandoned while queued (every attach client gone): drop it
@@ -254,15 +262,16 @@ impl HubState {
         }
     }
 
-    /// Take a queued job whose dedupe key is in `keys` (builds the
-    /// calling worker can resume), regardless of RequestJob credits.
-    pub(super) async fn take_job_by_key(&self, keys: &HashSet<String>) -> Option<Job> {
-        if keys.is_empty() {
-            return None;
-        }
+    /// Take a queued job `worker` can resume, regardless of RequestJob
+    /// credits. Each held key is honoured once.
+    pub(super) async fn take_job_by_key(&self, worker: u64) -> Option<Job> {
         let mut queue = self.queue.lock().await;
+        let mut held = self.held.lock().unwrap();
+        let keys = held.get_mut(&worker)?;
         let pos = queue.iter().position(|j| keys.contains(&j.key))?;
-        queue.remove(pos)
+        let job = queue.remove(pos)?;
+        keys.remove(&job.key);
+        Some(job)
     }
 
     /// Put a job back in the queue after its worker session died,
@@ -406,6 +415,18 @@ mod tests {
         state.record_departed(caps("x86_64-linux", &[]));
         state.fail_unservable().await;
         assert_eq!(state.queue.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn take_job_leaves_held_keys_to_their_holder() {
+        let state = HubState::for_test(Duration::ZERO);
+        let replay = Arc::new(Replay::default());
+        let _rx = replay.subscribe().await;
+        state.queue.lock().await.push_back(queued("x86_64-linux", replay));
+        state.held.lock().unwrap().insert(7, ["k1".to_string()].into());
+        let c = caps("x86_64-linux", &[]);
+        assert!(state.take_job(&c, 8).await.is_none());
+        assert!(state.take_job(&c, 7).await.is_some());
     }
 
     #[tokio::test]

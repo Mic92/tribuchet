@@ -125,6 +125,7 @@ async fn session_loop(
                 out_tx.send(msg(worker_message::Msg::Heartbeat(Heartbeat {
                     running_jobs: u32::try_from(running).unwrap_or(u32::MAX),
                     load1: loadavg1(),
+                    resumable_keys: ctx.resumable_keys(),
                 }))).await?;
                 continue;
             }
@@ -296,6 +297,9 @@ async fn handle_assignment(
     // instead of building again.
     if ctx.adopt_assignment(&a, out_tx) {
         tracing::info!(id = a.build_id, key = a.dedupe_key, "build resumed");
+        if !a.credit_free {
+            drop(pending.pop());
+        }
         out_tx
             .send(msg(worker_message::Msg::Resumed(Resumed {
                 build_id: a.build_id.clone(),
@@ -305,9 +309,7 @@ async fn handle_assignment(
         tokio::task::spawn_blocking(move || try_deliver(&ctx, &a.dedupe_key));
         return Ok(None);
     }
-    // Resumed assignments are credit-free on the hub, so never funded
-    // a permit into `pending`.
-    let permit = pending.pop();
+    let permit = if a.credit_free { None } else { pending.pop() };
     tracing::info!(id = a.build_id, "build assigned");
     // build ids are never reused; a duplicate is a confused hub
     if let Some(old) = active.remove(&a.build_id) {

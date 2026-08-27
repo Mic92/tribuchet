@@ -43,6 +43,7 @@ pub(super) async fn run_job(
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
     mut in_rx: mpsc::Receiver<worker_message::Msg>,
     sess: Arc<WorkerSession>,
+    credit_free: bool,
     dispatched: &mut bool,
 ) -> Result<()> {
     let req = &job.req;
@@ -63,6 +64,7 @@ pub(super) async fn run_job(
             fixed_output: req.fixed_output,
             dedupe_key: job.key.clone(),
             inputs,
+            credit_free,
         }),
     )
     .await?;

@@ -124,6 +124,8 @@ message Register {
 message Heartbeat {
   uint32 running_jobs = 1;
   double load1 = 2;
+  // Current Register.resumable_keys. Keys not listed are no longer held.
+  repeated string resumable_keys = 3;
 }
 
 message BuildAssignment {
@@ -141,6 +143,8 @@ message BuildAssignment {
   // build_id. Keys the worker's resume bookkeeping.
   string dedupe_key = 10;
   repeated Manifest inputs = 11;
+  // Dispatched via resumable_keys without consuming a RequestJob.
+  bool credit_free = 12;
 }
 
 message TmpDirArchive {
