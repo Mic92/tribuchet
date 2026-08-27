@@ -469,6 +469,7 @@ mod tests {
             tmp_dir_pack: Arc::new(Vec::new()),
             features: vec![],
             replay: Arc::new(Replay::default()),
+            listing: Default::default(),
             attempts: 0,
             requeued_at: None,
         }

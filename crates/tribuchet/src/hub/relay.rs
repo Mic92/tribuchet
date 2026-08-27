@@ -93,7 +93,7 @@ pub(super) async fn run_job(
                     > CANCEL_GRACE
                 {
                     tracing::info!(id = job.id, "no attach client left; cancelling build");
-                    state.unlist(job).await;
+                    job.unlist();
                     send(
                         out_tx,
                         hub_message::Msg::Cancel(CancelBuild {

@@ -20,8 +20,12 @@ use crate::fsutil::io_ctx;
 
 use crate::proto::{AttachEvent, BuildRequest, attach_event};
 
+#[path = "state/inflight.rs"]
+mod inflight;
 #[path = "state/replay.rs"]
 mod replay;
+
+pub(super) use inflight::{Inflight, Listing};
 pub(super) use replay::Replay;
 
 type EventTx = mpsc::Sender<Result<AttachEvent, Status>>;
@@ -45,6 +49,8 @@ pub(super) struct Job {
     /// requiredSystemFeatures; only workers advertising them get the job.
     pub(super) features: Vec<String>,
     pub(super) replay: Arc<Replay>,
+    /// Dedupe registration, dropped on cancel or with the job.
+    pub(super) listing: StdMutex<Option<Listing>>,
     /// Times the job went back to the queue after its worker session
     /// died; capped so a crash-looping build cannot bounce forever.
     pub(super) attempts: u32,
@@ -53,18 +59,16 @@ pub(super) struct Job {
     pub(super) requeued_at: Option<Instant>,
 }
 
-#[derive(Default)]
-pub(super) struct Inflight {
-    /// Dedupe key (hash of the full request) -> replay buffer.
-    pub(super) by_key: HashMap<String, Arc<Replay>>,
-    /// Scratch output path -> dedupe key; different requests naming the
-    /// same scratch path would unpack into the same destination.
-    pub(super) by_path: HashMap<String, String>,
+impl Job {
+    /// Stop deduping new submissions onto this job.
+    pub(super) fn unlist(&self) {
+        drop(self.listing.lock().unwrap().take());
+    }
 }
 
 pub(super) struct HubState {
     pub(super) queue: Mutex<VecDeque<Job>>,
-    pub(super) inflight: Mutex<Inflight>,
+    pub(super) inflight: Arc<StdMutex<Inflight>>,
     pub(super) notify: Notify,
     /// Pooled connections to the local nix-daemon (path metadata
     /// queries); jobs are frequent enough that per-job handshakes
@@ -158,7 +162,7 @@ impl HubState {
     ) -> Self {
         Self {
             queue: Mutex::default(),
-            inflight: Mutex::default(),
+            inflight: Arc::default(),
             notify: Notify::default(),
             daemon_pool: harmonia_store_remote::ConnectionPool::new(
                 "/nix/var/nix/daemon-socket/socket",
@@ -310,22 +314,8 @@ impl HubState {
         }
     }
 
-    pub(super) async fn unlist(&self, job: &Job) {
-        let mut inflight = self.inflight.lock().await;
-        if inflight
-            .by_key
-            .get(&job.key)
-            .is_some_and(|r| Arc::ptr_eq(r, &job.replay))
-        {
-            inflight.by_key.remove(&job.key);
-            for p in job.req.outputs.values() {
-                inflight.by_path.remove(p);
-            }
-        }
-    }
-
     pub(super) async fn finish(&self, job: &Job) {
-        self.unlist(job).await;
+        job.unlist();
         job.replay.finish().await;
     }
 
@@ -395,6 +385,7 @@ mod tests {
             tmp_dir_pack: Arc::new(Vec::new()),
             features: vec![],
             replay,
+            listing: StdMutex::default(),
             attempts: 0,
             requeued_at: None,
         }
@@ -441,20 +432,11 @@ mod tests {
     async fn queued_job_fails_when_last_capable_worker_leaves() {
         let state = Arc::new(HubState::for_test(Duration::ZERO));
         let replay = Arc::new(Replay::default());
-        let job = Job {
-            id: "j1".into(),
-            key: "k1".into(),
-            req: BuildRequest {
-                system: "x86_64-linux".into(),
-                ..Default::default()
-            },
-            tmp_dir_pack: Arc::new(Vec::new()),
-            features: vec![],
-            replay: replay.clone(),
-            attempts: 0,
-            requeued_at: None,
-        };
-        state.queue.lock().await.push_back(job);
+        state
+            .queue
+            .lock()
+            .await
+            .push_back(queued("x86_64-linux", replay.clone()));
         state.fail_unservable().await;
         assert!(state.queue.lock().await.is_empty());
         let mut rx = replay.subscribe().await;

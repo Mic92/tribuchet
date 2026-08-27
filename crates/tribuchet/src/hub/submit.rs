@@ -11,7 +11,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use super::metrics::Metrics;
-use super::state::{HubState, Job, Replay};
+use super::state::{HubState, Inflight, Job, Replay};
 use crate::proto::{
     AttachEvent, BuildMessage, BuildRequest, DECLINE_EXIT_CODE, attach_event, attach_hub_server,
     build_message,
@@ -198,33 +198,37 @@ impl attach_hub_server::AttachHub for AttachSvc {
             return Ok(declined);
         }
 
-        let mut inflight = self.state.inflight.lock().await;
-        let (replay, rx) = if let Some(replay) = inflight.by_key.get(&key) {
+        let existing = self
+            .state
+            .inflight
+            .lock()
+            .unwrap()
+            .by_key
+            .get(&key)
+            .cloned();
+        let rx = if let Some(replay) = existing {
             tracing::info!(key, "deduplicating build submission");
-            (replay.clone(), None)
+            replay.subscribe().await
         } else {
-            // A different request claiming an in-flight scratch path
-            // would race the other client's unpack at the same dest.
-            for p in req.outputs.values() {
-                if inflight.by_path.contains_key(p) {
-                    return Err(Status::failed_precondition(format!(
-                        "output path {p} is part of a different in-flight build"
-                    )));
-                }
-            }
             let replay = Arc::new(Replay::default());
             let rx = replay.subscribe().await;
-            inflight.by_key.insert(key.clone(), replay.clone());
-            for p in req.outputs.values() {
-                inflight.by_path.insert(p.clone(), key.clone());
-            }
+            let paths = req.outputs.values().cloned().collect();
+            // A different request claiming an in-flight scratch path
+            // would race the other client's unpack at the same dest.
+            let listing =
+                Inflight::list(&self.state.inflight, &key, paths, &replay).ok_or_else(|| {
+                    Status::failed_precondition(
+                        "an output path is part of a different in-flight build",
+                    )
+                })?;
             let job = Job {
                 id: new_id(),
                 key,
                 req,
                 tmp_dir_pack,
                 features,
-                replay: replay.clone(),
+                replay,
+                listing: std::sync::Mutex::new(Some(listing)),
                 attempts: 0,
                 requeued_at: None,
             };
@@ -232,18 +236,12 @@ impl attach_hub_server::AttachHub for AttachSvc {
             Metrics::inc(&self.state.metrics.submitted);
             self.state.queue.lock().await.push_back(job);
             self.state.notify.notify_waiters();
-            (replay, Some(rx))
+            rx
         };
-        drop(inflight);
         // Close the check-then-queue race: the last capable worker may
         // have disconnected (and swept the queue) between the capability
         // check above and the push.
         self.state.fail_unservable().await;
-        let rx = if let Some(rx) = rx {
-            rx
-        } else {
-            replay.subscribe().await
-        };
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 }
