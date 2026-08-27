@@ -39,7 +39,7 @@ let
   agentStateDir = i: "/var/lib/tribuchet/a${toString i}";
   # nixbld gid: build users must be able to create their outputs in
   # the group-writable /nix/store.
-  nixbldGid = 350;
+  nixbldGid = config.ids.gids.nixbld;
   workerToml = format.generate "worker.toml" (
     {
       state-dir = toString cfg.stateDir;
