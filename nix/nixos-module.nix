@@ -372,6 +372,10 @@ in
           # Exiting after every build is the agent's normal lifecycle,
           # not a crash loop.
           unitConfig.StartLimitIntervalSec = 0;
+          # The agent lives for one build and is socket-activated per
+          # lease, so not restarting it here is a graceful drain: the
+          # next lease runs the new ExecStart.
+          restartIfChanged = false;
           serviceConfig = {
             ExecStart = "${agentStart} %i";
             User = "tribuchet-agent-%i";
