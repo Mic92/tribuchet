@@ -73,12 +73,17 @@ pub(super) fn parse_extras(reported: Vec<Manifest>) -> Result<Vec<(Announced, Ma
 struct ChunkSource<'a> {
     cache: &'a ChunkCache,
     needed: HashSet<Hash>,
+    /// hashes occurring more than once in this delivery
+    repeats: HashMap<Hash, Option<Vec<u8>>>,
     in_rx: &'a mut mpsc::Receiver<worker_message::Msg>,
 }
 
 impl ChunkSource<'_> {
     /// The chunk's zstd frame, plaintext verified against the recipe.
     async fn get(&mut self, hash: &Hash, size: usize) -> Result<Vec<u8>> {
+        if let Some(Some(frame)) = self.repeats.get(hash) {
+            return Ok(frame.clone());
+        }
         let frame = if self.needed.remove(hash) {
             self.receive(hash).await?
         } else {
@@ -88,6 +93,10 @@ impl ChunkSource<'_> {
                 .ok_or_else(|| err_msg("output chunk evicted from the cache mid-delivery"))?
         };
         decode_chunk(&frame, hash, size).map_err(err_ctx("output chunk"))?;
+        self.cache.admit(*hash, &frame);
+        if let Some(slot) = self.repeats.get_mut(hash) {
+            *slot = Some(frame.clone());
+        }
         Ok(frame)
     }
 
@@ -104,7 +113,6 @@ impl ChunkSource<'_> {
         if c.hash != hash[..] {
             return Err(err_msg("worker sent output chunks out of recipe order"));
         }
-        self.cache.admit(*hash, &c.zstd);
         Ok(c.zstd)
     }
 
@@ -129,12 +137,17 @@ pub(super) async fn deliver_outputs(
 ) -> Result<()> {
     let cache = &*state.chunks;
     let mut needed = HashSet::new();
+    let mut seen = HashSet::new();
+    let mut repeats = HashMap::new();
     let mut hashes = Vec::new();
     for (h, _) in outputs
         .iter()
         .chain(extras.iter().map(|(a, _)| a))
         .flat_map(|a| &a.recipe)
     {
+        if !seen.insert(*h) {
+            repeats.insert(*h, None);
+        }
         if !needed.contains(h) && cache.locate(h).is_none() {
             needed.insert(*h);
             hashes.extend_from_slice(h);
@@ -157,6 +170,7 @@ pub(super) async fn deliver_outputs(
     let mut src = ChunkSource {
         cache,
         needed,
+        repeats,
         in_rx,
     };
     for a in &outputs {
