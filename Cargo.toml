@@ -16,7 +16,7 @@ mod_module_files = "deny"
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"
 blake3 = "1"
-fastcdc = "4"
+fastcdc = "5"
 hyper-util = "0.1"
 rustix = { version = "1", features = ["event", "fs", "mount", "net", "pipe", "process", "stdio", "system", "thread"] }
 nix = { version = "0.31", features = ["process", "user"] }
