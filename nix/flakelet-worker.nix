@@ -10,7 +10,7 @@
     agents = {
       type = types.int;
       defaultFunc = { options, ... }: options.worker.max-jobs or 64;
-      description = "Per-uid build agent count.";
+      description = "Upper bound on build agents. The machine runs min(nproc, agents).";
     };
     agentUidBase = {
       type = types.int;
@@ -34,11 +34,10 @@
       inherit (inputs.flakelet) name;
       package = pkgs.callPackage ./package.nix { craneLib = crane.mkLib pkgs; };
       format = pkgs.formats.toml { };
-      agentIds = map toString (lib.range 1 options.agents);
       inherit (options) keyFile;
       # Not under a RuntimeDirectory: systemd creates the socket parents and
       # nothing removes them while agents keep running across worker stops.
-      agentSocket = i: "/run/tribuchet/agents/${i}.sock";
+      agentSocketsDir = "/run/tribuchet/agents";
       # ExecStart cannot do arithmetic or resolve the worker's uid.
       agentStart = pkgs.writeShellScript "tribuchet-agent" ''
         exec ${lib.getExe' package "tribuchet"} agent \
@@ -48,19 +47,29 @@
       '';
       workerToml = format.generate "worker.toml" (
         {
-          agent-sockets = map agentSocket agentIds;
+          agent-sockets-dir = agentSocketsDir;
         }
         // options.worker
       );
-      agentUnit = i: "${name}-agent@${i}.socket";
     in
     {
+      # One agent per CPU up to options.agents, decided on the machine.
+      generators.agents = pkgs.writeShellScript "agents" ''
+        n=$(nproc)
+        [ "$n" -gt ${toString options.agents} ] && n=${toString options.agents}
+        mkdir -p "$1/sockets.target.wants" "$1/${name}.service.wants"
+        for i in $(seq "$n"); do
+          ln -s /run/systemd/system/${name}-agent@.socket "$1/sockets.target.wants/${name}-agent@$i.socket"
+          ln -s /run/systemd/system/${name}-agent@.socket "$1/${name}.service.wants/${name}-agent@$i.socket"
+        done
+      '';
+
       sockets."agent@" = {
         description = "tribuchet build agent %i socket";
         wantedBy = [ "sockets.target" ];
-        instances = agentIds;
+        before = [ "${name}.service" ];
         socketConfig = {
-          ListenStream = agentSocket "%i";
+          ListenStream = "${agentSocketsDir}/%i.sock";
           # The agent itself only accepts connections from the worker uid.
           SocketMode = "0666";
         };
@@ -98,8 +107,6 @@
       services.${name} = {
         description = "tribuchet build worker";
         wantedBy = [ "multi-user.target" ];
-        wants = map agentUnit agentIds;
-        after = map agentUnit agentIds;
         serviceConfig = {
           Type = "notify";
           User = "tribuchet";

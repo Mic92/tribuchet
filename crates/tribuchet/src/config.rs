@@ -227,6 +227,10 @@ pub struct WorkerConfig {
     /// agent count bounds concurrent builds.
     #[serde(default)]
     pub agent_sockets: Vec<PathBuf>,
+    /// Directory whose `*.sock` entries are appended to agent-sockets at
+    /// startup, for hosts that size the agent count at boot.
+    #[serde(default)]
+    pub agent_sockets_dir: Option<PathBuf>,
     /// Number of agents the worker spawns and supervises itself, for
     /// hosts without systemd-managed agent units such as containers.
     /// Mutually exclusive with agent-sockets.

@@ -328,6 +328,16 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
                 agent_spawn::spawn(&opts.state_dir, opts.spawn_agents, opts.agent_uid_base)?;
         }
     }
+    if let Some(dir) = &opts.agent_sockets_dir {
+        let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+            .map_err(|e| err_msg(format!("agent-sockets-dir {}: {e}", dir.display())))?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "sock"))
+            .collect();
+        found.sort();
+        opts.agent_sockets.extend(found);
+    }
     // Every build runs on one agent, so the agent list bounds
     // concurrency.
     if opts.agent_sockets.is_empty() {
