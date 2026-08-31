@@ -254,14 +254,19 @@ in
         # the memhog subtest relies on a plain memcg OOM kill
         boot.kernel.sysctl."vm.panic_on_oom" = lib.mkForce 0;
         virtualisation.diskSize = 4096;
+        # agents = "auto": one agent per core
+        virtualisation.cores = 2;
         virtualisation.additionalPaths = nspawnPaths;
 
         imports = [ nixosModule ];
         services.tribuchet-worker = {
           enable = true;
           package = tribuchet;
+          keyFile = "/etc/tribuchet/tls/worker.key";
           settings = {
             hub = "https://hub:7437";
+            cert = "/etc/tribuchet/tls/worker.crt";
+            ca-cert = "/etc/tribuchet/tls/ca.crt";
             max-jobs = 2;
             max-log-size = 1048576;
             # 2 GiB, exceeded only by the memhog subtest
@@ -294,16 +299,21 @@ in
         hub.succeed("tribuchet ca issue worker --dir /root/ca")
         hub.succeed("mkdir -p /etc/tribuchet/ca")
         hub.succeed("cp /root/ca/hub.crt /root/ca/hub.key /root/ca/ca.crt /etc/tribuchet/ca/")
-        worker.succeed("mkdir -p /var/lib/tribuchet/tls")
+        # certs are public, the key stays root-owned and reaches the
+        # DynamicUser worker via LoadCredential (keyFile)
+        worker.succeed("mkdir -p /etc/tribuchet/tls")
         for f in ["worker.crt", "worker.key", "ca.crt"]:
             pem = hub.succeed(f"cat /root/ca/{f}")
-            worker.succeed(f"cat > /var/lib/tribuchet/tls/{f} << 'PEMEOF'\n{pem}PEMEOF")
-        worker.succeed("chown -R tribuchet:tribuchet /var/lib/tribuchet/tls")
+            worker.succeed(f"cat > /etc/tribuchet/tls/{f} << 'PEMEOF'\n{pem}PEMEOF")
+        worker.succeed("chmod 600 /etc/tribuchet/tls/worker.key")
 
     with subtest("worker registers at hub over mTLS"):
         hub.succeed("systemctl start tribuchet-hub.socket")
         hub.succeed("systemctl start tribuchet-hub")
         worker.succeed("systemctl start tribuchet-worker")
+        # agents = "auto": the generator made one agent socket per core
+        worker.succeed("systemctl is-active tribuchet-agent@1.socket tribuchet-agent@2.socket")
+        worker.fail("systemctl is-active tribuchet-agent@3.socket")
         hub.wait_until_succeeds(
             "journalctl -u tribuchet-hub | grep -q 'worker registered'"
         )

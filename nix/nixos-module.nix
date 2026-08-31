@@ -2,12 +2,7 @@
 #
 # Hub: socket-activated (systemd holds the attach socket and the worker
 # port), so hub restarts never refuse connections, clients just queue.
-# Worker: runs unprivileged as tribuchet and leases every build to a
-# per-uid agent (tribuchet-agent-N, socket-activated), which owns the
-# builder process and its user namespace, so builds survive worker
-# stops and restarts. A restarted worker re-adopts them from the
-# state persisted in its build dirs, so package upgrades and settings
-# changes are plain restarts.
+# Worker and agents: see worker-units.nix.
 self:
 {
   config,
@@ -20,23 +15,18 @@ let
   worker = config.services.tribuchet-worker;
   defaultPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
   format = pkgs.formats.toml { };
-  # One per-uid build agent per concurrent build. With max-jobs unset
-  # the worker uses min(cores, agents), so provision a generous
-  # ceiling. Idle agents are socket-activated and cost nothing.
-  agentCount = worker.settings.max-jobs or 64;
-  agentIds = lib.range 1 agentCount;
-  agentUser = i: "tribuchet-agent-${toString i}";
-  agentInstance = i: "tribuchet-agent@${toString i}";
-  forEachAgent = f: lib.listToAttrs (map (i: lib.nameValuePair (agentUser i) (f i)) agentIds);
-  agentSocket = i: "/run/tribuchet/agents/${toString i}.sock";
-  # ExecStart cannot resolve the worker's uid, which the agent needs
-  # for its peer-uid check. Takes the instance number as $1.
-  agentStart = pkgs.writeShellScript "tribuchet-agent" ''
-    exec ${lib.getExe' worker.package "tribuchet"} agent \
-      --state-dir "/var/lib/tribuchet/a$1" \
-      --uid-base "$(( ${toString worker.agentUidBase} + ($1 - 1) * 65536 ))" \
-      --worker-uid "$(${lib.getExe' pkgs.coreutils "id"} -u tribuchet)"
-  '';
+  workerUnits = import ./worker-units.nix {
+    inherit pkgs lib;
+    inherit (worker)
+      package
+      agents
+      agentUidBase
+      keyFile
+      ;
+    workerUnit = "tribuchet-worker";
+    agentUnit = "tribuchet-agent@";
+    workerToml = "/etc/tribuchet/worker.toml";
+  };
   hubToml = format.generate "hub.toml" (
     {
       socket = toString hub.socketPath;
@@ -47,7 +37,7 @@ let
   );
   workerToml = format.generate "worker.toml" (
     {
-      agent-sockets = map agentSocket agentIds;
+      agent-sockets-dir = workerUnits.agentSocketsDir;
     }
     // worker.settings
   );
@@ -189,6 +179,11 @@ in
         unset when using this.
       '';
     };
+    agents = lib.mkOption {
+      type = lib.types.either lib.types.ints.positive (lib.types.enum [ "auto" ]);
+      default = "auto";
+      description = "Build agent count, or \"auto\" for one per CPU, decided at boot.";
+    };
     agentUidBase = lib.mkOption {
       type = lib.types.int;
       default = 1325400064;
@@ -234,7 +229,8 @@ in
   };
 
   config = lib.mkMerge [
-    (lib.mkIf (hub.enable && hub.externalBuilders.enable) {
+    # independent of `enable` so the hub can run as a flakelet
+    (lib.mkIf hub.externalBuilders.enable {
       nix.package =
         let
           patches =
@@ -262,7 +258,7 @@ in
       };
     })
 
-    (lib.mkIf (hub.enable && hub.externalBuilders.enable && hub.externalBuilders.dynamic) {
+    (lib.mkIf (hub.externalBuilders.enable && hub.externalBuilders.dynamic) {
       # The hub owns external-builders/max-jobs; nix.conf just includes
       # its fragment (soft include: nix still starts if it is absent).
       nix.extraOptions = "!include ${hub.externalBuilders.nixConfigPath}\n";
@@ -286,8 +282,11 @@ in
       };
     })
 
-    (lib.mkIf hub.enable {
+    {
       networking.firewall.allowedTCPPorts = lib.optional hub.openFirewall hub.port;
+    }
+
+    (lib.mkIf hub.enable {
       systemd.sockets.tribuchet-hub = {
         wantedBy = [ "sockets.target" ];
         listenStreams = [
@@ -329,116 +328,27 @@ in
       # signatures, which only trusted users may do
       nix.settings.trusted-users = [ "tribuchet" ];
 
-      # One build user per agent. Builds run as (or map) that agent's
-      # uid, never the worker's, so a running build can neither tamper
-      # with the worker nor leave files it cannot delete.
-      users.users = {
-        tribuchet = {
-          isSystemUser = true;
-          group = "tribuchet";
-        };
-      }
-      // forEachAgent (i: {
-        isSystemUser = true;
-        group = agentUser i;
-      });
-      users.groups = {
-        tribuchet = { };
-      }
-      // forEachAgent (_: { });
+      systemd.generators = lib.mapAttrs' (
+        n: v: lib.nameValuePair "tribuchet-${n}" v
+      ) workerUnits.generators;
 
-      # One socket-activated agent per build user. systemd owns the
-      # socket, the agent starts on the first connection and exits
-      # after each build's Cleanup. The socket mode is open because
-      # the agent itself only accepts connections from the worker uid.
       systemd.sockets = {
-        "tribuchet-agent@" = {
-          listenStreams = [ "/run/tribuchet/agents/%i.sock" ];
-          socketConfig.SocketMode = "0666";
-        };
+        "tribuchet-agent@" = removeAttrs workerUnits.agentSocketConfig [ "wantedBy" ];
       }
       // lib.listToAttrs (
         map (
           i:
-          lib.nameValuePair (agentInstance i) {
+          lib.nameValuePair "tribuchet-agent@${i}" {
             overrideStrategy = "asDropin";
             wantedBy = [ "sockets.target" ];
           }
-        ) agentIds
+        ) workerUnits.agentInstances
       );
 
       systemd.services = {
-        "tribuchet-agent@" = {
-          # Exiting after every build is the agent's normal lifecycle,
-          # not a crash loop.
-          unitConfig.StartLimitIntervalSec = 0;
-          # The agent lives for one build and is socket-activated per
-          # lease, so not restarting it here is a graceful drain: the
-          # next lease runs the new ExecStart.
-          restartIfChanged = false;
-          serviceConfig = {
-            ExecStart = "${agentStart} %i";
-            User = "tribuchet-agent-%i";
-            Group = "tribuchet-agent-%i";
-            StateDirectory = "tribuchet/a%i";
-            # Traverse-only for the worker and the uid block: the
-            # per-build scratch dirs under scratch/ are world-writable
-            # for the block, but their names are random and the missing
-            # read bit hides them.
-            StateDirectoryMode = "0711";
-            # Writing the uid/gid maps of the agent's pre-mapped user
-            # namespace needs CAP_SETUID/CAP_SETGID over the uid block;
-            # the agent drops both right after the write. CAP_CHOWN
-            # stays: each build cgroup is handed to its mapped root uid.
-            AmbientCapabilities = [
-              "CAP_SETUID"
-              "CAP_SETGID"
-              "CAP_CHOWN"
-            ];
-            CapabilityBoundingSet = [
-              "CAP_SETUID"
-              "CAP_SETGID"
-              "CAP_CHOWN"
-            ];
-            # delegate the cgroup subtree so the agent can create the
-            # per-build cgroup the sandbox roots its cgroup namespace in
-            Delegate = true;
-            # Builders inherit this; match nix-daemon so they are not
-            # stuck at the systemd default soft limit of 1024 and fail
-            # with EMFILE.
-            LimitNOFILE = 1048576;
-            Environment = "RUST_LOG=info";
-          };
-        };
-        tribuchet-worker = {
-          wantedBy = [ "multi-user.target" ];
-          # the agent sockets must exist before the worker leases builds
-          wants = map (i: "${agentInstance i}.socket") agentIds;
-          after = map (i: "${agentInstance i}.socket") agentIds;
+        "tribuchet-agent@" = workerUnits.agentServiceConfig;
+        tribuchet-worker = workerUnits.workerServiceConfig // {
           restartTriggers = [ workerToml ];
-          serviceConfig = {
-            Type = "notify";
-            LoadCredential = lib.optional (worker.keyFile != null) "worker-key:${worker.keyFile}";
-            User = "tribuchet";
-            Group = "tribuchet";
-            WatchdogSec = "30";
-            ExecStart = "${lib.getExe' worker.package "tribuchet"} worker --config /etc/tribuchet/worker.toml";
-            # Running builds live in the agent services and are
-            # re-adopted by the next worker instance.
-            StateDirectory = "tribuchet/worker";
-            Environment = [
-              "RUST_LOG=info"
-            ]
-            ++ lib.optional (worker.keyFile != null) "TRIBUCHET_KEY=%d/worker-key";
-            # the worker itself only stages inputs and packs outputs;
-            # store writes go through the nix-daemon socket
-            NoNewPrivileges = true;
-            PrivateTmp = true;
-            ProtectHome = true;
-            ProtectSystem = "strict";
-            RestrictSUIDSGID = true;
-            Restart = "on-failure";
-          };
         };
       };
     })
