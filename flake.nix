@@ -63,9 +63,12 @@
 
       nixosModules.default = import ./nix/nixos-module.nix self;
 
-      # Run the hub via flakelet (https://github.com/Mic92/flakelet):
+      # Run hub/worker via flakelet (https://github.com/Mic92/flakelet):
       # units update from this flake independently of the host system.
-      flakelets.hub = import ./nix/flakelet-hub.nix { inherit crane; };
+      flakelets = {
+        hub = import ./nix/flakelet-hub.nix { inherit crane; };
+        worker = import ./nix/flakelet-worker.nix { inherit crane; };
+      };
 
       # CI builds every package and devShell on every system, plus the
       # x86_64-linux-only checks below.
