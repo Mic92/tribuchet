@@ -7,11 +7,6 @@
     url = "github:numtide/treefmt-nix";
     inputs.nixpkgs.follows = "nixpkgs";
   };
-  inputs.nixbot = {
-    url = "github:Mic92/nixbot";
-    inputs.nixpkgs.follows = "nixpkgs";
-    inputs.treefmt-nix.follows = "treefmt-nix";
-  };
   # only used to evaluate the darwin module in checks
   inputs.nix-darwin = {
     url = "github:nix-darwin/nix-darwin";
@@ -23,7 +18,6 @@
       self,
       nixpkgs,
       crane,
-      nixbot,
       nix-darwin,
       treefmt-nix,
     }:
@@ -71,7 +65,7 @@
 
       herculesCI = import ./nix/hercules-ci.nix {
         pkgs = nixpkgs.legacyPackages.x86_64-linux;
-        effects = nixbot.lib.effects { pkgs = nixpkgs.legacyPackages.x86_64-linux; };
+        effects = import ./nix/effects.nix { pkgs = nixpkgs.legacyPackages.x86_64-linux; };
       };
 
       # Run hub/worker via flakelet (https://github.com/Mic92/flakelet):
