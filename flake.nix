@@ -7,6 +7,11 @@
     url = "github:numtide/treefmt-nix";
     inputs.nixpkgs.follows = "nixpkgs";
   };
+  inputs.nixbot = {
+    url = "github:Mic92/nixbot";
+    inputs.nixpkgs.follows = "nixpkgs";
+    inputs.treefmt-nix.follows = "treefmt-nix";
+  };
   # only used to evaluate the darwin module in checks
   inputs.nix-darwin = {
     url = "github:nix-darwin/nix-darwin";
@@ -18,6 +23,7 @@
       self,
       nixpkgs,
       crane,
+      nixbot,
       nix-darwin,
       treefmt-nix,
     }:
@@ -62,6 +68,11 @@
       darwinModules.default = import ./nix/darwin-module.nix self;
 
       nixosModules.default = import ./nix/nixos-module.nix self;
+
+      herculesCI = import ./nix/hercules-ci.nix {
+        pkgs = nixpkgs.legacyPackages.x86_64-linux;
+        effects = nixbot.lib.effects { pkgs = nixpkgs.legacyPackages.x86_64-linux; };
+      };
 
       # Run hub/worker via flakelet (https://github.com/Mic92/flakelet):
       # units update from this flake independently of the host system.
