@@ -21,10 +21,15 @@ mod worker;
 
 #[cfg(target_os = "linux")]
 use std::env;
+use std::fs;
+use std::num::NonZero;
+use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::thread;
 
 use clap::{Parser, Subcommand};
+use errors::{Error, err_ctx, err_msg};
 
 /// RBE-style remote build execution for Nix, driven by the
 /// `external-builders` experimental feature.
@@ -83,6 +88,20 @@ enum Command {
         #[arg(long)]
         dedicated_uid: bool,
     },
+    /// systemd generator: want one agent socket per CPU.
+    AgentGenerator {
+        /// Unit the sockets are ordered before and wanted by, e.g. tribuchet-worker.service.
+        #[arg(long)]
+        worker_unit: String,
+        /// Socket template, e.g. tribuchet-agent@.socket.
+        #[arg(long)]
+        template: String,
+        /// Upper bound on the count.
+        #[arg(long)]
+        max: Option<usize>,
+        /// normal, early and late output directories passed by systemd.
+        dirs: Vec<PathBuf>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -95,7 +114,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<(), errors::Error> {
+fn run() -> Result<(), Error> {
     // Builds re-exec this binary as the sandbox setup stage; divert
     // before clap and tracing touch anything.
     #[cfg(target_os = "linux")]
@@ -147,5 +166,42 @@ fn run() -> Result<(), errors::Error> {
             uid_base,
             dedicated_uid,
         })?),
+        Command::AgentGenerator {
+            worker_unit,
+            template,
+            max,
+            dirs,
+        } => agent_generator(&worker_unit, &template, max, &dirs),
     }
+}
+
+fn agent_generator(
+    worker_unit: &str,
+    template: &str,
+    max: Option<usize>,
+    dirs: &[PathBuf],
+) -> Result<(), Error> {
+    let out = dirs
+        .first()
+        .ok_or_else(|| err_msg("systemd passes the output directory"))?;
+    let (prefix, suffix) = template
+        .split_once("@.")
+        .ok_or_else(|| err_msg("template must look like name@.socket"))?;
+    let mut n = thread::available_parallelism().map_or(1, NonZero::get);
+    if let Some(max) = max {
+        n = n.min(max);
+    }
+    for wants in [
+        "sockets.target.wants".to_string(),
+        format!("{worker_unit}.wants"),
+    ] {
+        let dir = out.join(wants);
+        fs::create_dir_all(&dir).map_err(err_ctx(format!("mkdir {}", dir.display())))?;
+        for i in 1..=n {
+            let link = dir.join(format!("{prefix}@{i}.{suffix}"));
+            symlink(format!("../{template}"), &link)
+                .map_err(err_ctx(format!("symlink {}", link.display())))?;
+        }
+    }
+    Ok(())
 }
