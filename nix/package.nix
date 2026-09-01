@@ -59,12 +59,12 @@ craneLib.buildPackage (
     inherit cargoArtifacts;
     passthru = { inherit cargoArtifacts e2eTests; };
   }
-  // lib.optionalAttrs stdenv.isDarwin {
+  // lib.optionalAttrs stdenv.hostPlatform.isDarwin {
     # sandbox_init is not permitted inside the Nix build sandbox;
     # `nix develop -c cargo test` runs it
     cargoTestExtraArgs = "-- --skip=worker::agents::tests::seatbelt_profile_confines_the_builder";
   }
-  // lib.optionalAttrs stdenv.isLinux {
+  // lib.optionalAttrs stdenv.hostPlatform.isLinux {
     # default network backend for fixed-output builds
     # static /bin/sh for the sandbox, as Nix uses for its sandbox-shell
     TRIBUCHET_BIN_SH = "${busybox-sandbox-shell}/bin/busybox";
