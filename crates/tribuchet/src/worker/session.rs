@@ -23,6 +23,10 @@ use crate::proto::{
     RequestJob, Resumed, WorkerMessage, hub_message, worker_hub_client::WorkerHubClient,
     worker_message,
 };
+use crate::sd;
+
+/// nix/flakelet-worker.nix greps the unit's StatusText for this.
+pub const CONNECTED_STATUS: &str = "connected to hub";
 
 pub(super) async fn session(opts: &WorkerConfig, ctx: &Arc<WorkerCtx>) -> Result<()> {
     let mut endpoint = Endpoint::from_shared(opts.hub.clone())?;
@@ -69,6 +73,7 @@ pub(super) async fn session(opts: &WorkerConfig, ctx: &Arc<WorkerCtx>) -> Result
         .await?
         .into_inner();
     tracing::info!(hub = opts.hub, systems = ?opts.systems, "connected to hub");
+    sd::notify_status(CONNECTED_STATUS);
 
     let mut active: HashMap<String, ActiveBuild> = HashMap::new();
     let result = session_loop(

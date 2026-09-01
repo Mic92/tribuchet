@@ -54,5 +54,18 @@
       };
       services."agent@" = units.agentServiceConfig;
       services.${name} = units.workerServiceConfig;
+
+      # READY only means local setup finished; roll back a worker that
+      # never reaches the hub.
+      healthCheck = pkgs.writeShellScript "${name}-health" ''
+        for _ in $(${pkgs.coreutils}/bin/seq 30); do
+          case $(${pkgs.systemd}/bin/systemctl show -P StatusText ${name}.service) in
+            "connected to hub") exit 0 ;;
+          esac
+          ${pkgs.coreutils}/bin/sleep 2
+        done
+        echo "${name}: no hub session after 60s" >&2
+        exit 1
+      '';
     };
 }

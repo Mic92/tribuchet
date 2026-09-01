@@ -392,7 +392,10 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
         let started = Instant::now();
         match session::session(&opts, &ctx).await {
             Ok(()) => unreachable!("session only returns on error"),
-            Err(e) => tracing::warn!("hub session ended: {e:#}"),
+            Err(e) => {
+                tracing::warn!("hub session ended: {e:#}");
+                sd::notify_status(&format!("disconnected from hub: {e:#}"));
+            }
         }
         if started.elapsed() > Duration::from_mins(1) {
             backoff = Duration::from_secs(1);

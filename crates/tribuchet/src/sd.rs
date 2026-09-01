@@ -179,6 +179,11 @@ pub fn notify_ready() {
     let _ = sd_notify::notify(&[sd_notify::NotifyState::Ready]);
 }
 
+/// STATUS= line shown by `systemctl status`.
+pub fn notify_status(status: &str) {
+    let _ = sd_notify::notify(&[sd_notify::NotifyState::Status(status)]);
+}
+
 /// Resolves on SIGTERM, after telling systemd shutdown started
 /// ("deactivating" in systemctl status instead of an apparently hung
 /// stop while builds drain). Never resolves if no handler can be

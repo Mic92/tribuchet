@@ -124,5 +124,13 @@
       };
 
       exports.ports.workers = { inherit port; };
+    }
+    # The listeners are systemd's, so only the metrics endpoint proves the
+    # hub process serves; Type=notify covers startup otherwise.
+    // lib.optionalAttrs (options.hub ? "metrics-listen") {
+      healthCheck = pkgs.writeShellScript "${name}-health" ''
+        exec ${lib.getExe pkgs.curl} -sf --max-time 5 --retry 5 --retry-all-errors --retry-delay 2 \
+          -o /dev/null http://${options.hub."metrics-listen"}/metrics
+      '';
     };
 }
