@@ -169,7 +169,11 @@ impl HubState {
             notify: Notify::default(),
             daemon_pool: harmonia_store_remote::ConnectionPool::new(
                 "/nix/var/nix/daemon-socket/socket",
-                harmonia_store_remote::PoolConfig::default(),
+                // A loaded nix-daemon can exceed the 10s default.
+                harmonia_store_remote::PoolConfig {
+                    connection_timeout: Duration::from_mins(1),
+                    ..Default::default()
+                },
             ),
             worker_caps: StdMutex::default(),
             next_worker_id: atomic::AtomicU64::default(),
