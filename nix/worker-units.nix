@@ -21,8 +21,7 @@ let
   agentIds = map toString (lib.range 1 agents);
   agentSocket = i: "${agentUnit}${i}.socket";
   stateDir = "/var/lib/tribuchet/a%i";
-  # ExecStart cannot do arithmetic or resolve the worker's uid, which
-  # the agent needs for its peer-uid check.
+  # ExecStart cannot do arithmetic or resolve the worker's uid
   agentStart = pkgs.writeShellScript "tribuchet-agent" ''
     exec ${lib.getExe' package "tribuchet"} agent \
       --state-dir "/var/lib/tribuchet/a$1" \
@@ -71,7 +70,11 @@ in
       # /var/lib/private, out of reach for the worker and the uid block.
       # Traverse-only: the per-build scratch dirs are world-writable for
       # the block, but their names are random.
-      ExecStartPre = "+${pkgs.coreutils}/bin/install -d -m 0711 -o tribuchet-agent-%i -g tribuchet-agent-%i ${stateDir}";
+      ExecStartPre = [
+        # scratch may belong to a previous DynamicUser uid
+        "+${pkgs.coreutils}/bin/rm -rf ${stateDir}/scratch"
+        "+${pkgs.coreutils}/bin/install -d -m 0711 -o tribuchet-agent-%i -g tribuchet-agent-%i ${stateDir}"
+      ];
       ReadWritePaths = "/var/lib/tribuchet";
       # Writing the uid/gid maps of the agent's user namespace needs
       # CAP_SETUID/CAP_SETGID over the uid block, dropped right after.
