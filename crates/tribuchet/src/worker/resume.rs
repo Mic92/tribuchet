@@ -115,12 +115,18 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>) {
 /// Clean up agent builds without an on-disk record, left by a Start
 /// that raced the previous worker's shutdown. They fail every later
 /// Start on their agent with Busy. Runs after adoption, so adopted
-/// agents are already out of the pool.
+/// agents are already out of the pool. The query activates every agent,
+/// so idle ones are told to exit again.
 pub(super) fn sweep_orphaned_agent_builds(ctx: &Arc<WorkerCtx>) {
     for socket in ctx.agents.idle_sockets() {
         let id = match agents::current_build(&socket) {
             Ok(Some(id)) => id,
-            Ok(None) => continue,
+            Ok(None) => {
+                if let Err(e) = agents::shutdown(&socket) {
+                    tracing::warn!("agent shutdown {}: {}", socket.display(), chain(&e));
+                }
+                continue;
+            }
             Err(e) => {
                 tracing::warn!("querying agent {}: {}", socket.display(), chain(&e));
                 continue;

@@ -317,6 +317,12 @@ in
         hub.wait_until_succeeds(
             "journalctl -u tribuchet-hub | grep -q 'worker registered'"
         )
+        # The startup sweep activates every agent. Idle ones exit again so
+        # they do not pin the binary they were started with.
+        worker.wait_until_succeeds(
+            "test $(systemctl list-units --state=active --no-legend 'tribuchet-agent@*.service' | wc -l) = 0",
+            timeout=30,
+        )
 
     with subtest("worker sshd reachable for the harness backdoor"):
         hub.wait_for_unit("sshd.service")
