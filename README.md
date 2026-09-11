@@ -172,7 +172,9 @@ which again keeps builds alive across upgrades.
 ### Container
 
 For hosts without Nix the flake builds an OCI image,
-`packages.x86_64-linux.worker-image`. It carries its own Nix store,
+`packages.x86_64-linux.worker-image`. CI publishes the same image for
+x86_64-linux and aarch64-linux as `ghcr.io/mic92/tribuchet-worker`,
+tagged `main` and per release. It carries its own Nix store,
 starts a nix-daemon and the worker, and spawns build agents according
 to `spawn-agents` and `agent-uid-base` in worker.toml. It needs no
 added capabilities, but the sandbox creates namespaces and mounts,
@@ -185,7 +187,7 @@ $ podman run -d --name tribuchet-worker \
     -v tribuchet-nix:/nix \
     --security-opt seccomp=$(nix build --print-out-paths .#seccomp-profile) \
     --security-opt unmask=ALL \
-    tribuchet-worker:latest
+    ghcr.io/mic92/tribuchet-worker:main
 ```
 
 The one extra syscall rule the sandbox needs is also available on its
