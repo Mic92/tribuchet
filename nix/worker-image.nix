@@ -20,13 +20,14 @@ let
   '';
   # auto-GC so imported inputs do not fill the store
   nixConf = writeTextDir "etc/nix/nix.conf" ''
+    build-users-group =
     min-free = 1073741824
     max-free = 5368709120
   '';
 in
 dockerTools.buildLayeredImage {
   name = "tribuchet-worker";
-  tag = "latest";
+  tag = tribuchet.version;
   contents = [
     tribuchet
     nix
@@ -49,5 +50,13 @@ dockerTools.buildLayeredImage {
       "SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt"
       "PATH=/bin"
     ];
+    # ghcr.io links the package to the repo via the source label
+    Labels = {
+      "org.opencontainers.image.title" = "tribuchet-worker";
+      "org.opencontainers.image.description" = "tribuchet build worker with its own Nix store";
+      "org.opencontainers.image.source" = "https://github.com/Mic92/tribuchet";
+      "org.opencontainers.image.licenses" = "MIT";
+      "org.opencontainers.image.version" = tribuchet.version;
+    };
   };
 }

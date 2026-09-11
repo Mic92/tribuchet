@@ -69,7 +69,7 @@
         virtualisation.oci-containers = {
           backend = "podman";
           containers.worker = {
-            image = "tribuchet-worker:latest";
+            image = "tribuchet-worker:${workerImage.imageTag}";
             imageFile = workerImage;
             autoStart = false;
             volumes = [
