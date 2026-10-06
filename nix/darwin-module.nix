@@ -35,7 +35,11 @@ let
   # chown the socket, so this directory carries the nixbld restriction.
   attachDir = lib.escapeShellArg (dirOf (toString hub.socketPath));
   agentUser = i: "_tribuchetbld${toString i}";
-  agentSocket = i: "/var/run/tribuchet/agents/${toString i}.sock";
+  # Not under /var/run: it is wiped at boot, nothing recreates the
+  # directory, and launchd does not create parents of a socket path, so
+  # every agent would fail launch_activate_socket after a reboot.
+  agentSocketDir = "/var/lib/tribuchet/agents";
+  agentSocket = i: "${agentSocketDir}/${toString i}.sock";
   agentStateDir = i: "/var/lib/tribuchet/a${toString i}";
   # nixbld gid: build users must be able to create their outputs in
   # the group-writable /nix/store.
@@ -283,6 +287,9 @@ in
       # worker on the new binary and settings; running builds stay in
       # their agents and are re-adopted.
       system.activationScripts.preActivation.text = ''
+        mkdir -p ${agentSocketDir}
+        chown root:daemon ${agentSocketDir}
+        chmod 0755 ${agentSocketDir}
         mkdir -p ${lib.escapeShellArg (toString cfg.stateDir)}
         chown ${toString cfg.uid} ${lib.escapeShellArg (toString cfg.stateDir)}
         touch ${lib.escapeShellArg (toString cfg.logFile)}

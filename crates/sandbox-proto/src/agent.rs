@@ -4,7 +4,7 @@ include!(concat!(env!("OUT_DIR"), "/agent.rs"));
 
 /// Directory of per-agent sockets (`<n>.sock`), root-owned and only
 /// group-reachable by the worker.
-pub const SOCKET_DIR: &str = "/var/run/tribuchet/agents";
+pub const SOCKET_DIR: &str = "/var/lib/tribuchet/agents";
 
 /// Seatbelt profile parameter carrying the agent's scratch dir. The
 /// worker builds the profile without knowing that path. The agent
