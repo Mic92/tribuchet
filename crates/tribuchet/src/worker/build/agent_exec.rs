@@ -45,6 +45,9 @@ impl ActiveBuild {
                 "the uid-range feature is only supported on Linux workers",
             ));
         }
+        if self.reuse_outputs {
+            return Ok(self.finish_reused());
+        }
         let socket =
             self.ctx.agents.acquire().ok_or_else(|| {
                 err_msg("no free build agent (max-jobs exceeds the agent count?)")
@@ -52,6 +55,32 @@ impl ActiveBuild {
         let result = self.execute_on_agent(&socket, out_tx, timeout);
         self.ctx.agents.release(socket);
         result
+    }
+
+    /// Pack outputs that already exist valid in the shared store, with
+    /// no builder and no agent cleanup (which would delete them).
+    fn finish_reused(&self) -> FinishedBuild {
+        let spec = sandbox::SandboxSpec {
+            outputs: self.assignment.outputs.values().cloned().collect(),
+            store_inputs: self.input_list(),
+            recursive_nix: self.recursive_nix(),
+            ..sandbox::SandboxSpec::default()
+        };
+        let deadline = Instant::now() + Duration::from_mins(10);
+        let packed = tokio::runtime::Handle::current()
+            .block_on(pack_outputs_and_extras(&self.dir, &spec, None, deadline));
+        let (exit_code, error, outputs, extras) = match packed {
+            Ok((o, e)) => (0, String::new(), o, e),
+            Err(e) => (1, chain(&e), vec![], vec![]),
+        };
+        FinishedBuild {
+            exit_code,
+            error,
+            outputs,
+            extras,
+            dir: self.dir.clone(),
+            finished_at: Instant::now(),
+        }
     }
 
     fn execute_on_agent(

@@ -61,10 +61,27 @@ pub(super) struct ActiveBuild {
     /// Daemon connection; carries this build's temp roots, so it must
     /// outlive the build.
     daemon: Option<DaemonConn>,
+    /// macOS: every output is already valid in the shared /nix/store
+    /// (another builder produced it), so the build is skipped and the
+    /// existing paths are packed.
+    reuse_outputs: bool,
     imports: HashMap<String, ImportHandle>,
     pool: Option<ImportPool>,
     chunks: ChunkStaging,
     tmp_unpacker: Option<Unpacker>,
+}
+
+/// Decide what to do with outputs found on disk: build (none exist),
+/// reuse (all exist and are registered), or reject (anything else, as
+/// the build would overwrite and cleanup delete it).
+fn reuse_existing_outputs(total: usize, present: usize, valid: usize) -> Result<bool> {
+    match (present, valid) {
+        (0, _) => Ok(false),
+        (p, v) if p == total && v == total => Ok(true),
+        _ => Err(err_msg(
+            "output path already exists on this worker but is not a registered store path",
+        )),
+    }
 }
 
 fn store_base(store_path: &str) -> &str {
@@ -107,6 +124,7 @@ impl ActiveBuild {
             resend_rounds: 0,
             needs_outstanding: 0,
             daemon: None,
+            reuse_outputs: false,
             imports: HashMap::new(),
             pool: None,
             chunks,
@@ -218,15 +236,46 @@ impl ActiveBuild {
             }
         }
         if cfg!(target_os = "macos") {
-            for p in self.assignment.outputs.values() {
-                let sp = store_dir
-                    .parse(p)
-                    .map_err(err_ctx(format!("output {p:?} is not a store path")))?;
-                add_temp_root(&mut daemon, p, &sp).await?;
-            }
+            self.reuse_outputs = self.check_outputs(&mut daemon, &store_dir).await?;
         }
         self.daemon = Some(daemon);
         Ok(missing)
+    }
+
+    /// macOS builds write straight into the store and cleanup deletes
+    /// the output, so an output that already exists must not be built
+    /// over. The farm worker shares this store: when every output is
+    /// registered valid there, reuse them. Anything else that exists
+    /// is unregistered or partial, and is rejected rather than
+    /// deleted.
+    async fn check_outputs(&self, daemon: &mut DaemonConn, store_dir: &StoreDir) -> Result<bool> {
+        let mut set = StorePathSet::new();
+        let mut present = 0;
+        for p in self.assignment.outputs.values() {
+            let sp = store_dir
+                .parse(p)
+                .map_err(err_ctx(format!("output {p:?} is not a store path")))?;
+            add_temp_root(daemon, p, &sp).await?;
+            if fs::symlink_metadata(p).is_ok() {
+                present += 1;
+            }
+            set.insert(sp);
+        }
+        if present == 0 {
+            return Ok(false);
+        }
+        let valid = daemon
+            .query_valid_paths(&set, false)
+            .await
+            .map_err(err_ctx("querying valid outputs"))?;
+        let reuse = reuse_existing_outputs(set.len(), present, valid.len())?;
+        if reuse {
+            tracing::info!(
+                id = self.assignment.build_id,
+                "outputs already valid, reusing"
+            );
+        }
+        Ok(reuse)
     }
 
     /// True when the path is ours to request, else we wait on it.
@@ -407,7 +456,16 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::store::{STORE_DIR, valid_store_path};
+
+    #[test]
+    fn existing_outputs_reused_only_when_all_registered() {
+        assert!(!reuse_existing_outputs(2, 0, 0).unwrap());
+        assert!(reuse_existing_outputs(2, 2, 2).unwrap());
+        // exists but unregistered, or only some outputs present
+        assert!(reuse_existing_outputs(1, 1, 0).is_err());
+        assert!(reuse_existing_outputs(2, 1, 1).is_err());
+        assert!(reuse_existing_outputs(2, 2, 1).is_err());
+    }
 
     fn base_assignment() -> BuildAssignment {
         BuildAssignment {
@@ -450,26 +508,6 @@ mod tests {
         let mut a = base_assignment();
         a.outputs.insert("doc".into(), "/etc/shadow".into());
         assert!(validate_assignment(&a).is_err());
-
-        // An existing store path as an output: rejected on macOS
-        // (in-place tampering, deletion by cleanup), accepted on Linux
-        // (isolated build root, no-op cleanup).
-        if let Some(existing) = fs::read_dir("/nix/store")
-            .ok()
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.path().to_string_lossy().into_owned())
-            .find(|p| valid_store_path(STORE_DIR, p))
-        {
-            let mut a = base_assignment();
-            a.outputs.insert("doc".into(), existing);
-            if cfg!(target_os = "macos") {
-                assert!(validate_assignment(&a).is_err());
-            } else {
-                assert!(validate_assignment(&a).is_ok());
-            }
-        }
 
         let mut a = base_assignment();
         a.builder = "-p".into();
