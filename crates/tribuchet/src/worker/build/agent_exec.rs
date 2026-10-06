@@ -57,8 +57,8 @@ impl ActiveBuild {
         result
     }
 
-    /// Pack outputs that already exist valid in the shared store, with
-    /// no builder and no agent cleanup (which would delete them).
+    /// Pack existing outputs without running a builder. Agent cleanup
+    /// is skipped since it would delete them.
     fn finish_reused(&self) -> FinishedBuild {
         let spec = sandbox::SandboxSpec {
             outputs: self.assignment.outputs.values().cloned().collect(),
