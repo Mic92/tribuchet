@@ -40,7 +40,9 @@ let
   # every agent would fail launch_activate_socket after a reboot.
   agentSocketDir = "/var/lib/tribuchet/agents";
   agentSocket = i: "${agentSocketDir}/${toString i}.sock";
-  agentStateDir = i: "/var/lib/tribuchet/a${toString i}";
+  # Short: the build dir below it holds unix sockets, and sun_path is 103
+  # bytes on darwin, where /var also becomes /private/var.
+  agentStateDir = i: "/var/tb/${toString i}";
   # nixbld gid: build users must be able to create their outputs in
   # the group-writable /nix/store.
   nixbldGid = config.ids.gids.nixbld;
