@@ -224,7 +224,7 @@ pub struct WorkerConfig {
     #[serde(default)]
     pub recursive_nix: bool,
     /// Confine builds with a Seatbelt profile (macOS only).
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub sandbox: bool,
     /// Sockets of the per-uid build agents, one per pool user. The
     /// agent count bounds concurrent builds.
@@ -292,10 +292,6 @@ fn default_max_jobs() -> u32 {
         .and_then(|n| u32::try_from(n.get()).ok())
         .unwrap_or(1)
 }
-fn default_true() -> bool {
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,11 +330,11 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_defaults_on() {
+    fn sandbox_defaults_off() {
         let parse =
             |body: &str| toml::from_str::<WorkerConfig>(&format!("hub = \"x\"\n{body}")).unwrap();
-        assert!(parse("").sandbox);
-        assert!(!parse("sandbox = false").sandbox);
+        assert!(!parse("").sandbox);
+        assert!(parse("sandbox = true").sandbox);
     }
 
     #[test]
