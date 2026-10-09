@@ -223,6 +223,9 @@ pub struct WorkerConfig {
     /// client side (see `nix/patches/`).
     #[serde(default)]
     pub recursive_nix: bool,
+    /// Confine builds with a Seatbelt profile (macOS only).
+    #[serde(default = "default_true")]
+    pub sandbox: bool,
     /// Sockets of the per-uid build agents, one per pool user. The
     /// agent count bounds concurrent builds.
     #[serde(default)]
@@ -289,6 +292,10 @@ fn default_max_jobs() -> u32 {
         .and_then(|n| u32::try_from(n.get()).ok())
         .unwrap_or(1)
 }
+fn default_true() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,6 +331,14 @@ mod tests {
             cfg.emulate.get("aarch64-linux"),
             Some(&PathBuf::from("/nix/store/x-qemu/bin/qemu-aarch64"))
         );
+    }
+
+    #[test]
+    fn sandbox_defaults_on() {
+        let parse =
+            |body: &str| toml::from_str::<WorkerConfig>(&format!("hub = \"x\"\n{body}")).unwrap();
+        assert!(parse("").sandbox);
+        assert!(!parse("sandbox = false").sandbox);
     }
 
     #[test]

@@ -63,6 +63,8 @@ struct WorkerCtx {
     /// Files a build must never read even where DAC would allow it
     /// (macOS Seatbelt deny rules; Linux relies on the mount namespace).
     secret_paths: Vec<PathBuf>,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    sandbox: bool,
     /// One permit per concurrent build.
     slots: Arc<Semaphore>,
     /// A `Slot` dropped. The session loop re-declares capacity.
@@ -359,6 +361,7 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
         state_dir: opts.state_dir.clone(),
         sandbox_bin_sh: opts.sandbox_bin_sh.clone(),
         secret_paths: vec![opts.key.clone()],
+        sandbox: opts.sandbox,
         slots: Arc::new(Semaphore::new(opts.max_jobs.max(1) as usize)),
         slot_freed: Notify::new(),
         import_jobs: opts.import_jobs.max(1) as usize,
