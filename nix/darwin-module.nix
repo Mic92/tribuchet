@@ -35,6 +35,8 @@ let
   # chown the socket, so this directory carries the nixbld restriction.
   attachDir = lib.escapeShellArg (dirOf (toString hub.socketPath));
   agentUser = i: "_tribuchetbld${toString i}";
+  # launchd's default soft limit of 256 is inherited by builders.
+  fileLimits.SoftResourceLimits.NumberOfFiles = 10240;
   # Not under /var/run: it is wiped at boot, nothing recreates the
   # directory, and launchd does not create parents of a socket path, so
   # every agent would fail launch_activate_socket after a reboot.
@@ -240,6 +242,7 @@ in
         [
           {
             tribuchet-worker.serviceConfig = {
+              inherit (fileLimits) SoftResourceLimits;
               ProgramArguments = [
                 execLink
                 "worker"
@@ -262,6 +265,7 @@ in
         # uid (getpeereid).
         ++ map (i: {
           "tribuchet-agent-${toString i}".serviceConfig = {
+            inherit (fileLimits) SoftResourceLimits;
             ProgramArguments = [
               (lib.getExe' cfg.package "tribuchet")
               "agent"
