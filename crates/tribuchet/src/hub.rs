@@ -335,6 +335,7 @@ async fn worker_loop(
             out_tx.clone(),
             in_rx,
             sess.clone(),
+            (worker_id, register.worker_name.clone()),
         ));
     }
     // Builds in flight fail through their closed router channels.
@@ -345,14 +346,41 @@ async fn worker_loop(
     tracing::info!(worker = register.worker_name, "worker disconnected");
 }
 
+/// A requeued build kept for the worker whose session died while it ran
+/// the build: the worker likely still runs it and re-registers shortly.
+struct Reservation {
+    /// Name the worker registers with, the identity a reconnect keeps.
+    worker: String,
+    /// Id of the session that died.
+    session: u64,
+    until: Instant,
+}
+
+impl Reservation {
+    /// Within the grace and the worker is not back. Back means
+    /// registered with its held keys: from then on those route the job.
+    fn awaited(
+        &self,
+        workers: &HashMap<u64, WorkerCaps>,
+        held: &HashMap<u64, HashSet<String>>,
+    ) -> bool {
+        Instant::now() < self.until
+            && !workers.iter().any(|(id, c)| {
+                *id != self.session && c.name == self.worker && held.contains_key(id)
+            })
+    }
+}
+
 /// Run one dispatched job and settle it: finish, requeue or fail.
+/// `worker` is the session's id and worker name.
 async fn supervise_job(
     state: Arc<HubState>,
-    job: Job,
+    mut job: Job,
     router: Router,
     out_tx: mpsc::Sender<Result<HubMessage, Status>>,
     in_rx: mpsc::Receiver<worker_message::Msg>,
     sess: Arc<WorkerSession>,
+    worker: (u64, String),
 ) {
     let _running = state.metrics.running(&job.req.system);
     let mut dispatched = false;
@@ -372,6 +400,15 @@ async fn supervise_job(
     if (session_dead || !dispatched) && job.attempts < MAX_JOB_ATTEMPTS {
         tracing::warn!(id = job.id, "dispatch lost, requeueing build: {err}");
         Metrics::inc(&state.metrics.requeued);
+        // A worker restart drops the session but not the build: keep
+        // it for that worker until it re-registers, or the grace ends,
+        // instead of running it a second time elsewhere.
+        let (session, worker) = worker;
+        job.reserved = (session_dead && dispatched).then(|| Reservation {
+            worker,
+            session,
+            until: Instant::now() + state.worker_grace,
+        });
         state.requeue(job).await;
     } else {
         tracing::warn!(id = job.id, "build failed: {err}");
@@ -388,5 +425,129 @@ async fn supervise_job(
         .await;
         job.replay.publish(attach_event::Event::Error(err)).await;
         state.finish(&job).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    use state::Replay;
+
+    use crate::proto::{AttachEvent, BuildRequest};
+
+    fn caps(name: &str) -> WorkerCaps {
+        WorkerCaps {
+            name: name.into(),
+            connected_at: Instant::now(),
+            systems: [("x86_64-linux".to_owned(), HashSet::new())].into(),
+            max_jobs: 1,
+        }
+    }
+
+    /// A worker session as worker_loop registers it.
+    fn register(state: &Arc<HubState>, name: &str, held: &[&str]) -> CapsGuard {
+        let guard = CapsGuard::new(state.clone(), caps(name));
+        let keys = held.iter().map(|k| (*k).to_owned()).collect();
+        state.held.lock().unwrap().insert(guard.id, keys);
+        guard
+    }
+
+    fn job(replay: Arc<Replay>) -> Job {
+        Job {
+            id: "0123456789abcdef0123456789abcdef".into(),
+            key: "k1".into(),
+            req: BuildRequest {
+                system: "x86_64-linux".into(),
+                ..Default::default()
+            },
+            tmp_dir_pack: Arc::new(Vec::new()),
+            features: vec![],
+            replay,
+            listing: StdMutex::default(),
+            attempts: 0,
+            queued_at: Instant::now(),
+            reserved: None,
+        }
+    }
+
+    /// Dispatch `job` to `worker`, whose session then dies while the
+    /// build runs, as when the worker unit restarts.
+    async fn lose_session(state: &Arc<HubState>, job: Job, worker: CapsGuard) {
+        let router = Router::default();
+        let in_rx = router.register(&job.id);
+        let (out_tx, _out_rx) = mpsc::channel(64);
+        let session = (worker.id, worker.caps.name.clone());
+        router.close_all();
+        drop(worker);
+        let sess = Arc::new(WorkerSession::new());
+        supervise_job(state.clone(), job, router, out_tx, in_rx, sess, session).await;
+    }
+
+    #[tokio::test]
+    async fn restarted_worker_gets_its_build_back() {
+        let state = Arc::new(HubState::for_test(Duration::from_secs(30)));
+        let other = register(&state, "w2", &[]);
+        let replay = Arc::new(Replay::default());
+        let _client = replay.subscribe().await;
+        lose_session(&state, job(replay), register(&state, "w1", &[])).await;
+        assert!(
+            state.take_job(&caps("w2"), other.id).await.is_none(),
+            "build handed to another worker while its own reconnects"
+        );
+        let back = register(&state, "w1", &["k1"]);
+        assert!(state.take_job(&caps("w2"), other.id).await.is_none());
+        let resumed = state.take_job_by_key(back.id).await;
+        assert_eq!(resumed.map(|j| j.attempts), Some(1));
+    }
+
+    #[tokio::test]
+    async fn build_goes_elsewhere_once_the_grace_ends() {
+        let state = Arc::new(HubState::for_test(Duration::from_secs(1)));
+        let other = register(&state, "w2", &[]);
+        let replay = Arc::new(Replay::default());
+        let _client = replay.subscribe().await;
+        lose_session(&state, job(replay), register(&state, "w1", &[])).await;
+        assert!(state.take_job(&caps("w2"), other.id).await.is_none());
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(state.take_job(&caps("w2"), other.id).await.is_some());
+    }
+
+    /// The worker came back without the build (it was still staging):
+    /// no reason to keep it from the others any longer.
+    #[tokio::test]
+    async fn build_is_released_when_its_worker_returns_without_it() {
+        let state = Arc::new(HubState::for_test(Duration::from_secs(30)));
+        let other = register(&state, "w2", &[]);
+        let replay = Arc::new(Replay::default());
+        let _client = replay.subscribe().await;
+        lose_session(&state, job(replay), register(&state, "w1", &[])).await;
+        let _back = register(&state, "w1", &[]);
+        assert!(state.take_job(&caps("w2"), other.id).await.is_some());
+    }
+
+    /// No worker returns and none other serves the system: the client
+    /// sees an error once the grace ends rather than waiting forever.
+    #[tokio::test]
+    async fn client_is_failed_when_no_worker_returns() {
+        let mut state = Arc::new(HubState::for_test(Duration::from_millis(200)));
+        Arc::get_mut(&mut state).unwrap().started_at =
+            Instant::now().checked_sub(Duration::from_mins(1)).unwrap();
+        let replay = Arc::new(Replay::default());
+        let mut client = replay.subscribe().await;
+        let worker = register(&state, "w1", &[]);
+        lose_session(&state, job(replay), worker).await;
+        let failed = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(Ok(AttachEvent { event: Some(e) })) = client.recv().await {
+                if let attach_event::Event::Error(e) = e {
+                    return e;
+                }
+            }
+            String::new()
+        })
+        .await
+        .expect("the client was left waiting");
+        assert!(failed.contains("no connected worker"), "{failed}");
     }
 }

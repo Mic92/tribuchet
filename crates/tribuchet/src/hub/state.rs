@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, mpsc};
 use tonic::Status;
 
+use super::Reservation;
 use super::chunkcache::ChunkCache;
 use super::metrics::Metrics;
 use crate::config::NixConfig;
@@ -56,6 +57,8 @@ pub(super) struct Job {
     pub(super) attempts: u32,
     /// When the job last entered the queue, for the queue-wait histogram.
     pub(super) queued_at: Instant,
+    /// Kept for the worker whose session died running it.
+    pub(super) reserved: Option<Reservation>,
 }
 
 impl Job {
@@ -274,9 +277,15 @@ impl HubState {
                     held.iter()
                         .any(|(id, keys)| *id != worker && keys.contains(key))
                 };
-                let pos = queue
-                    .iter()
-                    .position(|j| caps.serves(&j.req.system, &j.features) && !elsewhere(&j.key))?;
+                let workers = self.worker_caps.lock().unwrap();
+                let awaited = |j: &Job| {
+                    j.reserved
+                        .as_ref()
+                        .is_some_and(|r| r.awaited(&workers, &held))
+                };
+                let pos = queue.iter().position(|j| {
+                    caps.serves(&j.req.system, &j.features) && !elsewhere(&j.key) && !awaited(j)
+                })?;
                 queue.remove(pos)?
             };
             // Abandoned while queued (every attach client gone): drop it
@@ -401,6 +410,7 @@ mod tests {
             listing: StdMutex::default(),
             attempts: 0,
             queued_at: Instant::now(),
+            reserved: None,
         }
     }
 

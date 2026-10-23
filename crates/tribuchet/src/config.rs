@@ -73,7 +73,8 @@ pub struct HubConfig {
     /// (re)serve before declining (lets a patched Nix fall back to a
     /// local build). Covers the startup re-registration window and a
     /// worker's reconnect window; a never-seen platform declines at
-    /// once.
+    /// once. A build whose worker session died is also kept this long
+    /// for that worker to re-register and resume it.
     #[serde(default = "default_worker_grace_secs")]
     pub worker_grace_secs: u64,
     /// Optional address (e.g. 127.0.0.1:7438) for the Prometheus

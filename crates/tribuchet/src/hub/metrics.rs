@@ -465,6 +465,7 @@ mod tests {
             listing: Mutex::default(),
             attempts: 0,
             queued_at: Instant::now(),
+            reserved: None,
         };
         state.queue.lock().await.push_back(job("x86_64-linux"));
         state.queue.lock().await.push_back(job("x86_64-linux"));

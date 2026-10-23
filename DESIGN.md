@@ -194,7 +194,10 @@ dirs. The replacement worker re-adopts running builds from their
 agents, supervises them to completion and redelivers finished
 results. The hub covers the
 session gap by requeueing instead of failing jobs whose worker
-session died; the attached client sees a pause, not an error. A full
+session died; the attached client sees a pause, not an error. For
+`worker-grace-secs` such a job is kept for its worker (by name), so
+a quick reconnect resumes it instead of another worker running it a
+second time. A full
 stop behaves the same way: builds keep running, and their results
 wait on disk until a worker starts again (or expire undelivered).
 

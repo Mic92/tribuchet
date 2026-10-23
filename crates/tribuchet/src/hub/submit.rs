@@ -230,6 +230,7 @@ impl attach_hub_server::AttachHub for AttachSvc {
                 listing: Mutex::new(Some(listing)),
                 attempts: 0,
                 queued_at: Instant::now(),
+                reserved: None,
             };
             tracing::info!(id = job.id, system = job.req.system, "queueing build");
             Metrics::inc(&self.state.metrics.submitted);

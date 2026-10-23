@@ -473,6 +473,7 @@ mod tests {
             listing: Mutex::default(),
             attempts: 0,
             queued_at: Instant::now(),
+            reserved: None,
         }
     }
 
