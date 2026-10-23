@@ -9,6 +9,7 @@
 //! - verifies output chunks against their manifest while relaying
 
 use std::collections::{HashMap, HashSet};
+use std::mem;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -169,6 +170,14 @@ async fn route_loop(
         if let worker_message::Msg::Heartbeat(h) = &m {
             let keys: HashSet<String> = h.resumable_keys.iter().cloned().collect();
             state.held.lock().unwrap().insert(worker, keys);
+            let changed = h.max_jobs.is_some_and(|jobs| {
+                let mut caps = state.worker_caps.lock().unwrap();
+                caps.get_mut(&worker)
+                    .is_some_and(|c| mem::replace(&mut c.max_jobs, jobs) != jobs)
+            });
+            if changed {
+                state.regen_nix_config();
+            }
         }
         let Some(id) = msg_build_id(&m).map(str::to_string) else {
             continue;
@@ -388,5 +397,62 @@ async fn supervise_job(
         .await;
         job.replay.publish(attach_event::Event::Error(err)).await;
         state.finish(&job).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    use crate::config::NixConfig;
+    use crate::proto::Heartbeat;
+
+    fn heartbeat(max_jobs: Option<u32>) -> WorkerMessage {
+        WorkerMessage {
+            msg: Some(worker_message::Msg::Heartbeat(Heartbeat {
+                max_jobs,
+                ..Default::default()
+            })),
+        }
+    }
+
+    /// A heartbeat carries the worker's current capacity, e.g. after
+    /// an agent joined or went down, and the nix.conf fragment follows
+    /// it. One from a worker predating the field keeps the value.
+    #[tokio::test]
+    async fn heartbeat_updates_the_advertised_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nix.conf");
+        let nix_config = NixConfig {
+            path: path.clone(),
+            attach_program: "/attach".into(),
+            oversubscribe_percent: 100,
+            max_jobs_cap: 256,
+        };
+        let cache = chunkcache::ChunkCache::open(dir.path().join("chunks"), 1 << 20).unwrap();
+        let state = Arc::new(HubState::new(
+            Duration::ZERO,
+            Some(nix_config),
+            Arc::new(cache),
+        ));
+        let caps = WorkerCaps {
+            name: "w".into(),
+            connected_at: Instant::now(),
+            systems: HashMap::new(),
+            max_jobs: 2,
+        };
+        let guard = CapsGuard::new(state.clone(), caps);
+        let id = guard.id;
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(heartbeat(Some(3))).await.unwrap();
+        tx.send(heartbeat(None)).await.unwrap();
+        drop(tx);
+        let capacity = Arc::new(AtomicU32::new(0));
+        route_loop(rx, Router::default(), capacity, state.clone(), id).await;
+        let jobs = state.worker_caps.lock().unwrap()[&id].max_jobs;
+        assert_eq!(jobs, 3);
+        let conf = fs::read_to_string(&path).unwrap();
+        assert!(conf.contains("max-jobs = 3\n"), "{conf}");
     }
 }

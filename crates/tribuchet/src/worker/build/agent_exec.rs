@@ -16,7 +16,9 @@ use tokio::sync::mpsc;
 
 use super::{ActiveBuild, pack_outputs_and_extras, unix_now};
 use crate::errors::chain;
-use crate::errors::{Result, err_ctx, err_msg};
+#[cfg(target_os = "macos")]
+use crate::errors::err_msg;
+use crate::errors::{Result, err_ctx};
 use crate::fsutil::io_ctx;
 use crate::proto::WorkerMessage;
 use crate::tmpdir::pack_zstd_dir;
@@ -48,13 +50,7 @@ impl ActiveBuild {
         if self.reuse_outputs {
             return Ok(self.finish_reused());
         }
-        let socket =
-            self.ctx.agents.acquire().ok_or_else(|| {
-                err_msg("no free build agent (max-jobs exceeds the agent count?)")
-            })?;
-        let result = self.execute_on_agent(&socket, out_tx, timeout);
-        self.ctx.agents.release(socket);
-        result
+        self.execute_on_agent(out_tx, timeout)
     }
 
     /// Pack existing outputs without running a builder. Agent cleanup
@@ -86,7 +82,6 @@ impl ActiveBuild {
 
     fn execute_on_agent(
         &self,
-        socket: &Path,
         out_tx: &mpsc::Sender<WorkerMessage>,
         timeout: Duration,
     ) -> Result<FinishedBuild> {
@@ -143,12 +138,13 @@ impl ActiveBuild {
             .create(true)
             .append(true)
             .open(self.dir.join("build.log"))?;
-        let build = agents::AgentBuild::start(
-            socket,
+        let (socket, build) = self.ctx.agents.start(
             &req,
             &fs::File::open(self.dir.join("top.tmpdir.zst"))
                 .map_err(io_ctx("opening", &self.dir.join("top.tmpdir.zst")))?,
             &log_w,
+            || self.ctx.cancelled.lock().unwrap().remove(&a.dedupe_key),
+            Instant::now() + timeout,
         )?;
         drop(log_w);
         tracing::info!(
@@ -187,14 +183,15 @@ impl ActiveBuild {
             pid: build.pid,
             spec,
             deadline_unix: unix_now() + timeout.as_secs(),
-            agent_socket: socket.to_path_buf(),
+            agent_socket: socket.clone(),
         };
         if let Err(e) = resume.persist(&self.dir) {
             tracing::warn!(id = a.build_id, "persisting resume state: {}", chain(&e));
         }
-        let fin = supervise_agent(&self.ctx, &resume, self.dir.clone(), socket, build);
+        let fin = supervise_agent(&self.ctx, &resume, self.dir.clone(), &socket, build);
         log_done.store(true, Ordering::Relaxed);
         let _ = tailer.join();
+        self.ctx.agents.release(socket);
         Ok(fin)
     }
 

@@ -29,6 +29,7 @@ pub use userns::{USERNS_HOLD_ARG, hold_stage as userns_hold_stage};
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -41,7 +42,10 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 
 use caps::host_system;
 use logtail::spawn_log_tail;
-use resume::{ResumableBuild, adopt_builds, spawn_resumable_reaper, sweep_orphaned_agent_builds};
+use resume::{
+    ResumableBuild, adopt_builds, spawn_agent_rescan, spawn_resumable_reaper,
+    sweep_orphaned_agent_builds,
+};
 
 use crate::chunkstore::ChunkStore;
 use crate::config::WorkerConfig;
@@ -67,7 +71,10 @@ struct WorkerCtx {
     sandbox: bool,
     /// One permit per concurrent build.
     slots: Arc<Semaphore>,
-    /// A `Slot` dropped. The session loop re-declares capacity.
+    /// Permits in `slots`: the max-jobs setting.
+    max_jobs: usize,
+    /// A `Slot` dropped or an agent joined. The session loop
+    /// re-declares capacity.
     slot_freed: Notify,
     /// dedupe_key -> build past staging; survives session loss so a
     /// replacement hub can resume instead of rebuilding.
@@ -249,7 +256,22 @@ impl Drop for Slot {
 }
 
 impl WorkerCtx {
+    /// Builds that can run at once: one per reachable agent, at most
+    /// max-jobs.
+    fn jobs(&self) -> usize {
+        self.max_jobs.min(self.agents.usable())
+    }
+
+    /// Slots a build can take now.
+    fn free_slots(&self) -> usize {
+        let held = self.max_jobs - self.slots.available_permits();
+        self.jobs().saturating_sub(held)
+    }
+
     fn try_slot(self: &Arc<Self>) -> Option<Slot> {
+        if self.free_slots() == 0 {
+            return None;
+        }
         let permit = self.slots.clone().try_acquire_owned().ok()?;
         Some(Slot {
             _permit: permit,
@@ -331,23 +353,15 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
         }
     }
     if let Some(dir) = &opts.agent_sockets_dir {
-        let mut found: Vec<PathBuf> = fs::read_dir(dir)
-            .map_err(|e| err_msg(format!("agent-sockets-dir {}: {e}", dir.display())))?
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "sock"))
-            .collect();
-        found.sort();
+        let found = agent_sockets_in(dir)
+            .map_err(|e| err_msg(format!("agent-sockets-dir {}: {e}", dir.display())))?;
         opts.agent_sockets.extend(found);
     }
-    // Every build runs on one agent, so the agent list bounds
-    // concurrency.
+    // Every build runs on one agent, so the reachable agents bound
+    // concurrency (WorkerCtx::jobs).
     if opts.agent_sockets.is_empty() {
         return Err(err_msg("agent-sockets must list at least one build agent"));
     }
-    opts.max_jobs = opts
-        .max_jobs
-        .min(u32::try_from(opts.agent_sockets.len()).unwrap_or(u32::MAX));
     if cfg!(target_os = "macos") && opts.build_memory_max_bytes.is_some() {
         tracing::warn!("build-memory-max is not enforced on macOS");
     }
@@ -363,6 +377,7 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
         secret_paths: vec![opts.key.clone()],
         sandbox: opts.sandbox,
         slots: Arc::new(Semaphore::new(opts.max_jobs.max(1) as usize)),
+        max_jobs: opts.max_jobs.max(1) as usize,
         slot_freed: Notify::new(),
         import_jobs: opts.import_jobs.max(1) as usize,
         chunks: open_chunk_store(&opts)?,
@@ -387,7 +402,8 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
     spawn_resumable_reaper(ctx.clone());
     spawn_handover();
     adopt_builds(&ctx).await;
-    sweep_orphaned_agent_builds(&ctx);
+    sweep_orphaned_agent_builds(&ctx, ctx.agents.idle_sockets());
+    spawn_agent_rescan(ctx.clone(), opts.agent_sockets_dir.clone());
 
     // Reconnect with backoff: a hub restart must not drain the fleet.
     let mut backoff = Duration::from_secs(1);
@@ -409,6 +425,17 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
     }
 }
 
+/// The `*.sock` entries of agent-sockets-dir, sorted.
+fn agent_sockets_in(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut found: Vec<PathBuf> = fs::read_dir(dir)?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "sock"))
+        .collect();
+    found.sort();
+    Ok(found)
+}
+
 /// SIGTERM (unit stop or restart): exit immediately. All resumable
 /// state is already on disk and builds run in their own process
 /// groups/cgroups (KillMode=process), so a replacement worker
@@ -424,6 +451,40 @@ fn spawn_handover() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl WorkerCtx {
+        /// A context leasing builds to `agents`, every optional
+        /// feature off.
+        pub(in crate::worker) fn for_test(
+            state_dir: &Path,
+            max_jobs: usize,
+            agents: Vec<PathBuf>,
+        ) -> Result<Arc<Self>> {
+            let chunks = ChunkStore::open(state_dir.join("chunks"), 1 << 20)?;
+            Ok(Arc::new(Self {
+                state_dir: state_dir.to_path_buf(),
+                sandbox_bin_sh: None,
+                secret_paths: vec![],
+                sandbox: false,
+                slots: Arc::new(Semaphore::new(max_jobs)),
+                max_jobs,
+                slot_freed: Notify::new(),
+                resumable: Mutex::new(HashMap::new()),
+                emulators: HashMap::new(),
+                fod_isolation: false,
+                fod_network: NetPolicy::default(),
+                max_silent_time: Duration::ZERO,
+                max_log_size: 0,
+                build_memory_max_bytes: None,
+                recursive_nix: false,
+                agents: agents::AgentPool::new(agents),
+                cancelled: Mutex::new(HashSet::new()),
+                claims: build::Claims::default(),
+                import_jobs: 1,
+                chunks: Arc::new(Mutex::new(chunks)),
+            }))
+        }
+    }
 
     #[test]
     fn sweep_removes_stale_builds_and_keeps_adoptable_ones() -> Result<()> {

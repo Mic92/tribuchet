@@ -64,7 +64,7 @@ pub(super) async fn session(opts: &WorkerConfig, ctx: &Arc<WorkerCtx>) -> Result
             worker_name: hostname(),
             caps: system_caps(opts, ctx),
             resumable_keys: ctx.resumable_keys(),
-            max_jobs: opts.max_jobs.max(1),
+            max_jobs: u32::try_from(ctx.jobs()).unwrap_or(u32::MAX),
         })))
         .await?;
 
@@ -126,6 +126,7 @@ async fn session_loop(
                     running_jobs: u32::try_from(running).unwrap_or(u32::MAX),
                     load1: loadavg1(),
                     resumable_keys: ctx.resumable_keys(),
+                    max_jobs: u32::try_from(ctx.jobs()).ok(),
                 }))).await?;
                 declare_capacity(active, &ready, &env).await?;
                 continue;
@@ -186,14 +187,16 @@ async fn session_loop(
 }
 
 /// Free slots, plus one lookahead build staged while every slot is
-/// busy so a finishing build hands over without a round trip.
+/// busy so a finishing build hands over without a round trip. None
+/// with no agent reachable.
 async fn declare_capacity(
     active: &HashMap<String, ActiveBuild>,
     ready: &VecDeque<String>,
     env: &LaunchEnv<'_>,
 ) -> Result<()> {
-    let lookahead = ready.is_empty() && active.values().all(|b| b.slot.is_some());
-    let capacity = env.ctx.slots.available_permits() + usize::from(lookahead);
+    let lookahead =
+        env.ctx.jobs() > 0 && ready.is_empty() && active.values().all(|b| b.slot.is_some());
+    let capacity = env.ctx.free_slots() + usize::from(lookahead);
     env.out_tx
         .send(msg(worker_message::Msg::RequestJob(RequestJob {
             capacity: u32::try_from(capacity).unwrap_or(u32::MAX),
@@ -404,4 +407,34 @@ async fn fail_build(
         })))
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sockpath;
+    use crate::worker::resume::sweep_orphaned_agent_builds;
+
+    /// An agent that does not answer is not offered to the hub, and
+    /// with none reachable not even a lookahead build is.
+    #[tokio::test]
+    async fn capacity_counts_only_reachable_agents() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let stale = dir.path().join("1.sock");
+        drop(sockpath::bind(&stale)?);
+        let ctx = WorkerCtx::for_test(dir.path(), 4, vec![stale])?;
+        sweep_orphaned_agent_builds(&ctx, ctx.agents.idle_sockets());
+        let (out_tx, mut out_rx) = mpsc::channel(1);
+        let env = LaunchEnv {
+            ctx: &ctx,
+            out_tx: &out_tx,
+            build_timeout: Duration::ZERO,
+        };
+        declare_capacity(&HashMap::new(), &VecDeque::new(), &env).await?;
+        let Some(worker_message::Msg::RequestJob(r)) = out_rx.recv().await.unwrap().msg else {
+            panic!("expected RequestJob");
+        };
+        assert_eq!(r.capacity, 0);
+        Ok(())
+    }
 }

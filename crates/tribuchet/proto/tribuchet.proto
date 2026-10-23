@@ -128,6 +128,9 @@ message Heartbeat {
   double load1 = 2;
   // Current Register.resumable_keys. Keys not listed are no longer held.
   repeated string resumable_keys = 3;
+  // Current Register.max_jobs: reachable build agents change. Unset by
+  // workers predating the field.
+  optional uint32 max_jobs = 4;
 }
 
 message BuildAssignment {
