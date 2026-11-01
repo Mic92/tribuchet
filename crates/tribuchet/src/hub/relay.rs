@@ -48,7 +48,6 @@ pub(super) async fn run_job(
     let req = &job.req;
     let mut staging = Staging::new(state, job, &sess);
     let inputs = staging.assignment_inputs().await?;
-    *dispatched = true;
     send(
         out_tx,
         hub_message::Msg::Assignment(BuildAssignment {
@@ -68,6 +67,7 @@ pub(super) async fn run_job(
         }),
     )
     .await?;
+    *dispatched = true;
 
     stream_tmp_dir(&job.id, &job.tmp_dir_pack, out_tx).await?;
 

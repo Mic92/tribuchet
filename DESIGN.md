@@ -194,9 +194,22 @@ dirs. The replacement worker re-adopts running builds from their
 agents, supervises them to completion and redelivers finished
 results. The hub covers the
 session gap by requeueing instead of failing jobs whose worker
-session died; the attached client sees a pause, not an error. A full
+session died; the attached client sees a pause, not an error. For
+`worker-grace-secs`, or until that worker registers again, such a
+job, once its assignment was sent, is kept for its worker (by name):
+a quick reconnect resumes it instead of another worker running it a
+second time. A full
 stop behaves the same way: builds keep running, and their results
 wait on disk until a worker starts again (or expire undelivered).
+The hub knows a reconnecting worker by name: the hostname it reports
+(not anything in its certificate), or with `auth = "tailscale"` its
+tailscale node's short name. No two workers may share a name, nor two
+workers one tailscale node. The hub does not check, so a shared name
+goes unnoticed, and a build kept for its worker through the reconnect
+grace can be released while that worker still runs it, and run twice.
+Give each worker its own hostname, and a container `--hostname`:
+podman otherwise uses its ID, new on every recreate, or with
+`--network=host` the host's own hostname.
 
 ## Known limitations (MVP)
 

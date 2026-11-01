@@ -335,6 +335,7 @@ async fn worker_loop(
             out_tx.clone(),
             in_rx,
             sess.clone(),
+            (worker_id, register.worker_name.clone()),
         ));
     }
     // Builds in flight fail through their closed router channels.
@@ -345,14 +346,42 @@ async fn worker_loop(
     tracing::info!(worker = register.worker_name, "worker disconnected");
 }
 
+/// The loss of a build with the session of the worker that ran it. The
+/// worker likely still runs it and re-registers shortly: until `until`,
+/// the build is kept for it.
+struct Loss {
+    /// Name the worker registers with, the identity a reconnect keeps.
+    worker: String,
+    /// Id of the session that died.
+    session: u64,
+    until: Instant,
+}
+
+impl Loss {
+    /// Within the grace and the worker is not back. Back means
+    /// registered with its held keys: from then on those route the job.
+    fn awaited(
+        &self,
+        workers: &HashMap<u64, WorkerCaps>,
+        holding: &HashMap<u64, HashSet<String>>,
+    ) -> bool {
+        Instant::now() < self.until
+            && !workers.iter().any(|(id, c)| {
+                *id != self.session && c.name == self.worker && holding.contains_key(id)
+            })
+    }
+}
+
 /// Run one dispatched job and settle it: finish, requeue or fail.
+/// `worker` is the session's id and worker name.
 async fn supervise_job(
     state: Arc<HubState>,
-    job: Job,
+    mut job: Job,
     router: Router,
     out_tx: mpsc::Sender<Result<HubMessage, Status>>,
     in_rx: mpsc::Receiver<worker_message::Msg>,
     sess: Arc<WorkerSession>,
+    worker: (u64, String),
 ) {
     let _running = state.metrics.running(&job.req.system);
     let mut dispatched = false;
@@ -372,6 +401,15 @@ async fn supervise_job(
     if (session_dead || !dispatched) && job.attempts < MAX_JOB_ATTEMPTS {
         tracing::warn!(id = job.id, "dispatch lost, requeueing build: {err}");
         Metrics::inc(&state.metrics.requeued);
+        // A worker restart drops the session but not the build: keep
+        // it for that worker until it re-registers, or the grace ends,
+        // instead of running it a second time elsewhere.
+        let (session, worker) = worker;
+        job.loss = (session_dead && dispatched).then(|| Loss {
+            worker,
+            session,
+            until: Instant::now() + state.worker_grace,
+        });
         state.requeue(job).await;
     } else {
         tracing::warn!(id = job.id, "build failed: {err}");
@@ -390,3 +428,6 @@ async fn supervise_job(
         state.finish(&job).await;
     }
 }
+
+#[cfg(test)]
+mod tests;
