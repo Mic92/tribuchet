@@ -9,6 +9,7 @@
 //! - verifies output chunks against their manifest while relaying
 
 use std::collections::{HashMap, HashSet};
+use std::mem;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -169,6 +170,14 @@ async fn route_loop(
         if let worker_message::Msg::Heartbeat(h) = &m {
             let keys: HashSet<String> = h.resumable_keys.iter().cloned().collect();
             state.held.lock().unwrap().insert(worker, keys);
+            let changed = h.max_jobs.is_some_and(|jobs| {
+                let mut caps = state.worker_caps.lock().unwrap();
+                caps.get_mut(&worker)
+                    .is_some_and(|c| mem::replace(&mut c.max_jobs, jobs) != jobs)
+            });
+            if changed {
+                state.regen_nix_config();
+            }
         }
         let Some(id) = msg_build_id(&m).map(str::to_string) else {
             continue;
@@ -390,3 +399,6 @@ async fn supervise_job(
         state.finish(&job).await;
     }
 }
+
+#[cfg(test)]
+mod tests;
