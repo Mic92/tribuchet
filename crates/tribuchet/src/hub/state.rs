@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, mpsc};
 use tonic::Status;
 
+use super::Loss;
 use super::chunkcache::ChunkCache;
 use super::metrics::Metrics;
 use crate::config::NixConfig;
@@ -56,6 +57,10 @@ pub(super) struct Job {
     pub(super) attempts: u32,
     /// When the job last entered the queue, for the queue-wait histogram.
     pub(super) queued_at: Instant,
+    /// The loss of the build with its worker's session, when that is
+    /// why it was requeued. Until the loss's grace ends, or the worker
+    /// is back, the build is kept for that worker (Loss::awaited).
+    pub(super) loss: Option<Loss>,
 }
 
 impl Job {
@@ -274,9 +279,12 @@ impl HubState {
                     held.iter()
                         .any(|(id, keys)| *id != worker && keys.contains(key))
                 };
-                let pos = queue
-                    .iter()
-                    .position(|j| caps.serves(&j.req.system, &j.features) && !elsewhere(&j.key))?;
+                let workers = self.worker_caps.lock().unwrap();
+                let pos = queue.iter().position(|j| {
+                    caps.serves(&j.req.system, &j.features)
+                        && !elsewhere(&j.key)
+                        && !(j.loss.as_ref()).is_some_and(|r| r.awaited(&workers, &held))
+                })?;
                 queue.remove(pos)?
             };
             // Abandoned while queued (every attach client gone): drop it
@@ -401,6 +409,7 @@ mod tests {
             listing: StdMutex::default(),
             attempts: 0,
             queued_at: Instant::now(),
+            loss: None,
         }
     }
 

@@ -70,6 +70,16 @@ up in tailscaled's LocalAPI, rejects anything not on the tailnet, and
 uses the node name as the worker identity. Restrict registration to
 ACL tags with `tailscale-allowed-tags = ["tag:tribuchet-worker"]`.
 
+The hub knows a reconnecting worker by name: the hostname it reports
+(not anything in its certificate), or with `auth = "tailscale"` its
+tailscale node's short name. No two workers may share a name, nor two
+workers one tailscale node. The hub does not check, so a shared name
+goes unnoticed, and a build kept for its worker through the reconnect
+grace can be released while that worker still runs it, and run twice.
+Give each worker its own hostname, and a container `--hostname`:
+podman otherwise uses its ID, new on every recreate, or with
+`--network=host` the host's own hostname.
+
 ### 2. Hub (on the machine running nix-daemon)
 
 `/etc/tribuchet/hub.toml`:
