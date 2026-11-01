@@ -230,8 +230,9 @@ pub struct WorkerConfig {
     /// agent count bounds concurrent builds.
     #[serde(default)]
     pub agent_sockets: Vec<PathBuf>,
-    /// Directory whose `*.sock` entries are appended to agent-sockets at
-    /// startup, for hosts that size the agent count at boot.
+    /// Directory whose `*.sock` entries are appended to agent-sockets,
+    /// for hosts that size the agent count at boot. Sockets created
+    /// later join within 10 s.
     #[serde(default)]
     pub agent_sockets_dir: Option<PathBuf>,
     /// Number of agents the worker spawns and supervises itself, for

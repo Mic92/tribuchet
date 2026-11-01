@@ -64,7 +64,7 @@ pub(super) async fn session(opts: &WorkerConfig, ctx: &Arc<WorkerCtx>) -> Result
             worker_name: hostname(),
             caps: system_caps(opts, ctx),
             resumable_keys: ctx.resumable_keys(),
-            max_jobs: opts.max_jobs.max(1),
+            max_jobs: u32::try_from(ctx.jobs()).unwrap_or(u32::MAX),
         })))
         .await?;
 
@@ -82,7 +82,6 @@ pub(super) async fn session(opts: &WorkerConfig, ctx: &Arc<WorkerCtx>) -> Result
         &out_tx,
         ctx,
         Duration::from_secs(opts.build_timeout_secs),
-        opts.max_jobs.max(1),
     )
     .await;
     // Builds still staging when the session dies must not keep their
@@ -99,7 +98,6 @@ async fn session_loop(
     out_tx: &mpsc::Sender<WorkerMessage>,
     ctx: &Arc<WorkerCtx>,
     build_timeout: Duration,
-    max_jobs: u32,
 ) -> Result<()> {
     let env = LaunchEnv {
         ctx,
@@ -120,12 +118,12 @@ async fn session_loop(
             }
             _ = heartbeat.tick() => {
                 let staging = active.values().filter(|b| b.slot.is_some()).count();
-                let running = (max_jobs as usize)
-                    .saturating_sub(ctx.slots.available_permits() + staging);
+                let running = ctx.held.lock().unwrap().saturating_sub(staging);
                 out_tx.send(msg(worker_message::Msg::Heartbeat(Heartbeat {
                     running_jobs: u32::try_from(running).unwrap_or(u32::MAX),
                     load1: loadavg1(),
                     resumable_keys: ctx.resumable_keys(),
+                    max_jobs: u32::try_from(ctx.jobs()).ok(),
                 }))).await?;
                 declare_capacity(active, &ready, &env).await?;
                 continue;
@@ -186,14 +184,16 @@ async fn session_loop(
 }
 
 /// Free slots, plus one lookahead build staged while every slot is
-/// busy so a finishing build hands over without a round trip.
+/// busy so a finishing build hands over without a round trip. None
+/// with no agent reachable.
 async fn declare_capacity(
     active: &HashMap<String, ActiveBuild>,
     ready: &VecDeque<String>,
     env: &LaunchEnv<'_>,
 ) -> Result<()> {
-    let lookahead = ready.is_empty() && active.values().all(|b| b.slot.is_some());
-    let capacity = env.ctx.slots.available_permits() + usize::from(lookahead);
+    let lookahead =
+        env.ctx.jobs() > 0 && ready.is_empty() && active.values().all(|b| b.slot.is_some());
+    let capacity = env.ctx.free_slots() + usize::from(lookahead);
     env.out_tx
         .send(msg(worker_message::Msg::RequestJob(RequestJob {
             capacity: u32::try_from(capacity).unwrap_or(u32::MAX),
@@ -404,4 +404,142 @@ async fn fail_build(
         })))
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::hint;
+    use std::pin::pin;
+    use std::sync::Mutex;
+    use std::sync::atomic::Ordering::SeqCst;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::task::{Context, Wake, Waker};
+    use std::thread;
+
+    use super::*;
+    use crate::sockpath;
+    use crate::worker::resume::sweep_orphaned_agent_builds;
+
+    /// The free slots the session loop finds when it is woken.
+    struct Woken(Arc<WorkerCtx>, Mutex<Option<usize>>);
+
+    impl Wake for Woken {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            *self.1.lock().unwrap() = Some(self.0.free_slots());
+        }
+    }
+
+    /// A slot is free by the time its release wakes the session loop,
+    /// which hands it to a staged build (grant_slots). Were the loop
+    /// woken first, it would find no free slot and wait for a wake that
+    /// never comes: the staged build would be stranded.
+    #[test]
+    fn a_freed_slot_is_free_when_the_session_loop_wakes_for_it() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let ctx = WorkerCtx::for_test(dir.path(), 1, vec![dir.path().join("1.sock")])?;
+        let slot = ctx.try_slot().expect("a free slot");
+        let woken = Arc::new(Woken(ctx.clone(), Mutex::new(None)));
+        let waker = Waker::from(woken.clone());
+        let mut notified = pin!(ctx.slot_freed.notified());
+        let polled = notified.as_mut().poll(&mut Context::from_waker(&waker));
+        assert!(polled.is_pending());
+        drop(slot);
+        assert_eq!(*woken.1.lock().unwrap(), Some(1), "free slots when woken");
+        Ok(())
+    }
+
+    /// Builds asking at once never hold more slots than there are. With
+    /// fewer agents than max-jobs, a try_slot that checks free_slots, then
+    /// takes a permit of a semaphore of max-jobs, which does not bind,
+    /// lets two callers both pass the check.
+    #[test]
+    fn callers_at_once_never_hold_more_slots_than_there_are() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let ctx = WorkerCtx::for_test(dir.path(), 8, vec![dir.path().join("1.sock")])?;
+        assert_eq!(ctx.jobs(), 1, "one usable agent");
+        let (held, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    for _ in 0..100_000 {
+                        if let Some(slot) = ctx.try_slot() {
+                            most.fetch_max(held.fetch_add(1, SeqCst) + 1, SeqCst);
+                            thread::yield_now();
+                            held.fetch_sub(1, SeqCst);
+                            drop(slot);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(most.load(SeqCst), 1, "the most slots held at once");
+        Ok(())
+    }
+
+    /// The slot an agent back from down frees goes to the orphan cleanup
+    /// that reserves the agent, not to a build asking meanwhile. Were
+    /// the agent reserved first and a slot asked for after, a build
+    /// asking between would take it, and the cleanup run without one.
+    #[test]
+    fn a_reserved_agents_slot_goes_to_the_reservation() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let socket = dir.path().join("1.sock");
+        let ctx = WorkerCtx::for_test(dir.path(), 8, vec![socket.clone()])?;
+        let rounds = 2_000;
+        let mut lost = 0;
+        for _ in 0..rounds {
+            ctx.agents.mark_down(&socket);
+            let (asking, done) = (AtomicBool::new(false), AtomicBool::new(false));
+            let (reserved, taken) = thread::scope(|s| {
+                let taker = s.spawn(|| {
+                    loop {
+                        asking.store(true, SeqCst);
+                        let slot = ctx.try_slot();
+                        if slot.is_some() || done.load(SeqCst) {
+                            break slot;
+                        }
+                    }
+                });
+                while !asking.load(SeqCst) {
+                    hint::spin_loop();
+                }
+                let reserved = ctx.reserve(&socket);
+                done.store(true, SeqCst);
+                (reserved, taker.join().unwrap())
+            });
+            lost += usize::from(reserved.is_none() || taken.is_some());
+        }
+        assert_eq!(
+            lost, 0,
+            "a build took the reserved slot in {lost} of {rounds} rounds"
+        );
+        Ok(())
+    }
+
+    /// An agent that does not answer is not offered to the hub, and
+    /// with none reachable not even a lookahead build is.
+    #[tokio::test]
+    async fn capacity_counts_only_reachable_agents() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let stale = dir.path().join("1.sock");
+        drop(sockpath::bind(&stale)?);
+        let ctx = WorkerCtx::for_test(dir.path(), 4, vec![stale])?;
+        sweep_orphaned_agent_builds(&ctx, ctx.agents.idle_sockets());
+        let (out_tx, mut out_rx) = mpsc::channel(1);
+        let env = LaunchEnv {
+            ctx: &ctx,
+            out_tx: &out_tx,
+            build_timeout: Duration::ZERO,
+        };
+        declare_capacity(&HashMap::new(), &VecDeque::new(), &env).await?;
+        let Some(worker_message::Msg::RequestJob(r)) = out_rx.recv().await.unwrap().msg else {
+            panic!("expected RequestJob");
+        };
+        assert_eq!(r.capacity, 0);
+        Ok(())
+    }
 }

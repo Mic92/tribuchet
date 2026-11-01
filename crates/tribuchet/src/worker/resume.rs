@@ -7,13 +7,13 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use harmonia_store_path::StoreDir;
 use harmonia_store_remote::{DaemonClient, DaemonStore};
 
 use super::build::supervise_agent;
-use super::{DaemonConn, WorkerCtx, agents, remove_build_dir, sandbox};
+use super::{DaemonConn, WorkerCtx, agent_sockets_in, agents, remove_build_dir, sandbox};
 use crate::errors::chain;
 use crate::fsutil::io_ctx;
 
@@ -118,14 +118,22 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>) {
 /// that raced the previous worker's shutdown. They fail every later
 /// Start on their agent with Busy. Runs after adoption, so adopted
 /// agents are already out of the pool. The query activates every agent,
-/// so idle ones are told to exit again.
-pub(super) fn sweep_orphaned_agent_builds(ctx: &Arc<WorkerCtx>) {
-    for socket in ctx.agents.idle_sockets() {
+/// so idle ones are told to exit again. `sockets` are idle or down;
+/// those that answer join the free list, the others are marked down.
+pub(super) fn sweep_orphaned_agent_builds(ctx: &Arc<WorkerCtx>, sockets: Vec<PathBuf>) {
+    for socket in sockets {
         let id = match agents::current_build(&socket) {
             Ok(Some(id)) => id,
             Ok(None) => {
                 if let Err(e) = agents::shutdown(&socket) {
                     tracing::warn!("agent shutdown {}: {}", socket.display(), chain(&e));
+                }
+                ctx.agents.release(socket);
+                continue;
+            }
+            Err(e) if agents::unreachable(&e) => {
+                if ctx.agents.mark_down(&socket) {
+                    tracing::warn!("{}; not leasing builds to it", chain(&e));
                 }
                 continue;
             }
@@ -137,8 +145,7 @@ pub(super) fn sweep_orphaned_agent_builds(ctx: &Arc<WorkerCtx>) {
         tracing::warn!(id, "cleaning up an orphaned agent build");
         // Cleanup is slow. Run it in the background, with the agent
         // reserved, so the hub connection is not delayed.
-        ctx.agents.reserve(&socket);
-        let slot = ctx.try_slot();
+        let slot = ctx.reserve(&socket);
         let ctx = ctx.clone();
         tokio::task::spawn_blocking(move || {
             let _slot = slot;
@@ -150,6 +157,39 @@ pub(super) fn sweep_orphaned_agent_builds(ctx: &Arc<WorkerCtx>) {
             }
             ctx.agents.release(socket);
         });
+    }
+}
+
+/// Every 10 s, probe the agents marked down and the sockets new in
+/// agent-sockets-dir. Those that answer join the pool, so neither a
+/// restarted nor an added socket unit is missed.
+pub(super) fn spawn_agent_rescan(ctx: Arc<WorkerCtx>, dir: Option<PathBuf>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let (ctx, dir) = (ctx.clone(), dir.clone());
+            let res = tokio::task::spawn_blocking(move || rescan_agents(&ctx, dir.as_deref()));
+            if let Err(e) = res.await {
+                tracing::warn!("rescanning build agents: {e}");
+            }
+        }
+    });
+}
+
+fn rescan_agents(ctx: &Arc<WorkerCtx>, dir: Option<&Path>) {
+    if let Some(dir) = dir {
+        match agent_sockets_in(dir) {
+            Ok(found) => ctx.agents.discover(found),
+            Err(e) => tracing::warn!("agent-sockets-dir {}: {e}", dir.display()),
+        }
+    }
+    let before = ctx.agents.usable();
+    sweep_orphaned_agent_builds(ctx, ctx.agents.down_sockets());
+    let usable = ctx.agents.usable();
+    if usable > before {
+        tracing::info!(usable, "build agents joined");
+        // The session hands out the new slots and re-declares capacity.
+        ctx.slot_freed.notify_one();
     }
 }
 
@@ -240,7 +280,122 @@ impl ResumeState {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+    use std::thread;
+
+    use sandbox_proto::agent::{StatusReply, call, reply};
+    use sandbox_proto::framing;
+
     use super::*;
+    use crate::errors::Result;
+    use crate::sockpath;
+    use crate::worker::agents::tests::spawn_agent;
+
+    /// The startup sweep sets a stopped socket unit's file aside, so
+    /// it counts neither for the hub nor for slots, and a rescan
+    /// returns it once its agent answers again.
+    #[test]
+    fn unreachable_agents_do_not_count_until_they_answer() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (live, stale) = (dir.path().join("1.sock"), dir.path().join("2.sock"));
+        spawn_agent(&live, dir.path().join("a1"))?;
+        drop(sockpath::bind(&stale)?);
+        let ctx = WorkerCtx::for_test(dir.path(), 4, vec![live, stale.clone()])?;
+        sweep_orphaned_agent_builds(&ctx, ctx.agents.idle_sockets());
+        assert_eq!(ctx.jobs(), 1);
+        let _slot = ctx.try_slot().unwrap();
+        assert!(ctx.try_slot().is_none());
+
+        fs::remove_file(&stale)?;
+        spawn_agent(&stale, dir.path().join("a2"))?;
+        rescan_agents(&ctx, None);
+        assert_eq!((ctx.jobs(), ctx.free_slots()), (2, 1));
+        Ok(())
+    }
+
+    /// A down agent that accepts a connection and never answers holds up
+    /// no rescan: each call to it gives up after AGENT_ANSWER, so the
+    /// rescan still returns another agent that answers again, and the
+    /// next one runs.
+    #[test]
+    fn a_silent_agent_does_not_stop_the_rescan() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (silent, back) = (dir.path().join("1.sock"), dir.path().join("2.sock"));
+        let _silent = sockpath::bind(&silent)?;
+        let ctx = WorkerCtx::for_test(dir.path(), 4, vec![silent.clone(), back.clone()])?;
+        ctx.agents.mark_down(&silent);
+        ctx.agents.mark_down(&back);
+        spawn_agent(&back, dir.path().join("a2"))?;
+        let (done, finished) = mpsc::channel();
+        let task_ctx = ctx.clone();
+        thread::spawn(move || {
+            rescan_agents(&task_ctx, None);
+            done.send(()).unwrap();
+        });
+        assert!(
+            finished.recv_timeout(Duration::from_secs(30)).is_ok(),
+            "the rescan still waits on the silent agent after 30 s"
+        );
+        assert_eq!(ctx.agents.down_sockets(), vec![silent]);
+        assert_eq!(ctx.jobs(), 1);
+        Ok(())
+    }
+
+    /// An agent that answers Status, then never answers Shutdown, holds
+    /// up no rescan either: Shutdown gives up after AGENT_ANSWER too, and
+    /// the agent still joins the pool.
+    #[test]
+    fn an_agent_silent_on_shutdown_does_not_stop_the_rescan() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let socket = dir.path().join("1.sock");
+        let listener = sockpath::bind(&socket)?;
+        thread::spawn(move || {
+            let mut unanswered = Vec::new();
+            for conn in listener.incoming().flatten() {
+                if let Ok((call::Call::Status(_), _)) = framing::recv_call(&conn) {
+                    let status = reply::Reply::Status(StatusReply { current: None });
+                    let _ = framing::send_reply(&conn, status, &[]);
+                }
+                unanswered.push(conn);
+            }
+        });
+        let ctx = WorkerCtx::for_test(dir.path(), 4, vec![socket.clone()])?;
+        ctx.agents.mark_down(&socket);
+        let (done, finished) = mpsc::channel();
+        let task_ctx = ctx.clone();
+        thread::spawn(move || {
+            rescan_agents(&task_ctx, None);
+            let _ = done.send(());
+        });
+        assert!(
+            finished.recv_timeout(Duration::from_secs(30)).is_ok(),
+            "the rescan still waits on Shutdown after 30 s"
+        );
+        assert_eq!(ctx.jobs(), 1);
+        Ok(())
+    }
+
+    /// A socket added to agent-sockets-dir after startup joins the
+    /// pool, up to max-jobs.
+    #[test]
+    fn rescan_adds_new_agent_sockets() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let agents = dir.path().join("agents");
+        fs::create_dir(&agents)?;
+        spawn_agent(&agents.join("1.sock"), dir.path().join("a1"))?;
+        let ctx = WorkerCtx::for_test(dir.path(), 2, agent_sockets_in(&agents)?)?;
+        assert_eq!(ctx.jobs(), 1);
+        for i in 2..=3 {
+            spawn_agent(
+                &agents.join(format!("{i}.sock")),
+                dir.path().join(format!("a{i}")),
+            )?;
+        }
+        rescan_agents(&ctx, Some(&agents));
+        assert_eq!(ctx.agents.usable(), 3);
+        assert_eq!(ctx.jobs(), 2);
+        Ok(())
+    }
 
     #[test]
     fn a_finished_state_written_before_usage_existed_still_loads() {
