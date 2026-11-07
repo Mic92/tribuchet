@@ -3,8 +3,10 @@
 //! chunks, verifying every chunk's BLAKE3 against the recipe.
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
+use tokio::task::spawn_blocking;
 use tonic::Status;
 
 use super::extras::{ExtraImport, start_extra};
@@ -71,7 +73,7 @@ pub(super) fn parse_extras(reported: Vec<Manifest>) -> Result<Vec<(Announced, Ma
 /// Chunks arrive in the order `send_chunks` on the worker emits them:
 /// recipe order across outputs then extras, each needed hash once.
 struct ChunkSource<'a> {
-    cache: &'a ChunkCache,
+    cache: &'a Arc<ChunkCache>,
     needed: HashSet<Hash>,
     _pin: PinGuard,
     in_rx: &'a mut mpsc::Receiver<worker_message::Msg>,
@@ -80,20 +82,20 @@ struct ChunkSource<'a> {
 impl ChunkSource<'_> {
     /// The chunk's zstd frame, plaintext verified against the recipe.
     /// The delivery's hashes are pinned, so repeats read back from the
-    /// cache.
+    /// cache. Cache I/O runs on the blocking pool.
     async fn get(&mut self, hash: &Hash, size: usize) -> Result<Vec<u8>> {
+        let (cache, h) = (self.cache.clone(), *hash);
         let frame = if self.needed.remove(hash) {
             let frame = self.receive(hash).await?;
             decode_chunk(&frame, hash, size).map_err(err_ctx("output chunk"))?;
-            self.cache
-                .admit(*hash, &frame)
-                .map_err(|e| err_msg(format!("caching output chunk: {e}")))?;
-            frame
+            spawn_blocking(move || cache.admit(h, &frame).map(|()| frame))
+                .await
+                .map_err(err_ctx("cache admit task panicked"))?
+                .map_err(|e| err_msg(format!("caching output chunk: {e}")))?
         } else {
-            let frame = self
-                .cache
-                .locate(hash)
-                .and_then(|f| f.read().ok())
+            let frame = spawn_blocking(move || cache.locate(&h).and_then(|f| f.read().ok()))
+                .await
+                .map_err(err_ctx("cache read task panicked"))?
                 .ok_or_else(|| err_msg("pinned output chunk missing from the cache"))?;
             decode_chunk(&frame, hash, size).map_err(err_ctx("cached output chunk"))?;
             frame
@@ -136,22 +138,27 @@ pub(super) async fn deliver_outputs(
     outputs: Vec<Announced>,
     extras: Vec<(Announced, Manifest)>,
 ) -> Result<()> {
-    let cache = &*state.chunks;
-    let all = || {
-        outputs
-            .iter()
-            .chain(extras.iter().map(|(a, _)| a))
-            .flat_map(|a| &a.recipe)
-    };
-    let pin = cache.pin(all().map(|(h, _)| *h));
-    let mut needed = HashSet::new();
-    let mut hashes = Vec::new();
-    for (h, _) in all() {
-        if !needed.contains(h) && cache.locate(h).is_none() {
-            needed.insert(*h);
-            hashes.extend_from_slice(h);
+    let cache = &state.chunks;
+    let all: Vec<Hash> = outputs
+        .iter()
+        .chain(extras.iter().map(|(a, _)| a))
+        .flat_map(|a| a.recipe.iter().map(|(h, _)| *h))
+        .collect();
+    let c = cache.clone();
+    let (pin, needed, hashes) = spawn_blocking(move || {
+        let pin = c.pin(all.iter().copied());
+        let mut needed = HashSet::new();
+        let mut hashes = Vec::new();
+        for h in &all {
+            if !needed.contains(h) && c.locate(h).is_none() {
+                needed.insert(*h);
+                hashes.extend_from_slice(h);
+            }
         }
-    }
+        (pin, needed, hashes)
+    })
+    .await
+    .map_err(err_ctx("cache lookup task panicked"))?;
     tracing::debug!(
         id = job.id,
         needed = needed.len(),
@@ -207,4 +214,68 @@ pub(super) async fn deliver_outputs(
             .await;
     }
     src.finish().await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex as StdMutex;
+    use std::time::{Duration, Instant};
+
+    use zstd::bulk::compress;
+
+    use super::*;
+    use crate::chunkstore::probe;
+    use crate::hub::state::Replay;
+    use crate::proto::{BuildRequest, ChunkFrame};
+
+    /// Delivery admits a received chunk and reads its repeat back on the
+    /// blocking pool: the runtime's thread, the test's own, does no store
+    /// I/O and takes no store lock.
+    #[tokio::test]
+    async fn delivery_keeps_store_io_off_the_runtime() {
+        let state = HubState::for_test(Duration::ZERO);
+        let job = Job {
+            id: "b1".into(),
+            key: "k1".into(),
+            req: BuildRequest::default(),
+            tmp_dir_pack: Arc::new(Vec::new()),
+            features: vec![],
+            replay: Arc::new(Replay::default()),
+            listing: StdMutex::default(),
+            attempts: 0,
+            queued_at: Instant::now(),
+        };
+        let data = b"an output chunk".to_vec();
+        let hash: Hash = *blake3::hash(&data).as_bytes();
+        let size = data.len() as u64;
+        let out = "/nix/store/00000000000000000000000000000000-out".to_string();
+        let announced = Announced::new(out, &[hash, hash].concat(), &[size, size]).unwrap();
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        let (in_tx, mut in_rx) = mpsc::channel(8);
+        for (zstd, eof) in [(compress(&data, 3).unwrap(), false), (Vec::new(), true)] {
+            let c = ChunkFrame {
+                build_id: "b1".into(),
+                hash: hash.to_vec(),
+                zstd,
+                eof,
+            };
+            in_tx.send(worker_message::Msg::Chunk(c)).await.unwrap();
+        }
+        let io_here = probe::record(|| true);
+        deliver_outputs(
+            &state,
+            &job,
+            &out_tx,
+            &mut in_rx,
+            vec![announced],
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(io_here.borrow().is_empty(), "store I/O on the runtime");
+        let Some(hub_message::Msg::Need(need)) = out_rx.recv().await.unwrap().unwrap().msg else {
+            panic!("expected a Need");
+        };
+        assert_eq!(need.hashes, hash.to_vec(), "the Need lists the chunk once");
+    }
 }

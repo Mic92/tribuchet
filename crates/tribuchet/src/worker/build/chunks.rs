@@ -344,13 +344,16 @@ pub(super) fn feed_import(
 }
 
 fn read_verified(store: &Mutex<ChunkStore>, hash: &Hash, size: usize) -> Option<Vec<u8>> {
-    let frame = store.lock().unwrap().peek(hash)?.read().ok()?;
+    // A guard in the read's statement would live through the read.
+    let located = store.lock().unwrap().peek(hash)?;
+    let frame = located.read().ok()?;
     decode_chunk(&frame, hash, size).ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chunkstore::probe;
     use zstd::bulk::compress;
 
     #[test]
@@ -376,5 +379,33 @@ mod tests {
         let s = store.lock().unwrap();
         assert!(s.contains(&good_hash));
         assert!(!s.contains(&liar));
+    }
+
+    /// The import feeds read each frame after releasing the store lock,
+    /// so a feed's read stalls neither the other feeds nor the session
+    /// loop, which takes the same lock to store arriving chunks.
+    #[test]
+    fn feed_import_reads_frames_without_the_store_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(
+            ChunkStore::open(dir.path().to_path_buf(), 1 << 20).unwrap(),
+        ));
+        let data = b"a staged chunk".to_vec();
+        let hash: Hash = *blake3::hash(&data).as_bytes();
+        store
+            .lock()
+            .unwrap()
+            .insert(hash, &compress(&data, 3).unwrap())
+            .unwrap();
+        let s = store.clone();
+        let lock_free_at_read = probe::record(move || s.try_lock().is_ok());
+        let (tx, mut rx) = mpsc::channel(8);
+        assert!(feed_import(&store, &[(hash, data.len())], &tx).is_empty());
+        assert_eq!(rx.try_recv().unwrap().as_ref(), data.as_slice());
+        assert_eq!(
+            *lock_free_at_read.borrow(),
+            [true],
+            "the frame was read while holding the store lock"
+        );
     }
 }
