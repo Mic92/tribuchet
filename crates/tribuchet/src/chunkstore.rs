@@ -318,8 +318,13 @@ impl ChunkStore {
     fn retire(&mut self, id: u64, queue: Queue) -> io::Result<()> {
         let entries = pack::load_index(&self.dir, id)?;
         let mut promoted = false;
-        let pins = self.pins.clone();
-        let pins = pins.lock().unwrap();
+        // Snapshot this pack's pins, so a PinGuard drop never waits on the
+        // copies below. Pins only drop meanwhile: pinning needs the store.
+        let pinned: HashSet<Hash> = {
+            let pins = self.pins.lock().unwrap();
+            let pinned = entries.iter().map(|(h, ..)| *h);
+            pinned.filter(|h| pins.contains_key(h)).collect()
+        };
         for (hash, ..) in entries {
             // Promotion rewrites entry.pack. Only current owners count.
             let Some(entry) = self.map.get(&hash) else {
@@ -328,7 +333,7 @@ impl ChunkStore {
             if entry.pack != id {
                 continue;
             }
-            if entry.freq == 0 && !pins.contains_key(&hash) {
+            if entry.freq == 0 && !pinned.contains(&hash) {
                 self.map.remove(&hash);
                 if queue == Queue::Small {
                     self.ghost_push(hash);
@@ -504,6 +509,8 @@ mod tests {
             s.insert(*p, &frame).unwrap();
         }
         let guard = s.pin(pinned.clone());
+        let pins = s.pins.clone();
+        let pins_free = probe::record(move || pins.try_lock().is_ok());
         s.budget = 128 << 10;
         for n in 20..200u8 {
             s.insert(h(n), &frame).unwrap();
@@ -511,6 +518,11 @@ mod tests {
         assert!(
             pinned.iter().all(|p| s.peek(p).is_some()),
             "pinned chunk evicted"
+        );
+        // Copying survivors forward must not hold up a PinGuard drop.
+        assert!(
+            pins_free.borrow().iter().all(|f| *f),
+            "pins locked across I/O"
         );
         assert!(s.peek(&h(20)).is_none());
         drop(guard);
