@@ -120,19 +120,27 @@ async fn send_frame(
 }
 
 /// Serve needed chunks from the cache, returning what still needs a repack.
+/// Cache I/O runs on the blocking pool.
 async fn serve_cached(
-    cache: &ChunkCache,
+    cache: &Arc<ChunkCache>,
     build_id: &str,
     todo: HashSet<Hash>,
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
 ) -> Result<HashSet<Hash>> {
-    let Some(frames) = cache.locate_all(&todo) else {
+    let c = cache.clone();
+    let (frames, todo) = spawn_blocking(move || (c.locate_all(&todo), todo))
+        .await
+        .map_err(err_ctx("cache lookup task panicked"))?;
+    let Some(frames) = frames else {
         return Ok(todo);
     };
     let mut rest = todo;
     for (hash, fref) in frames {
+        let read = spawn_blocking(move || fref.read()).await;
         // Evicted between locate and read: the repack picks it up.
-        let Ok(frame) = fref.read() else { break };
+        let Ok(frame) = read.map_err(err_ctx("cache read task panicked"))? else {
+            break;
+        };
         send_frame(out_tx, build_id, &hash, frame).await?;
         rest.remove(&hash);
     }
@@ -195,14 +203,21 @@ fn frame_for(cache: &ChunkCache, chunk: &Chunk) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chunkstore::probe;
 
+    /// Also: no store I/O on the runtime's thread, the test's own.
     #[tokio::test]
     async fn serve_cached_skips_repack_and_reports_leftovers() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = ChunkCache::open(dir.path().to_path_buf(), 1 << 20).unwrap();
+        let cache = Arc::new(ChunkCache::open(dir.path().to_path_buf(), 1 << 20).unwrap());
         let a: Hash = [1; 32];
         let b: Hash = [2; 32];
-        cache.admit(a, &compress(b"hello", 3).unwrap()).unwrap();
+        let c = cache.clone();
+        spawn_blocking(move || c.admit(a, &compress(b"hello", 3).unwrap()))
+            .await
+            .unwrap()
+            .unwrap();
+        let io_here = probe::record(|| true);
 
         let (tx, mut rx) = mpsc::channel(8);
 
@@ -212,6 +227,7 @@ mod tests {
 
         let rest = serve_cached(&cache, "b1", [a].into(), &tx).await.unwrap();
         assert!(rest.is_empty());
+        assert!(io_here.borrow().is_empty(), "store I/O on the runtime");
         let msg = rx.recv().await.unwrap().unwrap();
         let Some(hub_message::Msg::Chunk(c)) = msg.msg else {
             panic!("expected ChunkFrame");
