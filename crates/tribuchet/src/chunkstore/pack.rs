@@ -52,6 +52,8 @@ impl PackWriter {
         rec.extend_from_slice(&len.to_le_bytes());
         rec.extend_from_slice(hash);
         rec.extend_from_slice(frame);
+        #[cfg(test)]
+        probe::fire();
         self.file.write_all_at(&rec, self.len)?;
         let offset = self.len + HEADER;
         self.len += HEADER + u64::from(len);
@@ -64,6 +66,8 @@ impl PackWriter {
     pub(super) fn seal(self, dir: &Path) -> io::Result<()> {
         // drop a torn tail left by a failed last append
         self.file.set_len(self.len)?;
+        #[cfg(test)]
+        probe::fire();
         self.file.sync_data()?;
         write_index(dir, self.id, &self.entries)
     }
@@ -138,12 +142,48 @@ pub(super) fn open_pack(dir: &Path, id: u64) -> io::Result<File> {
 
 pub(super) fn read_frame(file: &File, offset: u64, len: u32) -> io::Result<Vec<u8>> {
     let mut buf = vec![0u8; len as usize];
+    #[cfg(test)]
+    probe::fire();
     file.read_exact_at(&mut buf, offset)?;
     Ok(buf)
 }
 
 impl PackWriter {
     pub(super) fn sync(&self) -> io::Result<()> {
+        #[cfg(test)]
+        probe::fire();
         self.file.sync_data()
+    }
+}
+
+/// Test seam: a check run on the calling thread right before each
+/// frame read, pack write and pack fsync, to see what that thread holds
+/// while it does file I/O.
+#[cfg(test)]
+pub(crate) mod probe {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    type Check = Box<dyn Fn() -> bool>;
+    type Log = Rc<RefCell<Vec<bool>>>;
+
+    thread_local! {
+        static PROBE: RefCell<Option<(Check, Log)>> = const { RefCell::new(None) };
+    }
+
+    /// Evaluate `check` before each of this thread's pack reads, writes
+    /// and fsyncs. The returned log holds its results in order.
+    pub(crate) fn record(check: impl Fn() -> bool + 'static) -> Log {
+        let log = Log::default();
+        PROBE.with(|p| *p.borrow_mut() = Some((Box::new(check), log.clone())));
+        log
+    }
+
+    pub(super) fn fire() {
+        PROBE.with(|p| {
+            if let Some((check, log)) = &*p.borrow() {
+                log.borrow_mut().push(check());
+            }
+        });
     }
 }
