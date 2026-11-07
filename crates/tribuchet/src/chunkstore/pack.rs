@@ -83,6 +83,38 @@ fn write_index(dir: &Path, id: u64, entries: &[(Hash, u64, u32)]) -> io::Result<
     fs::rename(tmp, index_path(dir, id))
 }
 
+/// Pack ids in `dir`, ascending. Deletes each index whose pack is gone
+/// (a stop between retire's unlinks): ids are reused, and a later pack
+/// with that id would load the stale index as its own. Only the names
+/// `pack_path` and `index_path` write count; others stay untouched.
+pub(super) fn list(dir: &Path) -> io::Result<Vec<u64>> {
+    let (mut packs, mut indexes) = (Vec::new(), Vec::new());
+    for e in fs::read_dir(dir)? {
+        let name = e?.file_name();
+        let Some((hex, ext)) = name.to_str().and_then(|n| n.split_once('.')) else {
+            continue;
+        };
+        let Ok(id) = u64::from_str_radix(hex, 16) else {
+            continue;
+        };
+        if hex != format!("{id:016x}") {
+            continue;
+        }
+        match ext {
+            "pack" => packs.push(id),
+            "idx" => indexes.push(id),
+            _ => {}
+        }
+    }
+    packs.sort_unstable();
+    for id in indexes {
+        if packs.binary_search(&id).is_err() {
+            fs::remove_file(index_path(dir, id))?;
+        }
+    }
+    Ok(packs)
+}
+
 pub(super) fn load_index(dir: &Path, id: u64) -> io::Result<Vec<(Hash, u64, u32)>> {
     let data = fs::read(index_path(dir, id))?;
     let mut out = Vec::with_capacity(data.len() / 44);

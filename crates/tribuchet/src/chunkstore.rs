@@ -128,17 +128,7 @@ impl ChunkStore {
 
     /// Everything on disk loads into main with freq 0.
     fn load(&mut self) -> io::Result<()> {
-        let mut ids: Vec<u64> = Vec::new();
-        for e in fs::read_dir(&self.dir)? {
-            let name = e?.file_name();
-            if let Some(hex) = name.to_str().and_then(|n| n.strip_suffix(".pack"))
-                && let Ok(id) = u64::from_str_radix(hex, 16)
-            {
-                ids.push(id);
-            }
-        }
-        ids.sort_unstable();
-        for id in ids {
+        for id in pack::list(&self.dir)? {
             let entries = match pack::load_index(&self.dir, id) {
                 Ok(entries) => entries,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => pack::recover(&self.dir, id)?,
@@ -581,5 +571,27 @@ mod tests {
             get(&mut s, &h(1)).is_some(),
             "ghost readmission did not stick"
         );
+    }
+
+    #[test]
+    fn index_without_its_pack_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let ((ha, fa), (hc, fc)) = (frame(b"aaa"), frame(b"ccc"));
+        store(dir.path(), 1 << 20).insert(ha, &fa).unwrap();
+        drop(store(dir.path(), 1 << 20)); // recovery writes pack 0's index
+        fs::remove_file(pack_file(dir.path())).unwrap(); // as a stop mid-retire can
+        store(dir.path(), 1 << 20).insert(hc, &fc).unwrap(); // new pack 0, unsealed
+        assert_eq!(get(&mut store(dir.path(), 1 << 20), &hc), Some(fc));
+    }
+
+    #[test]
+    fn non_canonical_names_are_left_alone() {
+        for name in ["0.idx", "+0.idx", "00000000000000AB.idx", "0.pack"] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join(name), b"").unwrap();
+            let opened = ChunkStore::open(dir.path().to_path_buf(), 1 << 20);
+            assert!(opened.is_ok(), "{name}: {:?}", opened.err());
+            assert!(dir.path().join(name).exists(), "{name} was removed");
+        }
     }
 }
