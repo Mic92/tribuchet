@@ -17,6 +17,8 @@ use std::sync::{Arc, Mutex};
 mod pack;
 
 use pack::PackWriter;
+#[cfg(test)]
+pub(crate) use pack::probe;
 
 /// BLAKE3 of the uncompressed chunk bytes.
 pub type Hash = [u8; 32];
