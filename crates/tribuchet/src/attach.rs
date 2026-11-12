@@ -6,7 +6,7 @@
 //! performs self-reference rewriting and registration afterwards).
 //! Exits with the builder's exit code.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -15,7 +15,6 @@ use std::sync::Once;
 use std::time::Duration;
 
 use hyper_util::rt::TokioIo;
-use tokio::sync::mpsc;
 use tonic::Code;
 use tonic::transport::{Endpoint, Uri};
 use tower::service_fn;
@@ -23,13 +22,15 @@ use tower::service_fn;
 use crate::build_json::{BuildJson, flag, required_system_features};
 use crate::chunkio;
 use crate::errors::{Error, Result, chain, err_ctx, err_msg};
-use crate::nar;
 use crate::proto::{
-    BuildMessage, BuildRequest, DECLINE_EXIT_CODE, MAX_MSG_SIZE, OutputNar, TmpDirChunk,
-    attach_event, attach_hub_client::AttachHubClient, build_message,
+    BuildMessage, BuildRequest, DECLINE_EXIT_CODE, MAX_MSG_SIZE, TmpDirChunk, attach_event,
+    attach_hub_client::AttachHubClient, build_message,
 };
 use crate::rt;
 use crate::tmpdir;
+
+mod outputs;
+use outputs::{Unpacker, cleanup_unpackers, handle_output_chunk, remove_tree};
 
 pub fn run(build_json: &Path, socket: &Path) -> Result<()> {
     let build = BuildJson::load(build_json)?;
@@ -94,6 +95,9 @@ async fn run_async(build: BuildJson, socket: PathBuf, build_json_path: PathBuf) 
     // matches the build still running on the worker, which resumes
     // instead of building twice.
     let mut attempts = 0u32;
+    // Outputs this run renamed into place, kept across attempts: a
+    // resubmitted or requeued build delivers them again.
+    let mut committed = HashSet::new();
     loop {
         match attempt_build(
             &req,
@@ -101,6 +105,7 @@ async fn run_async(build: BuildJson, socket: PathBuf, build_json_path: PathBuf) 
             &socket,
             &expected_outputs,
             &top_tmp_dir,
+            &mut committed,
         )
         .await?
         {
@@ -168,6 +173,7 @@ async fn attempt_build(
     socket: &Path,
     expected_outputs: &[String],
     top_tmp_dir: &Path,
+    committed: &mut HashSet<String>,
 ) -> Result<Outcome> {
     let channel = match connect(socket).await {
         Ok(c) => c,
@@ -223,7 +229,12 @@ async fn attempt_build(
                 io::stderr().write_all(&data)?;
             }
             Some(attach_event::Event::Output(out)) => {
-                handle_output_chunk(&mut unpackers, expected_outputs, out).await?;
+                if let Err(err) =
+                    handle_output_chunk(&mut unpackers, committed, expected_outputs, out).await
+                {
+                    cleanup_unpackers(&mut unpackers).await;
+                    return Err(err);
+                }
             }
             Some(attach_event::Event::AddedPath(path)) => {
                 added_paths.insert(path);
@@ -234,9 +245,10 @@ async fn attempt_build(
             Some(attach_event::Event::OutputRestart(path)) => {
                 // The previous worker attempt died mid-NAR; the next
                 // attempt streams this output again from the start.
-                if let Some((tx, task)) = unpackers.remove(&path) {
+                if let Some((tx, task, scratch)) = unpackers.remove(&path) {
                     drop(tx);
                     let _ = task.await;
+                    remove_tree(&scratch);
                 }
             }
             Some(attach_event::Event::ExitCode(code)) => {
@@ -284,58 +296,6 @@ fn ready_marker() -> Result<()> {
     res
 }
 
-/// (chunk sender, unpack task) for one in-flight output transfer.
-type Unpacker = (mpsc::Sender<Vec<u8>>, tokio::task::JoinHandle<Result<()>>);
-
-fn remove_tree(path: &Path) {
-    let _ = fs::remove_dir_all(path);
-    let _ = fs::remove_file(path);
-}
-
-/// Unpack directly into the output path. Nix holds the path lock and
-/// deletes invalid leftovers before the next builder run; a killed
-/// attach leaves nothing behind that Nix does not already clean up.
-async fn handle_output_chunk(
-    unpackers: &mut HashMap<String, Unpacker>,
-    expected: &[String],
-    out: OutputNar,
-) -> Result<()> {
-    if !expected.contains(&out.store_path) {
-        return Err(err_msg(format!(
-            "hub sent unexpected output {}",
-            out.store_path
-        )));
-    }
-    let (tx, _) = unpackers.entry(out.store_path.clone()).or_insert_with(|| {
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
-        let dest = PathBuf::from(&out.store_path);
-        // An earlier attempt in this process may have left a partial
-        // tree here; the re-delivered NAR replaces it.
-        remove_tree(&dest);
-        let task =
-            tokio::spawn(
-                async move { nar::unpack_zstd_chunks(rx, &dest).await.map_err(Into::into) },
-            );
-        (tx, task)
-    });
-    if !out.zstd_nar_chunk.is_empty() && tx.send(out.zstd_nar_chunk).await.is_err() {
-        // The unpacker only stops early on error; report that error.
-        let (_, task) = unpackers.remove(&out.store_path).unwrap();
-        let err = task
-            .await?
-            .err()
-            .unwrap_or_else(|| err_msg("unpacker exited before eof"));
-        return Err(err_ctx(format!("unpacking output {}", out.store_path))(err));
-    }
-    if out.eof {
-        let (tx, task) = unpackers.remove(&out.store_path).unwrap();
-        drop(tx);
-        task.await??;
-        tracing::debug!(path = out.store_path, "output unpacked");
-    }
-    Ok(())
-}
-
 /// Sidecar the patched external-derivation-builder reads to extend
 /// addedPaths before the output reference scan.
 fn write_result_json(top_tmp_dir: &Path, added: &BTreeSet<String>) -> Result<()> {
@@ -343,72 +303,4 @@ fn write_result_json(top_tmp_dir: &Path, added: &BTreeSet<String>) -> Result<()>
     let body = serde_json::json!({ "addedPaths": added });
     fs::write(&path, serde_json::to_vec(&body)?)
         .map_err(err_ctx(format!("writing {}", path.display())))
-}
-
-/// Stop in-flight unpackers; partial trees stay at the output paths
-/// and are removed before the next unpack of the same path.
-async fn cleanup_unpackers(unpackers: &mut HashMap<String, Unpacker>) {
-    for (_, (tx, task)) in unpackers.drain() {
-        drop(tx);
-        let _ = task.await;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// zstd-compressed NAR of a single regular file, as the hub streams it.
-    fn zstd_nar_of_file(dir: &Path, body: &[u8]) -> Vec<u8> {
-        let src = dir.join("src");
-        fs::write(&src, body).unwrap();
-        let nar = nar::pack::to_vec(&src).unwrap();
-        zstd::encode_all(&nar[..], 3).unwrap()
-    }
-
-    async fn deliver(
-        unpackers: &mut HashMap<String, Unpacker>,
-        out: &str,
-        chunk: Vec<u8>,
-    ) -> Result<()> {
-        let expected = vec![out.to_owned()];
-        handle_output_chunk(
-            unpackers,
-            &expected,
-            OutputNar {
-                store_path: out.to_owned(),
-                zstd_nar_chunk: chunk,
-                eof: false,
-            },
-        )
-        .await?;
-        handle_output_chunk(
-            unpackers,
-            &expected,
-            OutputNar {
-                store_path: out.to_owned(),
-                zstd_nar_chunk: Vec::new(),
-                eof: true,
-            },
-        )
-        .await
-    }
-
-    /// Regression: a leftover tree at the output path (earlier attempt in
-    /// this process) must be replaced, not fail with EEXIST.
-    #[tokio::test]
-    async fn replaces_existing_output_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("out");
-        let out_str = out.to_string_lossy().into_owned();
-        fs::create_dir(&out).unwrap();
-        fs::write(out.join("stale"), b"junk").unwrap();
-
-        let chunk = zstd_nar_of_file(dir.path(), b"fresh");
-        let mut unpackers = HashMap::default();
-        deliver(&mut unpackers, &out_str, chunk).await.unwrap();
-
-        assert!(unpackers.is_empty());
-        assert_eq!(fs::read(&out).unwrap(), b"fresh");
-    }
 }
