@@ -202,6 +202,12 @@ pub struct WorkerConfig {
     /// Concurrent build slots.
     #[serde(default = "default_max_jobs")]
     pub max_jobs: u32,
+    /// NIX_BUILD_CORES for each build, i.e. how parallel one builder
+    /// makes itself. Defaults to this machine's parallelism, like Nix's
+    /// `cores = 0`. The value in the request comes from the hub's Nix,
+    /// which knows the hub's size and not ours.
+    #[serde(default = "default_build_cores")]
+    pub build_cores: u32,
     /// Parallel nix-daemon connections importing staged input NARs.
     #[serde(default = "default_import_jobs")]
     pub import_jobs: u32,
@@ -286,6 +292,9 @@ fn default_import_jobs() -> u32 {
 fn default_chunk_store_bytes() -> u64 {
     10 << 30
 }
+fn default_build_cores() -> u32 {
+    default_max_jobs()
+}
 fn default_max_jobs() -> u32 {
     thread::available_parallelism()
         .ok()
@@ -295,6 +304,18 @@ fn default_max_jobs() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_cores_defaults_to_our_own_parallelism() {
+        // The request carries the hub's NIX_BUILD_CORES, sized for the
+        // hub. Unset, we answer with this machine's parallelism; set, we
+        // answer with that.
+        let cfg: WorkerConfig = toml::from_str("hub = \"https://hub:7437\"").unwrap();
+        assert_eq!(cfg.build_cores, default_max_jobs());
+        let pinned: WorkerConfig =
+            toml::from_str("hub = \"https://hub:7437\"\nbuild-cores = 8").unwrap();
+        assert_eq!(pinned.build_cores, 8);
+    }
 
     #[test]
     fn env_overrides_tls_paths() {
