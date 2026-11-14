@@ -87,6 +87,13 @@ pub struct HubConfig {
     /// register as a worker (auth = tailscale).
     #[serde(default)]
     pub tailscale_allowed_tags: Vec<String>,
+    /// When set, a worker certificate must carry one of these URI SANs
+    /// (auth = mtls). Empty keeps the previous behaviour: any
+    /// certificate the CA signed may register. Set it when the CA
+    /// issues to more than workers -- a SPIFFE trust domain, say,
+    /// where every workload shares one root.
+    #[serde(default)]
+    pub mtls_allowed_ids: Vec<String>,
     /// When set, the hub rewrites a nix.conf fragment (the
     /// external-builders and max-jobs settings) whenever the
     /// connected-worker set changes, so a local nix-daemon offloads to
@@ -341,5 +348,25 @@ mod tests {
     fn unknown_keys_are_rejected() {
         let err = toml::from_str::<HubConfig>("max-jobs = 2").unwrap_err();
         assert!(err.to_string().contains("max-jobs"), "{err}");
+    }
+
+    /// `deny_unknown_fields` means a typo in the key name is a hard
+    /// error, so pin the spelling the docs and the error message use.
+    #[test]
+    fn mtls_allowed_ids_parses_from_kebab_case() {
+        let cfg: HubConfig = toml::from_str(
+            "auth = \"mtls\"\nmtls-allowed-ids = [\"spiffe://example.org/tribuchet/worker/bld1\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.mtls_allowed_ids,
+            vec!["spiffe://example.org/tribuchet/worker/bld1".to_owned()]
+        );
+    }
+
+    #[test]
+    fn mtls_allowed_ids_defaults_to_empty() {
+        let cfg: HubConfig = toml::from_str("auth = \"mtls\"\n").unwrap();
+        assert!(cfg.mtls_allowed_ids.is_empty());
     }
 }

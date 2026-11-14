@@ -108,7 +108,9 @@ fn configure_auth(
             );
             (
                 Some(ServerTlsConfig::new().identity(identity).client_ca_root(ca)),
-                PeerAuth::Mtls,
+                PeerAuth::Mtls {
+                    allowed_ids: cfg.mtls_allowed_ids.clone(),
+                },
             )
         }
         Auth::Tailscale => {
