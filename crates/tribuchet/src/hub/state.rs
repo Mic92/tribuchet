@@ -86,6 +86,8 @@ pub(super) struct HubState {
     pub(super) worker_grace: Duration,
     /// Never decline; see `HubConfig::require_worker`.
     pub(super) require_worker: bool,
+    /// Always decline; see `HubConfig::local_features`.
+    pub(super) local_features: Vec<String>,
     /// Hub start time and the capabilities of workers whose session
     /// ended: together they tell `expected_deadline` which platforms are
     /// still worth waiting for after a restart or a worker drop.
@@ -163,6 +165,7 @@ impl HubState {
     pub(super) fn new(
         worker_grace: Duration,
         require_worker: bool,
+        local_features: Vec<String>,
         nix_config: Option<NixConfig>,
         chunks: Arc<ChunkCache>,
     ) -> Self {
@@ -182,6 +185,7 @@ impl HubState {
             next_worker_id: atomic::AtomicU64::default(),
             worker_grace,
             require_worker,
+            local_features,
             started_at: Instant::now(),
             departed: StdMutex::default(),
             held: StdMutex::default(),
@@ -339,7 +343,7 @@ mod tests {
         pub(in crate::hub) fn for_test(worker_grace: Duration) -> Self {
             let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
             let cache = ChunkCache::open(dir.path().to_path_buf(), 1 << 20).unwrap();
-            Self::new(worker_grace, false, None, Arc::new(cache))
+            Self::new(worker_grace, false, Vec::new(), None, Arc::new(cache))
         }
     }
 

@@ -82,6 +82,12 @@ pub struct HubConfig {
     /// machine: declining there silently turns the hub into one.
     #[serde(default)]
     pub require_worker: bool,
+    /// System features only the hub's own Nix provides, e.g. a builder
+    /// RPC into its daemon: no worker can serve them, so a build
+    /// requiring one is declined at once and Nix builds it locally,
+    /// `require-worker` or not.
+    #[serde(default)]
+    pub local_features: Vec<String>,
     /// Optional address (e.g. 127.0.0.1:7438) for the Prometheus
     /// metrics endpoint; disabled when unset.
     #[serde(default)]

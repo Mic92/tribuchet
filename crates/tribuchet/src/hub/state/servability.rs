@@ -30,6 +30,11 @@ impl HubState {
     /// Whether a platform can be built now, once an expected worker is
     /// back, or never.
     pub(in crate::hub) fn servability(&self, system: &str, features: &[String]) -> Servability {
+        // Only the hub's own Nix has these: waiting, even for a worker
+        // that `require-worker` insists on, would wait forever.
+        if features.iter().any(|f| self.local_features.contains(f)) {
+            return Servability::Never;
+        }
         if self
             .worker_caps
             .lock()
@@ -99,6 +104,36 @@ mod tests {
                 Servability::Awaited
             ));
         }
+    }
+
+    #[test]
+    fn local_features_decline_even_with_require_worker() {
+        // A dynamic derivation's producer needs the hub's own daemon
+        // (builder-rpc-v0): no worker will ever serve it, so it must not
+        // wait for one, and no worker that claims it gets it either.
+        let mut state = HubState::for_test(Duration::ZERO);
+        state.require_worker = true;
+        state.local_features = vec!["builder-rpc-v0".to_owned()];
+        state
+            .worker_caps
+            .lock()
+            .unwrap()
+            .insert(1, caps("x86_64-linux", &["builder-rpc-v0"]));
+        let rpc = vec!["builder-rpc-v0".to_owned()];
+        assert!(matches!(
+            state.servability("x86_64-linux", &rpc),
+            Servability::Never
+        ));
+        // Everything else still waits for a worker.
+        let kvm = vec!["kvm".to_owned()];
+        assert!(matches!(
+            state.servability("x86_64-linux", &kvm),
+            Servability::Awaited
+        ));
+        assert!(matches!(
+            state.servability("x86_64-linux", &[]),
+            Servability::Now
+        ));
     }
 
     #[test]
