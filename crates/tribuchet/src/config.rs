@@ -76,6 +76,12 @@ pub struct HubConfig {
     /// once.
     #[serde(default = "default_worker_grace_secs")]
     pub worker_grace_secs: u64,
+    /// Require a worker for every build. Submissions queue until a
+    /// worker can serve them instead of declining, so Nix never falls
+    /// back to a local build. Set it on a hub that is not a build
+    /// machine: declining there silently turns the hub into one.
+    #[serde(default)]
+    pub require_worker: bool,
     /// Optional address (e.g. 127.0.0.1:7438) for the Prometheus
     /// metrics endpoint; disabled when unset.
     #[serde(default)]
