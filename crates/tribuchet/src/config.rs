@@ -69,6 +69,12 @@ pub struct HubConfig {
     /// Directory with the CA material and the hub TLS key pair.
     #[serde(default = "default_hub_config_dir")]
     pub config_dir: PathBuf,
+    /// Trust roots a worker's certificate may chain to, read on every
+    /// handshake. Defaults to `config_dir/ca/ca.crt`. Name each root
+    /// separately -- our CA, a SPIRE trust bundle -- rather than
+    /// splicing them into one file somewhere else.
+    #[serde(default)]
+    pub trust_files: Vec<PathBuf>,
     /// Seconds a build waits for a platform we expect a worker to
     /// (re)serve before declining (lets a patched Nix fall back to a
     /// local build). Covers the startup re-registration window and a

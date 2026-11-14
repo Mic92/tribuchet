@@ -21,6 +21,7 @@ toml.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 tokio-stream = { workspace = true, features = ["net"] }
+tokio-rustls.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
 tower.workspace = true

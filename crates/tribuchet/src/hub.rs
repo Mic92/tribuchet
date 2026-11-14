@@ -16,7 +16,6 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::transport::server::{TcpConnectInfo, TlsConnectInfo};
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::proto::worker_hub_server::WorkerHub;
@@ -32,6 +31,7 @@ mod relay;
 mod serve;
 mod state;
 mod submit;
+mod tls;
 pub use serve::run;
 
 use crate::errors::{Result, chain};
@@ -73,9 +73,8 @@ struct WorkerSvc {
 fn peer_uri_sans<T>(request: &Request<T>) -> Vec<String> {
     request
         .extensions()
-        .get::<TlsConnectInfo<TcpConnectInfo>>()
-        .and_then(tonic::transport::server::TlsConnectInfo::peer_certs)
-        .map(|certs| uri_sans(&certs))
+        .get::<tls::PeerInfo>()
+        .map(|info| uri_sans(&info.certs))
         .unwrap_or_default()
 }
 
@@ -244,7 +243,7 @@ impl WorkerHub for WorkerSvc {
     ) -> Result<Response<Self::SessionStream>, Status> {
         let remote = request
             .extensions()
-            .get::<TcpConnectInfo>()
+            .get::<tls::PeerInfo>()
             .and_then(|i| i.remote_addr);
         let peer_ids = peer_uri_sans(&request);
         let mut inbound = request.into_inner();

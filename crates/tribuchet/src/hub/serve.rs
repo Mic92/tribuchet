@@ -14,13 +14,15 @@ use std::time::Duration;
 use nix::unistd::Group;
 use rustix::fs::Mode;
 use rustix::process::umask;
+use tokio_rustls::rustls::ServerConfig;
 use tokio_stream::wrappers::UnixListenerStream;
-use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
+use tonic::transport::Server;
 
 use super::chunkcache::ChunkCache;
 use super::metrics;
 use super::state::HubState;
 use super::submit::AttachSvc;
+use super::tls;
 use super::{PeerAuth, WorkerSvc};
 use crate::config::{Auth, HubConfig, default_chunk_cache_dir};
 use crate::errors::{Result, chain, err_ctx, err_msg};
@@ -92,22 +94,23 @@ fn check_attach_socket_dir(socket: &Path) -> Result<()> {
     Ok(())
 }
 
-fn configure_auth(
-    cfg: &HubConfig,
-    config_dir: &Path,
-) -> Result<(Option<ServerTlsConfig>, PeerAuth)> {
+fn configure_auth(cfg: &HubConfig, config_dir: &Path) -> Result<(Option<ServerConfig>, PeerAuth)> {
     Ok(match cfg.auth {
         Auth::Mtls => {
             let ca_dir = config_dir.join("ca");
-            let identity = Identity::from_pem(
-                fs::read(ca_dir.join("hub.crt")).map_err(err_ctx("reading hub.crt"))?,
-                fs::read(ca_dir.join("hub.key")).map_err(err_ctx("reading hub.key"))?,
-            );
-            let ca = Certificate::from_pem(
-                fs::read(ca_dir.join("ca.crt")).map_err(err_ctx("reading ca.crt"))?,
-            );
+            // The roots are read per handshake (hub/tls.rs), so an
+            // unwritten SPIRE bundle delays workers instead of the hub.
+            let trust_files = if cfg.trust_files.is_empty() {
+                vec![ca_dir.join("ca.crt")]
+            } else {
+                cfg.trust_files.clone()
+            };
             (
-                Some(ServerTlsConfig::new().identity(identity).client_ca_root(ca)),
+                Some(tls::server_config(
+                    &ca_dir.join("hub.crt"),
+                    &ca_dir.join("hub.key"),
+                    trust_files,
+                )?),
                 PeerAuth::Mtls {
                     allowed_ids: cfg.mtls_allowed_ids.clone(),
                 },
@@ -167,11 +170,7 @@ async fn run_async(cfg: HubConfig) -> Result<()> {
         .await
         .map_err(err_ctx("binding worker listen address"))?,
     };
-    let mut builder = Server::builder();
-    if let Some(tls) = tls {
-        builder = builder.tls_config(tls)?;
-    }
-    let worker_server = builder
+    let worker_server = Server::builder()
         // Detect dead/half-open worker connections instead of relying on
         // the workers' own traffic.
         .http2_keepalive_interval(Some(Duration::from_secs(30)))
@@ -186,7 +185,7 @@ async fn run_async(cfg: HubConfig) -> Result<()> {
             .max_decoding_message_size(MAX_MSG_SIZE)
             .max_encoding_message_size(MAX_MSG_SIZE),
         )
-        .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(tcp));
+        .serve_with_incoming(tls::incoming(tcp, tls));
 
     let uds = match activated.unix {
         // Activated socket: systemd owns the path, mode and group
