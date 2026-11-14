@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::path::{Component, Path};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -113,6 +113,10 @@ pub(super) fn dedupe_key(req: &BuildRequest, tmp_dir_pack: &[u8]) -> String {
     hex::encode(h.finalize())
 }
 
+/// How often a submission waiting with no deadline (`require-worker`)
+/// reports that it is still waiting.
+const AWAIT_REPORT: Duration = Duration::from_mins(10);
+
 fn new_id() -> String {
     let mut buf = [0u8; 16];
     getrandom::fill(&mut buf).expect("read system randomness");
@@ -144,6 +148,11 @@ impl AttachSvc {
             }));
             Response::new(ReceiverStream::new(rx))
         };
+        let since = Instant::now();
+        let mut logged = false;
+        // Its own clock: a worker registering wakes the loop to recheck,
+        // but neither warns nor postpones the next report.
+        let mut next_report = since + AWAIT_REPORT;
         loop {
             // Arm the wakeup before checking, else a worker registering
             // in the gap would be missed.
@@ -153,12 +162,27 @@ impl AttachSvc {
             let deadline = match self.state.servability(system, features) {
                 Servability::Now => return None,
                 Servability::Never => return Some(decline()),
-                Servability::ExpectedBy(at) => at,
+                Servability::ExpectedBy(at) => Some(at),
+                Servability::Awaited => None,
             };
-            tracing::info!(system, "no capable worker yet; waiting");
+            if !logged {
+                tracing::info!(system, ?features, "no capable worker yet; waiting");
+                logged = true;
+            } else if deadline.is_none() && Instant::now() >= next_report {
+                // A wait with no deadline is otherwise silent for as
+                // long as it lasts: say so every AWAIT_REPORT.
+                tracing::warn!(
+                    system,
+                    ?features,
+                    waited_secs = since.elapsed().as_secs(),
+                    "still no capable worker; waiting"
+                );
+                next_report += AWAIT_REPORT;
+            }
+            let wake = deadline.unwrap_or(next_report);
             tokio::select! {
                 () = &mut notified => {}
-                () = tokio::time::sleep_until(deadline.into()) => {}
+                () = tokio::time::sleep_until(wake.into()) => {}
             }
         }
     }
