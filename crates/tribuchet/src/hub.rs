@@ -16,7 +16,6 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::transport::server::TcpConnectInfo;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::proto::worker_hub_server::WorkerHub;
@@ -32,6 +31,7 @@ mod relay;
 mod serve;
 mod state;
 mod submit;
+mod tls;
 pub use serve::run;
 
 use crate::errors::{Result, chain};
@@ -51,7 +51,11 @@ const MAX_JOB_ATTEMPTS: u32 = 3;
 /// transport layer (only certs signed by our CA can connect) and the
 /// self-reported name.
 enum PeerAuth {
-    Mtls,
+    Mtls {
+        /// URI SANs allowed to register; empty means any certificate
+        /// the CA signed.
+        allowed_ids: Vec<String>,
+    },
     Tailscale {
         socket: PathBuf,
         allowed_tags: Vec<String>,
@@ -61,6 +65,50 @@ enum PeerAuth {
 struct WorkerSvc {
     state: Arc<HubState>,
     auth: Arc<PeerAuth>,
+}
+
+/// URI SANs of the peer certificate, e.g. the SPIFFE ID a SPIRE agent
+/// issued. Empty when the connection is not mTLS or the peer sent no
+/// certificate, which `identity_allowed` then rejects.
+fn peer_uri_sans<T>(request: &Request<T>) -> Vec<String> {
+    request
+        .extensions()
+        .get::<tls::PeerInfo>()
+        .map(|info| uri_sans(&info.certs))
+        .unwrap_or_default()
+}
+
+/// URI SANs of the leaf certificate, i.e. the first entry of the chain.
+/// Only the leaf is the identity the peer proved possession of, so a
+/// worker cannot smuggle in an allowed identity by appending a
+/// certificate it does not hold the key for. An unparsable certificate
+/// yields nothing instead of failing the connection; the empty result is
+/// rejected by `identity_allowed` anyway.
+fn uri_sans(certs: &[tonic::transport::CertificateDer<'_>]) -> Vec<String> {
+    let Some(leaf) = certs.first() else {
+        return Vec::new();
+    };
+    let Ok((_, cert)) = x509_parser::parse_x509_certificate(leaf) else {
+        return Vec::new();
+    };
+    let Ok(Some(san)) = cert.subject_alternative_name() else {
+        return Vec::new();
+    };
+    san.value
+        .general_names
+        .iter()
+        .filter_map(|n| match n {
+            x509_parser::extensions::GeneralName::URI(uri) => Some((*uri).to_owned()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether a peer carrying `ids` may register. An empty `allowed` is
+/// the historical behaviour: any certificate the CA signed is a
+/// worker.
+fn identity_allowed(allowed: &[String], ids: &[String]) -> bool {
+    allowed.is_empty() || ids.iter().any(|id| allowed.contains(id))
 }
 
 /// Registers the worker's capabilities while alive; removes them on
@@ -195,8 +243,9 @@ impl WorkerHub for WorkerSvc {
     ) -> Result<Response<Self::SessionStream>, Status> {
         let remote = request
             .extensions()
-            .get::<TcpConnectInfo>()
+            .get::<tls::PeerInfo>()
             .and_then(|i| i.remote_addr);
+        let peer_ids = peer_uri_sans(&request);
         let mut inbound = request.into_inner();
         let Some(WorkerMessage {
             msg: Some(worker_message::Msg::Register(mut register)),
@@ -204,6 +253,17 @@ impl WorkerHub for WorkerSvc {
         else {
             return Err(Status::invalid_argument("first message must be Register"));
         };
+        if let PeerAuth::Mtls { allowed_ids } = self.auth.as_ref()
+            && !identity_allowed(allowed_ids, &peer_ids)
+        {
+            tracing::warn!(
+                ids = ?peer_ids,
+                "rejecting worker whose certificate identity is not allowed"
+            );
+            return Err(Status::permission_denied(
+                "certificate identity not in mtls-allowed-ids",
+            ));
+        }
         if let PeerAuth::Tailscale {
             socket,
             allowed_tags,
@@ -388,5 +448,100 @@ async fn supervise_job(
         .await;
         job.replay.publish(attach_event::Event::Error(err)).await;
         state.finish(&job).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{identity_allowed, uri_sans};
+    use rcgen::{CertificateParams, KeyPair, SanType};
+    use tonic::transport::CertificateDer;
+
+    fn cert_with_sans(sans: Vec<SanType>) -> Vec<u8> {
+        let mut params = CertificateParams::default();
+        params.subject_alt_names = sans;
+        let key = KeyPair::generate().unwrap();
+        params.self_signed(&key).unwrap().der().to_vec()
+    }
+
+    #[test]
+    fn reads_the_spiffe_id_from_a_uri_san() {
+        let id = "spiffe://example.org/tribuchet/worker/bld1";
+        let der = cert_with_sans(vec![SanType::URI(id.try_into().unwrap())]);
+        let certs = [CertificateDer::from(der.as_slice())];
+        assert_eq!(uri_sans(&certs), vec![id.to_owned()]);
+    }
+
+    #[test]
+    fn ignores_sans_that_are_not_uris() {
+        let der = cert_with_sans(vec![SanType::DnsName(
+            "worker.example.com".try_into().unwrap(),
+        )]);
+        let certs = [CertificateDer::from(der.as_slice())];
+        assert!(uri_sans(&certs).is_empty());
+    }
+
+    #[test]
+    fn unparsable_certificate_contributes_no_identity() {
+        let certs = [CertificateDer::from(&b"not a certificate"[..])];
+        assert!(uri_sans(&certs).is_empty());
+    }
+
+    /// Only the leaf authorises the peer. A worker holding an unlisted
+    /// key must not pass the allowlist by appending someone else's
+    /// certificate -- it never proved possession of that key.
+    #[test]
+    fn ignores_identities_of_certificates_after_the_leaf() {
+        let allowed = "spiffe://example.org/tribuchet/worker/bld1";
+        let leaf = cert_with_sans(vec![SanType::URI(
+            "spiffe://example.org/nix-farm/client/bld1"
+                .try_into()
+                .unwrap(),
+        )]);
+        let appended = cert_with_sans(vec![SanType::URI(allowed.try_into().unwrap())]);
+        let certs = [
+            CertificateDer::from(leaf.as_slice()),
+            CertificateDer::from(appended.as_slice()),
+        ];
+
+        let ids = uri_sans(&certs);
+        assert_eq!(
+            ids,
+            vec!["spiffe://example.org/nix-farm/client/bld1".to_owned()]
+        );
+        assert!(!identity_allowed(&[allowed.to_owned()], &ids));
+    }
+
+    #[test]
+    fn empty_chain_contributes_no_identity() {
+        assert!(uri_sans(&[]).is_empty());
+    }
+
+    /// Without `mtls_allowed_ids` any certificate the CA signed may
+    /// register, which is how every existing deployment is configured.
+    #[test]
+    fn empty_allowlist_accepts_anyone() {
+        assert!(identity_allowed(&[], &[]));
+        assert!(identity_allowed(
+            &[],
+            &["spiffe://example.org/other".to_owned()]
+        ));
+    }
+
+    #[test]
+    fn allowlist_admits_only_listed_ids() {
+        let allowed = vec!["spiffe://example.org/tribuchet/worker/bld1".to_owned()];
+        assert!(identity_allowed(
+            &allowed,
+            &["spiffe://example.org/tribuchet/worker/bld1".to_owned()]
+        ));
+        // A different workload in the same SPIRE trust domain: signed by
+        // the same root, but not a worker.
+        assert!(!identity_allowed(
+            &allowed,
+            &["spiffe://example.org/nix-farm/client/bld1".to_owned()]
+        ));
+        // No client certificate, or one without a URI SAN.
+        assert!(!identity_allowed(&allowed, &[]));
     }
 }

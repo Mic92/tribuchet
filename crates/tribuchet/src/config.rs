@@ -69,6 +69,12 @@ pub struct HubConfig {
     /// Directory with the CA material and the hub TLS key pair.
     #[serde(default = "default_hub_config_dir")]
     pub config_dir: PathBuf,
+    /// Trust roots a worker's certificate may chain to, read on every
+    /// handshake. Defaults to `config_dir/ca/ca.crt`. Name each root
+    /// separately -- our CA, a SPIRE trust bundle -- rather than
+    /// splicing them into one file somewhere else.
+    #[serde(default)]
+    pub trust_files: Vec<PathBuf>,
     /// Seconds a build waits for a platform we expect a worker to
     /// (re)serve before declining (lets a patched Nix fall back to a
     /// local build). Covers the startup re-registration window and a
@@ -87,6 +93,13 @@ pub struct HubConfig {
     /// register as a worker (auth = tailscale).
     #[serde(default)]
     pub tailscale_allowed_tags: Vec<String>,
+    /// When set, a worker certificate must carry one of these URI SANs
+    /// (auth = mtls). Empty keeps the previous behaviour: any
+    /// certificate the CA signed may register. Set it when the CA
+    /// issues to more than workers -- a SPIFFE trust domain, say,
+    /// where every workload shares one root.
+    #[serde(default)]
+    pub mtls_allowed_ids: Vec<String>,
     /// When set, the hub rewrites a nix.conf fragment (the
     /// external-builders and max-jobs settings) whenever the
     /// connected-worker set changes, so a local nix-daemon offloads to
@@ -341,5 +354,25 @@ mod tests {
     fn unknown_keys_are_rejected() {
         let err = toml::from_str::<HubConfig>("max-jobs = 2").unwrap_err();
         assert!(err.to_string().contains("max-jobs"), "{err}");
+    }
+
+    /// `deny_unknown_fields` means a typo in the key name is a hard
+    /// error, so pin the spelling the docs and the error message use.
+    #[test]
+    fn mtls_allowed_ids_parses_from_kebab_case() {
+        let cfg: HubConfig = toml::from_str(
+            "auth = \"mtls\"\nmtls-allowed-ids = [\"spiffe://example.org/tribuchet/worker/bld1\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.mtls_allowed_ids,
+            vec!["spiffe://example.org/tribuchet/worker/bld1".to_owned()]
+        );
+    }
+
+    #[test]
+    fn mtls_allowed_ids_defaults_to_empty() {
+        let cfg: HubConfig = toml::from_str("auth = \"mtls\"\n").unwrap();
+        assert!(cfg.mtls_allowed_ids.is_empty());
     }
 }
