@@ -85,6 +85,8 @@ struct WorkerCtx {
     max_log_size: u64,
     /// memory.max for each build's cgroup.
     build_memory_max_bytes: Option<u64>,
+    /// NIX_BUILD_CORES handed to each builder, from the build-cores setting.
+    build_cores: u32,
     /// Builder gets the host nix-daemon socket bind-mounted in; the
     /// worker advertises the `recursive-nix` feature.
     pub(super) recursive_nix: bool,
@@ -375,6 +377,7 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
         max_silent_time: Duration::from_secs(opts.max_silent_time_secs),
         max_log_size: opts.max_log_size,
         build_memory_max_bytes: opts.build_memory_max_bytes,
+        build_cores: opts.build_cores.max(1),
         recursive_nix: opts.recursive_nix,
         agents: agents::AgentPool::new(opts.agent_sockets.clone()),
     });
