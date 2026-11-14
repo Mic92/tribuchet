@@ -8,6 +8,8 @@ use super::{HubState, WorkerCaps};
 pub(in crate::hub) enum Servability {
     Now,
     ExpectedBy(Instant),
+    /// Awaited with no deadline: `require-worker` is set.
+    Awaited,
     Never,
 }
 
@@ -36,6 +38,9 @@ impl HubState {
             .any(|c| c.serves(system, features))
         {
             return Servability::Now;
+        }
+        if self.require_worker {
+            return Servability::Awaited;
         }
         self.expected_deadline(system, features)
             .map_or(Servability::Never, Servability::ExpectedBy)
@@ -77,6 +82,25 @@ mod tests {
         let lapsed = HubState::for_test(Duration::ZERO);
         assert!(lapsed.expected_deadline("aarch64-linux", &[]).is_none());
     }
+    #[test]
+    fn require_worker_waits_instead_of_declining() {
+        // A hub that is not a build machine: past the startup window,
+        // with no worker ever seen, every platform would decline and
+        // Nix would build it here. require-worker keeps them queued.
+        let mut state = HubState::for_test(Duration::ZERO);
+        assert!(matches!(
+            state.servability("x86_64-linux", &[]),
+            Servability::Never
+        ));
+        state.require_worker = true;
+        for system in ["x86_64-linux", "aarch64-linux", "aarch64-darwin"] {
+            assert!(matches!(
+                state.servability(system, &[]),
+                Servability::Awaited
+            ));
+        }
+    }
+
     #[test]
     fn departed_worker_keeps_its_platform_expected() {
         // Past the startup window but inside the reconnect window.

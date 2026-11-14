@@ -141,6 +141,7 @@ async fn run_async(cfg: HubConfig) -> Result<()> {
 
     let state = Arc::new(HubState::new(
         Duration::from_secs(cfg.worker_grace_secs),
+        cfg.require_worker,
         cfg.nix_config.clone(),
         chunks,
     ));

@@ -84,6 +84,8 @@ pub(super) struct HubState {
     /// How long a build waits for a platform expected back (hub
     /// restart, worker reconnect). Never-seen platforms decline at once.
     pub(super) worker_grace: Duration,
+    /// Never decline; see `HubConfig::require_worker`.
+    pub(super) require_worker: bool,
     /// Hub start time and the capabilities of workers whose session
     /// ended: together they tell `expected_deadline` which platforms are
     /// still worth waiting for after a restart or a worker drop.
@@ -160,6 +162,7 @@ impl WorkerCaps {
 impl HubState {
     pub(super) fn new(
         worker_grace: Duration,
+        require_worker: bool,
         nix_config: Option<NixConfig>,
         chunks: Arc<ChunkCache>,
     ) -> Self {
@@ -178,6 +181,7 @@ impl HubState {
             worker_caps: StdMutex::default(),
             next_worker_id: atomic::AtomicU64::default(),
             worker_grace,
+            require_worker,
             started_at: Instant::now(),
             departed: StdMutex::default(),
             held: StdMutex::default(),
@@ -298,7 +302,9 @@ impl HubState {
         let mut due: Option<Instant> = None;
         for j in queue.drain(..) {
             match self.servability(&j.req.system, &j.features) {
-                Servability::Now => kept.push_back(j),
+                // Awaited contributes no deadline: it waits for a
+                // worker, not a clock.
+                Servability::Now | Servability::Awaited => kept.push_back(j),
                 Servability::ExpectedBy(at) => {
                     due = Some(due.map_or(at, |d| d.max(at)));
                     kept.push_back(j);
@@ -333,7 +339,7 @@ mod tests {
         pub(in crate::hub) fn for_test(worker_grace: Duration) -> Self {
             let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
             let cache = ChunkCache::open(dir.path().to_path_buf(), 1 << 20).unwrap();
-            Self::new(worker_grace, None, Arc::new(cache))
+            Self::new(worker_grace, false, None, Arc::new(cache))
         }
     }
 

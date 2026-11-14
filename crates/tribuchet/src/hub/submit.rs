@@ -153,12 +153,19 @@ impl AttachSvc {
             let deadline = match self.state.servability(system, features) {
                 Servability::Now => return None,
                 Servability::Never => return Some(decline()),
-                Servability::ExpectedBy(at) => at,
+                Servability::ExpectedBy(at) => Some(at),
+                Servability::Awaited => None,
             };
             tracing::info!(system, "no capable worker yet; waiting");
-            tokio::select! {
-                () = &mut notified => {}
-                () = tokio::time::sleep_until(deadline.into()) => {}
+            match deadline {
+                Some(at) => {
+                    tokio::select! {
+                        () = &mut notified => {}
+                        () = tokio::time::sleep_until(at.into()) => {}
+                    }
+                }
+                // No deadline: only a worker registering ends the wait.
+                None => notified.await,
             }
         }
     }
