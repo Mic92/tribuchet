@@ -230,6 +230,14 @@ Set `metrics-listen = "127.0.0.1:7438"` in `hub.toml` and the hub serves
 JSON, sorted by name, with `name`, `systems` and their features, `max_jobs`
 and `connected_seconds`.
 
+A worker with `metrics-listen` set in `worker.toml` serves its own builds
+the same way, for whatever runs next to it, an autoscaler's idle check say:
+
+| metric | type | labels | meaning |
+|---|---|---|---|
+| `tribuchet_worker_builds` | gauge | state = staging, building, delivering | builds on this worker. `staging` builds are still receiving inputs, `building` ones run (also after a restart re-adopted them), `delivering` ones finished and wait for the hub to acknowledge their result. Only `building` holds a slot. All zero means idle |
+| `tribuchet_worker_slots` | gauge | | concurrent build slots (`max-jobs`) |
+
 ## Fixed-output network policy
 
 On Linux workers with `/dev/net/tun`, fixed-output builds run in a

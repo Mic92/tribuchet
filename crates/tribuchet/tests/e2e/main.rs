@@ -345,6 +345,15 @@ fn build_nspawn() {
 // Serial daemon-lifecycle sequence (run with --test-threads=1)
 // ===========================================================================
 
+/// A check that the worker's metrics endpoint reads `n` builds in `state`.
+fn worker_builds(state: &str, n: u32) -> String {
+    format!(
+        "python3 -c 'import urllib.request as u; \
+         print(u.urlopen(\"http://127.0.0.1:7439/metrics\").read().decode())' \
+         | grep -qx 'tribuchet_worker_builds{{state=\"{state}\"}} {n}'"
+    )
+}
+
 #[test]
 fn lifecycle() {
     // Own remote build establishes a path we can validate at the end; no
@@ -384,8 +393,20 @@ fn lifecycle() {
         &format!("[ $(journalctl -u tribuchet-worker | grep -c 'build assigned') -gt {assigned} ]"),
         60,
     );
+    // the worker's own gauge counts the build, also once a restart has
+    // re-adopted it (or it finished and still hands over its result)
+    wait_until_succeeds(Node::Worker, &worker_builds("building", 1), 30);
     succeed(Node::Worker, "systemctl restart tribuchet-worker");
     succeed(Node::Hub, "systemctl restart --no-block tribuchet-hub");
+    wait_until_succeeds(
+        Node::Worker,
+        &format!(
+            "{{ {}; }} || {{ {}; }}",
+            worker_builds("building", 1),
+            worker_builds("delivering", 1)
+        ),
+        30,
+    );
     wait_until_succeeds(Node::Hub, "test -f /tmp/drain.ok", 120);
     let out = succeed(Node::Hub, "cat /tmp/drain.out");
     succeed(
@@ -394,6 +415,10 @@ fn lifecycle() {
     );
     wait_until_succeeds(Node::Worker, "systemctl is-active tribuchet-worker", 60);
     wait_until_succeeds(Node::Hub, "systemctl is-active tribuchet-hub", 60);
+    // delivered and acknowledged: an idle worker reads all zeros
+    for state in ["staging", "building", "delivering"] {
+        wait_until_succeeds(Node::Worker, &worker_builds(state, 0), 30);
+    }
 
     // --- resubmitting a previously resumed derivation builds again --------
     succeed_t(

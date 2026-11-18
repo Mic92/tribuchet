@@ -264,6 +264,8 @@ in
             cert = "/etc/tribuchet/tls/worker.crt";
             ca-cert = "/etc/tribuchet/tls/ca.crt";
             max-jobs = 2;
+            # read by the lifecycle e2e around the drain build
+            metrics-listen = "127.0.0.1:7439";
             max-log-size = 1048576;
             # 2 GiB, exceeded only by the memhog subtest
             build-memory-max-bytes = 2147483648;

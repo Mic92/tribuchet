@@ -3,6 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -90,6 +91,7 @@ pub(super) async fn session(opts: &WorkerConfig, ctx: &Arc<WorkerCtx>) -> Result
     for (_, build) in active.drain() {
         build.abort().await;
     }
+    ctx.staging.store(0, Ordering::Relaxed);
     result
 }
 
@@ -112,6 +114,8 @@ async fn session_loop(
     let (wake_tx, mut wake_rx) = mpsc::unbounded_channel::<Wake>();
     declare_capacity(active, &ready, &env).await?;
     loop {
+        // for the metrics: whatever the last pass added or launched
+        ctx.staging.store(active.len(), Ordering::Relaxed);
         let m = tokio::select! {
             () = ctx.slot_freed.notified() => {
                 grant_slots(active, &mut ready, &env);
