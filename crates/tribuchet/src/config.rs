@@ -202,6 +202,10 @@ pub struct WorkerConfig {
     /// Concurrent build slots.
     #[serde(default = "default_max_jobs")]
     pub max_jobs: u32,
+    /// Optional address (e.g. [::1]:7439) for a Prometheus endpoint
+    /// with this worker's builds; disabled when unset.
+    #[serde(default)]
+    pub metrics_listen: Option<String>,
     /// Parallel nix-daemon connections importing staged input NARs.
     #[serde(default = "default_import_jobs")]
     pub import_jobs: u32,

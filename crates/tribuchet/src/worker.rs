@@ -18,6 +18,7 @@ pub mod binfmt;
 mod build;
 mod caps;
 mod logtail;
+mod metrics;
 mod pins;
 mod resume;
 pub mod sandbox;
@@ -32,7 +33,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -69,6 +70,8 @@ struct WorkerCtx {
     slots: Arc<Semaphore>,
     /// A `Slot` dropped. The session loop re-declares capacity.
     slot_freed: Notify,
+    /// Builds of the current hub session still staging, for metrics.
+    staging: AtomicUsize,
     /// dedupe_key -> build past staging; survives session loss so a
     /// replacement hub can resume instead of rebuilding.
     resumable: Mutex<HashMap<String, ResumableBuild>>,
@@ -364,6 +367,7 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
         sandbox: opts.sandbox,
         slots: Arc::new(Semaphore::new(opts.max_jobs.max(1) as usize)),
         slot_freed: Notify::new(),
+        staging: AtomicUsize::new(0),
         import_jobs: opts.import_jobs.max(1) as usize,
         chunks: open_chunk_store(&opts)?,
         cancelled: Mutex::new(HashSet::new()),
@@ -386,6 +390,7 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
     sd::spawn_watchdog();
     spawn_resumable_reaper(ctx.clone());
     spawn_handover();
+    metrics::spawn(&ctx, opts.metrics_listen.clone(), opts.max_jobs.max(1));
     adopt_builds(&ctx).await;
     sweep_orphaned_agent_builds(&ctx);
 
