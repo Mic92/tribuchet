@@ -38,23 +38,35 @@ pub(super) struct Metrics {
     build_seconds: Series,
     build_cpu_seconds: Series,
     build_peak_memory_bytes: Series,
-    /// Builds currently on a worker, by system.
+    /// Builds currently on a worker, by system and required features.
     running: Arc<Counts>,
 }
 
-type Counts = Mutex<BTreeMap<String, u64>>;
+/// (system, [`features_label`]) of a build.
+type BuildKey = (String, String);
+
+type Counts = Mutex<BTreeMap<BuildKey, u64>>;
 
 pub(super) struct Running {
     counts: Arc<Counts>,
-    system: String,
+    key: BuildKey,
 }
 
 impl Drop for Running {
     fn drop(&mut self) {
-        if let Some(n) = self.counts.lock().unwrap().get_mut(&self.system) {
+        if let Some(n) = self.counts.lock().unwrap().get_mut(&self.key) {
             *n = n.saturating_sub(1);
         }
     }
+}
+
+/// A build's required features as one label value: sorted, without
+/// duplicates, comma-joined. Empty for a build that needs none.
+fn features_label(features: &[String]) -> String {
+    let mut f: Vec<&str> = features.iter().map(String::as_str).collect();
+    f.sort_unstable();
+    f.dedup();
+    f.join(",")
 }
 
 /// Names returned by `relay::msg_name`.
@@ -84,16 +96,12 @@ impl Metrics {
     }
 
     /// Count a build as running until the guard drops, on every exit path.
-    pub(super) fn running(&self, system: &str) -> Running {
-        *self
-            .running
-            .lock()
-            .unwrap()
-            .entry(system.to_owned())
-            .or_default() += 1;
+    pub(super) fn running(&self, system: &str, features: &[String]) -> Running {
+        let key = (system.to_owned(), features_label(features));
+        *self.running.lock().unwrap().entry(key.clone()).or_default() += 1;
         Running {
             counts: self.running.clone(),
-            system: system.to_owned(),
+            key,
         }
     }
 
@@ -248,9 +256,11 @@ async fn render(state: &HubState) -> String {
     }
     render_histograms(&mut out, m);
 
-    let mut queued: BTreeMap<String, u64> = BTreeMap::new();
+    let mut queued: BTreeMap<BuildKey, u64> = BTreeMap::new();
     for j in state.queue.lock().await.iter() {
-        *queued.entry(j.req.system.clone()).or_default() += 1;
+        *queued
+            .entry((j.req.system.clone(), features_label(&j.features)))
+            .or_default() += 1;
     }
 
     render_workers(&mut out, state);
@@ -259,9 +269,10 @@ async fn render(state: &HubState) -> String {
 }
 
 /// Queue, running builds and capacity per system, for autoscaling. A worker
-/// serving several systems counts its slots in each. Free slots are
-/// `slots - running`.
-fn render_systems(out: &mut String, state: &HubState, queued: &BTreeMap<String, u64>) {
+/// serving several systems counts its slots in each. Builds are also split
+/// by their required features, so a scaler can start only workers that
+/// offer them; a build that needs none has no `features` label.
+fn render_systems(out: &mut String, state: &HubState, queued: &BTreeMap<BuildKey, u64>) {
     let mut slots: BTreeMap<String, u64> = BTreeMap::new();
     for c in state.worker_caps.lock().unwrap().values() {
         for system in c.systems.keys() {
@@ -271,14 +282,19 @@ fn render_systems(out: &mut String, state: &HubState, queued: &BTreeMap<String, 
     let running = state.metrics.running.lock().unwrap().clone();
     let _ = writeln!(
         out,
-        "# HELP tribuchet_system_builds Builds queued or running, by system."
+        "# HELP tribuchet_system_builds Builds queued or running, by system and required features."
     );
     let _ = writeln!(out, "# TYPE tribuchet_system_builds gauge");
     for (kind, counts) in [("queued", queued), ("running", &running)] {
-        for (system, n) in counts {
+        for ((system, features), n) in counts {
+            let features = if features.is_empty() {
+                String::new()
+            } else {
+                format!(",features=\"{}\"", label(features))
+            };
             let _ = writeln!(
                 out,
-                "tribuchet_system_builds{{system=\"{}\",state=\"{kind}\"}} {n}",
+                "tribuchet_system_builds{{system=\"{}\"{features},state=\"{kind}\"}} {n}",
                 label(system)
             );
         }
@@ -439,9 +455,10 @@ mod tests {
     #[test]
     fn running_counts_until_the_guard_drops() {
         let m = Metrics::default();
-        let a = m.running("x86_64-linux");
-        let b = m.running("x86_64-linux");
-        let get = || m.running.lock().unwrap().get("x86_64-linux").copied();
+        let a = m.running("x86_64-linux", &[]);
+        let b = m.running("x86_64-linux", &[]);
+        let key = ("x86_64-linux".to_owned(), String::new());
+        let get = || m.running.lock().unwrap().get(&key).copied();
         assert_eq!(get(), Some(2));
         drop(a);
         assert_eq!(get(), Some(1));
@@ -452,7 +469,7 @@ mod tests {
     #[tokio::test]
     async fn system_gauges_show_queued_running_and_slots() {
         let state = HubState::for_test(Duration::ZERO);
-        let job = |system: &str| Job {
+        let job = |system: &str, features: &[&str]| Job {
             id: "j".into(),
             key: "k".into(),
             req: BuildRequest {
@@ -460,16 +477,26 @@ mod tests {
                 ..Default::default()
             },
             tmp_dir_pack: Arc::new(Vec::new()),
-            features: vec![],
+            features: features.iter().map(|f| (*f).to_owned()).collect(),
             replay: Arc::new(Replay::default()),
             listing: Mutex::default(),
             attempts: 0,
             queued_at: Instant::now(),
         };
-        state.queue.lock().await.push_back(job("x86_64-linux"));
-        state.queue.lock().await.push_back(job("x86_64-linux"));
-        state.queue.lock().await.push_back(job("aarch64-linux"));
-        let _r = state.metrics.running("x86_64-linux");
+        for j in [
+            job("x86_64-linux", &[]),
+            job("x86_64-linux", &[]),
+            job("aarch64-linux", &[]),
+            // order and duplicates as a client may send them
+            job("x86_64-linux", &["kvm", "big-parallel"]),
+            job("x86_64-linux", &["big-parallel", "kvm", "kvm"]),
+        ] {
+            state.queue.lock().await.push_back(j);
+        }
+        let _r = state.metrics.running("x86_64-linux", &[]);
+        let _t = state
+            .metrics
+            .running("x86_64-linux", &["nixos-test".to_owned()]);
         for (id, max_jobs) in [(1, 4), (2, 8)] {
             state.worker_caps.lock().unwrap().insert(
                 id,
@@ -493,6 +520,18 @@ mod tests {
         );
         assert!(
             has("tribuchet_system_builds{system=\"x86_64-linux\",state=\"running\"} 1"),
+            "{out}"
+        );
+        assert!(
+            has(
+                "tribuchet_system_builds{system=\"x86_64-linux\",features=\"big-parallel,kvm\",state=\"queued\"} 2"
+            ),
+            "{out}"
+        );
+        assert!(
+            has(
+                "tribuchet_system_builds{system=\"x86_64-linux\",features=\"nixos-test\",state=\"running\"} 1"
+            ),
             "{out}"
         );
         assert!(
