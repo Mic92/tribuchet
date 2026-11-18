@@ -10,6 +10,7 @@ mod fsutil;
 mod hub;
 mod nar;
 mod netpolicy;
+mod prom;
 mod proto;
 mod rt;
 mod sd;

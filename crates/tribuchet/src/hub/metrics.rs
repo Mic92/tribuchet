@@ -1,18 +1,14 @@
-//! Prometheus metrics for the hub, exposed as a tiny text/plain HTTP
-//! endpoint. Kept dependency-free (raw tokio TCP) since the hub already
-//! pulls in plenty and a scrape endpoint needs no routing.
+//! Prometheus metrics for the hub, served by [`crate::prom`].
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
 use super::state::HubState;
-use crate::errors::{Result, err_ctx};
+use crate::errors::Result;
+use crate::prom::{self, metric};
 use crate::proto::BuildUsage;
 
 mod histogram;
@@ -144,12 +140,6 @@ fn label(value: &str) -> String {
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', "\\n")
-}
-
-fn metric(out: &mut String, name: &str, kind: &str, help: &str, value: u64) {
-    let _ = writeln!(out, "# HELP {name} {help}");
-    let _ = writeln!(out, "# TYPE {name} {kind}");
-    let _ = writeln!(out, "{name} {value}");
 }
 
 fn render_histograms(out: &mut String, m: &Metrics) {
@@ -331,44 +321,20 @@ fn render_workers(out: &mut String, state: &HubState) {
     }
 }
 
-/// Serve `/metrics` over plain HTTP/1.1 on `addr` until the process
-/// exits. A scrape is a single short request/response, so each
-/// connection is handled inline and then dropped.
+/// Serve `/metrics` on `addr` until the process exits.
 pub(super) async fn serve(state: Arc<HubState>, addr: String) -> Result<()> {
-    let parsed: SocketAddr = addr
-        .parse()
-        .map_err(err_ctx("parsing metrics-listen address"))?;
-    let listener = tokio::net::TcpListener::bind(parsed)
-        .await
-        .map_err(err_ctx(format!("binding metrics-listen address {addr}")))?;
-    tracing::info!(%addr, "metrics endpoint listening");
-    loop {
-        let (mut sock, _) = match listener.accept().await {
-            Ok(pair) => pair,
-            Err(e) => {
-                tracing::warn!("metrics accept failed: {e}");
-                continue;
-            }
-        };
+    prom::serve(&addr, move |req| {
         let state = state.clone();
-        tokio::spawn(async move {
+        async move {
             // Only /workers is special. Any other path scrapes the metrics.
-            let mut buf = [0u8; 1024];
-            let n = sock.read(&mut buf).await.unwrap_or(0);
-            let (kind, body) = if wants_workers(&buf[..n]) {
+            if wants_workers(&req) {
                 ("application/json", render_workers_json(&state))
             } else {
-                ("text/plain; version=0.0.4", render(&state).await)
-            };
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = sock.write_all(resp.as_bytes()).await;
-            let _ = sock.shutdown().await;
-        });
-    }
+                (prom::TEXT, render(&state).await)
+            }
+        }
+    })
+    .await
 }
 
 #[cfg(test)]
