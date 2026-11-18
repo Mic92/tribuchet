@@ -215,7 +215,7 @@ Set `metrics-listen = "127.0.0.1:7438"` in `hub.toml` and the hub serves
 | `tribuchet_builds_requeued_total` | counter | | builds requeued after a worker session was lost |
 | `tribuchet_builds_failed_total` | counter | | builds that ended in failure |
 | `tribuchet_builds_succeeded_total` | counter | | builds that completed |
-| `tribuchet_system_builds` | gauge | system, state = queued, running | builds in each state. Sum the `queued` series for the queue depth |
+| `tribuchet_system_builds` | gauge | system, features, state = queued, running | builds in each state. `features` lists a build's required system features, sorted and comma-joined, and is absent for a build that needs none. Sum the `queued` series for the queue depth |
 | `tribuchet_system_slots` | gauge | system | build slots of connected workers. A worker serving several systems counts in each. Free slots are `slots - running` |
 | `tribuchet_workers_connected` | gauge | | workers with an open session |
 | `tribuchet_workers_for_system` | gauge | system | connected workers advertising a system |

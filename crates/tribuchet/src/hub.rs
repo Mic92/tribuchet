@@ -354,7 +354,7 @@ async fn supervise_job(
     in_rx: mpsc::Receiver<worker_message::Msg>,
     sess: Arc<WorkerSession>,
 ) {
-    let _running = state.metrics.running(&job.req.system);
+    let _running = state.metrics.running(&job.req.system, &job.features);
     let mut dispatched = false;
     let res = run_job(&state, &job, &out_tx, in_rx, sess, &mut dispatched).await;
     router.unregister(&job.id);
