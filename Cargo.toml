@@ -19,7 +19,7 @@ blake3 = "1"
 fastcdc = "5"
 hyper-util = "0.1"
 rustix = { version = "1", features = ["event", "fs", "mount", "net", "pipe", "process", "stdio", "system", "thread"] }
-nix = { version = "0.31", features = ["process", "user"] }
+nix = { version = "0.32", features = ["process", "user"] }
 libc = "0.2"
 prost = "0.14"
 getrandom = "0.4"
